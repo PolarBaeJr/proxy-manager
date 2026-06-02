@@ -1,98 +1,118 @@
 # proxy-manager
 
-Self-hosted reverse proxy + load balancer + management dashboard for a single host (Raspberry Pi, VPS, anything that runs Docker).
+> A self-hosted reverse proxy, load balancer, and management dashboard for a single host. Two small Go binaries. Zero external dependencies aside from one QR code library.
 
-Two small Go binaries, zero external dependencies aside from one QR library:
+Built for a Raspberry Pi running 10+ services. Replaces the usual nginx + Traefik + Portainer + Homepage + a pile of bash scripts with ~3000 lines of Go you can read in an afternoon.
 
-| Binary | Port | Role | Docker socket |
-|---|---|---|---|
-| **proxy** | 8092 | Reverse proxy + weighted round-robin LB + health checks | read-only |
-| **dashboard** | 8093 | Auth + 2FA UI for services / DNS / users | read-write |
+---
 
-## Routing model
+## What you get
 
-Any container with `proxy.enable=true` and a `proxy.host` label is routable. The proxy reads container labels from the Docker socket, builds an in-memory route table, and round-robins traffic across all healthy backends sharing the same `proxy.host` + `proxy.path`.
+- **Label-driven routing.** Drop `proxy.enable=true` + `proxy.host=foo.example` labels on any container — it's routed. No config files to edit.
+- **Weighted round-robin** across replicas with **automatic failover** and **per-backend health checks**.
+- **Web dashboard** with: live route table, scale services up/down, create new services from a form, edit Cloudflare DNS, manage users, host CPU/RAM/disk stats.
+- **Real deployment workflows**: blue/green Canary → Promote/Discard, atomic Replace, one-click Rollback, registry update detection.
+- **Multi-user auth** with PBKDF2 passwords and TOTP 2FA (QR code setup). Every write requires 2FA.
+- **Audit log** of every action, rate-limited login, read-only Docker socket for the request path.
 
-For backends not in containers (host-bound services, third-party stuff), drop entries into `proxy/routes.json`.
+---
+
+## Architecture
+
+```
+                 ┌─────────────────────────────────┐
+   internet ───→ │ nginx (TLS termination on :443) │
+                 └─────────────────┬───────────────┘
+                                   │ HTTP
+                                   ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │  proxy  :8092          (read-only docker socket)         │
+   │  - label discovery + static routes                       │
+   │  - weighted round-robin + retry on failure               │
+   │  - background health checks (HTTP or TCP)                │
+   └──────────────────────────────────────────────────────────┘
+                                   ▲
+                                   │ container labels
+                                   ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │  dashboard  :8093      (read-write docker socket)        │
+   │  - auth + 2FA, audit log, rate-limited login             │
+   │  - services: create/scale/replace/stage/promote/rollback │
+   │  - DNS via Cloudflare API                                │
+   │  - users, host stats                                     │
+   └──────────────────────────────────────────────────────────┘
+```
+
+The two binaries don't talk to each other — they both watch the Docker socket. If the dashboard crashes, traffic keeps flowing. If the proxy crashes, the dashboard still works.
+
+---
 
 ## Quick start
 
 ```bash
-# Build + run both binaries:
-cp .env.example .env                # optional: fill in CLOUDFLARE_* to enable the DNS tab
+git clone https://github.com/PolarBaeJr/proxy-manager.git
+cd proxy-manager
+cp .env.example .env                # optional: Cloudflare token for DNS tab
 docker compose up -d --build
-
-# Visit the dashboard (use SSH tunnel if remote):
-#   ssh -L 8093:localhost:8093 your-host
-open http://localhost:8093          # first-run setup screen
 ```
 
-First-run setup creates the initial user with TOTP 2FA (QR code shown).
+Open `http://<host>:8093` — first-run setup creates the initial user and shows a TOTP QR code.
+
+If the host is remote, tunnel the dashboard port:
+```bash
+ssh -L 8093:localhost:8093 your-host
+open http://localhost:8093
+```
+
+---
 
 ## Labels reference
 
+Add these to any container you want routed:
+
 | Label | Required | Notes |
 |---|---|---|
-| `proxy.enable=true` | yes | Opt the container into routing |
-| `proxy.host=foo.example` | yes | Match against request Host header |
-| `proxy.port=8080` | yes | Container's *internal* port |
-| `proxy.path=/admin` | no | Path prefix for fan-out (longer prefixes win) |
-| `proxy.strip=true` | no | Strip the prefix before forwarding |
-| `proxy.name=Friendly` | no | Dashboard display name |
-| `proxy.weight=2` | no | Weighted RR (default 1) |
-| `proxy.health=/healthz` | no | HTTP health probe (default = TCP connect) |
-| `proxy.service=myapp` | no | Group key for scale/replace/canary in the dashboard |
-| `proxy.unscalable=true` | no | Mark singleton (DB, gateway, bot) — disables +/- |
+| `proxy.enable=true` | ✓ | opt in |
+| `proxy.host=foo.example` | ✓ | match against request Host header |
+| `proxy.port=8080` | ✓ | container's **internal** port |
+| `proxy.path=/admin` |   | path prefix for fan-out |
+| `proxy.strip=true` |   | strip prefix before forwarding |
+| `proxy.weight=2` |   | weighted RR (default 1) |
+| `proxy.health=/healthz` |   | HTTP probe (default = TCP connect) |
+| `proxy.service=myapp` |   | group key — enables scale/replace/canary in the dashboard |
+| `proxy.unscalable=true` |   | mark singleton (DB, gateway, Discord bot) |
+| `proxy.name=Friendly` |   | dashboard label |
 
-Containers must share the **`edge`** network with the proxy so it can reach them by IP.
+Containers must share the **`edge`** Docker network with the proxy. See `services/example.yml`.
 
-## Dashboard capabilities
-
-- **Routes** — every active route + backend health, auto-refresh
-- **Services** — scale + / − , create from form, Stage (canary), Promote, Discard, Replace, Rollback, Delete
-- **DNS** — list / create / edit / delete CNAME, A, TXT records on a Cloudflare zone (uses your scoped API token)
-- **Users** — multi-user, per-user TOTP, add/delete users
-- **Header** — live host CPU / RAM / disk stats
-- **Auth** — PBKDF2 password + RFC 6238 TOTP, HMAC-signed session cookies, rate limiting, audit log
+---
 
 ## Repo layout
 
 ```
-proxy/                  # request-path binary (~700 LOC)
-  main.go               # wiring
-  router.go             # routing, weighted RR, retry
-  docker.go             # docker socket client (read-only)
-  health.go             # background health checker
-  routes.json           # static routes for non-Docker backends
-
-dashboard/              # management UI binary (~2500 LOC)
-  main.go               # wiring
-  api.go                # HTTP handlers
-  auth.go               # users, sessions, TOTP, PBKDF2
-  ratelimit.go          # per-IP token bucket
-  audit.go              # JSONL audit log
-  cloudflare.go         # CF DNS CRUD
-  docker.go             # docker socket client (read-write)
-  images.go             # background registry digest checker
-  stats.go              # host CPU/MEM/DISK
-  qr.go                 # TOTP QR rendering
-  ui.go                 # single-file HTML+CSS+JS dashboard
-  data/                 # auth.json + audit.log (gitignored)
-
-services/               # example service definitions (drop your own here)
-docker-compose.yml      # the whole stack
-.env.example            # CF token placeholders
+proxy/        request-path binary  (~700 LOC)
+dashboard/    management UI binary (~2500 LOC, single-file embedded HTML)
+services/     example service definitions
+scripts/      CLI alternative for some dashboard actions
 ```
 
-## Security posture
+Every file is small enough to read top-to-bottom. No code generation, no third-party UI frameworks, no service mesh.
 
-- Auth required for every read; **2FA required for every write**
-- Rate-limited login + setup endpoints (5/min/IP, then 429)
-- Audit log of every write to `dashboard/data/audit.log`
-- proxy's docker socket mount is **read-only** — RCE there can't create/destroy containers
-- Cookies are HttpOnly + SameSite=Lax, HMAC-signed
-- TOTP secrets stored as plain JSON (file perms `0600`); back up `dashboard/data/`
+---
+
+## Security
+
+- 2FA required for **every** write (scale, create, delete, DNS edit, user mgmt)
+- TOTP secrets stay on disk in `dashboard/data/auth.json` (mode `0600`, gitignored)
+- Login + setup are rate-limited per IP
+- All writes append to `dashboard/data/audit.log` as JSONL
+- The proxy's Docker socket mount is **read-only** — an RCE there can't create or destroy containers
+- Cookies are HMAC-signed, HttpOnly, SameSite=Lax
+
+There's no TLS on the dashboard itself — front it with nginx + Let's Encrypt, or only access via SSH tunnel, before exposing it publicly.
+
+---
 
 ## License
 
-(your call)
+[MIT](LICENSE) © Matthew Cheng
