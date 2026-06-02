@@ -1,0 +1,30 @@
+name: example
+
+# Example: a service routed by the proxy via container labels.
+#
+#   docker compose -f services/example.yml up -d
+#
+# After it starts, the proxy sees the labels, registers a route, and serves
+# `myapp.pi.local` (or whatever you set as proxy.host) on port 8092.
+
+networks:
+  edge:
+    external: true
+
+services:
+  myapp:
+    image: nginxdemos/hello:plain-text
+    container_name: myapp
+    restart: unless-stopped
+    networks: [edge]
+    labels:
+      proxy.enable: "true"
+      proxy.host:    "myapp.pi.local"
+      proxy.port:    "80"
+      proxy.service: "myapp"           # group key for scaling
+      proxy.name:    "My App"
+      # proxy.path:        "/admin"     # optional path prefix
+      # proxy.strip:       "true"       # strip prefix before forwarding
+      # proxy.health:      "/healthz"   # HTTP health check path
+      # proxy.weight:      "2"          # weighted round-robin
+      # proxy.unscalable:  "true"       # disable scale buttons in dashboard

@@ -1,0 +1,46 @@
+name: pi-stack
+
+# Two independent binaries:
+#   proxy     :8092  — reverse proxy + label-driven load balancer (read-only docker socket)
+#   dashboard :8093  — auth-gated management UI (read-write docker socket, CF integration)
+#
+# nginx (running on the host, not in compose) terminates TLS on 443 and proxies
+# to 127.0.0.1:8092 — see /etc/nginx/sites-enabled on the Pi.
+
+networks:
+  edge:
+    name: edge
+
+services:
+  proxy:
+    build: ./proxy
+    image: proxy:latest
+    container_name: proxy
+    restart: unless-stopped
+    networks: [edge]
+    ports:
+      - "8092:8092"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro     # READ-ONLY
+      - ./proxy/routes.json:/etc/proxy/routes.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  dashboard:
+    build: ./dashboard
+    image: dashboard:latest
+    container_name: dashboard
+    restart: unless-stopped
+    networks: [edge]
+    ports:
+      - "8093:8093"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock        # read-write (service mgmt)
+      - ./proxy/routes.json:/etc/proxy/routes.json:ro    # same file the proxy reads
+      - ./dashboard/data:/data                           # auth.json + audit.log (persisted)
+      - /proc:/host-proc:ro                              # host CPU + memory stats
+      - /mnt/ssd:/host-root:ro                           # host disk stats (SSD)
+    environment:
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_ZONE_ID:   ${CLOUDFLARE_ZONE_ID:-}
+      CLOUDFLARE_DOMAIN:    ${CLOUDFLARE_DOMAIN:-}

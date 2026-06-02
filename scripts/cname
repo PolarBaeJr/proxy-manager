@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# CNAME management against Cloudflare. Reads CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID from .env.
+#
+# Usage:
+#   ./scripts/cname list
+#   ./scripts/cname add    myapp [target]          # target defaults to $CLOUDFLARE_TARGET_DOMAIN
+#   ./scripts/cname set    myapp new-target.com    # update existing record
+#   ./scripts/cname rm     myapp
+#   ./scripts/cname rename oldname newname         # change the hostname part
+#
+# Names may be bare ("myapp" => myapp.$CLOUDFLARE_DOMAIN) or fully qualified.
+set -euo pipefail
+
+ENV_FILE="${ENV_FILE:-.env}"
+[ -f "$ENV_FILE" ] && set -a && . "$ENV_FILE" && set +a
+
+: "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN missing (set in .env)}"
+: "${CLOUDFLARE_ZONE_ID:?CLOUDFLARE_ZONE_ID missing (set in .env)}"
+: "${CLOUDFLARE_DOMAIN:?CLOUDFLARE_DOMAIN missing (set in .env)}"
+TARGET_DEFAULT="${CLOUDFLARE_TARGET_DOMAIN:-}"
+
+API="https://api.cloudflare.com/client/v4"
+AUTH=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json")
+
+need_jq() { command -v jq >/dev/null || { echo "jq required: sudo apt install jq"; exit 1; }; }
+need_jq
+
+fqdn() {
+  case "$1" in
+    *.*) echo "$1" ;;
+    *)   echo "$1.$CLOUDFLARE_DOMAIN" ;;
+  esac
+}
+
+api() { curl -fsS "${AUTH[@]}" "$@"; }
+
+find_record_id() {
+  local name="$1"
+  api "$API/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=CNAME&name=$name" \
+    | jq -r '.result[0].id // empty'
+}
+
+cmd_list() {
+  api "$API/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=CNAME&per_page=100" \
+    | jq -r '.result[] | "\(.name)\t-> \(.content)\t(proxied=\(.proxied))"' \
+    | column -t -s $'\t'
+}
+
+cmd_add() {
+  local name target
+  name=$(fqdn "$1")
+  target="${2:-$TARGET_DEFAULT}"
+  [ -z "$target" ] && { echo "no target given and CLOUDFLARE_TARGET_DOMAIN unset"; exit 1; }
+
+  if [ -n "$(find_record_id "$name")" ]; then
+    echo "$name already exists — use: $0 set $1 $target"; exit 1
+  fi
+  api -X POST "$API/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+    --data "$(jq -nc --arg n "$name" --arg t "$target" \
+        '{type:"CNAME", name:$n, content:$t, ttl:1, proxied:true}')" \
+    | jq -r '"added \(.result.name) -> \(.result.content)"'
+}
+
+cmd_set() {
+  local name target id
+  name=$(fqdn "$1")
+  target="${2:?target required}"
+  id=$(find_record_id "$name")
+  [ -z "$id" ] && { echo "$name not found — use: $0 add $1 $target"; exit 1; }
+  api -X PATCH "$API/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" \
+    --data "$(jq -nc --arg t "$target" '{content:$t}')" \
+    | jq -r '"updated \(.result.name) -> \(.result.content)"'
+}
+
+cmd_rm() {
+  local name id
+  name=$(fqdn "$1")
+  id=$(find_record_id "$name")
+  [ -z "$id" ] && { echo "$name not found"; exit 1; }
+  api -X DELETE "$API/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" >/dev/null
+  echo "deleted $name"
+}
+
+cmd_rename() {
+  local old new id old_target proxied
+  old=$(fqdn "$1"); new=$(fqdn "$2")
+  id=$(find_record_id "$old")
+  [ -z "$id" ] && { echo "$old not found"; exit 1; }
+  read -r old_target proxied < <(
+    api "$API/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" \
+      | jq -r '.result | "\(.content) \(.proxied)"'
+  )
+  api -X PATCH "$API/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" \
+    --data "$(jq -nc --arg n "$new" --arg t "$old_target" --argjson p "$proxied" \
+        '{name:$n, content:$t, proxied:$p}')" \
+    | jq -r '"renamed -> \(.result.name)"'
+  echo "remember to update Traefik Host(\`...\`) labels for any service still using $old"
+}
+
+cmd="${1:-list}"
+shift || true
+case "$cmd" in
+  list)   cmd_list "$@" ;;
+  add)    cmd_add  "$@" ;;
+  set)    cmd_set  "$@" ;;
+  rm|del) cmd_rm   "$@" ;;
+  rename) cmd_rename "$@" ;;
+  *) sed -n '3,12p' "$0"; exit 1 ;;
+esac
