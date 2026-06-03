@@ -31,7 +31,8 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		overall := "up"
 		targets := []map[string]any{}
 		if monitorURLFromEnv() != "" {
-			resp, err := http.Get(monitorURLFromEnv() + "/api/overview")
+			client := http.Client{Timeout: 3 * time.Second}
+			resp, err := client.Get(monitorURLFromEnv() + "/api/overview")
 			if err == nil {
 				defer resp.Body.Close()
 				var o struct {
@@ -42,11 +43,21 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 					} `json:"targets"`
 				}
 				if err := json.NewDecoder(resp.Body).Decode(&o); err == nil {
-					if o.Health != "" {
-						overall = o.Health
-					}
+					// Recompute overall from non-absent targets so the public
+					// health endpoint isn't poisoned by services the user
+					// hasn't deployed (e.g. edge with profile off).
+					anyDegraded := false
 					for _, t := range o.Targets {
+						if t.Health == "absent" {
+							continue
+						}
 						targets = append(targets, map[string]any{"name": t.Name, "health": t.Health})
+						if t.Health != "up" {
+							anyDegraded = true
+						}
+					}
+					if anyDegraded {
+						overall = "degraded"
 					}
 				}
 			} else {
@@ -92,6 +103,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		mux.HandleFunc("/api/monitor/overview", auth.requireAuth(fwd("/api/overview")))
 		mux.HandleFunc("/api/monitor/snapshot", auth.requireAuth(fwd("/api/snapshot")))
 		mux.HandleFunc("/api/monitor/series", auth.requireAuth(fwd("/api/series")))
+
+		// Per-target detail endpoints. Path passthrough — /api/monitor/target/proxy
+		// hits monitor's /api/target/proxy and so on for /hosts /errors /series.
+		mux.HandleFunc("/api/monitor/target/", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+			sub := strings.TrimPrefix(req.URL.Path, "/api/monitor/target/")
+			fwd("/api/target/" + sub)(w, req)
+		}))
 	}
 
 	// ---- Auth (rate-limited where it matters) ----

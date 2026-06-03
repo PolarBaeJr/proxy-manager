@@ -56,6 +56,47 @@ func main() {
 		writeJSON(w, store.Overview())
 	})
 
+	// Per-target detail. Path: /api/target/{name}[/hosts|/errors|/series]
+	mux.HandleFunc("/api/target/", func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/target/")
+		if rest == "" {
+			http.NotFound(w, r)
+			return
+		}
+		parts := strings.SplitN(rest, "/", 2)
+		name := parts[0]
+		sub := ""
+		if len(parts) == 2 {
+			sub = parts[1]
+		}
+		switch sub {
+		case "":
+			t := store.Target(name)
+			if t == nil {
+				http.NotFound(w, r)
+				return
+			}
+			writeJSON(w, t)
+		case "hosts":
+			h := store.TargetHosts(name)
+			if h == nil {
+				h = []map[string]any{}
+			}
+			writeJSON(w, h)
+		case "errors":
+			e := store.TargetErrors(name)
+			if e == nil {
+				e = map[string]any{}
+			}
+			writeJSON(w, e)
+		case "series":
+			field := r.URL.Query().Get("field")
+			writeJSON(w, store.Series(name, field))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
 	log.Printf("monitor on %s — scraping %d target(s) every %s", *addr, len(targets), *interval)
 	if err := http.ListenAndServe(*addr, mux); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
