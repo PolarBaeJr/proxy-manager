@@ -1,3 +1,4 @@
 .env
 dashboard/data/
+edge/data/
 .DS_Store

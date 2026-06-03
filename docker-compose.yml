@@ -1,17 +1,36 @@
 name: pi-stack
 
-# Two independent binaries:
-#   proxy     :8092  — reverse proxy + label-driven load balancer (read-only docker socket)
-#   dashboard :8093  — auth-gated management UI (read-write docker socket, CF integration)
-#
-# nginx (running on the host, not in compose) terminates TLS on 443 and proxies
-# to 127.0.0.1:8092 — see /etc/nginx/sites-enabled on the Pi.
+# Three independent binaries:
+#   edge      :80 / :443  — TLS termination + rate limiting + gzip + access log
+#                           OPT-IN: `docker compose --profile edge up -d`
+#                           (omit the profile if something else handles TLS, e.g. nginx)
+#   proxy     :8092       — reverse proxy + label-driven LB (read-only docker socket)
+#   dashboard :8093       — auth-gated management UI (read-write docker socket)
 
 networks:
   edge:
     name: edge
 
 services:
+  edge:
+    build: ./edge
+    image: edge:latest
+    container_name: edge
+    restart: unless-stopped
+    profiles: [edge]                    # opt-in: docker compose --profile edge up -d
+    networks: [edge]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./edge/data:/data               # autocert cert cache (persisted)
+    environment:
+      EDGE_DOMAINS: ${EDGE_DOMAINS:-}   # e.g. foo.example.com,bar.example.com
+    command: >
+      -tls-domains ${EDGE_DOMAINS:-}
+      -backend http://proxy:8092
+      -rate 100 -burst 200 -max-body 10485760
+
   proxy:
     build: ./proxy
     image: proxy:latest

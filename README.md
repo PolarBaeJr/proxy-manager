@@ -20,30 +20,35 @@ Built for a Raspberry Pi running 10+ services. Replaces the usual nginx + Traefi
 ## Architecture
 
 ```
-                 ┌─────────────────────────────────┐
-   internet ───→ │ nginx (TLS termination on :443) │
-                 └─────────────────┬───────────────┘
-                                   │ HTTP
-                                   ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  proxy  :8092          (read-only docker socket)         │
-   │  - label discovery + static routes                       │
-   │  - weighted round-robin + retry on failure               │
-   │  - background health checks (HTTP or TCP)                │
-   └──────────────────────────────────────────────────────────┘
-                                   ▲
-                                   │ container labels
-                                   ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  dashboard  :8093      (read-write docker socket)        │
-   │  - auth + 2FA, audit log, rate-limited login             │
-   │  - services: create/scale/replace/stage/promote/rollback │
-   │  - DNS via Cloudflare API                                │
-   │  - users, host stats                                     │
-   └──────────────────────────────────────────────────────────┘
+                ┌──────────────────────────────────────────────┐
+  internet ───→ │  edge  :443  (opt-in)                        │
+                │  - TLS via Let's Encrypt (autocert)          │
+                │  - per-IP rate limit + body size cap         │
+                │  - gzip + X-Forwarded-* + access log         │
+                └──────────────────────┬───────────────────────┘
+                                       │ HTTP (internal)
+                                       ▼
+                ┌──────────────────────────────────────────────┐
+                │  proxy  :8092        (read-only docker.sock) │
+                │  - label discovery + static routes           │
+                │  - weighted round-robin + retry              │
+                │  - background health checks                  │
+                └──────────────────────────────────────────────┘
+                                       ▲
+                                       │ container labels
+                                       ▼
+                ┌──────────────────────────────────────────────┐
+                │  dashboard  :8093    (read-write docker.sock)│
+                │  - auth + 2FA, audit log, rate-limited login │
+                │  - services: scale/replace/stage/promote/... │
+                │  - DNS via Cloudflare API                    │
+                │  - users, host stats                         │
+                └──────────────────────────────────────────────┘
 ```
 
-The two binaries don't talk to each other — they both watch the Docker socket. If the dashboard crashes, traffic keeps flowing. If the proxy crashes, the dashboard still works.
+The three binaries don't talk to each other — proxy and dashboard both watch the Docker socket; edge forwards to the proxy via HTTP. Any one of them can crash without taking the others down.
+
+**`edge` is opt-in.** If something else (nginx, Caddy, Cloudflare Tunnel) already terminates TLS, leave it off. Run with `docker compose --profile edge up -d` to enable it.
 
 ---
 
@@ -90,8 +95,9 @@ Containers must share the **`edge`** Docker network with the proxy. See `service
 ## Repo layout
 
 ```
-proxy/        request-path binary  (~700 LOC)
-dashboard/    management UI binary (~2500 LOC, single-file embedded HTML)
+edge/         outermost TLS / WAF binary  (~400 LOC, opt-in)
+proxy/        request-path binary         (~700 LOC)
+dashboard/    management UI binary        (~2500 LOC, single-file embedded HTML)
 services/     example service definitions
 scripts/      CLI alternative for some dashboard actions
 ```
