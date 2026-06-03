@@ -13,10 +13,15 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":8093", "dashboard listen address")
+	metricsAddr := flag.String("metrics-addr", ":8094", "internal metrics endpoint listen address")
 	authFile := flag.String("auth", "/data/auth.json", "auth state file (created on first run)")
 	auditFile := flag.String("audit", "/data/audit.log", "audit log file path")
 	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (read-only for the Routes view)")
 	flag.Parse()
+
+	metrics := NewMetrics()
+	metricsServer(*metricsAddr, metrics)
+	log.Printf("metrics on %s/metrics", *metricsAddr)
 
 	auth, err := loadAuthStore(*authFile)
 	if err != nil {
@@ -70,7 +75,7 @@ func main() {
 	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig)
 
 	log.Printf("dashboard on %s", *addr)
-	if err := http.ListenAndServe(*addr, mux); !errors.Is(err, http.ErrServerClosed) {
+	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }

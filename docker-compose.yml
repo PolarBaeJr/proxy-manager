@@ -75,6 +75,6 @@ services:
     networks: [edge]
     # No host port — dashboard reaches it via the edge network.
     command: >
-      -targets proxy=http://proxy:8094/metrics,edge=http://edge:8094/metrics
+      -targets proxy=http://proxy:8094/metrics,edge=http://edge:8094/metrics,dashboard=http://dashboard:8094/metrics
       -interval 5s
       -window 1h
