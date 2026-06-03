@@ -23,6 +23,9 @@ func main() {
 	targetsFlag := flag.String("targets", "edge=http://edge:8094/metrics,proxy=http://proxy:8094/metrics", "comma-separated name=url pairs to scrape")
 	interval := flag.Duration("interval", 5*time.Second, "scrape interval")
 	window := flag.Duration("window", 1*time.Hour, "how much history to retain in memory")
+	probeTargets := flag.String("tls-probe-targets", "", "comma-separated TLS probe targets (sni[@host:port]); empty disables cert probing")
+	probeInterval := flag.Duration("tls-probe-interval", 15*time.Minute, "TLS probe interval")
+	probeDial := flag.String("tls-probe-default-dial", "host.docker.internal:443", "default dial target for probe entries without @host:port")
 	flag.Parse()
 
 	targets := parseTargets(*targetsFlag)
@@ -36,6 +39,13 @@ func main() {
 	store := NewStore(*window, *interval)
 	scraper := NewScraper(targets, *interval, store)
 	go scraper.Run(ctx)
+
+	// Optional cert prober — runs only if -tls-probe-targets is non-empty.
+	var prober *CertProber
+	if *probeTargets != "" {
+		prober = NewCertProber(parseProbeTargets(*probeTargets, *probeDial), *probeInterval)
+		go prober.Run(ctx)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
@@ -95,6 +105,19 @@ func main() {
 		default:
 			http.NotFound(w, r)
 		}
+	})
+
+	// TLS cert info per probed hostname.
+	mux.HandleFunc("/api/certs", func(w http.ResponseWriter, _ *http.Request) {
+		if prober == nil {
+			writeJSON(w, map[string]any{"enabled": false, "certs": []any{}})
+			return
+		}
+		writeJSON(w, map[string]any{
+			"enabled":      true,
+			"worst_status": prober.Worst(),
+			"certs":        prober.Snapshot(),
+		})
 	})
 
 	log.Printf("monitor on %s — scraping %d target(s) every %s", *addr, len(targets), *interval)

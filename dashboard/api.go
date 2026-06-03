@@ -103,6 +103,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		mux.HandleFunc("/api/monitor/overview", auth.requireAuth(fwd("/api/overview")))
 		mux.HandleFunc("/api/monitor/snapshot", auth.requireAuth(fwd("/api/snapshot")))
 		mux.HandleFunc("/api/monitor/series", auth.requireAuth(fwd("/api/series")))
+		mux.HandleFunc("/api/monitor/certs", auth.requireAuth(fwd("/api/certs")))
 
 		// Per-target detail endpoints. Path passthrough — /api/monitor/target/proxy
 		// hits monitor's /api/target/proxy and so on for /hosts /errors /series.

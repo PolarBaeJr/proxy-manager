@@ -809,9 +809,12 @@ async function deleteUser(name) {
 // ---- Stats (from monitor binary) ----
 async function renderStats() {
   const el = $('#tab-stats');
-  let overview;
+  let overview, certs;
   try {
-    overview = await api('/api/monitor/overview');
+    [overview, certs] = await Promise.all([
+      api('/api/monitor/overview'),
+      api('/api/monitor/certs').catch(() => ({ enabled: false, certs: [] })),
+    ]);
   } catch (e) {
     el.innerHTML = '<p class="empty">Monitor unavailable — make sure the <code>monitor</code> container is running.</p>';
     return;
@@ -859,6 +862,34 @@ async function renderStats() {
     }
     html += '</div>';
   }
+
+  // ---- TLS certs (probed) ----
+  if (certs && certs.enabled) {
+    const worstPill = certs.worst_status === 'ok'
+      ? '<span class="pill ok">all good</span>'
+      : certs.worst_status === 'warning'
+      ? '<span class="pill warn">renew soon</span>'
+      : '<span class="pill bad">' + esc(certs.worst_status) + '</span>';
+    html += '<div class="card"><div class="card-head"><h2>TLS certs ' + worstPill + '</h2>'
+      + '<span class="meta">' + (certs.certs || []).length + ' probed</span></div>';
+    html += '<table><tr><th>Host</th><th>Issuer</th><th>Expires</th><th>Days left</th><th>Status</th></tr>';
+    for (const c of (certs.certs || [])) {
+      const statusPill = c.status === 'ok' ? 'pill ok'
+        : c.status === 'warning' ? 'pill warn'
+        : c.status === 'critical' || c.status === 'expired' ? 'pill bad'
+        : 'pill muted';
+      html += '<tr>';
+      html += '<td><code>' + esc(c.host) + '</code></td>';
+      html += '<td class="meta">' + esc(c.issuer || '—').slice(0, 60) + '</td>';
+      html += '<td class="meta">' + (c.not_after ? new Date(c.not_after).toLocaleDateString() : '—') + '</td>';
+      html += '<td>' + (c.days_left != null ? c.days_left : '—') + '</td>';
+      html += '<td><span class="' + statusPill + '">' + esc(c.status) + '</span>';
+      if (c.error) html += ' <span class="err">' + esc(c.error.slice(0, 80)) + '</span>';
+      html += '</td></tr>';
+    }
+    html += '</table></div>';
+  }
+
   el.innerHTML = html;
 }
 

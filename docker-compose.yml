@@ -74,7 +74,11 @@ services:
     restart: unless-stopped
     networks: [edge]
     # No host port — dashboard reaches it via the edge network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # for TLS-probing nginx on the host
     command: >
       -targets proxy=http://proxy:8094/metrics,edge=http://edge:8094/metrics,dashboard=http://dashboard:8094/metrics
       -interval 5s
       -window 1h
+      -tls-probe-targets ${TLS_PROBE_TARGETS:-}
+      -tls-probe-interval 15m
