@@ -2,10 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
+
+func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 
 func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string) http.Handler {
 	mux := http.NewServeMux()
@@ -24,6 +28,31 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 	mux.HandleFunc("/api/stats", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, GetStats())
 	}))
+
+	// Proxy through to the monitor binary for traffic metrics. Keeps the auth
+	// boundary on the dashboard rather than exposing monitor publicly.
+	monitorURL := monitorURLFromEnv()
+	if monitorURL != "" {
+		fwd := func(suffix string) http.HandlerFunc {
+			return func(w http.ResponseWriter, req *http.Request) {
+				url := monitorURL + suffix
+				if q := req.URL.RawQuery; q != "" {
+					url += "?" + q
+				}
+				resp, err := http.Get(url)
+				if err != nil {
+					http.Error(w, "monitor unreachable", http.StatusBadGateway)
+					return
+				}
+				defer resp.Body.Close()
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.Copy(w, resp.Body)
+			}
+		}
+		mux.HandleFunc("/api/monitor/overview", auth.requireAuth(fwd("/api/overview")))
+		mux.HandleFunc("/api/monitor/snapshot", auth.requireAuth(fwd("/api/snapshot")))
+		mux.HandleFunc("/api/monitor/series", auth.requireAuth(fwd("/api/series")))
+	}
 
 	// ---- Auth (rate-limited where it matters) ----
 	mux.HandleFunc("/api/auth/status", func(w http.ResponseWriter, req *http.Request) {

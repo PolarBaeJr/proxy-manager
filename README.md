@@ -42,7 +42,16 @@ Built for a Raspberry Pi running 10+ services. Replaces the usual nginx + Traefi
                 │  - auth + 2FA, audit log, rate-limited login │
                 │  - services: scale/replace/stage/promote/... │
                 │  - DNS via Cloudflare API                    │
-                │  - users, host stats                         │
+                │  - users, host stats, Stats tab (via monitor)│
+                └──────────────────────────────────────────────┘
+                                       │
+                                       │ /api/monitor/*
+                                       ▼
+                ┌──────────────────────────────────────────────┐
+                │  monitor  :8095      (internal only)         │
+                │  - scrapes proxy:8094 + edge:8094 every 5s   │
+                │  - 1h rolling time series in memory          │
+                │  - per-target health: up / flaky / down      │
                 └──────────────────────────────────────────────┘
 ```
 
@@ -95,12 +104,31 @@ Containers must share the **`edge`** Docker network with the proxy. See `service
 ## Repo layout
 
 ```
-edge/         outermost TLS / WAF binary  (~400 LOC, opt-in)
-proxy/        request-path binary         (~700 LOC)
-dashboard/    management UI binary        (~2500 LOC, single-file embedded HTML)
+edge/         outermost TLS / WAF binary    (~600 LOC, opt-in)
+proxy/        request-path binary           (~900 LOC, exposes /metrics)
+dashboard/    management UI binary          (~2700 LOC, single-file embedded HTML)
+monitor/      scrapes /metrics from edge + proxy, exposes aggregated stats
 services/     example service definitions
 scripts/      CLI alternative for some dashboard actions
 ```
+
+Each binary has its own `go.mod`; each is built and shipped independently.
+
+### Observability
+
+Edge and proxy each expose an internal `/metrics` endpoint (port `:8094`) returning JSON with:
+- per-host, per-status, per-method request counts
+- per-host × per-status counts (for error-rate-per-route)
+- latency percentiles (p50/p90/p95/p99)
+- in-flight requests, bytes out
+- rate-limit hits (edge only)
+
+The `monitor` binary scrapes both on a 5s tick, keeps a 1h rolling time series in memory, and exposes:
+- `/api/snapshot` — every target's latest sample + health classification
+- `/api/series` — recent points of any scalar field (sparkline-ready)
+- `/api/overview` — aggregated dashboard view
+
+The dashboard's **Stats** tab proxies these through its auth layer — no need to expose monitor publicly.
 
 Every file is small enough to read top-to-bottom. No code generation, no third-party UI frameworks, no service mesh.
 

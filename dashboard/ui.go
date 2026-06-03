@@ -215,12 +215,14 @@ const dashboardHTML = `<!doctype html>
     <button data-tab="services">Services</button>
     <button data-tab="dns">DNS</button>
     <button data-tab="users">Users</button>
+    <button data-tab="stats">Stats</button>
   </nav>
 
   <section id="tab-routes"></section>
   <section id="tab-services" hidden></section>
   <section id="tab-dns" hidden></section>
   <section id="tab-users" hidden></section>
+  <section id="tab-stats" hidden></section>
 </div>
 
 <dialog id="dlg-new-service">
@@ -456,7 +458,7 @@ $('#form-2fa').onsubmit = async (e) => {
 };
 
 // ---- Tabs ----
-const TABS = ['routes', 'services', 'dns', 'users'];
+const TABS = ['routes', 'services', 'dns', 'users', 'stats'];
 let activeTab = 'routes';
 $$('nav button').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 function switchTab(t) {
@@ -473,6 +475,7 @@ async function renderActive() {
     else if (activeTab === 'services') await renderServices();
     else if (activeTab === 'dns') await renderDNS();
     else if (activeTab === 'users') await renderUsers();
+    else if (activeTab === 'stats') await renderStats();
     $('#status').textContent = 'updated ' + fmtTime();
   } catch (e) {
     $('#status').textContent = 'error: ' + e.message;
@@ -759,6 +762,69 @@ async function deleteUser(name) {
     await api('/api/users/' + encodeURIComponent(name), { method:'DELETE' });
     toast('deleted ' + name); renderActive();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+// ---- Stats (from monitor binary) ----
+async function renderStats() {
+  const el = $('#tab-stats');
+  let overview;
+  try {
+    overview = await api('/api/monitor/overview');
+  } catch (e) {
+    el.innerHTML = '<p class="empty">Monitor unavailable — make sure the <code>monitor</code> container is running.</p>';
+    return;
+  }
+  const pill = overview.health === 'up'
+    ? '<span class="pill ok">all healthy</span>'
+    : '<span class="pill warn">degraded</span>';
+  let html = '<div class="card-head" style="margin-bottom:1em"><h2>Stack health ' + pill + '</h2>'
+    + '<span class="meta">' + (overview.targets || []).length + ' target(s) · ' + (overview.total_requests || 0).toLocaleString() + ' lifetime requests</span></div>';
+
+  for (const t of (overview.targets || [])) {
+    const tpill = t.health === 'up' ? 'pill ok' : t.health === 'flaky' ? 'pill warn' : 'pill bad';
+    html += '<div class="card"><div class="card-head"><h2>' + esc(t.name) + ' <span class="' + tpill + '">' + esc(t.health) + '</span></h2>';
+    html += '<span class="meta"><code>' + esc(t.url) + '</code></span></div>';
+    html += '<table>';
+    html += '<tr><th>Total requests</th><td>' + (t.total || 0).toLocaleString() + '</td>';
+    html += '<th>In flight</th><td>' + (t.in_flight || 0) + '</td></tr>';
+    html += '<tr><th>Uptime</th><td>' + fmtUptime(t.uptime_seconds || 0) + '</td>';
+    html += '<th>Latency p95</th><td>' + (t.latency_ms ? t.latency_ms.p95.toFixed(1) + ' ms' : '—') + '</td></tr>';
+    html += '</table>';
+
+    if (t.by_status) {
+      html += '<h2 style="font-size:13px;margin-top:1em">By status</h2><table><tr>';
+      const codes = Object.keys(t.by_status).sort();
+      for (const c of codes) {
+        const cls = c[0] === '2' ? 'pill ok' : c[0] === '3' ? 'pill muted' : c[0] === '4' ? 'pill warn' : 'pill bad';
+        html += '<td><span class="' + cls + '">' + c + '</span> &nbsp;' + t.by_status[c].toLocaleString() + '</td>';
+      }
+      html += '</tr></table>';
+    }
+    if (t.by_method) {
+      html += '<h2 style="font-size:13px;margin-top:1em">By method</h2><table><tr>';
+      for (const [k, v] of Object.entries(t.by_method)) {
+        html += '<td><code>' + esc(k) + '</code> &nbsp;' + v.toLocaleString() + '</td>';
+      }
+      html += '</tr></table>';
+    }
+    if (t.by_host) {
+      const entries = Object.entries(t.by_host).sort((a,b) => b[1] - a[1]);
+      html += '<h2 style="font-size:13px;margin-top:1em">Top hosts</h2><table>';
+      for (const [h, n] of entries.slice(0, 10)) {
+        html += '<tr><td><code>' + esc(h) + '</code></td><td style="text-align:right">' + n.toLocaleString() + '</td></tr>';
+      }
+      html += '</table>';
+    }
+    html += '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function fmtUptime(s) {
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  return Math.floor(s/86400) + 'd ' + Math.floor((s%86400)/3600) + 'h';
 }
 
 function esc(s) {

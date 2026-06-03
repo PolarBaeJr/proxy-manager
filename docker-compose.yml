@@ -1,11 +1,13 @@
 name: pi-stack
 
-# Three independent binaries:
-#   edge      :80 / :443  — TLS termination + rate limiting + gzip + access log
+# Four binaries (edge is opt-in):
+#   edge      :80 / :443  — TLS termination + rate limit + gzip + access log
 #                           OPT-IN: `docker compose --profile edge up -d`
-#                           (omit the profile if something else handles TLS, e.g. nginx)
 #   proxy     :8092       — reverse proxy + label-driven LB (read-only docker socket)
+#                           :8094       — internal metrics endpoint
 #   dashboard :8093       — auth-gated management UI (read-write docker socket)
+#   monitor   :8095       — scrapes proxy+edge metrics, exposes aggregated stats
+#                           (no public port; dashboard reads from it)
 
 networks:
   edge:
@@ -63,3 +65,16 @@ services:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CLOUDFLARE_ZONE_ID:   ${CLOUDFLARE_ZONE_ID:-}
       CLOUDFLARE_DOMAIN:    ${CLOUDFLARE_DOMAIN:-}
+      MONITOR_URL:          http://monitor:8095     # for the Stats tab
+
+  monitor:
+    build: ./monitor
+    image: monitor:latest
+    container_name: monitor
+    restart: unless-stopped
+    networks: [edge]
+    # No host port — dashboard reaches it via the edge network.
+    command: >
+      -targets proxy=http://proxy:8094/metrics,edge=http://edge:8094/metrics
+      -interval 5s
+      -window 1h
