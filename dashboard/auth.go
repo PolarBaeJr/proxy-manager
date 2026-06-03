@@ -45,12 +45,26 @@ const (
 )
 
 type User struct {
-	Username     string `json:"username"`
-	Salt         string `json:"salt"`
-	PasswordHash string `json:"password_hash"`
-	TOTPSecret   string `json:"totp_secret"`
-	CreatedAt    int64  `json:"created_at"`
+	Username     string     `json:"username"`
+	Salt         string     `json:"salt"`
+	PasswordHash string     `json:"password_hash"`
+	TOTPSecret   string     `json:"totp_secret"`
+	CreatedAt    int64      `json:"created_at"`
+	Tokens       []APIToken `json:"tokens,omitempty"`
 }
+
+// APIToken is a programmatic credential. The raw token is shown ONCE at
+// creation time and never stored — we only keep its SHA-256 hash.
+// Token format: pmt_<base64url-of-32-random-bytes>
+type APIToken struct {
+	ID         string `json:"id"`         // short hex prefix for display + delete lookup
+	Label      string `json:"label"`      // user-supplied description
+	Hash       string `json:"hash"`       // hex-encoded sha256(rawToken)
+	CreatedAt  int64  `json:"created_at"`
+	LastUsedAt int64  `json:"last_used_at,omitempty"`
+}
+
+const apiTokenPrefix = "pmt_"
 
 type AuthStore struct {
 	path    string
@@ -196,6 +210,91 @@ func (s *AuthStore) ConfirmPending(username, code string) error {
 	s.data.Users = append(s.data.Users, p.user)
 	delete(s.pending, key)
 	return s.save()
+}
+
+// ---- API tokens (programmatic credentials) ----
+
+// CreateToken generates a new API token for `username`. Returns the RAW token
+// (only time it's ever shown) and the stored APIToken metadata.
+func (s *AuthStore) CreateToken(username, label string) (rawToken string, t APIToken, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.findUser(username)
+	if u == nil {
+		return "", APIToken{}, fmt.Errorf("user %q not found", username)
+	}
+	if label == "" {
+		label = "untitled"
+	}
+	rb := make([]byte, 32)
+	rand.Read(rb)
+	raw := apiTokenPrefix + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(rb)
+	h := sha256.Sum256([]byte(raw))
+	hashHex := hex.EncodeToString(h[:])
+	t = APIToken{
+		ID:        hashHex[:12],
+		Label:     label,
+		Hash:      hashHex,
+		CreatedAt: time.Now().Unix(),
+	}
+	u.Tokens = append(u.Tokens, t)
+	if err := s.save(); err != nil {
+		return "", APIToken{}, err
+	}
+	return raw, t, nil
+}
+
+// VerifyToken hashes the raw token and looks for a matching APIToken across
+// all users. Returns the owning username if found, "" otherwise.
+func (s *AuthStore) VerifyToken(raw string) string {
+	if !strings.HasPrefix(raw, apiTokenPrefix) {
+		return ""
+	}
+	h := sha256.Sum256([]byte(raw))
+	hashHex := hex.EncodeToString(h[:])
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.data.Users {
+		for j := range s.data.Users[i].Tokens {
+			if subtle.ConstantTimeCompare([]byte(s.data.Users[i].Tokens[j].Hash), []byte(hashHex)) == 1 {
+				s.data.Users[i].Tokens[j].LastUsedAt = time.Now().Unix()
+				_ = s.save()
+				return s.data.Users[i].Username
+			}
+		}
+	}
+	return ""
+}
+
+func (s *AuthStore) ListTokens(username string) []APIToken {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u := s.findUser(username)
+	if u == nil {
+		return nil
+	}
+	out := make([]APIToken, 0, len(u.Tokens))
+	for _, t := range u.Tokens {
+		t.Hash = "" // never leak the hash through the API
+		out = append(out, t)
+	}
+	return out
+}
+
+func (s *AuthStore) DeleteToken(username, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.findUser(username)
+	if u == nil {
+		return fmt.Errorf("user %q not found", username)
+	}
+	for i, t := range u.Tokens {
+		if t.ID == id {
+			u.Tokens = append(u.Tokens[:i], u.Tokens[i+1:]...)
+			return s.save()
+		}
+	}
+	return fmt.Errorf("token %q not found", id)
 }
 
 // CancelPending throws away any pending user with the given username. Safe to call.
@@ -387,17 +486,32 @@ func clearSessionCookie(w http.ResponseWriter) {
 
 // ---- Middleware ----
 
+// bearerToken extracts an `Authorization: Bearer …` token, if present.
+func bearerToken(r *http.Request) string {
+	v := r.Header.Get("Authorization")
+	if !strings.HasPrefix(v, "Bearer ") {
+		return ""
+	}
+	return strings.TrimPrefix(v, "Bearer ")
+}
+
 func (s *AuthStore) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.IsSetup() {
 			http.Error(w, "auth not set up", http.StatusServiceUnavailable)
 			return
 		}
-		if _, ok := s.sessionFrom(r); !ok {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if _, ok := s.sessionFrom(r); ok {
+			next(w, r)
 			return
 		}
-		next(w, r)
+		if tok := bearerToken(r); tok != "" {
+			if user := s.VerifyToken(tok); user != "" {
+				next(w, r)
+				return
+			}
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}
 }
 
@@ -406,6 +520,13 @@ func (s *AuthStore) requireElevated(next http.HandlerFunc) http.HandlerFunc {
 		if !s.IsSetup() {
 			http.Error(w, "auth not set up", http.StatusServiceUnavailable)
 			return
+		}
+		// API tokens grant elevation (proof of possession of the token).
+		if tok := bearerToken(r); tok != "" {
+			if user := s.VerifyToken(tok); user != "" {
+				next(w, r)
+				return
+			}
 		}
 		info, ok := s.sessionFrom(r)
 		if !ok {

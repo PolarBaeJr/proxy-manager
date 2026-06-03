@@ -41,7 +41,12 @@ func main() {
 	rateBurst := flag.Int("burst", 200, "burst capacity per IP")
 	maxBody := flag.Int64("max-body", 10<<20, "max request body bytes")
 	insecure := flag.Bool("insecure", false, "skip TLS, serve plain HTTP on -http-addr (testing only)")
+	metricsAddr := flag.String("metrics-addr", ":8094", "internal metrics endpoint listen address")
 	flag.Parse()
+
+	metrics := NewMetrics()
+	metricsServer(*metricsAddr, metrics)
+	log.Printf("metrics on %s/metrics", *metricsAddr)
 
 	// Build the request handler chain. Outer-most first.
 	var handler http.Handler = newForwarder(*backend)
@@ -51,6 +56,7 @@ func main() {
 		handler = withRateLimit(handler, *rateLimit, *rateBurst)
 	}
 	handler = withForwardedHeaders(handler)
+	handler = withMetrics(handler, metrics)
 	handler = withAccessLog(handler)
 
 	// ----- Insecure mode (HTTP only) — for local testing, not production. -----

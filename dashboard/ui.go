@@ -215,12 +215,14 @@ const dashboardHTML = `<!doctype html>
     <button data-tab="services">Services</button>
     <button data-tab="dns">DNS</button>
     <button data-tab="users">Users</button>
+    <button data-tab="stats">Stats</button>
   </nav>
 
   <section id="tab-routes"></section>
   <section id="tab-services" hidden></section>
   <section id="tab-dns" hidden></section>
   <section id="tab-users" hidden></section>
+  <section id="tab-stats" hidden></section>
 </div>
 
 <dialog id="dlg-new-service">
@@ -456,7 +458,7 @@ $('#form-2fa').onsubmit = async (e) => {
 };
 
 // ---- Tabs ----
-const TABS = ['routes', 'services', 'dns', 'users'];
+const TABS = ['routes', 'services', 'dns', 'users', 'stats'];
 let activeTab = 'routes';
 $$('nav button').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 function switchTab(t) {
@@ -473,6 +475,7 @@ async function renderActive() {
     else if (activeTab === 'services') await renderServices();
     else if (activeTab === 'dns') await renderDNS();
     else if (activeTab === 'users') await renderUsers();
+    else if (activeTab === 'stats') await renderStats();
     $('#status').textContent = 'updated ' + fmtTime();
   } catch (e) {
     $('#status').textContent = 'error: ' + e.message;
@@ -711,7 +714,10 @@ $('#form-new-dns').onsubmit = async (e) => {
 
 // ---- Users ----
 async function renderUsers() {
-  const users = await api('/api/users');
+  const [users, myTokens] = await Promise.all([
+    api('/api/users'),
+    api('/api/users/tokens').catch(() => []),
+  ]);
   const el = $('#tab-users');
   let html = '<div class="btn-row" style="margin-bottom:1em"><button class="btn primary" ' + lockedAttr() + ' onclick="openAddUser()">+ Add user</button></div>';
   html += '<div class="card"><table><tr><th>Username</th><th>Created</th><th style="text-align:right">Actions</th></tr>';
@@ -724,7 +730,46 @@ async function renderUsers() {
     html += '</td></tr>';
   }
   html += '</table></div>';
+
+  // ---- My API tokens (for external scripts / monitoring tools) ----
+  html += '<div class="card"><div class="card-head"><h2>My API tokens</h2>';
+  html += '<span class="meta">Pass as <code>Authorization: Bearer pmt_…</code></span></div>';
+  html += '<div class="btn-row" style="margin:.5em 0"><button class="btn primary" ' + lockedAttr() + ' onclick="createToken()">+ Generate token</button></div>';
+  if (!myTokens.length) {
+    html += '<p class="empty">No tokens yet. Create one to call this API from scripts (Uptime Kuma, cron jobs, anything).</p>';
+  } else {
+    html += '<table><tr><th>Label</th><th>ID</th><th>Created</th><th>Last used</th><th style="text-align:right">Actions</th></tr>';
+    for (const t of myTokens) {
+      html += '<tr><td>' + esc(t.label) + '</td>';
+      html += '<td><code>' + esc(t.id) + '…</code></td>';
+      html += '<td class="meta">' + new Date(t.created_at * 1000).toLocaleString() + '</td>';
+      html += '<td class="meta">' + (t.last_used_at ? new Date(t.last_used_at * 1000).toLocaleString() : '—') + '</td>';
+      html += '<td style="text-align:right"><button class="btn danger" ' + lockedAttr() + ' onclick="deleteToken(\'' + esc(t.id) + '\')">Revoke</button></td></tr>';
+    }
+    html += '</table>';
+  }
+  html += '<div class="note" style="margin-top:1em"><strong>Public health endpoint:</strong> <code>' + window.location.origin + '/api/health</code> — no auth, returns just up/degraded/down. Good for Uptime Kuma.</div>';
+  html += '</div>';
+
   el.innerHTML = html;
+}
+
+async function createToken() {
+  const label = prompt('Token label (e.g. "uptime-kuma", "deploy-script"):', '');
+  if (label === null) return;
+  try {
+    const out = await api('/api/users/tokens', { method:'POST', body: JSON.stringify({ label })});
+    // Show the raw token ONCE.
+    alert('Save this token NOW — it will not be shown again:\n\n' + out.token + '\n\nUse with: Authorization: Bearer ' + out.token);
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function deleteToken(id) {
+  if (!confirm('Revoke this token? Anything using it will stop working.')) return;
+  try {
+    await api('/api/users/tokens/' + encodeURIComponent(id), { method:'DELETE' });
+    toast('revoked'); renderActive();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 function openAddUser() {
@@ -759,6 +804,69 @@ async function deleteUser(name) {
     await api('/api/users/' + encodeURIComponent(name), { method:'DELETE' });
     toast('deleted ' + name); renderActive();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+// ---- Stats (from monitor binary) ----
+async function renderStats() {
+  const el = $('#tab-stats');
+  let overview;
+  try {
+    overview = await api('/api/monitor/overview');
+  } catch (e) {
+    el.innerHTML = '<p class="empty">Monitor unavailable — make sure the <code>monitor</code> container is running.</p>';
+    return;
+  }
+  const pill = overview.health === 'up'
+    ? '<span class="pill ok">all healthy</span>'
+    : '<span class="pill warn">degraded</span>';
+  let html = '<div class="card-head" style="margin-bottom:1em"><h2>Stack health ' + pill + '</h2>'
+    + '<span class="meta">' + (overview.targets || []).length + ' target(s) · ' + (overview.total_requests || 0).toLocaleString() + ' lifetime requests</span></div>';
+
+  for (const t of (overview.targets || [])) {
+    const tpill = t.health === 'up' ? 'pill ok' : t.health === 'flaky' ? 'pill warn' : 'pill bad';
+    html += '<div class="card"><div class="card-head"><h2>' + esc(t.name) + ' <span class="' + tpill + '">' + esc(t.health) + '</span></h2>';
+    html += '<span class="meta"><code>' + esc(t.url) + '</code></span></div>';
+    html += '<table>';
+    html += '<tr><th>Total requests</th><td>' + (t.total || 0).toLocaleString() + '</td>';
+    html += '<th>In flight</th><td>' + (t.in_flight || 0) + '</td></tr>';
+    html += '<tr><th>Uptime</th><td>' + fmtUptime(t.uptime_seconds || 0) + '</td>';
+    html += '<th>Latency p95</th><td>' + (t.latency_ms ? t.latency_ms.p95.toFixed(1) + ' ms' : '—') + '</td></tr>';
+    html += '</table>';
+
+    if (t.by_status) {
+      html += '<h2 style="font-size:13px;margin-top:1em">By status</h2><table><tr>';
+      const codes = Object.keys(t.by_status).sort();
+      for (const c of codes) {
+        const cls = c[0] === '2' ? 'pill ok' : c[0] === '3' ? 'pill muted' : c[0] === '4' ? 'pill warn' : 'pill bad';
+        html += '<td><span class="' + cls + '">' + c + '</span> &nbsp;' + t.by_status[c].toLocaleString() + '</td>';
+      }
+      html += '</tr></table>';
+    }
+    if (t.by_method) {
+      html += '<h2 style="font-size:13px;margin-top:1em">By method</h2><table><tr>';
+      for (const [k, v] of Object.entries(t.by_method)) {
+        html += '<td><code>' + esc(k) + '</code> &nbsp;' + v.toLocaleString() + '</td>';
+      }
+      html += '</tr></table>';
+    }
+    if (t.by_host) {
+      const entries = Object.entries(t.by_host).sort((a,b) => b[1] - a[1]);
+      html += '<h2 style="font-size:13px;margin-top:1em">Top hosts</h2><table>';
+      for (const [h, n] of entries.slice(0, 10)) {
+        html += '<tr><td><code>' + esc(h) + '</code></td><td style="text-align:right">' + n.toLocaleString() + '</td></tr>';
+      }
+      html += '</table>';
+    }
+    html += '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function fmtUptime(s) {
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  return Math.floor(s/86400) + 'd ' + Math.floor((s%86400)/3600) + 'h';
 }
 
 function esc(s) {
