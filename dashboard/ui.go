@@ -714,7 +714,10 @@ $('#form-new-dns').onsubmit = async (e) => {
 
 // ---- Users ----
 async function renderUsers() {
-  const users = await api('/api/users');
+  const [users, myTokens] = await Promise.all([
+    api('/api/users'),
+    api('/api/users/tokens').catch(() => []),
+  ]);
   const el = $('#tab-users');
   let html = '<div class="btn-row" style="margin-bottom:1em"><button class="btn primary" ' + lockedAttr() + ' onclick="openAddUser()">+ Add user</button></div>';
   html += '<div class="card"><table><tr><th>Username</th><th>Created</th><th style="text-align:right">Actions</th></tr>';
@@ -727,7 +730,46 @@ async function renderUsers() {
     html += '</td></tr>';
   }
   html += '</table></div>';
+
+  // ---- My API tokens (for external scripts / monitoring tools) ----
+  html += '<div class="card"><div class="card-head"><h2>My API tokens</h2>';
+  html += '<span class="meta">Pass as <code>Authorization: Bearer pmt_…</code></span></div>';
+  html += '<div class="btn-row" style="margin:.5em 0"><button class="btn primary" ' + lockedAttr() + ' onclick="createToken()">+ Generate token</button></div>';
+  if (!myTokens.length) {
+    html += '<p class="empty">No tokens yet. Create one to call this API from scripts (Uptime Kuma, cron jobs, anything).</p>';
+  } else {
+    html += '<table><tr><th>Label</th><th>ID</th><th>Created</th><th>Last used</th><th style="text-align:right">Actions</th></tr>';
+    for (const t of myTokens) {
+      html += '<tr><td>' + esc(t.label) + '</td>';
+      html += '<td><code>' + esc(t.id) + '…</code></td>';
+      html += '<td class="meta">' + new Date(t.created_at * 1000).toLocaleString() + '</td>';
+      html += '<td class="meta">' + (t.last_used_at ? new Date(t.last_used_at * 1000).toLocaleString() : '—') + '</td>';
+      html += '<td style="text-align:right"><button class="btn danger" ' + lockedAttr() + ' onclick="deleteToken(\'' + esc(t.id) + '\')">Revoke</button></td></tr>';
+    }
+    html += '</table>';
+  }
+  html += '<div class="note" style="margin-top:1em"><strong>Public health endpoint:</strong> <code>' + window.location.origin + '/api/health</code> — no auth, returns just up/degraded/down. Good for Uptime Kuma.</div>';
+  html += '</div>';
+
   el.innerHTML = html;
+}
+
+async function createToken() {
+  const label = prompt('Token label (e.g. "uptime-kuma", "deploy-script"):', '');
+  if (label === null) return;
+  try {
+    const out = await api('/api/users/tokens', { method:'POST', body: JSON.stringify({ label })});
+    // Show the raw token ONCE.
+    alert('Save this token NOW — it will not be shown again:\n\n' + out.token + '\n\nUse with: Authorization: Bearer ' + out.token);
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function deleteToken(id) {
+  if (!confirm('Revoke this token? Anything using it will stop working.')) return;
+  try {
+    await api('/api/users/tokens/' + encodeURIComponent(id), { method:'DELETE' });
+    toast('revoked'); renderActive();
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 function openAddUser() {

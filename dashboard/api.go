@@ -24,6 +24,46 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 
+	// Public health endpoint — no auth, sanitized output. Safe to expose to
+	// Uptime Kuma / Pingdom / Statuspage / curl scripts. Does NOT leak host names,
+	// route details, or traffic counts. Returns only per-binary up/down state.
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
+		overall := "up"
+		targets := []map[string]any{}
+		if monitorURLFromEnv() != "" {
+			resp, err := http.Get(monitorURLFromEnv() + "/api/overview")
+			if err == nil {
+				defer resp.Body.Close()
+				var o struct {
+					Health  string `json:"health"`
+					Targets []struct {
+						Name   string `json:"name"`
+						Health string `json:"health"`
+					} `json:"targets"`
+				}
+				if err := json.NewDecoder(resp.Body).Decode(&o); err == nil {
+					if o.Health != "" {
+						overall = o.Health
+					}
+					for _, t := range o.Targets {
+						targets = append(targets, map[string]any{"name": t.Name, "health": t.Health})
+					}
+				}
+			} else {
+				overall = "degraded"
+			}
+		}
+		status := http.StatusOK
+		if overall != "up" {
+			status = http.StatusServiceUnavailable
+		}
+		writeJSON(w, status, map[string]any{
+			"status":   overall,
+			"targets":  targets,
+			"checked_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	})
+
 	// Host CPU / memory / disk for the header widget.
 	mux.HandleFunc("/api/stats", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, GetStats())
@@ -205,6 +245,63 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+
+	// ---- API tokens (per-user, generated on demand) ----
+	mux.HandleFunc("/api/users/tokens", func(w http.ResponseWriter, req *http.Request) {
+		switch req.Method {
+		case "GET":
+			auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+				info, _ := auth.sessionFrom(req)
+				if info == nil {
+					http.Error(w, "tokens listing requires a session", http.StatusUnauthorized)
+					return
+				}
+				writeJSON(w, http.StatusOK, auth.ListTokens(info.Username))
+			})(w, req)
+		case "POST":
+			auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
+				info, _ := auth.sessionFrom(req)
+				if info == nil {
+					http.Error(w, "token creation requires a logged-in session (not another token)", http.StatusUnauthorized)
+					return
+				}
+				var body struct{ Label string `json:"label"` }
+				_ = json.NewDecoder(req.Body).Decode(&body)
+				raw, t, err := auth.CreateToken(info.Username, body.Label)
+				if err != nil {
+					writeErr(w, err)
+					return
+				}
+				audit(req, info.Username, "user.token_create", t.ID)
+				writeJSON(w, http.StatusOK, map[string]any{
+					"token": raw, // shown ONCE; never retrievable again
+					"id":    t.ID,
+					"label": t.Label,
+				})
+			})(w, req)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/api/users/tokens/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != "DELETE" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		info, _ := auth.sessionFrom(req)
+		if info == nil {
+			http.Error(w, "token deletion requires a logged-in session", http.StatusUnauthorized)
+			return
+		}
+		id := strings.TrimPrefix(req.URL.Path, "/api/users/tokens/")
+		if err := auth.DeleteToken(info.Username, id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		audit(req, info.Username, "user.token_delete", id)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	}))
 
 	mux.HandleFunc("/api/users/confirm", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "POST" {

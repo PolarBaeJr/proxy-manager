@@ -130,6 +130,24 @@ The `monitor` binary scrapes both on a 5s tick, keeps a 1h rolling time series i
 
 The dashboard's **Stats** tab proxies these through its auth layer — no need to expose monitor publicly.
 
+### Programmatic access
+
+Two ways to call the dashboard from external tools:
+
+**1. Public health endpoint (no auth).** Returns only per-binary up/degraded/down — no host names, no traffic counts. Safe for status pages and uptime monitors.
+```bash
+curl https://dashboard.example.com/api/health
+# {"status":"up","targets":[{"name":"proxy","health":"up"},{"name":"edge","health":"up"}],"checked_at":"..."}
+```
+
+**2. API tokens (full access).** Generate per-user from the dashboard Users tab. Pass as a bearer token:
+```bash
+curl -H 'Authorization: Bearer pmt_XXXX' https://dashboard.example.com/api/monitor/overview
+curl -H 'Authorization: Bearer pmt_XXXX' https://dashboard.example.com/api/services
+curl -H 'Authorization: Bearer pmt_XXXX' -X POST https://dashboard.example.com/api/services/myapp/scale -d '{"replicas":3}'
+```
+Tokens are shown once at creation and stored only as SHA-256 hashes. Revoke from the same UI.
+
 Every file is small enough to read top-to-bottom. No code generation, no third-party UI frameworks, no service mesh.
 
 ---
