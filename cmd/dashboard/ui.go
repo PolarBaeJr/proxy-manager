@@ -1245,6 +1245,16 @@ async function renderServices() {
 // the height-jump on every 5s auto-refresh tick where the panel would
 // otherwise flash "Loading…" → full content.
 let _svcStatsCache = { byHost: {}, recentByHost: {}, fetchedAt: 0 };
+// Per-panel hash of last-painted content, so we only touch innerHTML when
+// the rendered HTML would actually differ. Without this, the table inside
+// each panel was being re-parsed every 5s — that's what was "moving around".
+const _svcPanelHash = new WeakMap();
+
+function paintServicePanelIfChanged(panel, html) {
+  if (_svcPanelHash.get(panel) === html) return;
+  _svcPanelHash.set(panel, html);
+  panel.innerHTML = html;
+}
 
 async function fillServiceStatsPanels() {
   const panels = document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats');
@@ -1253,7 +1263,8 @@ async function fillServiceStatsPanels() {
   for (const panel of panels) {
     const host = panel.dataset.host;
     if (_svcStatsCache.byHost[host] || (_svcStatsCache.recentByHost[host] || []).length) {
-      panel.innerHTML = renderServiceStatsPanel(_svcStatsCache.byHost[host], _svcStatsCache.recentByHost[host] || []);
+      const html = renderServiceStatsPanel(_svcStatsCache.byHost[host], _svcStatsCache.recentByHost[host] || []);
+      paintServicePanelIfChanged(panel, html);
     }
   }
   // Then fetch fresh in the background and update the cache + panels.
@@ -1270,10 +1281,12 @@ async function fillServiceStatsPanels() {
       if (recentByHost[e.host].length < 12) recentByHost[e.host].push(e);
     }
     _svcStatsCache = { byHost, recentByHost, fetchedAt: Date.now() };
-    // Repaint only the panels that are still in the DOM and expanded.
+    // Repaint only the panels that are still in the DOM and expanded AND
+    // whose rendered HTML would actually differ from what they show now.
     document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats').forEach(panel => {
       const host = panel.dataset.host;
-      panel.innerHTML = renderServiceStatsPanel(byHost[host], recentByHost[host] || []);
+      const html = renderServiceStatsPanel(byHost[host], recentByHost[host] || []);
+      paintServicePanelIfChanged(panel, html);
     });
   } catch {}
 }
