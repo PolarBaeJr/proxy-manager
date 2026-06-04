@@ -401,6 +401,25 @@ footer.app{border-top:1px solid var(--border);margin-top:30px;padding:16px 0;dis
   font-size:11.5px;color:var(--muted-2);flex-wrap:wrap}
 footer.app .dotsep{width:3px;height:3px;border-radius:50%;background:var(--muted-2)}
 footer.app code{color:var(--muted)}
+
+/* ============ LOGS ============ */
+.logs-toolbar{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:0 0 14px}
+.logs-toolbar .field{margin:0;min-width:160px;flex:1}
+.logs-toolbar .field.tight{flex:0 0 110px;min-width:110px}
+.logs-toolbar .field.check{align-self:center;margin-bottom:2px}
+.logs-toolbar .btn{margin-bottom:0}
+.log-view{background:#000;border:1px solid var(--border);border-radius:var(--radius-md);padding:12px 14px;
+  font-family:var(--font-mono);font-size:12.5px;line-height:1.55;color:#d3d8df;
+  max-height:600px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-variant-ligatures:none}
+.log-view .line{display:block;padding:1px 0}
+.log-view .line.stderr{color:#ffa48a}
+.log-view .line .src{color:var(--muted-2);user-select:none;display:inline-block;width:54px;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.log-view .empty{color:var(--muted);font-style:italic}
+.log-view .hit{background:rgba(240,200,73,.18);color:#fff;border-radius:2px;padding:0 2px}
+.log-status{display:flex;gap:10px;align-items:center;margin-top:8px;font-size:11.5px;color:var(--muted)}
+.log-status .dot{width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block}
+.log-status.idle .dot{background:var(--muted-2)}
+.log-status.err .dot{background:var(--red)}
 </style>
 </head>
 <body>
@@ -443,6 +462,7 @@ footer.app code{color:var(--muted)}
         <button data-tab="services"></button>
         <button data-tab="dns"></button>
         <button data-tab="users"></button>
+        <button data-tab="logs"></button>
         <button data-tab="stats"></button>
       </nav>
       <div id="lock-banner" class="hide"></div>
@@ -454,6 +474,7 @@ footer.app code{color:var(--muted)}
       <section id="tab-services" class="tabpane" hidden></section>
       <section id="tab-dns" class="tabpane" hidden></section>
       <section id="tab-users" class="tabpane" hidden></section>
+      <section id="tab-logs" class="tabpane" hidden></section>
       <section id="tab-stats" class="tabpane" hidden></section>
     </div>
     <div class="wrap">
@@ -529,9 +550,11 @@ const I = {
   bolt:    svg('<path d="M13 3L4 14h7l-1 7 9-11h-7z"/>'),
   shield:  svg('<path d="M12 3l8 3v6c0 4-3 7-8 9-5-2-8-5-8-9V6z"/><path d="M9 12l2 2 4-4"/>'),
   link:    svg('<path d="M10 14a4 4 0 0 0 6 .5l2-2a4 4 0 0 0-6-6l-1 1M14 10a4 4 0 0 0-6-.5l-2 2a4 4 0 0 0 6 6l1-1"/>'),
+  terminal:svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>'),
+  refresh: svg('<path d="M20 11A8 8 0 0 0 6.3 6.3L4 8.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 13.7 4.7L20 15.4"/><path d="M20 20v-5h-5"/>'),
 };
-const NAVMETA = { routes:'Routes', services:'Services', dns:'DNS', users:'Users', stats:'Stats' };
-const NAVICON = { routes:I.routes, services:I.services, dns:I.dns, users:I.users, stats:I.stats };
+const NAVMETA = { routes:'Routes', services:'Services', dns:'DNS', users:'Users', logs:'Logs', stats:'Stats' };
+const NAVICON = { routes:I.routes, services:I.services, dns:I.dns, users:I.users, logs:I.terminal, stats:I.stats };
 
 /* ---------- toast (kind, msg) with icon + progshrink bar ---------- */
 function toast(msg, kind='ok') {
@@ -709,12 +732,15 @@ function lockedAttr() { return isElevated() ? '' : 'disabled title="Confirm 2FA 
 function lk() { return isElevated() ? '' : '<span class="lock">' + I.lock + '</span>'; }
 
 /* ---------- Tabs ---------- */
-const TABS = ['routes', 'services', 'dns', 'users', 'stats'];
+const TABS = ['routes', 'services', 'dns', 'users', 'logs', 'stats'];
 let activeTab = 'routes';
 $$('nav button').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 function switchTab(t) {
   activeTab = t;
   statsDetail = null;
+  // Re-mount the Logs toolbar when re-entering — picks up newly-started
+  // containers and avoids holding a stale picker.
+  if (t !== 'logs') logsState.mounted = false;
   $$('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   TABS.forEach(x => $('#tab-' + x).hidden = x !== t);
   renderActive();
@@ -728,6 +754,7 @@ async function renderActive() {
     else if (activeTab === 'services') await renderServices();
     else if (activeTab === 'dns') await renderDNS();
     else if (activeTab === 'users') await renderUsers();
+    else if (activeTab === 'logs') await renderLogs();
     else if (activeTab === 'stats') await renderStats();
     setStatusOK();
   } catch (e) {
@@ -1140,6 +1167,111 @@ async function deleteUser(name) {
     await api('/api/users/' + encodeURIComponent(name), { method:'DELETE' });
     toast('deleted ' + name); renderActive();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+/* ---------- Logs ---------- */
+// State persists across re-renders so toolbar inputs and scroll position survive
+// the 5s auto-refresh; renderLogs only paints the toolbar shell on first entry.
+let logsState = { container:'', tail:200, filter:'', follow:true, mounted:false };
+
+async function renderLogs() {
+  const el = $('#tab-logs');
+  if (!logsState.mounted) {
+    let containers = [];
+    try { containers = await api('/api/logs/containers'); }
+    catch (e) {
+      el.innerHTML = emptyState(I.terminal, 'Docker unreachable', 'The dashboard could not list containers from the Docker socket: ' + e.message);
+      return;
+    }
+    if (!containers.length) {
+      el.innerHTML = emptyState(I.terminal, 'No containers running', 'Start a service to view its logs here.');
+      return;
+    }
+    // Preferred default: first managed service, else first running, else first overall.
+    if (!logsState.container) {
+      const managed = containers.find(c => c.service && c.state === 'running');
+      const running = containers.find(c => c.state === 'running');
+      logsState.container = (managed || running || containers[0]).name;
+    }
+    const opts = containers.map(c => {
+      const label = c.name + (c.state !== 'running' ? ' (' + c.state + ')' : '');
+      const sel = c.name === logsState.container ? ' selected' : '';
+      return '<option value="' + esc(c.name) + '"' + sel + '>' + esc(label) + '</option>';
+    }).join('');
+    el.innerHTML =
+      '<div class="subhead">' + I.terminal + 'Container logs</div>'
+      + '<div class="card">'
+      +   '<div class="logs-toolbar">'
+      +     '<div class="field"><label>Container</label>'
+      +       '<select id="log-container">' + opts + '</select></div>'
+      +     '<div class="field tight"><label>Tail</label>'
+      +       '<input type="number" id="log-tail" min="50" max="5000" step="50" value="' + logsState.tail + '"></div>'
+      +     '<div class="field"><label>Filter</label>'
+      +       '<input type="text" id="log-filter" placeholder="case-insensitive substring" value="' + esc(logsState.filter) + '"></div>'
+      +     '<div class="field check"><input type="checkbox" id="log-follow"' + (logsState.follow ? ' checked' : '') + '>'
+      +       '<label for="log-follow">Auto-refresh (5s)</label></div>'
+      +     '<button class="btn" id="log-refresh-btn">' + I.refresh + 'Refresh</button>'
+      +   '</div>'
+      +   '<div id="log-view" class="log-view"><span class="empty">Loading…</span></div>'
+      +   '<div id="log-meta" class="log-status idle"><span class="dot"></span><span id="log-meta-text">idle</span></div>'
+      + '</div>';
+    $('#log-container').onchange = e => { logsState.container = e.target.value; fetchLogs(true); };
+    $('#log-tail').onchange      = e => { logsState.tail = Math.max(50, Math.min(5000, parseInt(e.target.value)||200)); fetchLogs(true); };
+    $('#log-filter').oninput     = e => { logsState.filter = e.target.value; paintLogs(); };
+    $('#log-follow').onchange    = e => { logsState.follow = e.target.checked; };
+    $('#log-refresh-btn').onclick = () => fetchLogs(true);
+    logsState.mounted = true;
+  }
+  if (logsState.follow || !logsState.lines) {
+    await fetchLogs(false);
+  }
+}
+
+let _logFetchInflight = false;
+async function fetchLogs(force) {
+  if (_logFetchInflight) return;
+  if (!logsState.container) return;
+  _logFetchInflight = true;
+  const meta = $('#log-meta');
+  const metaTxt = $('#log-meta-text');
+  if (meta) meta.className = 'log-status';
+  if (metaTxt) metaTxt.textContent = 'fetching ' + logsState.container + '…';
+  try {
+    const r = await api('/api/logs/' + encodeURIComponent(logsState.container) + '?tail=' + logsState.tail);
+    logsState.lines = r.lines || [];
+    logsState.fetchedAt = Date.now();
+    paintLogs();
+    if (metaTxt) metaTxt.textContent = (logsState.lines.length || 0) + ' lines · refreshed ' + fmtTime();
+  } catch (e) {
+    if (meta) meta.className = 'log-status err';
+    if (metaTxt) metaTxt.textContent = 'error: ' + e.message;
+  } finally {
+    _logFetchInflight = false;
+  }
+}
+
+function paintLogs() {
+  const view = $('#log-view');
+  if (!view) return;
+  const lines = logsState.lines || [];
+  const q = logsState.filter.trim().toLowerCase();
+  const filtered = q ? lines.filter(l => (l.text || '').toLowerCase().includes(q)) : lines;
+  if (!filtered.length) {
+    view.innerHTML = '<span class="empty">' + (lines.length ? 'No lines match the filter.' : 'No log output.') + '</span>';
+    return;
+  }
+  const wasAtBottom = (view.scrollHeight - view.scrollTop - view.clientHeight) < 24;
+  const out = filtered.map(l => {
+    let text = esc(l.text || '');
+    if (q) {
+      const re = new RegExp('(' + q.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + ')', 'gi');
+      text = text.replace(re, '<span class="hit">$1</span>');
+    }
+    return '<span class="line ' + (l.stream === 'stderr' ? 'stderr' : 'stdout') + '">'
+         +    '<span class="src">' + (l.stream || 'stdout') + '</span>' + text + '</span>';
+  }).join('');
+  view.innerHTML = out;
+  if (wasAtBottom) view.scrollTop = view.scrollHeight;
 }
 
 /* ---------- Stats (monitor binary) ---------- */
