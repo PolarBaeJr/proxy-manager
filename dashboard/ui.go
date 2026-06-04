@@ -1264,8 +1264,17 @@ function paintLogs() {
   const out = filtered.map(l => {
     let text = esc(l.text || '');
     if (q) {
-      const re = new RegExp('(' + q.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + ')', 'gi');
-      text = text.replace(re, '<span class="hit">$1</span>');
+      // Substring highlight via indexOf — avoids regex injection from special
+      // chars in the filter ('(', '[', '\', etc.) which would throw SyntaxError.
+      const lower = text.toLowerCase();
+      let pos = 0, parts = '';
+      for (;;) {
+        const i = lower.indexOf(q, pos);
+        if (i < 0) { parts += text.slice(pos); break; }
+        parts += text.slice(pos, i) + '<span class="hit">' + text.slice(i, i + q.length) + '</span>';
+        pos = i + q.length;
+      }
+      text = parts;
     }
     return '<span class="line ' + (l.stream === 'stderr' ? 'stderr' : 'stdout') + '">'
          +    '<span class="src">' + (l.stream || 'stdout') + '</span>' + text + '</span>';
