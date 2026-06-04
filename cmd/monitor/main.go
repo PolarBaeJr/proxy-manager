@@ -9,13 +9,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
 )
 
 func main() {
@@ -52,18 +53,18 @@ func main() {
 
 	// Current snapshot of all targets + per-target health classification.
 	mux.HandleFunc("/api/snapshot", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, store.Snapshot())
+		httpx.WriteJSON(w, http.StatusOK, store.Snapshot())
 	})
 
 	// Last N time-series points for a target, useful for sparklines.
 	// Query: /api/series?target=proxy&field=total&points=60
 	mux.HandleFunc("/api/series", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, store.Series(r.URL.Query().Get("target"), r.URL.Query().Get("field")))
+		httpx.WriteJSON(w, http.StatusOK, store.Series(r.URL.Query().Get("target"), r.URL.Query().Get("field")))
 	})
 
 	// Aggregated view across all targets. Convenient for the dashboard.
 	mux.HandleFunc("/api/overview", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, store.Overview())
+		httpx.WriteJSON(w, http.StatusOK, store.Overview())
 	})
 
 	// Per-target detail. Path: /api/target/{name}[/hosts|/errors|/series]
@@ -86,22 +87,22 @@ func main() {
 				http.NotFound(w, r)
 				return
 			}
-			writeJSON(w, t)
+			httpx.WriteJSON(w, http.StatusOK, t)
 		case "hosts":
 			h := store.TargetHosts(name)
 			if h == nil {
 				h = []map[string]any{}
 			}
-			writeJSON(w, h)
+			httpx.WriteJSON(w, http.StatusOK, h)
 		case "errors":
 			e := store.TargetErrors(name)
 			if e == nil {
 				e = map[string]any{}
 			}
-			writeJSON(w, e)
+			httpx.WriteJSON(w, http.StatusOK, e)
 		case "series":
 			field := r.URL.Query().Get("field")
-			writeJSON(w, store.Series(name, field))
+			httpx.WriteJSON(w, http.StatusOK, store.Series(name, field))
 		default:
 			http.NotFound(w, r)
 		}
@@ -110,10 +111,10 @@ func main() {
 	// TLS cert info per probed hostname.
 	mux.HandleFunc("/api/certs", func(w http.ResponseWriter, _ *http.Request) {
 		if prober == nil {
-			writeJSON(w, map[string]any{"enabled": false, "certs": []any{}})
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"enabled": false, "certs": []any{}})
 			return
 		}
-		writeJSON(w, map[string]any{
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{
 			"enabled":      true,
 			"worst_status": prober.Worst(),
 			"certs":        prober.Snapshot(),
@@ -143,7 +144,3 @@ func parseTargets(s string) map[string]string {
 	return out
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
-}

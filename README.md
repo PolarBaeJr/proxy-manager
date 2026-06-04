@@ -116,17 +116,21 @@ cmd/
   proxy/        request-path binary              (~1000 LOC, exposes /metrics + /access)
   dashboard/    management UI binary             (~3000 LOC, single-file embedded HTML)
   monitor/      scrapes proxy + edge metrics     (~500 LOC, time series + cert probe)
+internal/
+  httpx/        shared HTTP helpers (WriteJSON / WriteErr)
 examples/
   service.yml   minimal labelled compose file
 scripts/
   cname         Cloudflare DNS CLI (alternative to the DNS tab)
 docs/
   DESIGN_BRIEF.md   archived design handoff (Vercel/Geist dashboard rebuild)
+  PEERS_PLAN.md     draft design for federated multi-host support
+go.mod          single module: github.com/PolarBaeJr/proxy-manager
 docker-compose.yml
 .env.example
 ```
 
-Each binary has its own `go.mod` and is built and shipped independently. The dashboard's HTML lives inside a Go raw string in `cmd/dashboard/ui.go` — no bundler, no node_modules.
+Standard Go layout: one `go.mod` at the root, one binary per `cmd/<name>/`, shared code under `internal/`. Each binary's Docker image builds from the repo root (`context: .`) and only `COPY`s its own `cmd/<name>/` plus `internal/`, so the build context stays tight even though all four binaries share one module. The dashboard's HTML lives inside a Go raw string in `cmd/dashboard/ui.go` — no bundler, no node_modules.
 
 ---
 

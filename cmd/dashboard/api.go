@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
 )
 
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
@@ -69,7 +71,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		if overall != "up" {
 			status = http.StatusServiceUnavailable
 		}
-		writeJSON(w, status, map[string]any{
+		httpx.WriteJSON(w, status, map[string]any{
 			"status":   overall,
 			"targets":  targets,
 			"checked_at": time.Now().UTC().Format(time.RFC3339),
@@ -78,7 +80,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 
 	// Host CPU / memory / disk for the header widget.
 	mux.HandleFunc("/api/stats", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, GetStats())
+		httpx.WriteJSON(w, http.StatusOK, GetStats())
 	}))
 
 	// Proxy through to the monitor binary for traffic metrics. Keeps the auth
@@ -130,7 +132,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				resp["username"] = info.Username
 			}
 		}
-		writeJSON(w, http.StatusOK, resp)
+		httpx.WriteJSON(w, http.StatusOK, resp)
 	})
 
 	mux.HandleFunc("/api/auth/setup", rl.limit(func(w http.ResponseWriter, req *http.Request) {
@@ -142,7 +144,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			Username, Password string
 		}
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-			writeErr(w, err)
+			httpx.WriteErr(w, err)
 			return
 		}
 		secret, uri, err := auth.BeginSetup(body.Username, body.Password)
@@ -150,7 +152,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{
 			"username": body.Username, "totp_secret": secret, "otpauth_uri": uri,
 			"qr_data_url": qrDataURL(uri),
 		})
@@ -163,7 +165,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		}
 		var body struct{ Username, Code string }
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-			writeErr(w, err)
+			httpx.WriteErr(w, err)
 			return
 		}
 		if err := auth.ConfirmPending(body.Username, body.Code); err != nil {
@@ -171,7 +173,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			return
 		}
 		audit(req, body.Username, "user.setup_confirmed", body.Username)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "confirmed", "username": body.Username})
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "confirmed", "username": body.Username})
 	}))
 
 	mux.HandleFunc("/api/auth/login", rl.limit(func(w http.ResponseWriter, req *http.Request) {
@@ -183,7 +185,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			Username, Password, Code string
 		}
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-			writeErr(w, err)
+			httpx.WriteErr(w, err)
 			return
 		}
 		if !auth.IsSetup() {
@@ -201,7 +203,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		}
 		setSessionCookie(w, auth.newCookie(body.Username, elev))
 		audit(req, body.Username, "auth.login_ok", "")
-		writeJSON(w, http.StatusOK, map[string]any{"username": body.Username, "elevated_until": elev.Unix()})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"username": body.Username, "elevated_until": elev.Unix()})
 	}))
 
 	mux.HandleFunc("/api/auth/verify-2fa", rl.limit(func(w http.ResponseWriter, req *http.Request) {
@@ -216,7 +218,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		}
 		var body struct{ Code string }
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-			writeErr(w, err)
+			httpx.WriteErr(w, err)
 			return
 		}
 		if !auth.VerifyTOTP(info.Username, body.Code) {
@@ -227,7 +229,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		elev := time.Now().Add(elevatedLifetime)
 		setSessionCookie(w, auth.newCookie(info.Username, elev))
 		audit(req, info.Username, "auth.2fa_ok", "")
-		writeJSON(w, http.StatusOK, map[string]any{"elevated_until": elev.Unix()})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"elevated_until": elev.Unix()})
 	}))
 
 	mux.HandleFunc("/api/auth/logout", func(w http.ResponseWriter, req *http.Request) {
@@ -235,7 +237,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			audit(req, info.Username, "auth.logout", "")
 		}
 		clearSessionCookie(w)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
 	})
 
 	// ---- Users ----
@@ -243,13 +245,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		switch req.Method {
 		case "GET":
 			auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
-				writeJSON(w, http.StatusOK, auth.ListUsers())
+				httpx.WriteJSON(w, http.StatusOK, auth.ListUsers())
 			})(w, req)
 		case "POST":
 			auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
 				var body struct{ Username, Password string }
 				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-					writeErr(w, err)
+					httpx.WriteErr(w, err)
 					return
 				}
 				secret, uri, err := auth.BeginCreateUser(body.Username, body.Password)
@@ -259,7 +261,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				}
 				info, _ := auth.sessionFrom(req)
 				audit(req, sessionUser(info), "user.begin_create", body.Username)
-				writeJSON(w, http.StatusOK, map[string]string{"username": body.Username, "totp_secret": secret, "otpauth_uri": uri})
+				httpx.WriteJSON(w, http.StatusOK, map[string]string{"username": body.Username, "totp_secret": secret, "otpauth_uri": uri})
 			})(w, req)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -276,7 +278,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 					http.Error(w, "tokens listing requires a session", http.StatusUnauthorized)
 					return
 				}
-				writeJSON(w, http.StatusOK, auth.ListTokens(info.Username))
+				httpx.WriteJSON(w, http.StatusOK, auth.ListTokens(info.Username))
 			})(w, req)
 		case "POST":
 			auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
@@ -289,11 +291,11 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				_ = json.NewDecoder(req.Body).Decode(&body)
 				raw, t, err := auth.CreateToken(info.Username, body.Label)
 				if err != nil {
-					writeErr(w, err)
+					httpx.WriteErr(w, err)
 					return
 				}
 				audit(req, info.Username, "user.token_create", t.ID)
-				writeJSON(w, http.StatusOK, map[string]any{
+				httpx.WriteJSON(w, http.StatusOK, map[string]any{
 					"token": raw, // shown ONCE; never retrievable again
 					"id":    t.ID,
 					"label": t.Label,
@@ -320,7 +322,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			return
 		}
 		audit(req, info.Username, "user.token_delete", id)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	}))
 
 	mux.HandleFunc("/api/users/confirm", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
@@ -330,7 +332,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		}
 		var body struct{ Username, Code string }
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-			writeErr(w, err)
+			httpx.WriteErr(w, err)
 			return
 		}
 		if err := auth.ConfirmPending(body.Username, body.Code); err != nil {
@@ -339,7 +341,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		}
 		info, _ := auth.sessionFrom(req)
 		audit(req, sessionUser(info), "user.confirm_create", body.Username)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "confirmed", "username": body.Username})
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "confirmed", "username": body.Username})
 	}))
 
 	mux.HandleFunc("/api/users/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
@@ -358,14 +360,14 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			return
 		}
 		audit(req, sessionUser(info), "user.delete", name)
-		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	}))
 
 	// ---- Routes (view via dashboard's own docker discovery; no dep on proxy) ----
 	mux.HandleFunc("/api/routes", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		routes, err := dc.listRoutes(req.Context(), routesConfigPath)
 		if err != nil {
-			writeErr(w, err)
+			httpx.WriteErr(w, err)
 			return
 		}
 		// Match the proxy's old JSON shape so the UI doesn't care which it talks to.
@@ -392,7 +394,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			}
 			out = append(out, uiGroup{Host: r.Host, Path: r.Path, Strip: r.Strip, Name: r.Name, Service: r.Service, Backends: bs})
 		}
-		writeJSON(w, http.StatusOK, out)
+		httpx.WriteJSON(w, http.StatusOK, out)
 	}))
 
 	// ---- Services ----
@@ -402,7 +404,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
 				svcs, err := dc.listServices(req.Context())
 				if err != nil {
-					writeErr(w, err)
+					httpx.WriteErr(w, err)
 					return
 				}
 				// Enrich with image-checker results.
@@ -411,22 +413,22 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 						svcs[i].UpdateAvailable = true
 					}
 				}
-				writeJSON(w, http.StatusOK, svcs)
+				httpx.WriteJSON(w, http.StatusOK, svcs)
 			})(w, req)
 		case "POST":
 			auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
 				var body CreateServiceRequest
 				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-					writeErr(w, err)
+					httpx.WriteErr(w, err)
 					return
 				}
 				if err := dc.createService(req.Context(), body); err != nil {
-					writeErr(w, err)
+					httpx.WriteErr(w, err)
 					return
 				}
 				info, _ := auth.sessionFrom(req)
 				audit(req, sessionUser(info), "service.create", body.Name)
-				writeJSON(w, http.StatusOK, map[string]string{"status": "created"})
+				httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "created"})
 			})(w, req)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -445,7 +447,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		if len(parts) == 2 && parts[1] == "scale" && req.Method == "POST" {
 			var body struct{ Replicas int }
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				writeErr(w, err)
+				httpx.WriteErr(w, err)
 				return
 			}
 			if err := dc.scaleService(req.Context(), name, body.Replicas); err != nil {
@@ -453,13 +455,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				return
 			}
 			audit(req, sessionUser(info), "service.scale", name)
-			writeJSON(w, http.StatusOK, map[string]any{"status": "scaled", "replicas": body.Replicas})
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "scaled", "replicas": body.Replicas})
 			return
 		}
 		if len(parts) == 2 && parts[1] == "replace" && req.Method == "POST" {
 			var body ReplaceServiceRequest
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				writeErr(w, err)
+				httpx.WriteErr(w, err)
 				return
 			}
 			if err := dc.replaceService(req.Context(), name, body); err != nil {
@@ -467,13 +469,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				return
 			}
 			audit(req, sessionUser(info), "service.replace", name+" => "+body.Image)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "replaced", "image": body.Image})
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "replaced", "image": body.Image})
 			return
 		}
 		if len(parts) == 2 && parts[1] == "stage" && req.Method == "POST" {
 			var body ReplaceServiceRequest
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				writeErr(w, err)
+				httpx.WriteErr(w, err)
 				return
 			}
 			if err := dc.stageCanary(req.Context(), name, body); err != nil {
@@ -481,7 +483,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				return
 			}
 			audit(req, sessionUser(info), "service.stage", name+" => "+body.Image)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "staged"})
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "staged"})
 			return
 		}
 		if len(parts) == 2 && parts[1] == "promote" && req.Method == "POST" {
@@ -490,7 +492,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				return
 			}
 			audit(req, sessionUser(info), "service.promote", name)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "promoted"})
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "promoted"})
 			return
 		}
 		if len(parts) == 2 && parts[1] == "canary" && req.Method == "DELETE" {
@@ -499,16 +501,16 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				return
 			}
 			audit(req, sessionUser(info), "service.discard_canary", name)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "discarded"})
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "discarded"})
 			return
 		}
 		if req.Method == "DELETE" {
 			if err := dc.deleteService(req.Context(), name); err != nil {
-				writeErr(w, err)
+				httpx.WriteErr(w, err)
 				return
 			}
 			audit(req, sessionUser(info), "service.delete", name)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 			return
 		}
 		http.NotFound(w, req)
@@ -516,7 +518,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 
 	// ---- Cloudflare ----
 	mux.HandleFunc("/api/cf/enabled", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"enabled": cf != nil, "domain": cfDomain(cf)})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"enabled": cf != nil, "domain": cfDomain(cf)})
 	}))
 
 	// ---- Container logs (read-only; auth-gated) ----
@@ -550,26 +552,26 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
 				recs, err := cf.List(req.Context())
 				if err != nil {
-					writeErr(w, err)
+					httpx.WriteErr(w, err)
 					return
 				}
-				writeJSON(w, http.StatusOK, recs)
+				httpx.WriteJSON(w, http.StatusOK, recs)
 			})(w, req)
 		case "POST":
 			auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
 				var body CreateDNSRequest
 				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-					writeErr(w, err)
+					httpx.WriteErr(w, err)
 					return
 				}
 				rec, err := cf.Create(req.Context(), body)
 				if err != nil {
-					writeErr(w, err)
+					httpx.WriteErr(w, err)
 					return
 				}
 				info, _ := auth.sessionFrom(req)
 				audit(req, sessionUser(info), "dns.create", body.Name)
-				writeJSON(w, http.StatusOK, rec)
+				httpx.WriteJSON(w, http.StatusOK, rec)
 			})(w, req)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -591,23 +593,23 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		case "PATCH":
 			var body UpdateDNSRequest
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				writeErr(w, err)
+				httpx.WriteErr(w, err)
 				return
 			}
 			rec, err := cf.Update(req.Context(), id, body)
 			if err != nil {
-				writeErr(w, err)
+				httpx.WriteErr(w, err)
 				return
 			}
 			audit(req, sessionUser(info), "dns.update", id)
-			writeJSON(w, http.StatusOK, rec)
+			httpx.WriteJSON(w, http.StatusOK, rec)
 		case "DELETE":
 			if err := cf.Delete(req.Context(), id); err != nil {
-				writeErr(w, err)
+				httpx.WriteErr(w, err)
 				return
 			}
 			audit(req, sessionUser(info), "dns.delete", id)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -630,14 +632,3 @@ func cfDomain(cf *cloudflareClient) string {
 	return cf.domain
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
-}
-
-func writeErr(w http.ResponseWriter, err error) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
-	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-}

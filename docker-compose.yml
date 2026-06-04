@@ -15,7 +15,9 @@ networks:
 
 services:
   edge:
-    build: ./cmd/edge
+    build:
+      context: .
+      dockerfile: cmd/edge/Dockerfile
     image: edge:latest
     container_name: edge
     restart: unless-stopped
@@ -34,7 +36,9 @@ services:
       -rate 100 -burst 200 -max-body 10485760
 
   proxy:
-    build: ./cmd/proxy
+    build:
+      context: .
+      dockerfile: cmd/proxy/Dockerfile
     image: proxy:latest
     container_name: proxy
     restart: unless-stopped
@@ -48,7 +52,9 @@ services:
       - "host.docker.internal:host-gateway"
 
   dashboard:
-    build: ./cmd/dashboard
+    build:
+      context: .
+      dockerfile: cmd/dashboard/Dockerfile
     image: dashboard:latest
     container_name: dashboard
     restart: unless-stopped
@@ -69,7 +75,9 @@ services:
       PROXY_URL:            http://proxy:8094       # for the Access tab (proxy /access)
 
   monitor:
-    build: ./cmd/monitor
+    build:
+      context: .
+      dockerfile: cmd/monitor/Dockerfile
     image: monitor:latest
     container_name: monitor
     restart: unless-stopped

@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
 )
 
 // containerSummary is the lightweight shape the Logs picker consumes — just
@@ -133,10 +135,10 @@ func registerLogRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore) {
 	mux.HandleFunc("/api/logs/containers", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		list, err := dc.listContainerSummaries(req.Context())
 		if err != nil {
-			writeErr(w, err)
+			httpx.WriteErr(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, list)
+		httpx.WriteJSON(w, http.StatusOK, list)
 	}))
 
 	mux.HandleFunc("/api/logs/", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
@@ -153,10 +155,10 @@ func registerLogRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore) {
 		}
 		lines, err := dc.containerLogs(req.Context(), name, tail)
 		if err != nil {
-			writeErr(w, err)
+			httpx.WriteErr(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{
 			"container": name,
 			"tail":      tail,
 			"lines":     lines,
