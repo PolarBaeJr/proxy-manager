@@ -106,11 +106,12 @@ func (c *cloudflareClient) findByName(ctx context.Context, name string) (*DNSRec
 }
 
 type CreateDNSRequest struct {
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	Proxied bool   `json:"proxied"`
-	TTL     int    `json:"ttl"`
+	Type     string `json:"type"`
+	Name     string `json:"name"`
+	Content  string `json:"content"`
+	Proxied  bool   `json:"proxied"`
+	TTL      int    `json:"ttl"`
+	Priority *int   `json:"priority,omitempty"` // MX records only
 }
 
 func (c *cloudflareClient) Create(ctx context.Context, req CreateDNSRequest) (*DNSRecord, error) {

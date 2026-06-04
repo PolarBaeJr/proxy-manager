@@ -1572,6 +1572,9 @@ async function renderDNS() {
     el.innerHTML = emptyState(I.dns, 'Cloudflare not configured', 'Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID to manage DNS records from the dashboard.');
     return;
   }
+  // Surface the zone domain to the New DNS dialog so its name-preview hint
+  // can show "→ myapp.polardev.org" as you type.
+  window._cfZone = status.domain || '';
   const recs = await api('/api/cf/records');
   const hash = JSON.stringify(recs);
   if (hash === _lastDNSHash && el.children.length) return;
@@ -2246,22 +2249,39 @@ function buildDialogs() {
     +   '<button type="submit" class="btn primary">' + I.check + 'Replace</button>'
     + '</div></form></div>';
 
-  // New DNS
+  // New DNS — type-aware. The content field swaps shape per type:
+  //   A    → IPv4 input
+  //   AAAA → IPv6 input
+  //   CNAME→ hostname input
+  //   TXT  → textarea
+  //   MX   → priority number + hostname
+  // The name field gets a live ".<zone>" hint so it's obvious what gets created.
   $('#dlg-new-dns').innerHTML =
     '<div class="dlg"><div class="dlg-head"><div class="di">' + I.dns + '</div>'
     + '<div><h3>New DNS record</h3><div class="dsub">Create a record in the Cloudflare zone</div></div>'
     + '<button class="x" type="button" onclick="document.getElementById(\'dlg-new-dns\').close()">' + I.x + '</button></div>'
     + '<form id="form-new-dns"><div class="dlg-body">'
     + '<div class="field-row">'
-    +   '<div class="field"><label>Type</label><select name="type"><option>CNAME</option><option>A</option><option>AAAA</option><option>TXT</option><option>MX</option></select></div>'
-    +   '<div class="field"><label>Name</label><input name="name" placeholder="subdomain" required></div>'
+    +   '<div class="field"><label>Type</label><select name="type" id="dns-type">'
+    +     '<option value="CNAME">CNAME — alias to another hostname</option>'
+    +     '<option value="A">A — IPv4 address</option>'
+    +     '<option value="AAAA">AAAA — IPv6 address</option>'
+    +     '<option value="TXT">TXT — arbitrary text</option>'
+    +     '<option value="MX">MX — mail exchange</option>'
+    +   '</select></div>'
+    +   '<div class="field"><label>Name <span class="hint" id="dns-name-hint" style="color:var(--muted-2)"></span></label>'
+    +     '<input name="name" id="dns-name" placeholder="myapp" required></div>'
     + '</div>'
-    + '<div class="field"><label>Content (target)</label><input name="content" placeholder="tunnel.example.com" required></div>'
-    + '<div class="field check"><input type="checkbox" name="proxied" id="dns-proxied" checked><label for="dns-proxied">Proxy through Cloudflare<div class="hint">Orange-cloud: hides origin IP and adds CDN/TLS.</div></label></div>'
+    + '<div id="dns-content-slot"></div>'
+    + '<div class="field check" id="dns-proxied-row"><input type="checkbox" name="proxied" id="dns-proxied" checked><label for="dns-proxied">Proxy through Cloudflare<div class="hint">Orange-cloud: hides origin IP and adds CDN/TLS. Only applies to A / AAAA / CNAME.</div></label></div>'
     + '</div><div class="dialog-actions">'
     +   '<button type="button" class="btn" onclick="document.getElementById(\'dlg-new-dns\').close()">Cancel</button>'
     +   '<button type="submit" class="btn primary">' + I.check + 'Create</button>'
     + '</div></form></div>';
+  // Wire the type-aware content field.
+  refreshDNSFormShape();
+  $('#dns-type').onchange = refreshDNSFormShape;
+  $('#dns-name').oninput  = refreshDNSFormShape;
 
   // 2FA
   $('#dlg-2fa').innerHTML =
@@ -2349,14 +2369,81 @@ function wireDialogForms() {
 
   $('#form-new-dns').onsubmit = async (e) => {
     e.preventDefault();
-    const f = e.target;
+    const type = $('#dns-type').value;
+    const name = $('#dns-name').value.trim();
+    const content = (type === 'MX')
+      ? ($('#dns-mx-host').value.trim())
+      : ($('#dns-content').value.trim());
+    const body = { type, name, content, proxied: $('#dns-proxied').checked };
+    if (type === 'MX') {
+      const p = parseInt($('#dns-mx-prio').value);
+      if (!Number.isNaN(p)) body.priority = p;
+      body.proxied = false;
+    }
+    if (type === 'TXT') body.proxied = false;
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+    const orig = submitBtn ? submitBtn.innerHTML : '';
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Creating…'; }
     try {
-      await api('/api/cf/records', { method:'POST', body: JSON.stringify({
-        type: f.type.value, name: f.name.value, content: f.content.value, proxied: f.proxied.checked,
-      })});
-      toast('created'); $('#dlg-new-dns').close(); f.reset(); f.proxied.checked = true; renderActive();
+      await api('/api/cf/records', { method:'POST', body: JSON.stringify(body) });
+      toast('created ' + type + ' ' + name);
+      $('#dlg-new-dns').close();
+      renderActive();
     } catch (e) { toast(e.message, 'err'); }
+    finally { if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = orig; } }
   };
+}
+
+// refreshDNSFormShape swaps the Content slot based on type and updates the
+// live ".<zone>" suffix shown next to the Name input.
+function refreshDNSFormShape() {
+  const type = $('#dns-type') ? $('#dns-type').value : 'CNAME';
+  const slot = $('#dns-content-slot');
+  if (!slot) return;
+  // Name → live FQDN preview (server auto-fqdns; this just shows what'll happen).
+  const zone = (window._cfZone || '');
+  const hint = $('#dns-name-hint');
+  const nameVal = ($('#dns-name') ? $('#dns-name').value : '').trim();
+  if (hint && zone && nameVal && !nameVal.includes('.')) hint.textContent = '→ ' + nameVal + '.' + zone;
+  else if (hint && zone && !nameVal) hint.textContent = '(saved as <name>.' + zone + ')';
+  else if (hint) hint.textContent = '';
+  // Content slot
+  let html = '';
+  const proxiedRow = $('#dns-proxied-row');
+  if (type === 'A') {
+    html = '<div class="field"><label>IPv4 address</label>'
+         + '<input id="dns-content" inputmode="numeric" pattern="\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}" placeholder="203.0.113.42" required>'
+         + '<div class="hint">Four octets separated by dots.</div></div>';
+    if (proxiedRow) proxiedRow.style.display = '';
+  } else if (type === 'AAAA') {
+    html = '<div class="field"><label>IPv6 address</label>'
+         + '<input id="dns-content" placeholder="2001:db8::1" pattern="[0-9a-fA-F:]+" required>'
+         + '<div class="hint">Use :: to compress consecutive zero groups.</div></div>';
+    if (proxiedRow) proxiedRow.style.display = '';
+  } else if (type === 'CNAME') {
+    const def = (window._discoveryLastDomain && nameVal) ? '' : '';
+    html = '<div class="field"><label>Target hostname</label>'
+         + '<input id="dns-content" placeholder="origin.example.com" value="' + esc(def) + '" required>'
+         + '<div class="hint">Must end in a domain you control.</div></div>';
+    if (proxiedRow) proxiedRow.style.display = '';
+  } else if (type === 'TXT') {
+    html = '<div class="field"><label>Text value</label>'
+         + '<textarea id="dns-content" placeholder="v=spf1 include:_spf.example.com -all" required></textarea>'
+         + '<div class="hint">Cloudflare automatically quotes the string for you.</div></div>';
+    if (proxiedRow) proxiedRow.style.display = 'none';
+  } else if (type === 'MX') {
+    html = '<div class="field-row">'
+         + '<div class="field tight"><label>Priority</label>'
+         +   '<input id="dns-mx-prio" type="number" min="0" max="65535" value="10" required>'
+         +   '<div class="hint">Lower wins.</div>'
+         + '</div>'
+         + '<div class="field"><label>Mail server</label>'
+         +   '<input id="dns-mx-host" placeholder="mail.example.com" required>'
+         +   '<div class="hint">FQDN of the SMTP host (no @).</div>'
+         + '</div></div>';
+    if (proxiedRow) proxiedRow.style.display = 'none';
+  }
+  slot.innerHTML = html;
 }
 
 /* ---------- sys-stats (CPU / Mem / Disk) ---------- */
