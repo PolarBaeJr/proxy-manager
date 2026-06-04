@@ -643,7 +643,7 @@ function setupView() {
 function loginView() {
   return '<p class="meta" style="margin:0 0 14px;text-align:center">Sign in to your homelab.</p>'
        + '<button id="btn-passkey-login" class="btn primary" type="button" style="width:100%;justify-content:center;margin-bottom:14px;display:none">' + I.key + 'Sign in with passkey</button>'
-       + '<div id="passkey-divider" style="display:none;text-align:center;color:var(--muted-2);font-size:11px;letter-spacing:.08em;margin-bottom:14px">OR USE PASSWORD</div>'
+       + '<div id="passkey-only-hint" style="display:none;text-align:center;color:var(--muted);font-size:12px;margin-top:8px">Password / 2FA login is API-only — see <code>/api/auth/login</code>.</div>'
        + '<form id="form-login">'
        + '<div class="field"><label>Username</label><input name="username" required autofocus></div>'
        + '<div class="field"><label>Password</label><input name="password" type="password" required></div>'
@@ -686,8 +686,13 @@ function wireAuthForms() {
   if (pkBtn) {
     fetch('/api/auth/passkey/available').then(r => r.json()).then(d => {
       if (d && d.available) {
+        // At least one user has a passkey — primary login path. Hide the
+        // password form entirely. The /api/auth/login endpoint still works
+        // for emergency curl (lost-all-devices recovery).
         pkBtn.style.display = '';
-        $('#passkey-divider').style.display = '';
+        const form = $('#form-login');
+        if (form) form.style.display = 'none';
+        $('#passkey-only-hint').style.display = '';
       }
     }).catch(() => {});
     pkBtn.onclick = async () => {
