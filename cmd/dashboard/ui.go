@@ -414,6 +414,10 @@ dialog::backdrop{background:rgba(0,0,0,.66);backdrop-filter:blur(3px)}
 .toast.ok .prog{background:var(--green)} .toast.err .prog{background:var(--red)}
 @keyframes progshrink{from{width:100%}to{width:0%}}
 
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;
+  animation:spin .8s linear infinite;margin-right:7px;vertical-align:-2px;opacity:.8}
+@keyframes spin{to{transform:rotate(360deg)}}
+
 footer.app{border-top:1px solid var(--border);margin-top:30px;padding:16px 0;display:flex;gap:16px;align-items:center;
   font-size:11.5px;color:var(--muted-2);flex-wrap:wrap}
 footer.app .dotsep{width:3px;height:3px;border-radius:50%;background:var(--muted-2)}
@@ -546,6 +550,7 @@ footer.app code{color:var(--muted)}
 <dialog id="dlg-2fa"></dialog>
 <dialog id="dlg-add-user"><div class="dlg"><div id="add-user-body"></div></div></dialog>
 <dialog id="dlg-token-reveal"></dialog>
+<dialog id="dlg-prompt"></dialog>
 
 <div id="toasts"></div>
 
@@ -633,6 +638,53 @@ async function api(path, opts={}) {
     throw new Error(msg);
   }
   return r.status === 204 ? null : r.json();
+}
+
+/* ---------- Native-style in-app confirm / prompt (replace window.confirm/prompt) ---------- */
+// Both return promises and use the existing dialog styling, so the dashboard
+// never falls back to the OS's grey 1990s alert chrome.
+function confirmDialog(message, opts={}) {
+  return new Promise(resolve => {
+    const d = document.getElementById('dlg-prompt');
+    const danger = !!opts.danger;
+    const ok = opts.okLabel || (danger ? 'Delete' : 'Confirm');
+    d.innerHTML = '<div class="dlg"><div class="dlg-head"><div class="di">' + (danger ? I.alert : I.shield) + '</div>'
+      + '<div><h3>' + esc(opts.title || (danger ? 'Confirm delete' : 'Confirm')) + '</h3>'
+      + '<div class="dsub">' + esc(message) + '</div></div></div>'
+      + '<div class="dialog-actions">'
+      + '<button class="btn" data-act="cancel" type="button">Cancel</button>'
+      + '<button class="btn ' + (danger ? 'danger' : 'primary') + '" data-act="ok" type="button" autofocus>' + I.check + esc(ok) + '</button>'
+      + '</div></div>';
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; resolve(v); try { d.close(); } catch {} };
+    d.querySelector('[data-act="cancel"]').onclick = () => finish(false);
+    d.querySelector('[data-act="ok"]').onclick = () => finish(true);
+    d.addEventListener('close', () => finish(false), {once: true});
+    d.showModal();
+  });
+}
+
+function promptDialog(message, defaultValue='', opts={}) {
+  return new Promise(resolve => {
+    const d = document.getElementById('dlg-prompt');
+    d.innerHTML = '<div class="dlg"><div class="dlg-head"><div class="di">' + I.edit + '</div>'
+      + '<div><h3>' + esc(opts.title || 'Enter value') + '</h3>'
+      + '<div class="dsub">' + esc(message) + '</div></div></div>'
+      + '<form id="prompt-form"><div class="dlg-body">'
+      + '<div class="field"><input id="prompt-input" type="text" value="' + esc(defaultValue) + '"' + (opts.placeholder ? ' placeholder="' + esc(opts.placeholder) + '"' : '') + '></div>'
+      + '</div><div class="dialog-actions">'
+      + '<button class="btn" data-act="cancel" type="button">Cancel</button>'
+      + '<button class="btn primary" type="submit">' + I.check + esc(opts.okLabel || 'OK') + '</button>'
+      + '</div></form></div>';
+    const input = d.querySelector('#prompt-input');
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; resolve(v); try { d.close(); } catch {} };
+    d.querySelector('[data-act="cancel"]').onclick = () => finish(null);
+    d.querySelector('#prompt-form').onsubmit = (e) => { e.preventDefault(); finish(input.value); };
+    d.addEventListener('close', () => finish(null), {once: true});
+    d.showModal();
+    setTimeout(() => { input.focus(); input.select(); }, 30);
+  });
 }
 
 /* ---------- Auth bootstrap ---------- */
@@ -1166,10 +1218,75 @@ async function renderServices() {
          +  '<div class="svc-body">'
          +    facts
          +    '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
+         +    '<div class="svc-stats" data-host="' + esc(s.host) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>'
          +  '</div>'
          +  '</div>';
   }
   el.innerHTML = html;
+  // Fetch per-service stats only for cards that are actually expanded.
+  fillServiceStatsPanels().catch(() => {});
+}
+
+// Per-service stats: fetches the proxy's per-host metrics + a slice of the
+// access log, then renders a mini stats panel into each EXPANDED service card.
+// Skips collapsed cards so the user paying the network cost only when they
+// asked to see the data.
+async function fillServiceStatsPanels() {
+  const panels = document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats');
+  if (!panels.length) return;
+  const [hosts, access] = await Promise.all([
+    api('/api/monitor/target/proxy/hosts').catch(() => []),
+    api('/api/access?limit=400').catch(() => ({ entries: [] })),
+  ]);
+  const byHost = {};
+  for (const h of (Array.isArray(hosts) ? hosts : [])) byHost[h.host] = h;
+  panels.forEach(panel => {
+    const host = panel.dataset.host;
+    panel.innerHTML = renderServiceStatsPanel(byHost[host], (access.entries || []).filter(e => e.host === host).slice(0, 12));
+  });
+}
+
+function renderServiceStatsPanel(stats, recent) {
+  if ((!stats || !stats.total) && !recent.length) {
+    return '<div class="subhead" style="margin-top:12px">' + I.activity + 'No traffic yet</div>'
+         + '<div class="meta">No requests have hit this host since the proxy started. Hit it once and the stats will populate.</div>';
+  }
+  let html = '<div class="subhead" style="margin-top:14px">' + I.activity + 'Live traffic</div>';
+  if (stats) {
+    const p95 = (stats.latency_ms && stats.latency_ms.p95 != null) ? stats.latency_ms.p95.toFixed(1) : '—';
+    const tot = stats.total || 0;
+    const inflight = stats.in_flight || 0;
+    const by = stats.by_status || {};
+    let errs = 0;
+    for (const [c, v] of Object.entries(by)) { const f = String(c)[0]; if (f === '4' || f === '5') errs += v; }
+    const errPct = tot > 0 ? (errs / tot * 100) : 0;
+    html += '<div class="grid k4" style="margin-bottom:10px">'
+          + kpiSm('Requests', fmt(tot))
+          + kpiSm('In flight', String(inflight))
+          + kpiSm('p95', p95 + ' <small>ms</small>')
+          + kpiSm('Errors', pct(errPct))
+          + '</div>';
+    if (Object.keys(by).length) html += statusBarFromCodes(by);
+  }
+  if (recent.length) {
+    html += '<div class="meta" style="margin:14px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:600">Recent requests</div>';
+    html += '<table class="acc-table"><thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>ms</th><th>Backend</th></tr></thead><tbody>';
+    for (const r of recent) {
+      const t = new Date(r.t).toLocaleTimeString();
+      const ms = r.ms || 0;
+      const msCls = ms > 1000 ? ' veryslow' : ms > 250 ? ' slow' : '';
+      html += '<tr>'
+        + '<td class="meta" style="font-size:11.5px">' + t + '</td>'
+        + '<td><b>' + esc(r.method) + '</b></td>'
+        + '<td class="path" title="' + esc(r.path) + '">' + esc(r.path) + '</td>'
+        + '<td><span class="sc ' + statusClass(r.status) + '">' + r.status + '</span></td>'
+        + '<td class="ms' + msCls + '">' + ms + '</td>'
+        + '<td class="meta" title="' + esc(r.backend || '') + '">' + esc((r.backend || '').replace(/^https?:\/\//, '').slice(0, 28)) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>';
+  }
+  return html;
 }
 
 // Discovery — runs only when the user opens the Discovery sub-tab. Pulls the
@@ -1209,6 +1326,8 @@ function toggleServiceCard(name) {
   const s = JSON.parse(localStorage.getItem('pmgr-svc-collapsed') || '{}');
   if (willCollapse) s[name] = 1; else delete s[name];
   localStorage.setItem('pmgr-svc-collapsed', JSON.stringify(s));
+  // Just expanded — refresh its stats panel without waiting for the 5s tick.
+  if (!willCollapse) fillServiceStatsPanels().catch(() => {});
 }
 
 // discoveryShowLabels pops a dialog with the docker-compose labels block the
@@ -1363,19 +1482,19 @@ function openStage(name, currentImage) {
 }
 
 async function promoteCanary(name) {
-  if (!confirm('Promote canary to live? Old replicas will be removed.')) return;
+  if (!(await confirmDialog('Promote canary to live? Old replicas will be removed.', {title: 'Promote canary'}))) return;
   try { await api('/api/services/' + encodeURIComponent(name) + '/promote', { method:'POST' });
     toast('promoted ' + name); renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
 async function discardCanary(name) {
-  if (!confirm('Discard canary? Live continues unchanged.')) return;
+  if (!(await confirmDialog('Discard canary? Live continues unchanged.', {title: 'Discard canary', danger: true, okLabel: 'Discard'}))) return;
   try { await api('/api/services/' + encodeURIComponent(name) + '/canary', { method:'DELETE' });
     toast('discarded canary for ' + name); renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
 async function rollback(name, prevImage) {
-  if (!confirm('Replace ' + name + ' with ' + prevImage + '?')) return;
+  if (!(await confirmDialog('Replace ' + name + ' with ' + prevImage + '?', {title: 'Rollback', okLabel: 'Rollback'}))) return;
   try { await api('/api/services/' + encodeURIComponent(name) + '/replace', {
       method:'POST', body: JSON.stringify({ image: prevImage }),
     });
@@ -1384,7 +1503,7 @@ async function rollback(name, prevImage) {
 }
 
 async function deleteSvc(name) {
-  if (!confirm('Delete service "' + name + '" and all its containers?')) return;
+  if (!(await confirmDialog('Delete service "' + name + '" and all its containers?', {title: 'Delete service', danger: true}))) return;
   try {
     await api('/api/services/' + encodeURIComponent(name), { method:'DELETE' });
     toast('deleted ' + name);
@@ -1424,7 +1543,7 @@ async function renderDNS() {
 }
 
 async function editDNS(id, currentContent) {
-  const v = prompt('New content:', currentContent);
+  const v = await promptDialog('New content:', currentContent, {title: 'Edit DNS content', okLabel: 'Save'});
   if (v === null || v === currentContent) return;
   try {
     await api('/api/cf/records/' + id, { method:'PATCH', body: JSON.stringify({content: v}) });
@@ -1432,7 +1551,7 @@ async function editDNS(id, currentContent) {
   } catch (e) { toast(e.message, 'err'); }
 }
 async function deleteDNS(id, name) {
-  if (!confirm('Delete DNS record "' + name + '"?')) return;
+  if (!(await confirmDialog('Delete DNS record "' + name + '"?', {title: 'Delete DNS record', danger: true}))) return;
   try {
     await api('/api/cf/records/' + id, { method:'DELETE' });
     toast('deleted'); renderActive();
@@ -1511,7 +1630,7 @@ function copyText(t, btn) {
 }
 
 async function createToken() {
-  const label = prompt('Token label (e.g. "uptime-kuma", "deploy-script"):', '');
+  const label = await promptDialog('What is this token for?', '', {title: 'New API token', placeholder: 'e.g. uptime-kuma, deploy-script', okLabel: 'Create'});
   if (label === null) return;
   try {
     const out = await api('/api/users/tokens', { method:'POST', body: JSON.stringify({ label })});
@@ -1532,7 +1651,7 @@ function tokenReveal(raw) {
   d.showModal();
 }
 async function deleteToken(id) {
-  if (!confirm('Revoke this token? Anything using it will stop working.')) return;
+  if (!(await confirmDialog('Revoke this token? Anything using it will stop working.', {title: 'Revoke API token', danger: true, okLabel: 'Revoke'}))) return;
   try {
     await api('/api/users/tokens/' + encodeURIComponent(id), { method:'DELETE' });
     toast('revoked'); renderActive();
@@ -1541,7 +1660,7 @@ async function deleteToken(id) {
 
 async function addPasskey() {
   if (!window.PublicKeyCredential) { toast('This browser does not support WebAuthn.', 'err'); return; }
-  const label = prompt('Name this passkey (e.g. "MacBook Touch ID", "iPhone", "YubiKey 5"):', 'Passkey');
+  const label = await promptDialog('Name this passkey so you recognise it later.', 'Passkey', {title: 'Add passkey', placeholder: 'MacBook Touch ID, iPhone, YubiKey 5…', okLabel: 'Continue'});
   if (label === null) return;
   try {
     await passkeyRegister(label || 'Passkey');
@@ -1554,7 +1673,7 @@ async function addPasskey() {
 }
 
 async function deletePasskey(idKey) {
-  if (!confirm('Remove this passkey? You will no longer be able to sign in with it.')) return;
+  if (!(await confirmDialog('Remove this passkey? You will no longer be able to sign in with it.', {title: 'Remove passkey', danger: true, okLabel: 'Remove'}))) return;
   try {
     await api('/api/users/passkeys/' + encodeURIComponent(idKey), { method:'DELETE' });
     toast('removed'); renderActive();
@@ -1592,7 +1711,7 @@ function openAddUser() {
 }
 
 async function deleteUser(name) {
-  if (!confirm('Delete user "' + name + '"? Their session will end immediately.')) return;
+  if (!(await confirmDialog('Delete user "' + name + '"? Their session will end immediately.', {title: 'Delete user', danger: true}))) return;
   try {
     await api('/api/users/' + encodeURIComponent(name), { method:'DELETE' });
     toast('deleted ' + name); renderActive();
@@ -2118,6 +2237,11 @@ function wireDialogForms() {
       }
     }
     const mode = f.dataset.mode === 'stage' ? 'stage' : 'replace';
+    // Long-running on the server (pull + create + start + 3s settle), so show
+    // a busy state on the submit button or the user thinks the dialog froze.
+    const submitBtn = f.querySelector('button[type="submit"]');
+    const original = submitBtn ? submitBtn.innerHTML : '';
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Working…'; }
     try {
       await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/' + mode, {
         method: 'POST',
@@ -2130,7 +2254,11 @@ function wireDialogForms() {
       const sub = $('#dlg-replace-service').querySelector('.dsub');
       if (sub) sub.textContent = 'Spins up new replicas, waits, then removes the old. Env is copied unless overridden.';
       renderActive();
-    } catch (e) { toast(e.message, 'err'); }
+    } catch (e) {
+      toast(e.message, 'err');
+    } finally {
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; }
+    }
   };
 
   $('#form-new-service').onsubmit = async (e) => {
