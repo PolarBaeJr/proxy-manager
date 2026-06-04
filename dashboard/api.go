@@ -10,6 +10,7 @@ import (
 )
 
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
+func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
 func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string) http.Handler {
 	mux := http.NewServeMux()
@@ -520,6 +521,24 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 
 	// ---- Container logs (read-only; auth-gated) ----
 	registerLogRoutes(mux, dc, auth)
+
+	// ---- Proxy access log (read-only; auth-gated) ----
+	if px := proxyURLFromEnv(); px != "" {
+		mux.HandleFunc("/api/access", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+			url := px + "/access"
+			if q := req.URL.RawQuery; q != "" {
+				url += "?" + q
+			}
+			resp, err := http.Get(url)
+			if err != nil {
+				http.Error(w, "proxy unreachable", http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.Copy(w, resp.Body)
+		}))
+	}
 
 	mux.HandleFunc("/api/cf/records", func(w http.ResponseWriter, req *http.Request) {
 		if cf == nil {

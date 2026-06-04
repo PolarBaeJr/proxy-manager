@@ -420,6 +420,25 @@ footer.app code{color:var(--muted)}
 .log-status .dot{width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block}
 .log-status.idle .dot{background:var(--muted-2)}
 .log-status.err .dot{background:var(--red)}
+
+/* ============ ACCESS LOG ============ */
+.acc-table{width:100%;border-collapse:collapse;font-size:12px;font-family:var(--font-mono);font-variant-ligatures:none}
+.acc-table th{font-family:-apple-system,BlinkMacSystemFont,"Inter",system-ui,sans-serif;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--muted);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);font-weight:600}
+.acc-table td{padding:6px 10px;border-bottom:1px solid var(--surface-3);vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acc-table td.path{max-width:340px}
+.acc-table td.ua{max-width:200px;color:var(--muted)}
+.acc-table tbody tr:hover{background:var(--surface-2)}
+.acc-table .sc{display:inline-block;min-width:36px;padding:2px 7px;border-radius:4px;font-weight:600;font-size:11px;text-align:center}
+.acc-table .sc.s2{background:rgba(63,185,80,.13);color:#5cd97f}
+.acc-table .sc.s3{background:rgba(94,180,255,.13);color:#7fc4ff}
+.acc-table .sc.s4{background:rgba(240,200,73,.13);color:#f7d976}
+.acc-table .sc.s5{background:rgba(248,81,73,.13);color:#ff7173}
+.acc-table .ms{font-variant-numeric:tabular-nums;text-align:right}
+.acc-table .ms.slow{color:var(--yellow)}
+.acc-table .ms.veryslow{color:#ff7173}
+.acc-table .by{font-variant-numeric:tabular-nums;text-align:right;color:var(--muted)}
+.acc-empty{padding:30px 0;text-align:center;color:var(--muted);font-size:13px}
 </style>
 </head>
 <body>
@@ -463,6 +482,7 @@ footer.app code{color:var(--muted)}
         <button data-tab="dns"></button>
         <button data-tab="users"></button>
         <button data-tab="logs"></button>
+        <button data-tab="access"></button>
         <button data-tab="stats"></button>
       </nav>
       <div id="lock-banner" class="hide"></div>
@@ -475,6 +495,7 @@ footer.app code{color:var(--muted)}
       <section id="tab-dns" class="tabpane" hidden></section>
       <section id="tab-users" class="tabpane" hidden></section>
       <section id="tab-logs" class="tabpane" hidden></section>
+      <section id="tab-access" class="tabpane" hidden></section>
       <section id="tab-stats" class="tabpane" hidden></section>
     </div>
     <div class="wrap">
@@ -553,8 +574,8 @@ const I = {
   terminal:svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>'),
   refresh: svg('<path d="M20 11A8 8 0 0 0 6.3 6.3L4 8.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 13.7 4.7L20 15.4"/><path d="M20 20v-5h-5"/>'),
 };
-const NAVMETA = { routes:'Routes', services:'Services', dns:'DNS', users:'Users', logs:'Logs', stats:'Stats' };
-const NAVICON = { routes:I.routes, services:I.services, dns:I.dns, users:I.users, logs:I.terminal, stats:I.stats };
+const NAVMETA = { routes:'Routes', services:'Services', dns:'DNS', users:'Users', logs:'Logs', access:'Access', stats:'Stats' };
+const NAVICON = { routes:I.routes, services:I.services, dns:I.dns, users:I.users, logs:I.terminal, access:I.activity, stats:I.stats };
 
 /* ---------- toast (kind, msg) with icon + progshrink bar ---------- */
 function toast(msg, kind='ok') {
@@ -732,7 +753,7 @@ function lockedAttr() { return isElevated() ? '' : 'disabled title="Confirm 2FA 
 function lk() { return isElevated() ? '' : '<span class="lock">' + I.lock + '</span>'; }
 
 /* ---------- Tabs ---------- */
-const TABS = ['routes', 'services', 'dns', 'users', 'logs', 'stats'];
+const TABS = ['routes', 'services', 'dns', 'users', 'logs', 'access', 'stats'];
 let activeTab = 'routes';
 $$('nav button').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 function switchTab(t) {
@@ -741,6 +762,7 @@ function switchTab(t) {
   // Re-mount the Logs toolbar when re-entering — picks up newly-started
   // containers and avoids holding a stale picker.
   if (t !== 'logs') logsState.mounted = false;
+  if (t !== 'access') accessState.mounted = false;
   $$('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   TABS.forEach(x => $('#tab-' + x).hidden = x !== t);
   renderActive();
@@ -755,6 +777,7 @@ async function renderActive() {
     else if (activeTab === 'dns') await renderDNS();
     else if (activeTab === 'users') await renderUsers();
     else if (activeTab === 'logs') await renderLogs();
+    else if (activeTab === 'access') await renderAccess();
     else if (activeTab === 'stats') await renderStats();
     setStatusOK();
   } catch (e) {
@@ -1281,6 +1304,120 @@ function paintLogs() {
   }).join('');
   view.innerHTML = out;
   if (wasAtBottom) view.scrollTop = view.scrollHeight;
+}
+
+/* ---------- Access log (proxy ring buffer) ---------- */
+let accessState = { limit:200, hostFilter:'', statusFilter:'', textFilter:'', follow:true, mounted:false, entries:[] };
+
+async function renderAccess() {
+  const el = $('#tab-access');
+  if (!accessState.mounted) {
+    el.innerHTML =
+      '<div class="subhead">' + I.activity + 'Proxy access log <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— last ' + accessState.limit + ' requests</span></div>'
+      + '<div class="card">'
+      +   '<div class="logs-toolbar">'
+      +     '<div class="field"><label>Host</label>'
+      +       '<input type="text" id="acc-host" placeholder="contains…" value="' + esc(accessState.hostFilter) + '"></div>'
+      +     '<div class="field tight"><label>Status</label>'
+      +       '<input type="text" id="acc-status" placeholder="2xx, 404, 5" value="' + esc(accessState.statusFilter) + '"></div>'
+      +     '<div class="field"><label>Path / UA</label>'
+      +       '<input type="text" id="acc-text" placeholder="contains…" value="' + esc(accessState.textFilter) + '"></div>'
+      +     '<div class="field tight"><label>Limit</label>'
+      +       '<input type="number" id="acc-limit" min="50" max="2000" step="50" value="' + accessState.limit + '"></div>'
+      +     '<div class="field check"><input type="checkbox" id="acc-follow"' + (accessState.follow ? ' checked' : '') + '>'
+      +       '<label for="acc-follow">Auto-refresh (5s)</label></div>'
+      +     '<button class="btn" id="acc-refresh-btn">' + I.refresh + 'Refresh</button>'
+      +   '</div>'
+      +   '<div id="acc-view"><div class="acc-empty">Loading…</div></div>'
+      +   '<div id="acc-meta" class="log-status idle"><span class="dot"></span><span id="acc-meta-text">idle</span></div>'
+      + '</div>';
+    $('#acc-host').oninput   = e => { accessState.hostFilter = e.target.value; paintAccess(); };
+    $('#acc-status').oninput = e => { accessState.statusFilter = e.target.value; paintAccess(); };
+    $('#acc-text').oninput   = e => { accessState.textFilter = e.target.value; paintAccess(); };
+    $('#acc-limit').onchange = e => { accessState.limit = Math.max(50, Math.min(2000, parseInt(e.target.value)||200)); fetchAccess(); };
+    $('#acc-follow').onchange = e => { accessState.follow = e.target.checked; };
+    $('#acc-refresh-btn').onclick = () => fetchAccess();
+    accessState.mounted = true;
+  }
+  if (accessState.follow || !accessState.entries.length) {
+    await fetchAccess();
+  }
+}
+
+let _accFetchInflight = false;
+async function fetchAccess() {
+  if (_accFetchInflight) return;
+  _accFetchInflight = true;
+  const meta = $('#acc-meta'); const txt = $('#acc-meta-text');
+  if (meta) meta.className = 'log-status';
+  if (txt) txt.textContent = 'fetching…';
+  try {
+    const r = await api('/api/access?limit=' + accessState.limit);
+    accessState.entries = r.entries || [];
+    paintAccess();
+    if (txt) txt.textContent = (accessState.entries.length) + ' shown · ' + fmt(r.total || 0) + ' total · refreshed ' + fmtTime();
+  } catch (e) {
+    if (meta) meta.className = 'log-status err';
+    if (txt) txt.textContent = 'error: ' + e.message;
+    const view = $('#acc-view');
+    if (view) view.innerHTML = '<div class="acc-empty">' + esc(e.message) + '</div>';
+  } finally {
+    _accFetchInflight = false;
+  }
+}
+
+function statusClass(s) { const f = String(s)[0]; return f === '2' ? 's2' : f === '3' ? 's3' : f === '4' ? 's4' : f === '5' ? 's5' : ''; }
+function statusMatches(want, code) {
+  want = (want || '').trim().toLowerCase();
+  if (!want) return true;
+  const c = String(code);
+  if (want.endsWith('xx')) return c[0] === want[0];
+  // "5" matches 5xx; "404" matches exactly; "404,500" matches either.
+  for (const part of want.split(/[\s,]+/).filter(Boolean)) {
+    if (part.length === 1 && /\d/.test(part)) { if (c[0] === part) return true; }
+    else if (c === part) return true;
+  }
+  return false;
+}
+
+function paintAccess() {
+  const view = $('#acc-view');
+  if (!view) return;
+  const e = accessState.entries || [];
+  const host = accessState.hostFilter.trim().toLowerCase();
+  const text = accessState.textFilter.trim().toLowerCase();
+  const want = accessState.statusFilter.trim();
+  const filtered = e.filter(r => {
+    if (host && !(r.host || '').toLowerCase().includes(host)) return false;
+    if (text && !((r.path || '').toLowerCase().includes(text) || (r.ua || '').toLowerCase().includes(text))) return false;
+    if (want && !statusMatches(want, r.status)) return false;
+    return true;
+  });
+  if (!filtered.length) {
+    view.innerHTML = '<div class="acc-empty">' + (e.length ? 'No requests match the filters.' : 'No requests yet — make some traffic and refresh.') + '</div>';
+    return;
+  }
+  const rows = filtered.map(r => {
+    const t = new Date(r.t);
+    const ts = t.toLocaleTimeString();
+    const ms = r.ms || 0;
+    const msCls = ms > 1000 ? ' veryslow' : ms > 250 ? ' slow' : '';
+    return '<tr>'
+      + '<td class="meta" style="font-size:11.5px">' + ts + '</td>'
+      + '<td><b>' + esc(r.method || '') + '</b></td>'
+      + '<td>' + esc(r.host || '') + '</td>'
+      + '<td class="path" title="' + esc(r.path || '') + '">' + esc(r.path || '') + '</td>'
+      + '<td><span class="sc ' + statusClass(r.status) + '">' + (r.status || 0) + '</span></td>'
+      + '<td class="ms' + msCls + '">' + ms + '<small style="color:var(--muted-2)">ms</small></td>'
+      + '<td class="by">' + fmt(r.bytes || 0) + '</td>'
+      + '<td class="meta">' + esc(r.ip || '') + '</td>'
+      + '<td class="meta" title="' + esc(r.backend || '') + '">' + esc((r.backend || '').replace(/^https?:\/\//, '').slice(0, 28)) + '</td>'
+      + '<td class="ua" title="' + esc(r.ua || '') + '">' + esc((r.ua || '').slice(0, 24)) + '</td>'
+      + '</tr>';
+  }).join('');
+  view.innerHTML = '<table class="acc-table"><thead><tr>'
+    + '<th>Time</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>ms</th><th>Bytes</th><th>Client IP</th><th>Backend</th><th>UA</th>'
+    + '</tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
 /* ---------- Stats (monitor binary) ---------- */

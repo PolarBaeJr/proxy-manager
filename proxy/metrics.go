@@ -152,14 +152,17 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// metricsServer starts an HTTP server on addr exposing /metrics (JSON).
-// Bind to internal addresses only; do NOT expose publicly.
-func metricsServer(addr string, m *Metrics) {
+// metricsServer starts an HTTP server on addr exposing /metrics (JSON) and
+// /access (per-request log ring). Bind to internal addresses only.
+func metricsServer(addr string, m *Metrics, a *AccessLog) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(m.Snapshot())
 	})
+	if a != nil {
+		mux.HandleFunc("/access", accessHandler(a))
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
