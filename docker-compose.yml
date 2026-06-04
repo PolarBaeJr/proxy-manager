@@ -66,6 +66,7 @@ services:
       CLOUDFLARE_ZONE_ID:   ${CLOUDFLARE_ZONE_ID:-}
       CLOUDFLARE_DOMAIN:    ${CLOUDFLARE_DOMAIN:-}
       MONITOR_URL:          http://monitor:8095     # for the Stats tab
+      PROXY_URL:            http://proxy:8094       # for the Access tab (proxy /access)
 
   monitor:
     build: ./monitor

@@ -18,8 +18,9 @@ func main() {
 	flag.Parse()
 
 	metrics := NewMetrics()
-	metricsServer(*metricsAddr, metrics)
-	log.Printf("metrics on %s/metrics", *metricsAddr)
+	access := NewAccessLog()
+	metricsServer(*metricsAddr, metrics, access)
+	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -50,24 +51,34 @@ func main() {
 	go runHealthChecks(ctx, router)
 
 	log.Printf("proxy on %s", *addr)
-	if err := http.ListenAndServe(*addr, withMetrics(router, metrics)); !errors.Is(err, http.ErrServerClosed) {
+	handler := withAccessLog(withMetrics(router, metrics), access)
+	if err := http.ListenAndServe(*addr, handler); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
 
-// withMetrics wraps the router to record per-request counters + latency.
+// withMetrics wraps the router to record per-request counters + latency. It
+// wraps the response in an *accessWriter when one isn't already in place, so
+// the access-log layer downstream can reuse the same capture.
 func withMetrics(next http.Handler, m *Metrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.InFlight.Add(1)
 		defer m.InFlight.Add(-1)
 		start := time.Now()
-		mw := &metricsWriter{ResponseWriter: w, status: 200}
-		next.ServeHTTP(mw, r)
+		aw, ok := w.(*accessWriter)
+		if !ok {
+			aw = &accessWriter{ResponseWriter: w}
+		}
+		next.ServeHTTP(aw, r)
 		host := r.Host
 		if i := indexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
-		m.Record(host, r.Method, mw.status, mw.bytes, time.Since(start))
+		status := aw.status
+		if status == 0 {
+			status = 200
+		}
+		m.Record(host, r.Method, status, aw.bytes, time.Since(start))
 	})
 }
 
@@ -78,20 +89,4 @@ func indexByte(s string, c byte) int {
 		}
 	}
 	return -1
-}
-
-type metricsWriter struct {
-	http.ResponseWriter
-	status int
-	bytes  int64
-}
-
-func (m *metricsWriter) WriteHeader(code int) {
-	m.status = code
-	m.ResponseWriter.WriteHeader(code)
-}
-func (m *metricsWriter) Write(b []byte) (int, error) {
-	n, err := m.ResponseWriter.Write(b)
-	m.bytes += int64(n)
-	return n, err
 }
