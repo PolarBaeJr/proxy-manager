@@ -119,6 +119,14 @@ nav button.active::after{content:"";position:absolute;left:12px;right:12px;botto
 nav button .badge{font-size:10px;font-weight:700;min-width:16px;height:16px;padding:0 5px;border-radius:var(--radius-pill);
   display:grid;place-items:center;background:var(--info-bg);color:var(--info);border:1px solid var(--info-border)}
 nav button .badge.warn{background:var(--yellow-bg);color:var(--yellow);border-color:var(--yellow-border)}
+
+/* Sub-nav inside Observability — smaller, no underline, pill-style toggles */
+nav.subnav{display:inline-flex;gap:2px;margin:6px 0 18px;padding:3px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--radius-sm);border-bottom:1px solid var(--border)}
+nav.subnav button{font-size:12px;padding:6px 12px;border-radius:calc(var(--radius-sm) - 2px);margin:0;color:var(--muted-2)}
+nav.subnav button:hover{color:var(--text);background:var(--surface-2)}
+nav.subnav button.active{background:var(--bg);color:var(--text)}
+nav.subnav button.active::after{display:none}
 nav button .badge.dot{min-width:7px;width:7px;height:7px;padding:0;background:var(--yellow);border:0;box-shadow:0 0 7px var(--yellow)}
 
 /* locked banner */
@@ -477,26 +485,35 @@ footer.app code{color:var(--muted)}
       <div id="sys-stats"></div>
       <div id="status">loading…</div>
       <nav>
-        <button class="active" data-tab="routes"></button>
-        <button data-tab="services"></button>
+        <button class="active" data-tab="routing"></button>
         <button data-tab="dns"></button>
+        <button data-tab="observability"></button>
         <button data-tab="users"></button>
-        <button data-tab="logs"></button>
-        <button data-tab="access"></button>
-        <button data-tab="stats"></button>
       </nav>
       <div id="lock-banner" class="hide"></div>
     </div>
   </header>
   <main>
     <div class="wrap">
-      <section id="tab-routes" class="tabpane"></section>
-      <section id="tab-services" class="tabpane" hidden></section>
+      <!-- Compressed to 4 top-level tabs. Inner divs keep the old IDs so the
+           existing renderRoutes/renderServices/renderLogs/renderAccess/
+           renderStats functions still target the right element. -->
+      <section id="tab-routing" class="tabpane">
+        <div id="tab-services"></div>
+        <div id="tab-routes" style="margin-top:18px"></div>
+      </section>
       <section id="tab-dns" class="tabpane" hidden></section>
+      <section id="tab-observability" class="tabpane" hidden>
+        <nav class="subnav" id="obs-subnav">
+          <button class="active" data-sub="stats">Stats</button>
+          <button data-sub="logs">Container logs</button>
+          <button data-sub="access">Access log</button>
+        </nav>
+        <div id="tab-stats"></div>
+        <div id="tab-logs" hidden></div>
+        <div id="tab-access" hidden></div>
+      </section>
       <section id="tab-users" class="tabpane" hidden></section>
-      <section id="tab-logs" class="tabpane" hidden></section>
-      <section id="tab-access" class="tabpane" hidden></section>
-      <section id="tab-stats" class="tabpane" hidden></section>
     </div>
     <div class="wrap">
       <footer class="app">
@@ -574,8 +591,8 @@ const I = {
   terminal:svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>'),
   refresh: svg('<path d="M20 11A8 8 0 0 0 6.3 6.3L4 8.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 13.7 4.7L20 15.4"/><path d="M20 20v-5h-5"/>'),
 };
-const NAVMETA = { routes:'Routes', services:'Services', dns:'DNS', users:'Users', logs:'Logs', access:'Access', stats:'Stats' };
-const NAVICON = { routes:I.routes, services:I.services, dns:I.dns, users:I.users, logs:I.terminal, access:I.activity, stats:I.stats };
+const NAVMETA = { routing:'Routing', dns:'DNS', observability:'Observability', users:'Users' };
+const NAVICON = { routing:I.services, dns:I.dns, observability:I.activity, users:I.users };
 
 /* ---------- toast (kind, msg) with icon + progshrink bar ---------- */
 function toast(msg, kind='ok') {
@@ -846,8 +863,11 @@ function renderHeader() {
   const u = authState.username || '?';
   $('#who').innerHTML = '<span class="avatar">' + esc(u.charAt(0).toUpperCase()) + '</span><span>' + esc(u) + '</span>';
   $('#logout-btn').innerHTML = I.x + 'Logout';
-  $$('nav button').forEach(b => {
+  // Only the TOP-level nav gets icon+label injected here. The sub-nav inside
+  // Observability has its own static labels in the HTML.
+  $$('nav > button').forEach(b => {
     const k = b.dataset.tab;
+    if (!k) return;
     b.innerHTML = NAVICON[k] + '<span>' + NAVMETA[k] + '</span>';
   });
   renderLockBanner();
@@ -866,18 +886,31 @@ function lockedAttr() { return isElevated() ? '' : 'disabled title="Confirm 2FA 
 function lk() { return isElevated() ? '' : '<span class="lock">' + I.lock + '</span>'; }
 
 /* ---------- Tabs ---------- */
-const TABS = ['routes', 'services', 'dns', 'users', 'logs', 'access', 'stats'];
-let activeTab = 'routes';
-$$('nav button').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+const TABS = ['routing', 'dns', 'observability', 'users'];
+let activeTab = 'routing';
+// Within Observability, which inner pane (stats | logs | access) is visible.
+let obsSubTab = 'stats';
+$$('nav > button').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+$$('#obs-subnav button').forEach(b => b.onclick = () => switchObsSub(b.dataset.sub));
 function switchTab(t) {
   activeTab = t;
   statsDetail = null;
-  // Re-mount the Logs toolbar when re-entering — picks up newly-started
-  // containers and avoids holding a stale picker.
-  if (t !== 'logs') logsState.mounted = false;
-  if (t !== 'access') accessState.mounted = false;
+  // Re-mount Logs / Access toolbars when leaving Observability so a returning
+  // user picks up newly-started containers and a fresh access window.
+  if (t !== 'observability') { logsState.mounted = false; accessState.mounted = false; }
   $$('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   TABS.forEach(x => $('#tab-' + x).hidden = x !== t);
+  renderActive();
+}
+
+function switchObsSub(s) {
+  obsSubTab = s;
+  // Reset moved-from sub-state when switching panels.
+  if (s !== 'logs') logsState.mounted = false;
+  if (s !== 'access') accessState.mounted = false;
+  if (s !== 'stats') statsDetail = null;
+  $$('#obs-subnav button').forEach(b => b.classList.toggle('active', b.dataset.sub === s));
+  ['stats','logs','access'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
   renderActive();
 }
 
@@ -885,13 +918,19 @@ async function renderActive() {
   if (!authState.authenticated) return;
   if (pendingActive) return;
   try {
-    if (activeTab === 'routes') await renderRoutes();
-    else if (activeTab === 'services') await renderServices();
-    else if (activeTab === 'dns') await renderDNS();
-    else if (activeTab === 'users') await renderUsers();
-    else if (activeTab === 'logs') await renderLogs();
-    else if (activeTab === 'access') await renderAccess();
-    else if (activeTab === 'stats') await renderStats();
+    if (activeTab === 'routing') {
+      // Services (with discovery) first, routes summary below.
+      await renderServices();
+      await renderRoutes();
+    } else if (activeTab === 'dns') {
+      await renderDNS();
+    } else if (activeTab === 'observability') {
+      if (obsSubTab === 'stats') await renderStats();
+      else if (obsSubTab === 'logs') await renderLogs();
+      else if (obsSubTab === 'access') await renderAccess();
+    } else if (activeTab === 'users') {
+      await renderUsers();
+    }
     setStatusOK();
   } catch (e) {
     setStatusErr(e.message);
