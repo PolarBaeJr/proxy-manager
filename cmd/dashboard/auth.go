@@ -45,12 +45,13 @@ const (
 )
 
 type User struct {
-	Username     string     `json:"username"`
-	Salt         string     `json:"salt"`
-	PasswordHash string     `json:"password_hash"`
-	TOTPSecret   string     `json:"totp_secret"`
-	CreatedAt    int64      `json:"created_at"`
-	Tokens       []APIToken `json:"tokens,omitempty"`
+	Username     string             `json:"username"`
+	Salt         string             `json:"salt"`
+	PasswordHash string             `json:"password_hash"`
+	TOTPSecret   string             `json:"totp_secret"`
+	CreatedAt    int64              `json:"created_at"`
+	Tokens       []APIToken         `json:"tokens,omitempty"`
+	Credentials  []StoredCredential `json:"credentials,omitempty"`
 }
 
 // APIToken is a programmatic credential. The raw token is shown ONCE at

@@ -14,7 +14,7 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -523,6 +523,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 
 	// ---- Container logs (read-only; auth-gated) ----
 	registerLogRoutes(mux, dc, auth)
+
+	// ---- Passkeys / WebAuthn (when PASSKEY_RP_ID is set or default localhost) ----
+	registerPasskeyRoutes(mux, auth, pm, rl)
 
 	// ---- Proxy access log (read-only; auth-gated) ----
 	if px := proxyURLFromEnv(); px != "" {

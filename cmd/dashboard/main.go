@@ -48,6 +48,14 @@ func main() {
 	limiter := newRateLimiter()
 	ic := newImageChecker(dc)
 
+	pm, err := newPasskeyManager(os.Getenv("PASSKEY_RP_ID"), os.Getenv("PASSKEY_RP_ORIGINS"))
+	if err != nil {
+		log.Printf("⚠ passkey support disabled: %v", err)
+		pm = nil
+	} else {
+		log.Printf("passkey support enabled (rp_id=%q)", firstNonEmpty(os.Getenv("PASSKEY_RP_ID"), "localhost"))
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -72,10 +80,19 @@ func main() {
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig)
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm)
 
 	log.Printf("dashboard on %s", *addr)
 	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
