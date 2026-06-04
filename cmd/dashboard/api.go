@@ -524,6 +524,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 	// ---- Container logs (read-only; auth-gated) ----
 	registerLogRoutes(mux, dc, auth)
 
+	// ---- Discovery: list containers NOT routed by the proxy (auth-gated) ----
+	registerDiscoveryRoutes(mux, dc, auth)
+
 	// ---- Passkeys / WebAuthn (when PASSKEY_RP_ID is set or default localhost) ----
 	registerPasskeyRoutes(mux, auth, pm, rl)
 

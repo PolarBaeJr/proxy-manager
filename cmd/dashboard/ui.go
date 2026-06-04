@@ -1053,7 +1053,83 @@ async function renderServices() {
          +  '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
          +  '</div>';
   }
+  // Discovery: containers not currently routed by the proxy. Surface them so
+  // the user can see what's running locally and one-click copy the labels
+  // needed to onboard.
+  const unmanaged = await api('/api/discovery').catch(() => []);
+  if (unmanaged && unmanaged.length) {
+    html += '<div class="divider"></div>';
+    html += '<div class="subhead">' + I.layers + 'Discovered (not routed) <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— ' + unmanaged.length + ' container' + (unmanaged.length === 1 ? '' : 's') + ' without proxy labels</span></div>';
+    html += '<div class="card"><table><thead><tr><th>Container</th><th>Image</th><th>State</th><th>Internal port</th><th style="text-align:right">Add</th></tr></thead><tbody>';
+    for (const u of unmanaged) {
+      const ports = (u.ports && u.ports.length) ? u.ports.join(', ') : '—';
+      html += '<tr><td><span class="ident">' + esc(u.name) + '</span>'
+           +  (u.project ? ' <span class="meta">· ' + esc(u.project) + '/' + esc(u.service || '') + '</span>' : '')
+           +  '</td>'
+           +  '<td class="meta">' + esc(u.image) + '</td>'
+           +  '<td><span class="pill ' + (u.state === 'running' ? 'ok' : 'muted') + '"><span class="gl"></span>' + esc(u.state) + '</span></td>'
+           +  '<td class="meta">' + esc(ports) + '</td>'
+           +  '<td style="text-align:right">'
+           +    '<button class="btn sm" onclick="discoveryShowLabels(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')">' + I.plus + 'Show labels</button>'
+           +  '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+    html += '<div class="meta" style="margin-top:8px;font-size:11.5px">Compose-managed containers are left as-is — paste the labels into the service\'s <code>docker-compose.yml</code> and run <code>docker compose up -d</code>.</div>';
+  }
   el.innerHTML = html;
+}
+
+// discoveryShowLabels pops a dialog with the docker-compose labels block the
+// user pastes into their compose file. Hostname defaults to <name>.polardev.org
+// and the user can edit before copy. Port is pre-filled from the lowest
+// exposed internal port (best heuristic for "the app's port").
+function discoveryShowLabels(name, port) {
+  const dom = (window._discoveryLastDomain || 'polardev.org');
+  const html = ''
+    + '<div class="dlg"><div class="dlg-head"><div class="di">' + I.plus + '</div>'
+    + '<div><h3>Onboard ' + esc(name) + '</h3><div class="dsub">Paste these labels into the service block of its docker-compose.yml</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.x + '</button></div>'
+    + '<div class="dlg-body">'
+    +   '<div class="field-row">'
+    +     '<div class="field"><label>Hostname</label><input id="disc-host" value="' + esc(name) + '.' + esc(dom) + '"></div>'
+    +     '<div class="field"><label>Internal port</label><input id="disc-port" type="number" min="1" max="65535" value="' + (port || 80) + '"></div>'
+    +   '</div>'
+    +   '<div class="field"><label>Labels (copy + paste into docker-compose.yml)</label>'
+    +     '<pre id="disc-snippet" class="token-block" style="white-space:pre;overflow:auto"></pre>'
+    +   '</div>'
+    +   '<button class="btn" onclick="copyText(document.getElementById(\'disc-snippet\').textContent,this)">' + I.copy + 'Copy snippet</button>'
+    +   '<div class="meta" style="margin-top:10px;font-size:11.5px">Container must also join the <code>edge</code> Docker network. After paste + <code>docker compose up -d</code>, it appears in Routes within a couple seconds.</div>'
+    + '</div><div class="dialog-actions">'
+    + '<button class="btn primary" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.check + 'Done</button>'
+    + '</div></div>';
+  const d = document.getElementById('dlg-token-reveal');
+  d.innerHTML = html;
+  const refresh = () => {
+    const h = document.getElementById('disc-host').value || (name + '.' + dom);
+    const p = document.getElementById('disc-port').value || '80';
+    document.getElementById('disc-snippet').textContent =
+      'networks:\n' +
+      '  edge:\n' +
+      '    external: true\n' +
+      '\n' +
+      'services:\n' +
+      '  ' + name + ':\n' +
+      '    # ...\n' +
+      '    networks: [edge]\n' +
+      '    labels:\n' +
+      '      proxy.enable:     "true"\n' +
+      '      proxy.host:       "' + h + '"\n' +
+      '      proxy.port:       "' + p + '"\n' +
+      '      proxy.service:    "' + name + '"\n' +
+      '      proxy.unscalable: "true"\n';
+    // Remember the domain so next dialog defaults to the same suffix.
+    const dot = h.indexOf('.');
+    if (dot > 0) window._discoveryLastDomain = h.slice(dot + 1);
+  };
+  refresh();
+  document.getElementById('disc-host').oninput = refresh;
+  document.getElementById('disc-port').oninput = refresh;
+  d.showModal();
 }
 
 function replicaCtrl(s) {
