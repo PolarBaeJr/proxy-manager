@@ -167,7 +167,11 @@ main{padding:24px 0 64px}
 .grid.k4{grid-template-columns:repeat(4,1fr)}
 .grid.k2{grid-template-columns:repeat(2,1fr)}
 @media(max-width:880px){.grid.k4{grid-template-columns:repeat(2,1fr)}.grid.k2{grid-template-columns:1fr}}
-.subhead{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;margin:20px 0 10px;display:flex;align-items:center;gap:8px}
+.subhead{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;margin:20px 0 10px;display:flex;align-items:center;gap:8px;
+  cursor:pointer;user-select:none;border-radius:var(--radius-sm);padding:4px 6px;margin-left:-6px;transition:background var(--transition-fast)}
+.subhead:hover{background:var(--surface-2);color:var(--text)}
+.subhead .collapse-chev{margin-left:auto;width:14px;height:14px;color:var(--muted-2);transition:transform var(--transition-fast)}
+.subhead.collapsed .collapse-chev{transform:rotate(-90deg)}
 .subhead svg{width:14px;height:14px;opacity:.8}
 .divider{height:1px;background:var(--border);margin:22px 0}
 
@@ -931,10 +935,47 @@ async function renderActive() {
     } else if (activeTab === 'users') {
       await renderUsers();
     }
+    wireCollapsibleSections();
     setStatusOK();
   } catch (e) {
     setStatusErr(e.message);
   }
+}
+
+// Make every .subhead clickable to collapse/expand the run of siblings up to
+// the next .subhead. State persists in localStorage so a section you closed
+// stays closed across reloads and across the 5s auto-refresh.
+function wireCollapsibleSections() {
+  const state = JSON.parse(localStorage.getItem('pmgr-collapsed') || '{}');
+  document.querySelectorAll('.subhead').forEach(head => {
+    // Stable key independent of dynamic counts ("11 active routes" → "active routes").
+    const key = head.textContent.replace(/\d+/g, '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 40);
+    head.dataset.sectionKey = key;
+    if (!head.querySelector('.collapse-chev')) {
+      head.insertAdjacentHTML('beforeend', '<span class="collapse-chev">' + I.chevron + '</span>');
+    }
+    head.onclick = () => {
+      const willCollapse = !head.classList.contains('collapsed');
+      head.classList.toggle('collapsed', willCollapse);
+      let n = head.nextElementSibling;
+      while (n && !n.classList.contains('subhead')) {
+        n.style.display = willCollapse ? 'none' : '';
+        n = n.nextElementSibling;
+      }
+      const s = JSON.parse(localStorage.getItem('pmgr-collapsed') || '{}');
+      if (willCollapse) s[key] = 1; else delete s[key];
+      localStorage.setItem('pmgr-collapsed', JSON.stringify(s));
+    };
+    // Restore from persisted state.
+    if (state[key]) {
+      head.classList.add('collapsed');
+      let n = head.nextElementSibling;
+      while (n && !n.classList.contains('subhead')) {
+        n.style.display = 'none';
+        n = n.nextElementSibling;
+      }
+    }
+  });
 }
 function setStatusOK() {
   const s = $('#status');
