@@ -15,7 +15,7 @@ networks:
 
 services:
   edge:
-    build: ./edge
+    build: ./cmd/edge
     image: edge:latest
     container_name: edge
     restart: unless-stopped
@@ -25,7 +25,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./edge/data:/data               # autocert cert cache (persisted)
+      - ./cmd/edge/data:/data           # autocert cert cache (persisted)
     environment:
       EDGE_DOMAINS: ${EDGE_DOMAINS:-}   # e.g. foo.example.com,bar.example.com
     command: >
@@ -34,7 +34,7 @@ services:
       -rate 100 -burst 200 -max-body 10485760
 
   proxy:
-    build: ./proxy
+    build: ./cmd/proxy
     image: proxy:latest
     container_name: proxy
     restart: unless-stopped
@@ -43,12 +43,12 @@ services:
       - "8092:8092"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro     # READ-ONLY
-      - ./proxy/routes.json:/etc/proxy/routes.json:ro
+      - ./cmd/proxy/routes.json:/etc/proxy/routes.json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
   dashboard:
-    build: ./dashboard
+    build: ./cmd/dashboard
     image: dashboard:latest
     container_name: dashboard
     restart: unless-stopped
@@ -57,8 +57,8 @@ services:
       - "8093:8093"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock        # read-write (service mgmt)
-      - ./proxy/routes.json:/etc/proxy/routes.json:ro    # same file the proxy reads
-      - ./dashboard/data:/data                           # auth.json + audit.log (persisted)
+      - ./cmd/proxy/routes.json:/etc/proxy/routes.json:ro    # same file the proxy reads
+      - ./cmd/dashboard/data:/data                       # auth.json + audit.log (persisted)
       - /proc:/host-proc:ro                              # host CPU + memory stats
       - /mnt/ssd:/host-root:ro                           # host disk stats (SSD)
     environment:
@@ -69,7 +69,7 @@ services:
       PROXY_URL:            http://proxy:8094       # for the Access tab (proxy /access)
 
   monitor:
-    build: ./monitor
+    build: ./cmd/monitor
     image: monitor:latest
     container_name: monitor
     restart: unless-stopped
