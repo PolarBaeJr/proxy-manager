@@ -1133,9 +1133,13 @@ function hostBarsFromObj(byHost) {
 }
 
 /* ---------- Routes ---------- */
+let _lastRoutesHash = '';
 async function renderRoutes() {
   const groups = await api('/api/routes');
   const el = $('#tab-routes');
+  const hash = JSON.stringify(groups);
+  if (hash === _lastRoutesHash && el.children.length) return;
+  _lastRoutesHash = hash;
   if (!groups.length) { el.innerHTML = emptyState(I.routes, 'No routes registered', 'Routes appear here as the proxy discovers Docker labels or static config entries.'); return; }
   let html = '<div class="subhead">' + I.routes + groups.length + ' active route' + (groups.length === 1 ? '' : 's') + '</div>';
   for (const g of groups) {
@@ -1165,9 +1169,19 @@ async function renderRoutes() {
 }
 
 /* ---------- Services ---------- */
+let _lastServicesHash = '';
 async function renderServices() {
   const svcs = await api('/api/services');
   const el = $('#tab-services');
+  // Bail out of the full rebuild on the 5s tick if nothing about the services
+  // changed — preserves scroll, hover, expanded-card state. We still refresh
+  // the per-service stats panels (which DO change) without touching the rest.
+  const hash = JSON.stringify(svcs);
+  if (hash === _lastServicesHash && el.children.length) {
+    fillServiceStatsPanels().catch(() => {});
+    return;
+  }
+  _lastServicesHash = hash;
   let html = '<div class="btn-row top">'
     + '<button class="btn primary" ' + lockedAttr() + ' onclick="document.getElementById(\'dlg-new-service\').showModal()">' + I.plus + 'New service' + lk() + '</button>'
     + '<span class="meta">' + svcs.length + ' managed service' + (svcs.length === 1 ? '' : 's') + '</span></div>';
@@ -1227,23 +1241,41 @@ async function renderServices() {
   fillServiceStatsPanels().catch(() => {});
 }
 
-// Per-service stats: fetches the proxy's per-host metrics + a slice of the
-// access log, then renders a mini stats panel into each EXPANDED service card.
-// Skips collapsed cards so the user paying the network cost only when they
-// asked to see the data.
+// Cache last per-host stats so re-render uses prior data instantly — kills
+// the height-jump on every 5s auto-refresh tick where the panel would
+// otherwise flash "Loading…" → full content.
+let _svcStatsCache = { byHost: {}, recentByHost: {}, fetchedAt: 0 };
+
 async function fillServiceStatsPanels() {
   const panels = document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats');
   if (!panels.length) return;
-  const [hosts, access] = await Promise.all([
-    api('/api/monitor/target/proxy/hosts').catch(() => []),
-    api('/api/access?limit=400').catch(() => ({ entries: [] })),
-  ]);
-  const byHost = {};
-  for (const h of (Array.isArray(hosts) ? hosts : [])) byHost[h.host] = h;
-  panels.forEach(panel => {
+  // Paint from cache first (no flicker on the tick that triggered this render).
+  for (const panel of panels) {
     const host = panel.dataset.host;
-    panel.innerHTML = renderServiceStatsPanel(byHost[host], (access.entries || []).filter(e => e.host === host).slice(0, 12));
-  });
+    if (_svcStatsCache.byHost[host] || (_svcStatsCache.recentByHost[host] || []).length) {
+      panel.innerHTML = renderServiceStatsPanel(_svcStatsCache.byHost[host], _svcStatsCache.recentByHost[host] || []);
+    }
+  }
+  // Then fetch fresh in the background and update the cache + panels.
+  try {
+    const [hosts, access] = await Promise.all([
+      api('/api/monitor/target/proxy/hosts').catch(() => []),
+      api('/api/access?limit=400').catch(() => ({ entries: [] })),
+    ]);
+    const byHost = {};
+    for (const h of (Array.isArray(hosts) ? hosts : [])) byHost[h.host] = h;
+    const recentByHost = {};
+    for (const e of (access.entries || [])) {
+      if (!recentByHost[e.host]) recentByHost[e.host] = [];
+      if (recentByHost[e.host].length < 12) recentByHost[e.host].push(e);
+    }
+    _svcStatsCache = { byHost, recentByHost, fetchedAt: Date.now() };
+    // Repaint only the panels that are still in the DOM and expanded.
+    document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats').forEach(panel => {
+      const host = panel.dataset.host;
+      panel.innerHTML = renderServiceStatsPanel(byHost[host], recentByHost[host] || []);
+    });
+  } catch {}
 }
 
 function renderServiceStatsPanel(stats, recent) {
@@ -1270,7 +1302,10 @@ function renderServiceStatsPanel(stats, recent) {
   }
   if (recent.length) {
     html += '<div class="meta" style="margin:14px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:600">Recent requests</div>';
-    html += '<table class="acc-table"><thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>ms</th><th>Backend</th></tr></thead><tbody>';
+    // Fixed-height scroll container so new rows don't push the rest of the
+    // card down on every auto-refresh tick.
+    html += '<div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm)">';
+    html += '<table class="acc-table" style="margin:0"><thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>ms</th><th>Backend</th></tr></thead><tbody>';
     for (const r of recent) {
       const t = new Date(r.t).toLocaleTimeString();
       const ms = r.ms || 0;
@@ -1284,16 +1319,20 @@ function renderServiceStatsPanel(stats, recent) {
         + '<td class="meta" title="' + esc(r.backend || '') + '">' + esc((r.backend || '').replace(/^https?:\/\//, '').slice(0, 28)) + '</td>'
         + '</tr>';
     }
-    html += '</tbody></table>';
+    html += '</tbody></table></div>';
   }
   return html;
 }
 
 // Discovery — runs only when the user opens the Discovery sub-tab. Pulls the
 // unmanaged-container list and shows a copy-pasteable labels dialog per row.
+let _lastDiscoveryHash = '';
 async function renderDiscovery() {
   const el = $('#tab-discovery');
   const unmanaged = await api('/api/discovery').catch(() => []);
+  const hash = JSON.stringify(unmanaged);
+  if (hash === _lastDiscoveryHash && el.children.length) return;
+  _lastDiscoveryHash = hash;
   if (!unmanaged || !unmanaged.length) {
     el.innerHTML = emptyState(I.layers, 'Nothing unrouted', 'Every running container on this host already has proxy labels (or is part of the proxy stack itself).');
     return;
@@ -1512,6 +1551,7 @@ async function deleteSvc(name) {
 }
 
 /* ---------- DNS ---------- */
+let _lastDNSHash = '';
 async function renderDNS() {
   const status = await api('/api/cf/enabled');
   const el = $('#tab-dns');
@@ -1520,6 +1560,9 @@ async function renderDNS() {
     return;
   }
   const recs = await api('/api/cf/records');
+  const hash = JSON.stringify(recs);
+  if (hash === _lastDNSHash && el.children.length) return;
+  _lastDNSHash = hash;
   let html = '<div class="btn-row top">'
     + '<button class="btn primary" ' + lockedAttr() + ' onclick="document.getElementById(\'dlg-new-dns\').showModal()">' + I.plus + 'New record' + lk() + '</button>'
     + (status.domain ? '<span class="pill muted">' + I.globe + 'zone ' + esc(status.domain) + '</span>' : '')
@@ -1559,12 +1602,17 @@ async function deleteDNS(id, name) {
 }
 
 /* ---------- Users + Tokens + Passkeys ---------- */
+let _lastUsersHash = '';
 async function renderUsers() {
   const [users, myTokens, myPasskeys] = await Promise.all([
     api('/api/users'),
     api('/api/users/tokens').catch(() => []),
     api('/api/users/passkeys').catch(() => []),
   ]);
+  const el0 = $('#tab-users');
+  const hash = JSON.stringify({ users, myTokens, myPasskeys });
+  if (hash === _lastUsersHash && el0.children.length) return;
+  _lastUsersHash = hash;
   const el = $('#tab-users');
   let html = '<div class="subhead">' + I.users + 'Dashboard users</div>';
   html += '<div class="btn-row top"><button class="btn primary" ' + lockedAttr() + ' onclick="openAddUser()">' + I.plus + 'Add user' + lk() + '</button></div>';
@@ -1947,6 +1995,7 @@ function paintAccess() {
 }
 
 /* ---------- Stats (monitor binary) ---------- */
+let _lastStatsHash = '';
 async function renderStats() {
   if (statsDetail) { return renderStatsDetail(statsDetail); }
   const el = $('#tab-stats');
@@ -1960,6 +2009,9 @@ async function renderStats() {
     el.innerHTML = emptyState(I.activity, 'Monitor unreachable', 'The traffic monitor is not responding. Make sure the monitor container is running. Health and metrics will resume when it recovers.');
     return;
   }
+  const hash = JSON.stringify({ overview, certs });
+  if (hash === _lastStatsHash && el.children.length) return;
+  _lastStatsHash = hash;
   const targets = overview.targets || [];
   const live    = targets.filter(t => t.health !== 'absent');
   const absent  = targets.filter(t => t.health === 'absent');
