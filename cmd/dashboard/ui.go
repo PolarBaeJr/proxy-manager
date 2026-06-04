@@ -281,7 +281,12 @@ details.errd[open] summary{color:#ff7173}
 .singleton-lock svg{width:13px;height:13px}
 
 /* service action zone */
-.svc-head{display:flex;align-items:flex-start;gap:14px;margin-bottom:4px}
+.svc-head{display:flex;align-items:flex-start;gap:14px;margin-bottom:4px;cursor:pointer;border-radius:var(--radius-sm);padding:4px;margin:-4px -4px 0}
+.svc-head:hover{background:var(--surface-2)}
+.svc-head .collapse-chev{width:14px;height:14px;color:var(--muted-2);transition:transform var(--transition-fast);flex:none}
+.svc-card.collapsed .collapse-chev{transform:rotate(-90deg)}
+.svc-card.collapsed .svc-body{display:none}
+.svc-card.collapsed .svc-head{margin-bottom:0}
 .svc-head .ic{width:40px;height:40px;border-radius:10px;flex:none;display:grid;place-items:center;background:var(--surface-2);border:1px solid var(--border);color:var(--accent)}
 .svc-head .ic svg{width:20px;height:20px}
 .svc-name{font-size:16px;font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -503,8 +508,14 @@ footer.app code{color:var(--muted)}
            existing renderRoutes/renderServices/renderLogs/renderAccess/
            renderStats functions still target the right element. -->
       <section id="tab-routing" class="tabpane">
+        <nav class="subnav" id="rt-subnav">
+          <button class="active" data-sub="services">Services</button>
+          <button data-sub="discovery">Discovery</button>
+          <button data-sub="routes">Routes</button>
+        </nav>
         <div id="tab-services"></div>
-        <div id="tab-routes" style="margin-top:18px"></div>
+        <div id="tab-discovery" hidden></div>
+        <div id="tab-routes" hidden></div>
       </section>
       <section id="tab-dns" class="tabpane" hidden></section>
       <section id="tab-observability" class="tabpane" hidden>
@@ -894,8 +905,11 @@ const TABS = ['routing', 'dns', 'observability', 'users'];
 let activeTab = 'routing';
 // Within Observability, which inner pane (stats | logs | access) is visible.
 let obsSubTab = 'stats';
+// Within Routing, which inner pane (services | discovery | routes) is visible.
+let routingSubTab = 'services';
 $$('nav > button').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
 $$('#obs-subnav button').forEach(b => b.onclick = () => switchObsSub(b.dataset.sub));
+$$('#rt-subnav button').forEach(b => b.onclick = () => switchRoutingSub(b.dataset.sub));
 function switchTab(t) {
   activeTab = t;
   statsDetail = null;
@@ -918,14 +932,21 @@ function switchObsSub(s) {
   renderActive();
 }
 
+function switchRoutingSub(s) {
+  routingSubTab = s;
+  $$('#rt-subnav button').forEach(b => b.classList.toggle('active', b.dataset.sub === s));
+  ['services','discovery','routes'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
+  renderActive();
+}
+
 async function renderActive() {
   if (!authState.authenticated) return;
   if (pendingActive) return;
   try {
     if (activeTab === 'routing') {
-      // Services (with discovery) first, routes summary below.
-      await renderServices();
-      await renderRoutes();
+      if (routingSubTab === 'services') await renderServices();
+      else if (routingSubTab === 'discovery') await renderDiscovery();
+      else if (routingSubTab === 'routes') await renderRoutes();
     } else if (activeTab === 'dns') {
       await renderDNS();
     } else if (activeTab === 'observability') {
@@ -1125,38 +1146,67 @@ async function renderServices() {
     const menu = '<div class="menu"><button class="btn icon" onclick="toggleMenu(event,\'m-' + sn + '\')">' + I.dots + '</button>'
                + '<div class="menu-pop" id="m-' + sn + '"><button class="danger" ' + lockedAttr() + ' onclick="deleteSvc(\'' + sn + '\')">' + I.trash + 'Delete service</button></div></div>';
 
-    html += '<div class="card">'
-         +  '<div class="svc-head"><div class="ic">' + I.services + '</div>'
-         +  '<div style="flex:1;min-width:0"><div class="svc-name">' + esc(s.name) + badges + '</div>'
-         +  '<div class="svc-img">' + I.layers + '<b>' + esc(s.image) + '</b></div></div></div>'
-         +  facts
-         +  '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
+    // Per-card collapse: clicking the svc-head folds facts + actionzone to a
+    // one-line summary. Persisted in localStorage keyed by service name.
+    const collapsedKey = 'pmgr-svc-collapsed';
+    const collapsedState = JSON.parse(localStorage.getItem(collapsedKey) || '{}');
+    const isCollapsed = !!collapsedState[s.name];
+    const replicaSummary = '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
+      + '<span class="ident dim">' + esc(s.host) + '</span>'
+      + '<span>' + s.replicas + ' replica' + (s.replicas === 1 ? '' : 's') + '</span>'
+      + '<span class="collapse-chev">' + I.chevron + '</span></span>';
+    html += '<div class="card svc-card' + (isCollapsed ? ' collapsed' : '') + '" data-svc="' + sn + '">'
+         +  '<div class="svc-head" onclick="toggleServiceCard(\'' + sn + '\')">'
+         +    '<div class="ic">' + I.services + '</div>'
+         +    '<div style="flex:1;min-width:0"><div class="svc-name">' + esc(s.name) + badges + '</div>'
+         +    '<div class="svc-img">' + I.layers + '<b>' + esc(s.image) + '</b></div></div>'
+         +    replicaSummary
+         +  '</div>'
+         +  '<div class="svc-body">'
+         +    facts
+         +    '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
+         +  '</div>'
          +  '</div>';
   }
-  // Discovery: containers not currently routed by the proxy. Surface them so
-  // the user can see what's running locally and one-click copy the labels
-  // needed to onboard.
-  const unmanaged = await api('/api/discovery').catch(() => []);
-  if (unmanaged && unmanaged.length) {
-    html += '<div class="divider"></div>';
-    html += '<div class="subhead">' + I.layers + 'Discovered (not routed) <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— ' + unmanaged.length + ' container' + (unmanaged.length === 1 ? '' : 's') + ' without proxy labels</span></div>';
-    html += '<div class="card"><table><thead><tr><th>Container</th><th>Image</th><th>State</th><th>Internal port</th><th style="text-align:right">Add</th></tr></thead><tbody>';
-    for (const u of unmanaged) {
-      const ports = (u.ports && u.ports.length) ? u.ports.join(', ') : '—';
-      html += '<tr><td><span class="ident">' + esc(u.name) + '</span>'
-           +  (u.project ? ' <span class="meta">· ' + esc(u.project) + '/' + esc(u.service || '') + '</span>' : '')
-           +  '</td>'
-           +  '<td class="meta">' + esc(u.image) + '</td>'
-           +  '<td><span class="pill ' + (u.state === 'running' ? 'ok' : 'muted') + '"><span class="gl"></span>' + esc(u.state) + '</span></td>'
-           +  '<td class="meta">' + esc(ports) + '</td>'
-           +  '<td style="text-align:right">'
-           +    '<button class="btn sm" onclick="discoveryShowLabels(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')">' + I.plus + 'Show labels</button>'
-           +  '</td></tr>';
-    }
-    html += '</tbody></table></div>';
-    html += '<div class="meta" style="margin-top:8px;font-size:11.5px">Compose-managed containers are left as-is — paste the labels into the service\'s <code>docker-compose.yml</code> and run <code>docker compose up -d</code>.</div>';
-  }
   el.innerHTML = html;
+}
+
+// Discovery — runs only when the user opens the Discovery sub-tab. Pulls the
+// unmanaged-container list and shows a copy-pasteable labels dialog per row.
+async function renderDiscovery() {
+  const el = $('#tab-discovery');
+  const unmanaged = await api('/api/discovery').catch(() => []);
+  if (!unmanaged || !unmanaged.length) {
+    el.innerHTML = emptyState(I.layers, 'Nothing unrouted', 'Every running container on this host already has proxy labels (or is part of the proxy stack itself).');
+    return;
+  }
+  let html = '<div class="subhead">' + I.layers + unmanaged.length + ' container' + (unmanaged.length === 1 ? '' : 's') + ' without proxy labels</div>';
+  html += '<div class="card"><table><thead><tr><th>Container</th><th>Image</th><th>State</th><th>Internal port</th><th style="text-align:right">Add</th></tr></thead><tbody>';
+  for (const u of unmanaged) {
+    const ports = (u.ports && u.ports.length) ? u.ports.join(', ') : '—';
+    html += '<tr><td><span class="ident">' + esc(u.name) + '</span>'
+         +  (u.project ? ' <span class="meta">· ' + esc(u.project) + '/' + esc(u.service || '') + '</span>' : '')
+         +  '</td>'
+         +  '<td class="meta">' + esc(u.image) + '</td>'
+         +  '<td><span class="pill ' + (u.state === 'running' ? 'ok' : 'muted') + '"><span class="gl"></span>' + esc(u.state) + '</span></td>'
+         +  '<td class="meta">' + esc(ports) + '</td>'
+         +  '<td style="text-align:right">'
+         +    '<button class="btn sm" onclick="discoveryShowLabels(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')">' + I.plus + 'Show labels</button>'
+         +  '</td></tr>';
+  }
+  html += '</tbody></table></div>';
+  html += '<div class="meta" style="margin-top:8px;font-size:11.5px">Compose-managed containers are left as-is — paste the labels into the service\'s <code>docker-compose.yml</code> and run <code>docker compose up -d</code>.</div>';
+  el.innerHTML = html;
+}
+
+function toggleServiceCard(name) {
+  const card = document.querySelector('.svc-card[data-svc="' + name + '"]');
+  if (!card) return;
+  const willCollapse = !card.classList.contains('collapsed');
+  card.classList.toggle('collapsed', willCollapse);
+  const s = JSON.parse(localStorage.getItem('pmgr-svc-collapsed') || '{}');
+  if (willCollapse) s[name] = 1; else delete s[name];
+  localStorage.setItem('pmgr-svc-collapsed', JSON.stringify(s));
 }
 
 // discoveryShowLabels pops a dialog with the docker-compose labels block the
