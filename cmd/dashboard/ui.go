@@ -1136,12 +1136,7 @@ async function renderServices() {
     facts += '</table>';
 
     let actions;
-    if (s.onboarded) {
-      // Onboarded services support scale (cloned via image+env) but not
-      // replace/canary — those need a deployable definition the dashboard
-      // doesn't have.
-      actions = '<span class="meta" style="padding:6px 0">Scale via the replica controls. Delete to offboard (leaves original container).</span>';
-    } else if (canary) {
+    if (canary) {
       actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="promoteCanary(\'' + sn + '\')">' + I.check + 'Promote canary' + lk() + '</button>'
               + '<button class="btn" ' + lockedAttr() + ' onclick="discardCanary(\'' + sn + '\')">' + I.x + 'Discard' + lk() + '</button>';
     } else {

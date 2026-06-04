@@ -33,14 +33,22 @@ const (
 // container. The Template fields are captured at onboard time so replicas can
 // be cloned later even if the original is destroyed.
 type OnboardedService struct {
-	Name      string            `json:"name"`              // logical service name (matches container)
-	Host      string            `json:"host"`              // proxy.host equivalent
-	Port      int               `json:"port"`              // internal container port
-	Image     string            `json:"image"`             // for replica cloning
-	Env       []string          `json:"env,omitempty"`     // captured at onboard time
-	Labels    map[string]string `json:"labels,omitempty"`  // original labels we want to preserve
-	Replicas  int               `json:"replicas"`          // includes the original (>= 1)
-	CreatedAt int64             `json:"created_at"`
+	Name           string            `json:"name"`              // logical service name (matches container)
+	Host           string            `json:"host"`              // proxy.host equivalent
+	Port           int               `json:"port"`              // internal container port
+	Image          string            `json:"image"`             // currently-live image (clones use this)
+	Env            []string          `json:"env,omitempty"`     // captured at onboard time
+	Labels         map[string]string `json:"labels,omitempty"`  // original labels we want to preserve
+	Replicas       int               `json:"replicas"`          // currently routed backend count (>= 1)
+	PreviousImage  string            `json:"previous_image,omitempty"`  // set on replace/promote — for rollback
+	CanaryImage    string            `json:"canary_image,omitempty"`    // non-empty while a canary is staged
+	CanaryReplicas int               `json:"canary_replicas,omitempty"`
+	// OriginalRouted flips to false once a replace/promote drops the original
+	// from the route. The original container keeps running; we just stop
+	// referring to it as a backend. Used so route-rebuild knows whether to
+	// include http://<name>:<port> as the first backend.
+	OriginalRouted bool  `json:"original_routed"`
+	CreatedAt      int64 `json:"created_at"`
 }
 
 type OnboardedStore struct {
@@ -274,13 +282,14 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	// Persist onboarded record FIRST so scale/delete can find it even if the
 	// route-write step below fails.
 	svc := OnboardedService{
-		Name:      name,
-		Host:      req.Host,
-		Port:      req.Port,
-		Image:     image,
-		Env:       env,
-		Replicas:  1,
-		CreatedAt: time.Now().Unix(),
+		Name:           name,
+		Host:           req.Host,
+		Port:           req.Port,
+		Image:          image,
+		Env:            env,
+		Replicas:       1,
+		OriginalRouted: true,
+		CreatedAt:      time.Now().Unix(),
 	}
 	if err := store.Put(svc); err != nil {
 		return fmt.Errorf("save onboarded record: %w", err)
@@ -318,10 +327,22 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 	if err != nil {
 		return err
 	}
-	// liveOnly() is irrelevant here — onboarded containers don't use the canary label.
-	current := 1 + len(clones)
+	// Filter out canary containers from the scale count.
+	nonCanary := clones[:0:0]
+	for _, cl := range clones {
+		if !strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+			nonCanary = append(nonCanary, cl)
+		}
+	}
+	clones = nonCanary
+	originalCount := 0
+	if svc.OriginalRouted {
+		originalCount = 1
+	}
+	current := originalCount + len(clones)
 	if current == desired {
-		return rebuildOnboardedRoute(ctx, c, name, svc, clones, routesPath)
+		_ = store.SetReplicas(name, desired)
+		return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
 	}
 	if desired > current {
 		needed := desired - current
@@ -359,18 +380,228 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 		}
 		clones = clones[toRemove:]
 	}
-	if err := rebuildOnboardedRoute(ctx, c, name, svc, clones, routesPath); err != nil {
-		return err
+	_ = store.SetReplicas(name, desired)
+	// Re-fetch svc to include updated replica count.
+	if s2, ok := store.Get(name); ok {
+		svc = s2
 	}
-	return store.SetReplicas(name, desired)
+	return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
 }
 
-func rebuildOnboardedRoute(_ context.Context, _ *dockerClient, name string, svc OnboardedService, clones []dockerContainer, routesPath string) error {
-	backends := []string{fmt.Sprintf("http://%s:%d", name, svc.Port)}
-	for _, c := range clones {
-		backends = append(backends, fmt.Sprintf("http://%s:%d", c.name(), svc.Port))
+// rebuildOnboardedRoute rewrites routes.json for this service from current
+// state: original (if still routed) + live clones + canaries (if any).
+func rebuildOnboardedRoute(ctx context.Context, c *dockerClient, name string, svc OnboardedService, routesPath string) error {
+	backends := []string{}
+	if svc.OriginalRouted {
+		backends = append(backends, fmt.Sprintf("http://%s:%d", name, svc.Port))
+	}
+	clones, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
+	if err != nil {
+		return err
+	}
+	for _, cl := range clones {
+		// Skip canary containers — separate naming pattern.
+		if strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+			continue
+		}
+		backends = append(backends, fmt.Sprintf("http://%s:%d", cl.name(), svc.Port))
+	}
+	// Canary containers (live in same route during staging — proxy splits traffic).
+	for _, cl := range clones {
+		if strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+			backends = append(backends, fmt.Sprintf("http://%s:%d", cl.name(), svc.Port))
+		}
+	}
+	if len(backends) == 0 {
+		// Shouldn't happen with a healthy service, but write a no-route entry
+		// rather than corrupting the file with an empty array Cloudflare-style.
+		return removeOnboardedRoute(routesPath, name)
 	}
 	return upsertOnboardedRoute(routesPath, name, svc.Host, backends)
+}
+
+// stageOnboarded spins up N=Replicas canary containers with new image+env and
+// adds them to the route alongside the original + existing clones. Proxy then
+// round-robins across all backends until promote or discard.
+func (c *dockerClient) stageOnboarded(ctx context.Context, name string, req ReplaceServiceRequest, store *OnboardedStore, routesPath string) error {
+	svc, ok := store.Get(name)
+	if !ok {
+		return fmt.Errorf("not onboarded: %s", name)
+	}
+	if req.Image == "" {
+		return fmt.Errorf("image is required")
+	}
+	if svc.CanaryImage != "" {
+		return fmt.Errorf("%q already has a canary — promote or discard first", name)
+	}
+	var env []string
+	if len(req.Env) > 0 {
+		for k, v := range req.Env {
+			env = append(env, k+"="+v)
+		}
+	} else {
+		env = svc.Env
+	}
+	c.pullImage(ctx, req.Image)
+	for i := 1; i <= svc.Replicas; i++ {
+		cname := fmt.Sprintf("goproxy-onb-%s-c%d", name, i)
+		id, err := c.createContainer(ctx, cname, createBody{Image: req.Image, Env: env})
+		if err != nil {
+			return fmt.Errorf("create canary %s: %w", cname, err)
+		}
+		if err := c.startContainer(ctx, id); err != nil {
+			return fmt.Errorf("start canary %s: %w", cname, err)
+		}
+	}
+	svc.CanaryImage = req.Image
+	svc.CanaryReplicas = svc.Replicas
+	if err := store.Put(svc); err != nil {
+		return err
+	}
+	return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
+}
+
+// promoteOnboarded keeps only the canary containers serving: drops the
+// original + old clones from the route, removes the old clones (the original
+// keeps running but is no longer a backend), updates the saved image to the
+// canary image. PreviousImage is stamped so rollback shows up.
+func (c *dockerClient) promoteOnboarded(ctx context.Context, name string, store *OnboardedStore, routesPath string) error {
+	svc, ok := store.Get(name)
+	if !ok {
+		return fmt.Errorf("not onboarded: %s", name)
+	}
+	if svc.CanaryImage == "" {
+		return fmt.Errorf("no canary to promote for %q", name)
+	}
+	// Tear down old (non-canary) clones first.
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
+	if err != nil {
+		return err
+	}
+	for _, cl := range all {
+		if strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+			continue
+		}
+		_ = c.stopContainer(ctx, cl.ID)
+		_ = c.removeContainer(ctx, cl.ID)
+	}
+	// Drop original from the route — user's container keeps running but isn't
+	// a backend anymore. They can stop it manually if they want.
+	svc.OriginalRouted = false
+	svc.PreviousImage = svc.Image
+	svc.Image = svc.CanaryImage
+	svc.CanaryImage = ""
+	svc.CanaryReplicas = 0
+	if err := store.Put(svc); err != nil {
+		return err
+	}
+	return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
+}
+
+// discardOnboarded removes the canary containers; the original + old clones
+// keep serving unchanged.
+func (c *dockerClient) discardOnboarded(ctx context.Context, name string, store *OnboardedStore, routesPath string) error {
+	svc, ok := store.Get(name)
+	if !ok {
+		return fmt.Errorf("not onboarded: %s", name)
+	}
+	if svc.CanaryImage == "" {
+		return fmt.Errorf("no canary to discard for %q", name)
+	}
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-c"]}`, name))
+	if err != nil {
+		return err
+	}
+	for _, cl := range all {
+		if !strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+			continue
+		}
+		_ = c.stopContainer(ctx, cl.ID)
+		_ = c.removeContainer(ctx, cl.ID)
+	}
+	svc.CanaryImage = ""
+	svc.CanaryReplicas = 0
+	if err := store.Put(svc); err != nil {
+		return err
+	}
+	return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
+}
+
+// replaceOnboarded is stage + promote in one shot, without the dual-serving
+// canary window. New clones come up first; only after they're started is the
+// route swapped and the old clones removed. PreviousImage stamped for rollback.
+func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req ReplaceServiceRequest, store *OnboardedStore, routesPath string) error {
+	svc, ok := store.Get(name)
+	if !ok {
+		return fmt.Errorf("not onboarded: %s", name)
+	}
+	if req.Image == "" {
+		return fmt.Errorf("image is required")
+	}
+	if svc.CanaryImage != "" {
+		return fmt.Errorf("%q has a canary in flight — promote or discard first", name)
+	}
+	var env []string
+	if len(req.Env) > 0 {
+		for k, v := range req.Env {
+			env = append(env, k+"="+v)
+		}
+	} else {
+		env = svc.Env
+	}
+	c.pullImage(ctx, req.Image)
+	// Spin up replacements named -r2 to avoid colliding with existing -1..N.
+	startIdx := 1000
+	var newIDs []string
+	for i := 0; i < svc.Replicas; i++ {
+		cname := fmt.Sprintf("goproxy-onb-%s-%d", name, startIdx+i)
+		id, err := c.createContainer(ctx, cname, createBody{Image: req.Image, Env: env})
+		if err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			return fmt.Errorf("create %s: %w", cname, err)
+		}
+		if err := c.startContainer(ctx, id); err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			return fmt.Errorf("start %s: %w", cname, err)
+		}
+		newIDs = append(newIDs, id)
+	}
+	// Give the new clones a few seconds to bind before swapping.
+	time.Sleep(3 * time.Second)
+	// Remove old (non-c-prefixed) clones whose name doesn't match the new -1000+ range.
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
+	if err != nil {
+		return err
+	}
+	for _, cl := range all {
+		n := cl.name()
+		isNew := false
+		for i := 0; i < svc.Replicas; i++ {
+			if n == fmt.Sprintf("goproxy-onb-%s-%d", name, startIdx+i) {
+				isNew = true
+				break
+			}
+		}
+		if isNew {
+			continue
+		}
+		if strings.HasPrefix(n, fmt.Sprintf("goproxy-onb-%s-c", name)) {
+			continue // canary cleanup is its own flow
+		}
+		_ = c.stopContainer(ctx, cl.ID)
+		_ = c.removeContainer(ctx, cl.ID)
+	}
+	svc.OriginalRouted = false
+	svc.PreviousImage = svc.Image
+	svc.Image = req.Image
+	if err := store.Put(svc); err != nil {
+		return err
+	}
+	return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
 }
 
 func nextCloneIndex(clones []dockerContainer, name string) int {

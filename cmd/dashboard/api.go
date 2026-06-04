@@ -413,18 +413,21 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 						svcs[i].UpdateAvailable = true
 					}
 				}
-				// Merge in onboarded services — same shape, distinguished by
-				// the Onboarded flag so the UI can hide canary/replace controls
-				// that don't make sense for adopted containers.
+				// Merge in onboarded services — same shape as label-managed
+				// ones so the existing card UI handles them. Distinguished by
+				// the Onboarded flag for cosmetic hints (e.g. the "onboarded"
+				// pill). Replace / stage / promote / discard all work.
 				for _, o := range onb.List() {
 					svcs = append(svcs, Service{
-						Name:       o.Name,
-						Image:      o.Image,
-						Host:       o.Host,
-						Port:       o.Port,
-						Replicas:   o.Replicas,
-						Unscalable: false,
-						Onboarded:  true,
+						Name:           o.Name,
+						Image:          o.Image,
+						Host:           o.Host,
+						Port:           o.Port,
+						Replicas:       o.Replicas,
+						PreviousImage:  o.PreviousImage,
+						CanaryImage:    o.CanaryImage,
+						CanaryReplicas: o.CanaryReplicas,
+						Onboarded:      true,
 					})
 				}
 				httpx.WriteJSON(w, http.StatusOK, svcs)
@@ -487,7 +490,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				httpx.WriteErr(w, err)
 				return
 			}
-			if err := dc.replaceService(req.Context(), name, body); err != nil {
+			if _, ok := onb.Get(name); ok {
+				if err := dc.replaceOnboarded(req.Context(), name, body, onb, routesConfigPath); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				proxyRefresh(proxyURLFromEnv())
+			} else if err := dc.replaceService(req.Context(), name, body); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -501,7 +510,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				httpx.WriteErr(w, err)
 				return
 			}
-			if err := dc.stageCanary(req.Context(), name, body); err != nil {
+			if _, ok := onb.Get(name); ok {
+				if err := dc.stageOnboarded(req.Context(), name, body, onb, routesConfigPath); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				proxyRefresh(proxyURLFromEnv())
+			} else if err := dc.stageCanary(req.Context(), name, body); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -510,7 +525,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			return
 		}
 		if len(parts) == 2 && parts[1] == "promote" && req.Method == "POST" {
-			if err := dc.promoteCanary(req.Context(), name); err != nil {
+			if _, ok := onb.Get(name); ok {
+				if err := dc.promoteOnboarded(req.Context(), name, onb, routesConfigPath); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				proxyRefresh(proxyURLFromEnv())
+			} else if err := dc.promoteCanary(req.Context(), name); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -519,7 +540,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			return
 		}
 		if len(parts) == 2 && parts[1] == "canary" && req.Method == "DELETE" {
-			if err := dc.discardCanary(req.Context(), name); err != nil {
+			if _, ok := onb.Get(name); ok {
+				if err := dc.discardOnboarded(req.Context(), name, onb, routesConfigPath); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				proxyRefresh(proxyURLFromEnv())
+			} else if err := dc.discardCanary(req.Context(), name); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
