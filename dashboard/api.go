@@ -518,6 +518,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		writeJSON(w, http.StatusOK, map[string]any{"enabled": cf != nil, "domain": cfDomain(cf)})
 	}))
 
+	// ---- Container logs (read-only; auth-gated) ----
+	registerLogRoutes(mux, dc, auth)
+
 	mux.HandleFunc("/api/cf/records", func(w http.ResponseWriter, req *http.Request) {
 		if cf == nil {
 			http.Error(w, "cloudflare not configured", http.StatusServiceUnavailable)
