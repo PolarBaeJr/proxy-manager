@@ -34,6 +34,15 @@ type StoredCredential struct {
 	Transports []string `json:"transports,omitempty"`
 	CreatedAt  int64    `json:"created_at"`
 	LastUsedAt int64    `json:"last_used_at,omitempty"`
+
+	// Flags tracked by go-webauthn. The library refuses validation if a stored
+	// credential reports BackupEligible=false but the response says true (or
+	// vice versa) — Apple flips BE the moment iCloud Keychain backs up the
+	// passkey, so we MUST persist these to avoid bogus rejections.
+	UserPresent    bool `json:"flag_up,omitempty"`
+	UserVerified   bool `json:"flag_uv,omitempty"`
+	BackupEligible bool `json:"flag_be,omitempty"`
+	BackupState    bool `json:"flag_bs,omitempty"`
 }
 
 // passkeyManager wraps the webauthn library and tracks in-flight ceremonies.
@@ -114,6 +123,12 @@ func toAdapter(u *User) *userAdapter {
 			Authenticator: webauthn.Authenticator{
 				AAGUID:    c.AAGUID,
 				SignCount: c.SignCount,
+			},
+			Flags: webauthn.CredentialFlags{
+				UserPresent:    c.UserPresent,
+				UserVerified:   c.UserVerified,
+				BackupEligible: c.BackupEligible,
+				BackupState:    c.BackupState,
 			},
 		})
 	}
@@ -217,9 +232,22 @@ func (s *AuthStore) DeleteCredential(username, idKey string) error {
 	return fmt.Errorf("credential not found")
 }
 
-// updateCredential bumps SignCount + LastUsedAt for an existing credential.
-// Called after a successful login. Returns false if the credential is unknown.
-func (s *AuthStore) updateCredential(username string, credID []byte, signCount uint32) bool {
+// snapshotUsers returns a copy of all users — used by the discoverable-login
+// handler which needs to walk every user looking for one whose WebAuthnID
+// matches the assertion's userHandle.
+func (s *AuthStore) snapshotUsers() []User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]User, len(s.data.Users))
+	copy(out, s.data.Users)
+	return out
+}
+
+// updateCredential bumps SignCount + LastUsedAt + Flags for an existing
+// credential. Called after a successful login. Returns false if the credential
+// is unknown. Flag persistence is what stops "BackupEligible inconsistency"
+// errors when iCloud Keychain syncs the passkey after registration.
+func (s *AuthStore) updateCredential(username string, credID []byte, signCount uint32, flags webauthn.CredentialFlags) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u := s.findUser(username)
@@ -229,6 +257,10 @@ func (s *AuthStore) updateCredential(username string, credID []byte, signCount u
 	for i := range u.Credentials {
 		if string(u.Credentials[i].ID) == string(credID) {
 			u.Credentials[i].SignCount = signCount
+			u.Credentials[i].UserPresent = flags.UserPresent
+			u.Credentials[i].UserVerified = flags.UserVerified
+			u.Credentials[i].BackupEligible = flags.BackupEligible
+			u.Credentials[i].BackupState = flags.BackupState
 			u.Credentials[i].LastUsedAt = time.Now().Unix()
 			_ = s.save()
 			return true
@@ -285,7 +317,16 @@ func registerPasskeyRoutes(mux *http.ServeMux, auth *AuthStore, pm *passkeyManag
 			http.Error(w, "user not found", http.StatusNotFound)
 			return
 		}
-		opts, sess, err := pm.w.BeginRegistration(toAdapter(&snap))
+		opts, sess, err := pm.w.BeginRegistration(toAdapter(&snap),
+			// Require resident / discoverable credentials so login doesn't need a
+			// username — the authenticator stores the user handle and the browser
+			// surfaces it directly. Combined with UV=required, Touch ID alone is
+			// both factors.
+			webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+				ResidentKey:      protocol.ResidentKeyRequirementRequired,
+				UserVerification: protocol.VerificationRequired,
+			}),
+		)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -333,11 +374,15 @@ func registerPasskeyRoutes(mux *http.ServeMux, auth *AuthStore, pm *passkeyManag
 			return
 		}
 		stored := StoredCredential{
-			ID:        cred.ID,
-			PublicKey: cred.PublicKey,
-			AAGUID:    cred.Authenticator.AAGUID,
-			SignCount: cred.Authenticator.SignCount,
-			Label:     label,
+			ID:             cred.ID,
+			PublicKey:      cred.PublicKey,
+			AAGUID:         cred.Authenticator.AAGUID,
+			SignCount:      cred.Authenticator.SignCount,
+			Label:          label,
+			UserPresent:    cred.Flags.UserPresent,
+			UserVerified:   cred.Flags.UserVerified,
+			BackupEligible: cred.Flags.BackupEligible,
+			BackupState:    cred.Flags.BackupState,
 		}
 		for _, t := range parsed.Response.Transports {
 			stored.Transports = append(stored.Transports, string(t))
@@ -352,30 +397,15 @@ func registerPasskeyRoutes(mux *http.ServeMux, auth *AuthStore, pm *passkeyManag
 
 	// ---- Login (public; rate-limited) ----
 
+	// Discoverable / passwordless login — no username needed. The browser
+	// already has the credential (resident key) and surfaces it directly.
 	mux.HandleFunc("/api/auth/passkey/login/begin", rl.limit(func(w http.ResponseWriter, r *http.Request) {
-		username := r.URL.Query().Get("username")
-		if username == "" {
-			http.Error(w, "username required", http.StatusBadRequest)
-			return
-		}
-		auth.mu.RLock()
-		u := auth.findUser(username)
-		var snap User
-		if u != nil {
-			snap = *u
-		}
-		auth.mu.RUnlock()
-		if u == nil || len(snap.Credentials) == 0 {
-			// Don't reveal whether user exists. Return a generic refusal.
-			http.Error(w, "passkey login unavailable for this user", http.StatusUnauthorized)
-			return
-		}
-		opts, sess, err := pm.w.BeginLogin(toAdapter(&snap))
+		opts, sess, err := pm.w.BeginDiscoverableLogin()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		tok, err := pm.putCeremony(&pendingCeremony{Session: *sess, Username: snap.Username})
+		tok, err := pm.putCeremony(&pendingCeremony{Session: *sess})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -395,30 +425,32 @@ func registerPasskeyRoutes(mux *http.ServeMux, auth *AuthStore, pm *passkeyManag
 			http.Error(w, "invalid assertion: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		auth.mu.RLock()
-		u := auth.findUser(ceremony.Username)
-		var snap User
-		if u != nil {
-			snap = *u
+		// Handler reverses our userHandle → username convention and returns
+		// the matching User adapter. Library uses it to look up the public key.
+		var matched string
+		handler := func(rawID, userHandle []byte) (webauthn.User, error) {
+			for _, u := range auth.snapshotUsers() {
+				ad := toAdapter(&u)
+				if string(ad.WebAuthnID()) == string(userHandle) {
+					matched = u.Username
+					return ad, nil
+				}
+			}
+			return nil, fmt.Errorf("no user matches handle")
 		}
-		auth.mu.RUnlock()
-		if u == nil {
-			http.Error(w, "user no longer exists", http.StatusUnauthorized)
-			return
-		}
-		cred, err := pm.w.ValidateLogin(toAdapter(&snap), ceremony.Session, parsed)
+		cred, err := pm.w.ValidateDiscoverableLogin(handler, ceremony.Session, parsed)
 		if err != nil {
-			audit(r, snap.Username, "auth.passkey_failed", err.Error())
+			audit(r, matched, "auth.passkey_failed", err.Error())
 			http.Error(w, "passkey verification failed", http.StatusUnauthorized)
 			return
 		}
-		auth.updateCredential(snap.Username, cred.ID, cred.Authenticator.SignCount)
+		auth.updateCredential(matched, cred.ID, cred.Authenticator.SignCount, cred.Flags)
 		// Passkey login is BOTH factors: issue a fully-elevated session immediately.
 		elev := time.Now().Add(elevatedLifetime)
-		setSessionCookie(w, auth.newCookie(snap.Username, elev))
-		audit(r, snap.Username, "auth.passkey_ok", credIDKey(cred.ID))
+		setSessionCookie(w, auth.newCookie(matched, elev))
+		audit(r, matched, "auth.passkey_ok", credIDKey(cred.ID))
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{
-			"username":       snap.Username,
+			"username":       matched,
 			"elevated_until": elev.Unix(),
 		})
 	}))

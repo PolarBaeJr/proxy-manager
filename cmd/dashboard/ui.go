@@ -691,11 +691,8 @@ function wireAuthForms() {
       }
     }).catch(() => {});
     pkBtn.onclick = async () => {
-      const usernameInput = $('#form-login') && $('#form-login').username;
-      const username = (usernameInput && usernameInput.value.trim()) || prompt('Username:');
-      if (!username) return;
       try {
-        await passkeyLogin(username);
+        await passkeyLogin();
         await refreshAuth();
       } catch (e) {
         if (e && e.name !== 'NotAllowedError') toast(e.message || String(e), 'err');
@@ -766,8 +763,8 @@ function encodeGetResponse(cred) {
   };
 }
 
-async function passkeyLogin(username) {
-  const begin = await api('/api/auth/passkey/login/begin?username=' + encodeURIComponent(username));
+async function passkeyLogin() {
+  const begin = await api('/api/auth/passkey/login/begin', { method:'POST' });
   const opts = decodeGetOptions(begin.options.publicKey);
   const cred = await navigator.credentials.get({ publicKey: opts });
   if (!cred) throw new Error('no credential returned');
