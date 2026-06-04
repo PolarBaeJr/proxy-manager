@@ -327,14 +327,18 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 	if err != nil {
 		return err
 	}
-	// Filter out canary containers from the scale count.
-	nonCanary := clones[:0:0]
-	for _, cl := range clones {
-		if !strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
-			nonCanary = append(nonCanary, cl)
+	// Filter out actively-staged canary containers from the scale math.
+	// Once promote ran, CanaryImage clears and the c-prefixed container IS
+	// the live one — count it as a regular clone.
+	if svc.CanaryImage != "" {
+		nonCanary := clones[:0:0]
+		for _, cl := range clones {
+			if !strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+				nonCanary = append(nonCanary, cl)
+			}
 		}
+		clones = nonCanary
 	}
-	clones = nonCanary
 	originalCount := 0
 	if svc.OriginalRouted {
 		originalCount = 1
@@ -390,6 +394,11 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 
 // rebuildOnboardedRoute rewrites routes.json for this service from current
 // state: original (if still routed) + live clones + canaries (if any).
+//
+// A container's name starting with goproxy-onb-<name>-c is treated as a
+// CANARY only while svc.CanaryImage is set. Once the canary is promoted,
+// CanaryImage clears and the same container is treated as a regular live
+// backend — it IS the new live, just retained its original name.
 func rebuildOnboardedRoute(ctx context.Context, c *dockerClient, name string, svc OnboardedService, routesPath string) error {
 	backends := []string{}
 	if svc.OriginalRouted {
@@ -399,22 +408,24 @@ func rebuildOnboardedRoute(ctx context.Context, c *dockerClient, name string, sv
 	if err != nil {
 		return err
 	}
+	canaryActive := svc.CanaryImage != ""
+	cPrefix := fmt.Sprintf("goproxy-onb-%s-c", name)
+	// First pass: non-canary live backends.
 	for _, cl := range clones {
-		// Skip canary containers — separate naming pattern.
-		if strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+		if canaryActive && strings.HasPrefix(cl.name(), cPrefix) {
 			continue
 		}
 		backends = append(backends, fmt.Sprintf("http://%s:%d", cl.name(), svc.Port))
 	}
-	// Canary containers (live in same route during staging — proxy splits traffic).
-	for _, cl := range clones {
-		if strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
-			backends = append(backends, fmt.Sprintf("http://%s:%d", cl.name(), svc.Port))
+	// Second pass: canary backends (only while a canary is actively staged).
+	if canaryActive {
+		for _, cl := range clones {
+			if strings.HasPrefix(cl.name(), cPrefix) {
+				backends = append(backends, fmt.Sprintf("http://%s:%d", cl.name(), svc.Port))
+			}
 		}
 	}
 	if len(backends) == 0 {
-		// Shouldn't happen with a healthy service, but write a no-route entry
-		// rather than corrupting the file with an empty array Cloudflare-style.
 		return removeOnboardedRoute(routesPath, name)
 	}
 	return upsertOnboardedRoute(routesPath, name, svc.Host, backends)
@@ -572,7 +583,10 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 	}
 	// Give the new clones a few seconds to bind before swapping.
 	time.Sleep(3 * time.Second)
-	// Remove old (non-c-prefixed) clones whose name doesn't match the new -1000+ range.
+	// Remove any clone that isn't one of the freshly-created ones. The only
+	// thing we preserve is an ACTIVE canary (svc.CanaryImage set) — but
+	// replaceOnboarded already rejected that case earlier, so post-promote
+	// c-prefixed leftovers ARE eligible for cleanup here.
 	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
 	if err != nil {
 		return err
@@ -588,9 +602,6 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 		}
 		if isNew {
 			continue
-		}
-		if strings.HasPrefix(n, fmt.Sprintf("goproxy-onb-%s-c", name)) {
-			continue // canary cleanup is its own flow
 		}
 		_ = c.stopContainer(ctx, cl.ID)
 		_ = c.removeContainer(ctx, cl.ID)
