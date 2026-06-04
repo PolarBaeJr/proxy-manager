@@ -642,6 +642,8 @@ function setupView() {
 
 function loginView() {
   return '<p class="meta" style="margin:0 0 14px;text-align:center">Sign in to your homelab.</p>'
+       + '<button id="btn-passkey-login" class="btn primary" type="button" style="width:100%;justify-content:center;margin-bottom:14px;display:none">' + I.key + 'Sign in with passkey</button>'
+       + '<div id="passkey-divider" style="display:none;text-align:center;color:var(--muted-2);font-size:11px;letter-spacing:.08em;margin-bottom:14px">OR USE PASSWORD</div>'
        + '<form id="form-login">'
        + '<div class="field"><label>Username</label><input name="username" required autofocus></div>'
        + '<div class="field"><label>Password</label><input name="password" type="password" required></div>'
@@ -676,6 +678,112 @@ function wireAuthForms() {
       await refreshAuth();
     } catch (e) { toast(e.message, 'err'); }
   };
+
+  // Reveal the passkey button only when at least one user has a registered passkey.
+  // We check this once on each login screen render so the page stays simple when
+  // no one's set one up yet.
+  const pkBtn = $('#btn-passkey-login');
+  if (pkBtn) {
+    fetch('/api/auth/passkey/available').then(r => r.json()).then(d => {
+      if (d && d.available) {
+        pkBtn.style.display = '';
+        $('#passkey-divider').style.display = '';
+      }
+    }).catch(() => {});
+    pkBtn.onclick = async () => {
+      try {
+        await passkeyLogin();
+        await refreshAuth();
+      } catch (e) {
+        if (e && e.name !== 'NotAllowedError') toast(e.message || String(e), 'err');
+      }
+    };
+  }
+}
+
+/* ---------- Passkeys / WebAuthn helpers ---------- */
+
+// Base64url <-> ArrayBuffer. WebAuthn options arrive with binary fields as
+// base64url strings; the browser API wants ArrayBuffer; responses come back as
+// ArrayBuffer and must be base64url'd before the server can decode them.
+function b64uToBuf(s) {
+  if (typeof s !== 'string') return s;
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+function bufToB64u(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+// Walk an options object and decode any base64url-encoded fields the WebAuthn
+// browser API needs as ArrayBuffer. The shape is well-known so a static walk is
+// faster (and more obvious) than a generic recursive transformer.
+function decodeCreateOptions(o) {
+  o.challenge = b64uToBuf(o.challenge);
+  if (o.user && o.user.id) o.user.id = b64uToBuf(o.user.id);
+  if (Array.isArray(o.excludeCredentials)) o.excludeCredentials.forEach(c => { c.id = b64uToBuf(c.id); });
+  return o;
+}
+function decodeGetOptions(o) {
+  o.challenge = b64uToBuf(o.challenge);
+  if (Array.isArray(o.allowCredentials)) o.allowCredentials.forEach(c => { c.id = b64uToBuf(c.id); });
+  return o;
+}
+function encodeCreateResponse(cred) {
+  return {
+    id: cred.id,
+    rawId: bufToB64u(cred.rawId),
+    type: cred.type,
+    clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+    response: {
+      attestationObject: bufToB64u(cred.response.attestationObject),
+      clientDataJSON:    bufToB64u(cred.response.clientDataJSON),
+      transports:        cred.response.getTransports ? cred.response.getTransports() : [],
+    },
+  };
+}
+function encodeGetResponse(cred) {
+  return {
+    id: cred.id,
+    rawId: bufToB64u(cred.rawId),
+    type: cred.type,
+    clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+    response: {
+      authenticatorData: bufToB64u(cred.response.authenticatorData),
+      clientDataJSON:    bufToB64u(cred.response.clientDataJSON),
+      signature:         bufToB64u(cred.response.signature),
+      userHandle:        cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null,
+    },
+  };
+}
+
+async function passkeyLogin() {
+  const begin = await api('/api/auth/passkey/login/begin', { method:'POST' });
+  const opts = decodeGetOptions(begin.options.publicKey);
+  const cred = await navigator.credentials.get({ publicKey: opts });
+  if (!cred) throw new Error('no credential returned');
+  await api('/api/auth/passkey/login/finish?ceremony=' + encodeURIComponent(begin.ceremony), {
+    method: 'POST',
+    body: JSON.stringify(encodeGetResponse(cred)),
+  });
+}
+
+async function passkeyRegister(label) {
+  const begin = await api('/api/auth/passkey/register/begin', { method:'POST' });
+  const opts = decodeCreateOptions(begin.options.publicKey);
+  const cred = await navigator.credentials.create({ publicKey: opts });
+  if (!cred) throw new Error('no credential returned');
+  await api('/api/auth/passkey/register/finish?ceremony=' + encodeURIComponent(begin.ceremony)
+            + '&label=' + encodeURIComponent(label || 'Passkey'), {
+    method: 'POST',
+    body: JSON.stringify(encodeCreateResponse(cred)),
+  });
 }
 
 // Shared pending-user block used by both setup view and add-user dialog.
@@ -1074,11 +1182,12 @@ async function deleteDNS(id, name) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
-/* ---------- Users + Tokens ---------- */
+/* ---------- Users + Tokens + Passkeys ---------- */
 async function renderUsers() {
-  const [users, myTokens] = await Promise.all([
+  const [users, myTokens, myPasskeys] = await Promise.all([
     api('/api/users'),
     api('/api/users/tokens').catch(() => []),
+    api('/api/users/passkeys').catch(() => []),
   ]);
   const el = $('#tab-users');
   let html = '<div class="subhead">' + I.users + 'Dashboard users</div>';
@@ -1093,6 +1202,25 @@ async function renderUsers() {
          +  '</td></tr>';
   }
   html += '</tbody></table></div>';
+
+  html += '<div class="divider"></div>';
+  html += '<div class="subhead">' + I.shield + 'My passkeys</div>';
+  html += '<div class="btn-row top"><button class="btn primary" onclick="addPasskey()">' + I.plus + 'Add passkey</button>'
+       +  '<span class="meta">One tap to sign in. Replaces password + 2FA.</span></div>';
+  if (!myPasskeys.length) {
+    html += '<div class="card"><div class="empty-state"><div class="es-ic">' + I.shield + '</div>'
+         +  '<h3>No passkeys yet</h3><p>Register one for fastest sign-in — Touch ID, Windows Hello, YubiKey, or your phone via Bluetooth.</p></div></div>';
+  } else {
+    html += '<div class="card"><table><thead><tr><th>Label</th><th>Added</th><th>Last used</th><th style="text-align:right">Actions</th></tr></thead><tbody>';
+    for (const p of myPasskeys) {
+      const idKey = (typeof p.id === 'string') ? p.id : '';
+      html += '<tr><td><span class="ident">' + esc(p.label || 'Passkey') + '</span></td>'
+           +  '<td class="meta">' + new Date((p.created_at || 0) * 1000).toLocaleString() + '</td>'
+           +  '<td class="meta">' + (p.last_used_at ? new Date(p.last_used_at * 1000).toLocaleString() : '—') + '</td>'
+           +  '<td style="text-align:right"><button class="btn sm danger" ' + lockedAttr() + ' onclick="deletePasskey(\'' + esc(idKey) + '\')">' + I.trash + 'Remove' + lk() + '</button></td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
 
   html += '<div class="divider"></div>';
   html += '<div class="subhead">' + I.key + 'My API tokens</div>';
@@ -1151,6 +1279,28 @@ async function deleteToken(id) {
   try {
     await api('/api/users/tokens/' + encodeURIComponent(id), { method:'DELETE' });
     toast('revoked'); renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function addPasskey() {
+  if (!window.PublicKeyCredential) { toast('This browser does not support WebAuthn.', 'err'); return; }
+  const label = prompt('Name this passkey (e.g. "MacBook Touch ID", "iPhone", "YubiKey 5"):', 'Passkey');
+  if (label === null) return;
+  try {
+    await passkeyRegister(label || 'Passkey');
+    toast('Passkey added — try signing in with it next time.');
+    renderActive();
+  } catch (e) {
+    if (e && e.name === 'NotAllowedError') return; // user dismissed prompt
+    toast(e.message || String(e), 'err');
+  }
+}
+
+async function deletePasskey(idKey) {
+  if (!confirm('Remove this passkey? You will no longer be able to sign in with it.')) return;
+  try {
+    await api('/api/users/passkeys/' + encodeURIComponent(idKey), { method:'DELETE' });
+    toast('removed'); renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
 
