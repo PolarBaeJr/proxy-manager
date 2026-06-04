@@ -1126,6 +1126,7 @@ async function renderServices() {
     let badges = '';
     if (s.update_available) badges += ' <span class="pill warn">' + I.arrowup + 'update available</span>';
     if (canary)             badges += ' <span class="pill info"><span class="gl"></span>canary live</span>';
+    if (s.onboarded)        badges += ' <span class="pill muted" title="Adopted from an unlabelled container — replace/canary disabled">' + I.rocket + 'onboarded</span>';
     let facts = '<table class="facts">';
     facts += '<tr><td>Host</td><td><span class="ident">' + esc(s.host) + (s.path ? esc(s.path) : '') + '</span></td></tr>';
     if (canary)              facts += '<tr><td>Canary</td><td><span class="ident" style="color:#5eb4ff">' + esc(s.canary_image) + '</span> <span class="meta">· ' + s.canary_replicas + ' replica' + (s.canary_replicas === 1 ? '' : 's') + '</span></td></tr>';
@@ -1135,7 +1136,12 @@ async function renderServices() {
     facts += '</table>';
 
     let actions;
-    if (canary) {
+    if (s.onboarded) {
+      // Onboarded services support scale (cloned via image+env) but not
+      // replace/canary — those need a deployable definition the dashboard
+      // doesn't have.
+      actions = '<span class="meta" style="padding:6px 0">Scale via the replica controls. Delete to offboard (leaves original container).</span>';
+    } else if (canary) {
       actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="promoteCanary(\'' + sn + '\')">' + I.check + 'Promote canary' + lk() + '</button>'
               + '<button class="btn" ' + lockedAttr() + ' onclick="discardCanary(\'' + sn + '\')">' + I.x + 'Discard' + lk() + '</button>';
     } else {
@@ -1191,7 +1197,8 @@ async function renderDiscovery() {
          +  '<td><span class="pill ' + (u.state === 'running' ? 'ok' : 'muted') + '"><span class="gl"></span>' + esc(u.state) + '</span></td>'
          +  '<td class="meta">' + esc(ports) + '</td>'
          +  '<td style="text-align:right">'
-         +    '<button class="btn sm" onclick="discoveryShowLabels(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')">' + I.plus + 'Show labels</button>'
+         +    '<button class="btn sm primary" ' + lockedAttr() + ' onclick="onboardDialog(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')">' + I.plus + 'Onboard' + lk() + '</button>'
+         +    ' <button class="btn sm" onclick="discoveryShowLabels(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')" title="Or paste labels into the service\'s docker-compose.yml yourself">YAML</button>'
          +  '</td></tr>';
   }
   html += '</tbody></table></div>';
@@ -1213,6 +1220,50 @@ function toggleServiceCard(name) {
 // user pastes into their compose file. Hostname defaults to <name>.polardev.org
 // and the user can edit before copy. Port is pre-filled from the lowest
 // exposed internal port (best heuristic for "the app's port").
+// Onboard dialog — one-click adopt: connect container to edge network,
+// write a static route pointing at <container-name>:<port>, register as a
+// service so Replicas can be scaled. Does NOT touch the user's compose file
+// or recreate their container. Reversible from the service's Delete button.
+function onboardDialog(name, port) {
+  const dom = (window._discoveryLastDomain || 'polardev.org');
+  const d = document.getElementById('dlg-token-reveal');
+  d.innerHTML = ''
+    + '<div class="dlg"><div class="dlg-head"><div class="di">' + I.rocket + '</div>'
+    + '<div><h3>Onboard ' + esc(name) + '</h3><div class="dsub">Adopts the container without touching its compose file</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.x + '</button></div>'
+    + '<form id="form-onboard"><div class="dlg-body">'
+    +   '<div class="field-row">'
+    +     '<div class="field"><label>Hostname</label><input id="onb-host" value="' + esc(name) + '.' + esc(dom) + '" required></div>'
+    +     '<div class="field tight"><label>Internal port</label><input id="onb-port" type="number" min="1" max="65535" value="' + (port || 80) + '" required></div>'
+    +   '</div>'
+    +   '<div class="field"><label>Initial replicas</label>'
+    +     '<input id="onb-replicas" type="number" min="1" max="20" value="1">'
+    +     '<div class="hint">If &gt; 1, the dashboard clones the container\'s image + env into <code>goproxy-onb-' + esc(name) + '-N</code>. Scale up/down later from the Services tab.</div>'
+    +   '</div>'
+    +   '<div class="note">' + I.alert + '<div><strong>What this does:</strong> connects the container to the <code>edge</code> Docker network and appends a route to <code>routes.json</code>. The container itself is not recreated.</div></div>'
+    + '</div><div class="dialog-actions">'
+    + '<button type="button" class="btn" onclick="document.getElementById(\'dlg-token-reveal\').close()">Cancel</button>'
+    + '<button type="submit" class="btn primary">' + I.check + 'Onboard</button>'
+    + '</div></form></div>';
+  d.showModal();
+  document.getElementById('form-onboard').onsubmit = async (e) => {
+    e.preventDefault();
+    const host = document.getElementById('onb-host').value.trim();
+    const portN = parseInt(document.getElementById('onb-port').value) || 0;
+    const reps  = Math.max(1, parseInt(document.getElementById('onb-replicas').value) || 1);
+    try {
+      await api('/api/discovery/' + encodeURIComponent(name) + '/onboard', {
+        method:'POST',
+        body: JSON.stringify({ host, port: portN, replicas: reps }),
+      });
+      toast('Onboarded ' + name + ' — now serving ' + host);
+      d.close();
+      // Bounce to Services so the user sees it appear.
+      switchRoutingSub('services');
+    } catch (e) { toast(e.message, 'err'); }
+  };
+}
+
 function discoveryShowLabels(name, port) {
   const dom = (window._discoveryLastDomain || 'polardev.org');
   const html = ''

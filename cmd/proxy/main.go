@@ -19,8 +19,6 @@ func main() {
 
 	metrics := NewMetrics()
 	access := NewAccessLog()
-	metricsServer(*metricsAddr, metrics, access)
-	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -41,6 +39,11 @@ func main() {
 		log.Printf("loaded %d route(s), %d backend(s)", len(groups), total)
 	}
 	refresh()
+
+	// Pass refresh into the metrics server so /refresh can be hit by the
+	// dashboard after it edits routes.json — saves a docker restart.
+	metricsServer(*metricsAddr, metrics, access, refresh)
+	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
 	go dc.streamEvents(ctx, func(action string) {
 		switch action {

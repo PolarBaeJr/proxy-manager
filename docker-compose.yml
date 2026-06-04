@@ -63,7 +63,7 @@ services:
       - "8093:8093"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock        # read-write (service mgmt)
-      - ./cmd/proxy/routes.json:/etc/proxy/routes.json:ro    # same file the proxy reads
+      - ./cmd/proxy/routes.json:/etc/proxy/routes.json    # rw: dashboard appends onboarded routes here
       - ./cmd/dashboard/data:/data                       # auth.json + audit.log (persisted)
       - /proc:/host-proc:ro                              # host CPU + memory stats
       - /mnt/ssd:/host-root:ro                           # host disk stats (SSD)

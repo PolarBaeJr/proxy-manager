@@ -14,7 +14,7 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -413,6 +413,20 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 						svcs[i].UpdateAvailable = true
 					}
 				}
+				// Merge in onboarded services — same shape, distinguished by
+				// the Onboarded flag so the UI can hide canary/replace controls
+				// that don't make sense for adopted containers.
+				for _, o := range onb.List() {
+					svcs = append(svcs, Service{
+						Name:       o.Name,
+						Image:      o.Image,
+						Host:       o.Host,
+						Port:       o.Port,
+						Replicas:   o.Replicas,
+						Unscalable: false,
+						Onboarded:  true,
+					})
+				}
 				httpx.WriteJSON(w, http.StatusOK, svcs)
 			})(w, req)
 		case "POST":
@@ -450,7 +464,16 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				httpx.WriteErr(w, err)
 				return
 			}
-			if err := dc.scaleService(req.Context(), name, body.Replicas); err != nil {
+			// Onboarded services have a separate scale path that clones via
+			// the saved template image+env and rewrites routes.json instead
+			// of relying on label-based discovery.
+			if _, ok := onb.Get(name); ok {
+				if err := dc.scaleOnboarded(req.Context(), name, body.Replicas, onb, routesConfigPath); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				proxyRefresh(proxyURLFromEnv())
+			} else if err := dc.scaleService(req.Context(), name, body.Replicas); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -505,6 +528,18 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			return
 		}
 		if req.Method == "DELETE" {
+			// Onboarded services: tear down the clones + route, leave the
+			// original container alone (the user started it).
+			if _, ok := onb.Get(name); ok {
+				if err := dc.offboardContainer(req.Context(), name, onb, routesConfigPath); err != nil {
+					httpx.WriteErr(w, err)
+					return
+				}
+				proxyRefresh(proxyURLFromEnv())
+				audit(req, sessionUser(info), "service.offboard", name)
+				httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "offboarded"})
+				return
+			}
 			if err := dc.deleteService(req.Context(), name); err != nil {
 				httpx.WriteErr(w, err)
 				return
@@ -526,6 +561,30 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 
 	// ---- Discovery: list containers NOT routed by the proxy (auth-gated) ----
 	registerDiscoveryRoutes(mux, dc, auth)
+
+	// ---- Onboarding: one-click adopt an unlabelled container as a service ----
+	mux.HandleFunc("/api/discovery/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
+		rest := strings.TrimPrefix(req.URL.Path, "/api/discovery/")
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) != 2 || parts[1] != "onboard" || req.Method != "POST" {
+			http.NotFound(w, req)
+			return
+		}
+		name := parts[0]
+		var body OnboardRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		if err := dc.onboardContainer(req.Context(), name, body, onb, routesConfigPath); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		proxyRefresh(proxyURLFromEnv())
+		info, _ := auth.sessionFrom(req)
+		audit(req, sessionUser(info), "service.onboard", name)
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "onboarded", "name": name})
+	}))
 
 	// ---- Passkeys / WebAuthn (when PASSKEY_RP_ID is set or default localhost) ----
 	registerPasskeyRoutes(mux, auth, pm, rl)

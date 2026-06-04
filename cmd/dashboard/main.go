@@ -16,7 +16,8 @@ func main() {
 	metricsAddr := flag.String("metrics-addr", ":8094", "internal metrics endpoint listen address")
 	authFile := flag.String("auth", "/data/auth.json", "auth state file (created on first run)")
 	auditFile := flag.String("audit", "/data/audit.log", "audit log file path")
-	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (read-only for the Routes view)")
+	onboardedFile := flag.String("onboarded", "/data/onboarded.json", "onboarded-services state file")
+	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (rw: dashboard appends onboarded routes here)")
 	flag.Parse()
 
 	metrics := NewMetrics()
@@ -47,6 +48,11 @@ func main() {
 
 	limiter := newRateLimiter()
 	ic := newImageChecker(dc)
+
+	onboarded, err := loadOnboardedStore(*onboardedFile)
+	if err != nil {
+		log.Fatalf("onboarded store: %v", err)
+	}
 
 	pm, err := newPasskeyManager(os.Getenv("PASSKEY_RP_ID"), os.Getenv("PASSKEY_RP_ORIGINS"))
 	if err != nil {
@@ -80,7 +86,7 @@ func main() {
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm)
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded)
 
 	log.Printf("dashboard on %s", *addr)
 	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {

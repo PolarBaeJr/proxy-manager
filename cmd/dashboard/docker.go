@@ -239,6 +239,7 @@ type Service struct {
 	UpdateAvailable bool              `json:"update_available,omitempty"` // set by image checker
 	CanaryImage     string            `json:"canary_image,omitempty"`     // non-empty when a stage is in progress
 	CanaryReplicas  int               `json:"canary_replicas,omitempty"`
+	Onboarded       bool              `json:"onboarded,omitempty"`        // adopted from an unlabelled container
 	Members         []dockerContainer `json:"-"`
 	Labels          map[string]string `json:"labels,omitempty"`
 }
