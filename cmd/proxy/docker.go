@@ -63,6 +63,7 @@ func (c *dockerClient) get(ctx context.Context, path string) (io.ReadCloser, err
 
 type dockerContainer struct {
 	Names           []string          `json:"Names"`
+	State           string            `json:"State"`
 	Labels          map[string]string `json:"Labels"`
 	NetworkSettings struct {
 		Networks map[string]struct {
@@ -79,8 +80,11 @@ func (c *dockerContainer) name() string {
 }
 
 func (c *dockerClient) listEnabledContainers(ctx context.Context) ([]dockerContainer, error) {
+	// all=true so stopped containers still surface — the router needs to know
+	// a host *would* be served by something currently down, so it can return
+	// 503 (service unavailable) instead of 404 (no such route).
 	filt := url.QueryEscape(fmt.Sprintf(`{"label":["%s=true"]}`, labelEnable))
-	body, err := c.get(ctx, "/containers/json?filters="+filt)
+	body, err := c.get(ctx, "/containers/json?all=true&filters="+filt)
 	if err != nil {
 		return nil, err
 	}

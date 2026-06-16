@@ -278,22 +278,11 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 			log.Printf("skip %s: bad %s=%q", name, labelPort, portStr)
 			continue
 		}
-		// Prefer the managed (edge) network IP for multi-network containers.
-		var ip string
-		if n, ok := c.NetworkSettings.Networks[managedNetwork]; ok && n.IPAddress != "" {
-			ip = n.IPAddress
-		} else {
-			for _, n := range c.NetworkSettings.Networks {
-				if n.IPAddress != "" {
-					ip = n.IPAddress
-					break
-				}
-			}
-		}
-		if ip == "" {
-			log.Printf("skip %s: no IP on any network", name)
-			continue
-		}
+		// Always register the route group so a stopped container's host
+		// still maps to *something* — that's what turns the user-visible
+		// page from 404 (no such host) into 503 (host exists, nothing
+		// healthy). Backends are only appended for containers that are
+		// running AND have a reachable IP.
 		path := c.Labels[labelPath]
 		key := host + "|" + path
 		g, ok := groupsByKey[key]
@@ -307,6 +296,25 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 				Name: display, Service: c.Labels[labelService],
 			}
 			groupsByKey[key] = g
+		}
+		if c.State != "running" {
+			continue
+		}
+		// Prefer the managed (edge) network IP for multi-network containers.
+		var ip string
+		if n, ok := c.NetworkSettings.Networks[managedNetwork]; ok && n.IPAddress != "" {
+			ip = n.IPAddress
+		} else {
+			for _, n := range c.NetworkSettings.Networks {
+				if n.IPAddress != "" {
+					ip = n.IPAddress
+					break
+				}
+			}
+		}
+		if ip == "" {
+			log.Printf("skip backend %s: no IP on any network (state=%s)", name, c.State)
+			continue
 		}
 		weight := 1
 		if w, err := strconv.Atoi(c.Labels[labelWeight]); err == nil && w > 0 {
