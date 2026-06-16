@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -576,7 +577,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		// Stopping retains all container config — `docker start` brings it
 		// back instantly. First stop of a labeled-but-not-onboarded service
 		// also snapshots it into the onboarded store so the full lifecycle
-		// (stage/promote/replace/rollback) becomes available.
+		// (stage/promote/replace/rollback) becomes available. Auto-onboard
+		// is best-effort: a snapshot failure is logged but doesn't block
+		// the user's stop/start action.
 		if len(parts) == 2 && (parts[1] == "stop" || parts[1] == "start") && req.Method == "POST" {
 			svc, ok, err := findService(req.Context(), dc, name)
 			if err != nil {
@@ -589,26 +592,29 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			}
 			if !svc.Onboarded {
 				if err := promoteToOnboarded(req.Context(), dc, onb, svc); err != nil {
-					httpx.WriteErr(w, err)
-					return
+					log.Printf("auto-onboard %s failed (continuing): %v", name, err)
+				} else {
+					audit(req, sessionUser(info), "service.auto_onboard", name)
 				}
-				audit(req, sessionUser(info), "service.auto_onboard", name)
 			}
 			act := parts[1]
+			var acted int
 			if act == "stop" {
-				if err := stopServiceMembers(req.Context(), dc, svc); err != nil {
-					httpx.WriteErr(w, err)
-					return
-				}
+				acted, err = stopServiceMembers(req.Context(), dc, svc)
 			} else {
-				if err := startServiceMembers(req.Context(), dc, svc); err != nil {
-					httpx.WriteErr(w, err)
-					return
-				}
+				acted, err = startServiceMembers(req.Context(), dc, svc)
+			}
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
 			}
 			proxyRefresh(proxyURLFromEnv())
 			audit(req, sessionUser(info), "service."+act, name)
-			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": act + "ped"})
+			msg := act + "ped"
+			if acted == 0 {
+				msg = "already-" + act + "ped"
+			}
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": msg, "members_acted": acted})
 			return
 		}
 		if len(parts) == 2 && strings.HasPrefix(parts[1], "replicas/") && req.Method == "POST" {
@@ -630,24 +636,32 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			}
 			if !svc.Onboarded {
 				if err := promoteToOnboarded(req.Context(), dc, onb, svc); err != nil {
-					httpx.WriteErr(w, err)
-					return
+					log.Printf("auto-onboard %s failed (continuing): %v", name, err)
+				} else {
+					audit(req, sessionUser(info), "service.auto_onboard", name)
 				}
-				audit(req, sessionUser(info), "service.auto_onboard", name)
 			}
-			id, found, err := findMemberByName(req.Context(), dc, name, member)
-			if err != nil {
-				httpx.WriteErr(w, err)
-				return
+			var targetID string
+			var targetIsCanary bool
+			for _, m := range svc.MemberSummaries {
+				if m.Name == member {
+					targetID = m.ID
+					targetIsCanary = m.IsCanary
+					break
+				}
 			}
-			if !found {
+			if targetID == "" {
 				http.Error(w, "replica not found", http.StatusNotFound)
 				return
 			}
+			if targetIsCanary {
+				http.Error(w, "canary replicas can't be stopped here — use Discard or Promote", http.StatusConflict)
+				return
+			}
 			if act == "stop" {
-				err = dc.stopContainer(req.Context(), id)
+				err = dc.stopContainer(req.Context(), targetID)
 			} else {
-				err = dc.startContainer(req.Context(), id)
+				err = dc.startContainer(req.Context(), targetID)
 			}
 			if err != nil {
 				httpx.WriteErr(w, err)

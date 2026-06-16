@@ -125,7 +125,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		break
 	}
 	if group == nil {
-		serveUnavailable(w, http.StatusNotFound, reqHost, "There's no service routed at this address.")
+		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.")
 		return
 	}
 	if group.StripPrefix && group.PathPrefix != "" {
@@ -151,18 +151,19 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "This service is offline or restarting. The page will reload automatically.")
+	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
 }
 
-// serveUnavailable writes a small styled HTML page with a meta-refresh so the
-// browser retries periodically. Used when a host has no healthy backends (all
-// replicas stopped, container crashed, etc.) or when the host has no route at
-// all. The page is intentionally minimal — no JS, no external assets — so it
-// works even when the only thing the proxy can do is fail.
+// serveUnavailable writes a small styled HTML page with a 5-minute
+// meta-refresh so the browser silently retries in the background. Used
+// when a host has no healthy backends (all replicas stopped, container
+// crashed, etc.) or when the host has no route at all. The page is
+// intentionally minimal — no JS, no external assets — so it works even
+// when the only thing the proxy can do is fail.
 func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Retry-After", "10")
+	w.Header().Set("Retry-After", "300")
 	w.WriteHeader(status)
 	title := "Service unavailable"
 	emoji := "⏳"
@@ -172,7 +173,7 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 	}
 	fmt.Fprintf(w, `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<meta http-equiv=refresh content="10">
+<meta http-equiv=refresh content="300">
 <title>%s · %s</title>
 <style>
   :root{color-scheme:dark}
@@ -181,20 +182,14 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
   .box{max-width:460px;text-align:center;background:#141414;border:1px solid #262626;border-radius:14px;padding:36px 28px;box-shadow:0 1px 0 #ffffff08 inset,0 8px 30px #00000060}
   .ic{font-size:46px;line-height:1;margin-bottom:14px}
   h1{margin:0 0 8px;font-size:18px;font-weight:650;letter-spacing:-.01em}
-  p{margin:0 0 18px;color:#a0a0a0}
-  code{background:#1f1f1f;border:1px solid #2a2a2a;padding:2px 7px;border-radius:5px;font:12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfcfcf}
-  .meta{margin-top:18px;font-size:11.5px;color:#6a6a6a;letter-spacing:.04em;text-transform:uppercase}
-  .dot{display:inline-block;width:7px;height:7px;border-radius:50%%;background:#f7d976;margin-right:6px;vertical-align:middle;animation:p 1.4s infinite}
-  @keyframes p{0%%,100%%{opacity:.35}50%%{opacity:1}}
+  p{margin:0;color:#a0a0a0}
 </style>
 <div class=box>
   <div class=ic>%s</div>
   <h1>%s</h1>
   <p>%s</p>
-  <code>%s</code>
-  <div class=meta><span class=dot></span>retrying in 10 s</div>
 </div>
-`, title, host, emoji, title, reason, host)
+`, title, host, emoji, title, reason)
 }
 
 func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {

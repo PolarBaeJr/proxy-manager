@@ -179,18 +179,32 @@ func (c *dockerClient) createContainer(ctx context.Context, name string, body cr
 	return out.ID, json.NewDecoder(resp).Decode(&out)
 }
 
+// startContainer issues POST /containers/{id}/start. Docker returns
+// 304 (Not Modified) when the container is already running — treat that
+// as success since the caller's intent is satisfied either way. 404 is
+// also tolerated so a race between listServices and the action (e.g.
+// the container was just removed by something else) doesn't escalate
+// into a user-visible error.
 func (c *dockerClient) startContainer(ctx context.Context, id string) error {
 	resp, err := c.do(ctx, "POST", "/containers/"+id+"/start", nil)
 	if err != nil {
+		if strings.Contains(err.Error(), ": 304 ") || strings.Contains(err.Error(), ": 404 ") {
+			return nil
+		}
 		return err
 	}
 	resp.Close()
 	return nil
 }
 
+// stopContainer is the symmetric of startContainer. 304 = already stopped,
+// 404 = already gone — both are fine for our intent.
 func (c *dockerClient) stopContainer(ctx context.Context, id string) error {
 	resp, err := c.do(ctx, "POST", "/containers/"+id+"/stop?t=5", nil)
 	if err != nil {
+		if strings.Contains(err.Error(), ": 304 ") || strings.Contains(err.Error(), ": 404 ") {
+			return nil
+		}
 		return err
 	}
 	resp.Close()
