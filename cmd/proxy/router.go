@@ -172,20 +172,22 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 	fmt.Fprintf(w, `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <meta http-equiv=refresh content="300">
-<title>%s · %s</title>
+<title>%d %s · %s</title>
 <style>
   :root{color-scheme:dark}
   html,body{height:100%%;margin:0}
   body{background:#0a0a0a;color:#e6e6e6;font:15px/1.55 -apple-system,BlinkMacSystemFont,"Inter",system-ui,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
   .box{max-width:420px;text-align:center}
+  .code{font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em;color:#6a6a6a;margin-bottom:14px;text-transform:uppercase}
   h1{margin:0 0 10px;font-size:20px;font-weight:600;letter-spacing:-.015em;color:#fafafa}
   p{margin:0;color:#8a8a8a;font-size:14px}
 </style>
 <div class=box>
+  <div class=code>%d · %s</div>
   <h1>%s</h1>
   <p>%s</p>
 </div>
-`, title, host, title, reason)
+`, status, title, host, status, http.StatusText(status), title, reason)
 }
 
 func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
