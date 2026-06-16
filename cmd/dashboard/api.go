@@ -413,11 +413,29 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 						svcs[i].UpdateAvailable = true
 					}
 				}
-				// Merge in onboarded services — same shape as label-managed
-				// ones so the existing card UI handles them. Distinguished by
-				// the Onboarded flag for cosmetic hints (e.g. the "onboarded"
-				// pill). Replace / stage / promote / discard all work.
+				// Merge in onboarded services. If a labeled service already
+				// has the same name (auto-promoted via the lifecycle Stop
+				// path), DON'T append a second entry — just mark the
+				// existing labeled view as Onboarded so it picks up the
+				// unified surface (Stage/Promote/Replace/Rollback). Pure
+				// onboarded-only entries (adopted from unlabelled
+				// containers) get appended as standalone Service cards.
+				labeledIdx := map[string]int{}
+				for i := range svcs {
+					labeledIdx[svcs[i].Name] = i
+				}
 				for _, o := range onb.List() {
+					if i, ok := labeledIdx[o.Name]; ok {
+						svcs[i].Onboarded = true
+						if svcs[i].PreviousImage == "" {
+							svcs[i].PreviousImage = o.PreviousImage
+						}
+						if svcs[i].CanaryImage == "" {
+							svcs[i].CanaryImage = o.CanaryImage
+							svcs[i].CanaryReplicas = o.CanaryReplicas
+						}
+						continue
+					}
 					svcs = append(svcs, Service{
 						Name:           o.Name,
 						Image:          o.Image,
