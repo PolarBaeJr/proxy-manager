@@ -1213,7 +1213,15 @@ async function renderServices() {
       actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="promoteCanary(\'' + sn + '\')">' + I.check + 'Promote canary' + lk() + '</button>'
               + '<button class="btn" ' + lockedAttr() + ' onclick="discardCanary(\'' + sn + '\')">' + I.x + 'Discard' + lk() + '</button>';
     } else {
-      actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + lk() + '</button>'
+      // When update_available is true, surface a one-click Update before
+      // the other actions — it's the most common click in this state.
+      const updateBtn = (s.update_available
+        ? '<button class="btn primary" ' + lockedAttr() + ' onclick="oneClickUpdate(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.arrowup + 'Pull update + restart' + lk() + '</button>'
+        : '');
+      actions = updateBtn
+              + (s.update_available
+                  ? '<button class="btn" ' + lockedAttr() + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + lk() + '</button>'
+                  : '<button class="btn primary" ' + lockedAttr() + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + lk() + '</button>')
               + '<button class="btn" ' + lockedAttr() + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.swap + 'Replace' + lk() + '</button>'
               + (s.all_stopped
                   ? '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\')">' + I.bolt + 'Start service' + lk() + '</button>'
@@ -1557,6 +1565,23 @@ async function lifecycleSvc(name, act) {
     renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
+// oneClickUpdate — when the image-checker has flagged "update available",
+// this re-runs Replace with the SAME image string. The proxy pulls the
+// new digest, spins up replacement containers, then drops the old ones
+// (rolling deploy on a single host).
+async function oneClickUpdate(name, image) {
+  if (!(await confirmDialog('Pull the newer ' + image + ' and replace ' + name + '? Briefly runs old + new side-by-side, then drops the old.', {title: 'Pull update'}))) return;
+  toast('updating ' + name + ' — pulling ' + image + '…');
+  try {
+    await api('/api/services/' + encodeURIComponent(name) + '/replace', {
+      method: 'POST', body: JSON.stringify({ image: image })
+    });
+    toast('updated ' + name, 'ok');
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
 async function lifecycleReplica(svc, member, act) {
   try {
     await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/' + act, { method:'POST' });

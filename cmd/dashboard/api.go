@@ -519,6 +519,11 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
+			// Re-check the image-checker immediately so the "update available"
+			// badge clears without waiting for the next 10 min poll. The pull
+			// during Replace updated the local digest; comparing now will say
+			// local == registry → flag flips off on the next list-services call.
+			ic.Check(req.Context(), body.Image)
 			audit(req, sessionUser(info), "service.replace", name+" => "+body.Image)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "replaced", "image": body.Image})
 			return
