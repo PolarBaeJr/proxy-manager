@@ -166,10 +166,8 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 	w.Header().Set("Retry-After", "300")
 	w.WriteHeader(status)
 	title := "Service unavailable"
-	emoji := "⏳"
 	if status == http.StatusNotFound {
 		title = "Not found"
-		emoji = "🚫"
 	}
 	fmt.Fprintf(w, `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -178,18 +176,16 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 <style>
   :root{color-scheme:dark}
   html,body{height:100%%;margin:0}
-  body{background:#0a0a0a;color:#e6e6e6;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Inter",system-ui,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
-  .box{max-width:460px;text-align:center;background:#141414;border:1px solid #262626;border-radius:14px;padding:36px 28px;box-shadow:0 1px 0 #ffffff08 inset,0 8px 30px #00000060}
-  .ic{font-size:46px;line-height:1;margin-bottom:14px}
-  h1{margin:0 0 8px;font-size:18px;font-weight:650;letter-spacing:-.01em}
-  p{margin:0;color:#a0a0a0}
+  body{background:#0a0a0a;color:#e6e6e6;font:15px/1.55 -apple-system,BlinkMacSystemFont,"Inter",system-ui,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
+  .box{max-width:420px;text-align:center}
+  h1{margin:0 0 10px;font-size:20px;font-weight:600;letter-spacing:-.015em;color:#fafafa}
+  p{margin:0;color:#8a8a8a;font-size:14px}
 </style>
 <div class=box>
-  <div class=ic>%s</div>
   <h1>%s</h1>
   <p>%s</p>
 </div>
-`, title, host, emoji, title, reason)
+`, title, host, title, reason)
 }
 
 func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
