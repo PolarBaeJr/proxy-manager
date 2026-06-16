@@ -18,7 +18,7 @@ services:
     build:
       context: .
       dockerfile: cmd/edge/Dockerfile
-    image: edge:latest
+    image: ghcr.io/polarbaejr/proxy-manager-edge:${EDGE_TAG:-latest}
     container_name: edge
     restart: unless-stopped
     profiles: [edge]                    # opt-in: docker compose --profile edge up -d
@@ -39,7 +39,7 @@ services:
     build:
       context: .
       dockerfile: cmd/proxy/Dockerfile
-    image: proxy:latest
+    image: ghcr.io/polarbaejr/proxy-manager-proxy:${PROXY_TAG:-latest}
     container_name: proxy
     restart: unless-stopped
     networks: [edge]
@@ -55,7 +55,7 @@ services:
     build:
       context: .
       dockerfile: cmd/dashboard/Dockerfile
-    image: dashboard:latest
+    image: ghcr.io/polarbaejr/proxy-manager-dashboard:${DASHBOARD_TAG:-latest}
     container_name: dashboard
     restart: unless-stopped
     networks: [edge]
@@ -78,7 +78,7 @@ services:
     build:
       context: .
       dockerfile: cmd/monitor/Dockerfile
-    image: monitor:latest
+    image: ghcr.io/polarbaejr/proxy-manager-monitor:${MONITOR_TAG:-latest}
     container_name: monitor
     restart: unless-stopped
     networks: [edge]
