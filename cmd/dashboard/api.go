@@ -14,7 +14,7 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -707,7 +707,98 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		}
 	}))
 
+	// ---- Releases / version history (per infra service: dashboard/proxy/edge/monitor) ----
+	// GET  /api/releases               → list all infra services with current+stable+ghcr tags
+	// GET  /api/releases/{svc}         → single service detail
+	// POST /api/releases/{svc}/mark    → body {"tag":"...","label":"..."} — mark a tag stable
+	// DELETE /api/releases/{svc}/mark/{tag} → unmark
+	mux.HandleFunc("/api/releases", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		out := []*releaseInfoResp{}
+		for _, name := range infraServices {
+			info, err := buildReleaseInfo(req.Context(), dc, rs, name)
+			if err != nil {
+				// Skip silently — container may not exist (edge with profile off).
+				continue
+			}
+			out = append(out, info)
+		}
+		httpx.WriteJSON(w, http.StatusOK, out)
+	}))
+	mux.HandleFunc("/api/releases/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
+		sub := strings.TrimPrefix(req.URL.Path, "/api/releases/")
+		parts := strings.Split(sub, "/")
+		if len(parts) == 0 || parts[0] == "" {
+			http.Error(w, "service required", http.StatusBadRequest)
+			return
+		}
+		svc := parts[0]
+		// Validate against the known infra list to keep path-walking attackers out.
+		known := false
+		for _, n := range infraServices {
+			if n == svc {
+				known = true
+				break
+			}
+		}
+		if !known {
+			http.Error(w, "unknown service", http.StatusNotFound)
+			return
+		}
+		switch {
+		case len(parts) == 1 && req.Method == "GET":
+			info, err := buildReleaseInfo(req.Context(), dc, rs, svc)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, info)
+		case len(parts) == 2 && parts[1] == "mark" && req.Method == "POST":
+			var body struct{ Tag, Label string }
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			info, err := buildReleaseInfo(req.Context(), dc, rs, svc)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if err := rs.Mark(info.ImageBase, body.Tag, body.Label, sessionUser(sessionFromReq(auth, req))); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(req, sessionUser(sessionFromReq(auth, req)), "release.mark", svc+":"+body.Tag)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "marked", "tag": body.Tag})
+		case len(parts) == 3 && parts[1] == "mark" && req.Method == "DELETE":
+			tag := parts[2]
+			info, err := buildReleaseInfo(req.Context(), dc, rs, svc)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if err := rs.Unmark(info.ImageBase, tag); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(req, sessionUser(sessionFromReq(auth, req)), "release.unmark", svc+":"+tag)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "unmarked", "tag": tag})
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+
 	return mux
+}
+
+// sessionFromReq is the nil-safe form of AuthStore.sessionFrom — returns
+// the *sessionInfo if the cookie validates, else nil. Useful for audit
+// callsites that just want the username (or "" if unauthenticated).
+func sessionFromReq(auth *AuthStore, r *http.Request) *sessionInfo {
+	info, ok := auth.sessionFrom(r)
+	if !ok {
+		return nil
+	}
+	return info
 }
 
 func sessionUser(info *sessionInfo) string {

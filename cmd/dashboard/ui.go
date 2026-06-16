@@ -527,10 +527,12 @@ footer.app code{color:var(--muted)}
           <button class="active" data-sub="stats">Stats</button>
           <button data-sub="logs">Container logs</button>
           <button data-sub="access">Access log</button>
+          <button data-sub="releases">Releases</button>
         </nav>
         <div id="tab-stats"></div>
         <div id="tab-logs" hidden></div>
         <div id="tab-access" hidden></div>
+        <div id="tab-releases" hidden></div>
       </section>
       <section id="tab-users" class="tabpane" hidden></section>
     </div>
@@ -608,6 +610,7 @@ const I = {
   bolt:    svg('<path d="M13 3L4 14h7l-1 7 9-11h-7z"/>'),
   shield:  svg('<path d="M12 3l8 3v6c0 4-3 7-8 9-5-2-8-5-8-9V6z"/><path d="M9 12l2 2 4-4"/>'),
   link:    svg('<path d="M10 14a4 4 0 0 0 6 .5l2-2a4 4 0 0 0-6-6l-1 1M14 10a4 4 0 0 0-6-.5l-2 2a4 4 0 0 0 6 6l1-1"/>'),
+  bookmark:svg('<path d="M6 3h12v18l-6-4-6 4z"/>'),
   terminal:svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>'),
   refresh: svg('<path d="M20 11A8 8 0 0 0 6.3 6.3L4 8.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 13.7 4.7L20 15.4"/><path d="M20 20v-5h-5"/>'),
 };
@@ -980,7 +983,7 @@ function switchObsSub(s) {
   if (s !== 'access') accessState.mounted = false;
   if (s !== 'stats') statsDetail = null;
   $$('#obs-subnav button').forEach(b => b.classList.toggle('active', b.dataset.sub === s));
-  ['stats','logs','access'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
+  ['stats','logs','access','releases'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
   renderActive();
 }
 
@@ -1005,6 +1008,7 @@ async function renderActive() {
       if (obsSubTab === 'stats') await renderStats();
       else if (obsSubTab === 'logs') await renderLogs();
       else if (obsSubTab === 'access') await renderAccess();
+      else if (obsSubTab === 'releases') await renderReleases();
     } else if (activeTab === 'users') {
       await renderUsers();
     }
@@ -2008,6 +2012,84 @@ function paintAccess() {
   view.innerHTML = '<table class="acc-table"><thead><tr>'
     + '<th>Time</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>ms</th><th>Bytes</th><th>Client IP</th><th>Backend</th><th>UA</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+/* ---------- Releases (mark stable + revert command for infra services) ---------- */
+let _lastReleasesHash = '';
+async function renderReleases() {
+  const el = $('#tab-releases');
+  let items;
+  try {
+    items = await api('/api/releases');
+  } catch (e) {
+    el.innerHTML = '<div class="card">' + esc(e.message) + '</div>';
+    return;
+  }
+  const hash = JSON.stringify(items);
+  if (hash === _lastReleasesHash && el.children.length) return;
+  _lastReleasesHash = hash;
+
+  const blurb = '<div class="subhead">' + I.activity + 'Releases'
+    + ' <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— mark a build as stable so you can roll back to it later</span>'
+    + '</div>';
+
+  const cards = (items || []).map(svc => {
+    const stableCount = (svc.entries || []).filter(e => e.is_stable).length;
+    const head = '<div class="card-head"><div class="ttl">' + I.layers + '<span>' + esc(svc.service) + '</span>'
+      + ' <span class="pill ' + (svc.current_tag === 'latest' ? 'ok' : 'warn') + '">' + esc(svc.current_tag || '?') + '</span>'
+      + ' <span class="pill">' + stableCount + ' stable</span></div>'
+      + '<div class="spacer"></div>'
+      + '<button class="btn" data-rel-mark="' + esc(svc.service) + '" data-tag="' + esc(svc.current_tag) + '">'
+      +   I.bookmark + 'Mark current as stable</button>'
+      + '</div>';
+    const rows = (svc.entries || []).map(e => {
+      const pills = [];
+      if (e.is_current) pills.push('<span class="pill ok">running</span>');
+      if (e.is_stable)  pills.push('<span class="pill warn">stable</span>');
+      const cmd = svc.env_var + '=' + e.tag + ' docker compose up -d ' + svc.service;
+      const label = e.label ? '<div style="color:var(--muted);font-size:12px;margin-top:2px">' + esc(e.label) + '</div>' : '';
+      return '<tr>'
+        + '<td><code>' + esc(e.tag) + '</code>' + label + '</td>'
+        + '<td>' + pills.join(' ') + '</td>'
+        + '<td style="text-align:right">'
+        +   (e.is_stable ? '<button class="btn sm ghost" data-rel-unmark="' + esc(svc.service) + '" data-tag="' + esc(e.tag) + '">Unmark</button> ' : '')
+        +   (e.is_current ? '' : '<button class="btn sm" data-rel-cmd="' + esc(cmd) + '">Revert command</button>')
+        + '</td></tr>';
+    }).join('');
+    const body = '<table class="acc-table"><thead><tr>'
+      + '<th>Tag</th><th>Status</th><th style="text-align:right">Actions</th>'
+      + '</tr></thead><tbody>' + (rows || '<tr><td colspan="3" style="color:var(--muted)">No tags found yet — first GH Actions build will populate this list.</td></tr>') + '</tbody></table>';
+    return '<div class="card">' + head + body + '</div>';
+  }).join('');
+
+  el.innerHTML = blurb + (cards || '<div class="card">No infra services running.</div>');
+
+  el.querySelectorAll('[data-rel-mark]').forEach(b => b.onclick = async () => {
+    const svc = b.dataset.relMark, tag = b.dataset.tag;
+    const label = await promptDialog('Label for this stable build of ' + svc + ' (' + tag + ')?', '');
+    if (label === null) return;
+    try {
+      await api('/api/releases/' + svc + '/mark', { method: 'POST', body: JSON.stringify({ tag, label }) });
+      toast('Marked ' + svc + ':' + tag + ' as stable', 'ok');
+      _lastReleasesHash = '';
+      renderReleases();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  el.querySelectorAll('[data-rel-unmark]').forEach(b => b.onclick = async () => {
+    const svc = b.dataset.relUnmark, tag = b.dataset.tag;
+    if (!(await confirmDialog('Unmark ' + svc + ':' + tag + '?'))) return;
+    try {
+      await api('/api/releases/' + svc + '/mark/' + encodeURIComponent(tag), { method: 'DELETE' });
+      toast('Unmarked', 'ok');
+      _lastReleasesHash = '';
+      renderReleases();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  el.querySelectorAll('[data-rel-cmd]').forEach(b => b.onclick = () => {
+    const cmd = b.dataset.relCmd;
+    navigator.clipboard?.writeText(cmd).catch(() => {});
+    toast('Copied — paste on the Pi: ' + cmd, 'ok');
+  });
 }
 
 /* ---------- Stats (monitor binary) ---------- */

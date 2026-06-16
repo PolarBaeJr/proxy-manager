@@ -17,6 +17,7 @@ func main() {
 	authFile := flag.String("auth", "/data/auth.json", "auth state file (created on first run)")
 	auditFile := flag.String("audit", "/data/audit.log", "audit log file path")
 	onboardedFile := flag.String("onboarded", "/data/onboarded.json", "onboarded-services state file")
+	releasesFile := flag.String("releases", "/data/releases.json", "release marks (stable-tag pins) state file")
 	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (rw: dashboard appends onboarded routes here)")
 	flag.Parse()
 
@@ -54,6 +55,11 @@ func main() {
 		log.Fatalf("onboarded store: %v", err)
 	}
 
+	releases, err := loadReleasesStore(*releasesFile)
+	if err != nil {
+		log.Fatalf("releases store: %v", err)
+	}
+
 	pm, err := newPasskeyManager(os.Getenv("PASSKEY_RP_ID"), os.Getenv("PASSKEY_RP_ORIGINS"))
 	if err != nil {
 		log.Printf("⚠ passkey support disabled: %v", err)
@@ -86,7 +92,7 @@ func main() {
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded)
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases)
 
 	log.Printf("dashboard on %s", *addr)
 	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {
