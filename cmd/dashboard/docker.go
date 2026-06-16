@@ -242,6 +242,18 @@ type Service struct {
 	Onboarded       bool              `json:"onboarded,omitempty"`        // adopted from an unlabelled container
 	Members         []dockerContainer `json:"-"`
 	Labels          map[string]string `json:"labels,omitempty"`
+	MemberSummaries []ServiceMember   `json:"member_summaries"`           // per-replica name/state for UI
+	AllStopped      bool              `json:"all_stopped,omitempty"`      // true if every non-canary member is stopped
+}
+
+// ServiceMember is one container's surface for the UI — name (DNS-routable),
+// state ("running", "exited", "created", "paused"…), and whether it's the
+// canary or a normal replica.
+type ServiceMember struct {
+	Name    string `json:"name"`
+	ID      string `json:"id"`
+	State   string `json:"state"`
+	IsCanary bool  `json:"is_canary,omitempty"`
 }
 
 func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
@@ -275,6 +287,20 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 	}
 	out := make([]Service, 0, len(byName))
 	for _, s := range byName {
+		// Build per-member summaries (sorted by name for stable UI order)
+		// and determine the AllStopped flag from non-canary members.
+		allStopped := len(s.Members) > 0
+		for _, m := range s.Members {
+			isCanary := m.Labels[labelCanary] == "true"
+			s.MemberSummaries = append(s.MemberSummaries, ServiceMember{
+				Name: m.name(), ID: m.ID, State: m.State, IsCanary: isCanary,
+			})
+			if !isCanary && m.State == "running" {
+				allStopped = false
+			}
+		}
+		sort.Slice(s.MemberSummaries, func(i, j int) bool { return s.MemberSummaries[i].Name < s.MemberSummaries[j].Name })
+		s.AllStopped = allStopped
 		out = append(out, *s)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

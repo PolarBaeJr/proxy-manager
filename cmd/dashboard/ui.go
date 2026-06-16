@@ -295,6 +295,9 @@ details.errd[open] summary{color:#ff7173}
 .svc-img svg{width:13px;height:13px}
 .actionzone{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
 .actionzone .sep{flex:1}
+.member-list{margin-top:12px;padding:8px 10px;background:var(--surface-2);border-radius:var(--radius-sm);display:flex;flex-direction:column;gap:6px}
+.member-row{display:flex;align-items:center;gap:8px;font-size:12px;font-family:var(--font-mono)}
+.member-row .spacer{flex:1}
 .menu{position:relative}
 .menu-pop{position:absolute;right:0;top:calc(100% + 6px);background:var(--surface-2);border:1px solid var(--border-2);border-radius:var(--radius-md);
   box-shadow:var(--shadow-dialog);min-width:170px;padding:5px;z-index:30;display:none}
@@ -1212,8 +1215,33 @@ async function renderServices() {
     } else {
       actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + lk() + '</button>'
               + '<button class="btn" ' + lockedAttr() + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.swap + 'Replace' + lk() + '</button>'
+              + (s.all_stopped
+                  ? '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\')">' + I.bolt + 'Start service' + lk() + '</button>'
+                  : '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\')">' + I.lock + 'Stop service' + lk() + '</button>')
               + (s.previous_image ? '<button class="linkbtn" ' + lockedAttr() + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\')">' + I.rewind + 'Rollback</button>' : '');
     }
+    // Per-replica list with stop/start per row. Hidden when there's only one
+    // replica AND no stopped members (saves card height for the common case).
+    const members = s.member_summaries || [];
+    const showMembers = members.length > 1 || members.some(m => m.state !== 'running');
+    let memberList = '';
+    if (showMembers) {
+      memberList = '<div class="member-list">';
+      for (const m of members) {
+        const live = m.state === 'running';
+        const pill = live
+          ? '<span class="pill ok"><span class="gl"></span>running</span>'
+          : '<span class="pill muted">' + esc(m.state) + '</span>';
+        const canaryPill = m.is_canary ? ' <span class="pill info">canary</span>' : '';
+        const btn = m.is_canary ? ''
+          : (live
+              ? '<button class="btn sm ghost" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'stop\')">' + I.lock + 'Stop' + lk() + '</button>'
+              : '<button class="btn sm" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'start\')">' + I.bolt + 'Start' + lk() + '</button>');
+        memberList += '<div class="member-row"><span class="ident dim">' + esc(m.name) + '</span> ' + pill + canaryPill + '<span class="spacer"></span>' + btn + '</div>';
+      }
+      memberList += '</div>';
+    }
+    if (s.all_stopped) badges += ' <span class="pill muted">' + I.lock + 'stopped</span>';
     const menu = '<div class="menu"><button class="btn icon" onclick="toggleMenu(event,\'m-' + sn + '\')">' + I.dots + '</button>'
                + '<div class="menu-pop" id="m-' + sn + '"><button class="danger" ' + lockedAttr() + ' onclick="deleteSvc(\'' + sn + '\')">' + I.trash + 'Delete service</button></div></div>';
 
@@ -1235,6 +1263,7 @@ async function renderServices() {
          +  '</div>'
          +  '<div class="svc-body">'
          +    facts
+         +    memberList
          +    '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
          +    '<div class="svc-stats" data-host="' + esc(s.host) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>'
          +  '</div>'
@@ -1509,6 +1538,30 @@ async function scaleSvc(name, n) {
   try {
     await api('/api/services/' + encodeURIComponent(name) + '/scale', { method:'POST', body: JSON.stringify({replicas: n}) });
     toast('scaled ' + name + ' → ' + n);
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// lifecycleSvc / lifecycleReplica — stop/start all-of-service or a single
+// replica. Containers retain config; "start" just brings the same container
+// back. First stop of a labeled-but-not-onboarded service auto-promotes it
+// to onboarded so it picks up Stage/Promote/Replace/Rollback.
+async function lifecycleSvc(name, act) {
+  if (act === 'stop') {
+    if (!(await confirmDialog('Stop all replicas of ' + name + '? They retain config and can be restarted instantly.', {title: 'Stop service'}))) return;
+  }
+  try {
+    await api('/api/services/' + encodeURIComponent(name) + '/' + act, { method:'POST' });
+    toast(act === 'stop' ? 'stopped ' + name : 'started ' + name, 'ok');
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function lifecycleReplica(svc, member, act) {
+  try {
+    await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/' + act, { method:'POST' });
+    toast(act === 'stop' ? 'stopped ' + member : 'started ' + member, 'ok');
+    _lastServicesHash = '';
     renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }

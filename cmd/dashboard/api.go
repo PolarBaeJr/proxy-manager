@@ -554,6 +554,92 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "discarded"})
 			return
 		}
+		// ---- Stop / Start (per-service or per-replica) ----
+		// Stopping retains all container config — `docker start` brings it
+		// back instantly. First stop of a labeled-but-not-onboarded service
+		// also snapshots it into the onboarded store so the full lifecycle
+		// (stage/promote/replace/rollback) becomes available.
+		if len(parts) == 2 && (parts[1] == "stop" || parts[1] == "start") && req.Method == "POST" {
+			svc, ok, err := findService(req.Context(), dc, name)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if !ok {
+				http.Error(w, "service not found", http.StatusNotFound)
+				return
+			}
+			if !svc.Onboarded {
+				if err := promoteToOnboarded(req.Context(), dc, onb, svc); err != nil {
+					httpx.WriteErr(w, err)
+					return
+				}
+				audit(req, sessionUser(info), "service.auto_onboard", name)
+			}
+			act := parts[1]
+			if act == "stop" {
+				if err := stopServiceMembers(req.Context(), dc, svc); err != nil {
+					httpx.WriteErr(w, err)
+					return
+				}
+			} else {
+				if err := startServiceMembers(req.Context(), dc, svc); err != nil {
+					httpx.WriteErr(w, err)
+					return
+				}
+			}
+			proxyRefresh(proxyURLFromEnv())
+			audit(req, sessionUser(info), "service."+act, name)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": act + "ped"})
+			return
+		}
+		if len(parts) == 2 && strings.HasPrefix(parts[1], "replicas/") && req.Method == "POST" {
+			sub := strings.TrimPrefix(parts[1], "replicas/")
+			memberParts := strings.SplitN(sub, "/", 2)
+			if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start") {
+				http.NotFound(w, req)
+				return
+			}
+			member, act := memberParts[0], memberParts[1]
+			svc, ok, err := findService(req.Context(), dc, name)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if !ok {
+				http.Error(w, "service not found", http.StatusNotFound)
+				return
+			}
+			if !svc.Onboarded {
+				if err := promoteToOnboarded(req.Context(), dc, onb, svc); err != nil {
+					httpx.WriteErr(w, err)
+					return
+				}
+				audit(req, sessionUser(info), "service.auto_onboard", name)
+			}
+			id, found, err := findMemberByName(req.Context(), dc, name, member)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if !found {
+				http.Error(w, "replica not found", http.StatusNotFound)
+				return
+			}
+			if act == "stop" {
+				err = dc.stopContainer(req.Context(), id)
+			} else {
+				err = dc.startContainer(req.Context(), id)
+			}
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			proxyRefresh(proxyURLFromEnv())
+			audit(req, sessionUser(info), "service.replica_"+act, name+"/"+member)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": act + "ped", "member": member})
+			return
+		}
 		if req.Method == "DELETE" {
 			// Onboarded services: tear down the clones + route, leave the
 			// original container alone (the user started it).
