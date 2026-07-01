@@ -116,6 +116,85 @@ func (m *Metrics) Snapshot() map[string]any {
 	}
 }
 
+// metricsState is the on-disk snapshot of the counters that survive restarts
+// (see persist.go). The latency ring is included so percentiles don't reset
+// to zero on every deploy.
+type metricsState struct {
+	Version      int                       `json:"version"`
+	SavedAt      time.Time                 `json:"saved_at"`
+	Total        uint64                    `json:"total"`
+	BytesOut     uint64                    `json:"bytes_out"`
+	ByHost       map[string]uint64         `json:"by_host"`
+	ByStatus     map[int]uint64            `json:"by_status"`
+	ByMethod     map[string]uint64         `json:"by_method"`
+	ByHostStatus map[string]map[int]uint64 `json:"by_host_status"`
+	LatencyMs    []float64                 `json:"latency_ms"`
+	LatencyHead  int                       `json:"latency_head"`
+}
+
+const metricsStateVersion = 1
+
+// exportState deep-copies the counters into a serializable snapshot. No
+// marshalling or I/O happens under the mutex — callers do that outside.
+func (m *Metrics) exportState() metricsState {
+	st := metricsState{
+		Version:  metricsStateVersion,
+		SavedAt:  time.Now().UTC(),
+		Total:    m.Total.Load(),
+		BytesOut: m.BytesOut.Load(),
+	}
+	m.mu.Lock()
+	st.ByHost = copyMap(m.byHost)
+	st.ByStatus = make(map[int]uint64, len(m.byStatus))
+	for k, v := range m.byStatus {
+		st.ByStatus[k] = v
+	}
+	st.ByMethod = copyMapStr(m.byMethod)
+	st.ByHostStatus = make(map[string]map[int]uint64, len(m.byHostStatus))
+	for h, statuses := range m.byHostStatus {
+		inner := make(map[int]uint64, len(statuses))
+		for s, c := range statuses {
+			inner[s] = c
+		}
+		st.ByHostStatus[h] = inner
+	}
+	st.LatencyMs = append([]float64(nil), m.latencyMs...)
+	st.LatencyHead = m.latencyHead
+	m.mu.Unlock()
+	return st
+}
+
+// restoreState installs a previously-saved snapshot. StartedAt is deliberately
+// NOT restored: "total" now spans restarts while uptime_seconds stays
+// per-process, so total can legitimately exceed what the uptime implies.
+func (m *Metrics) restoreState(st metricsState) {
+	m.Total.Store(st.Total)
+	m.BytesOut.Store(st.BytesOut)
+	m.mu.Lock()
+	if st.ByHost != nil {
+		m.byHost = st.ByHost
+	}
+	if st.ByStatus != nil {
+		m.byStatus = st.ByStatus
+	}
+	if st.ByMethod != nil {
+		m.byMethod = st.ByMethod
+	}
+	if st.ByHostStatus != nil {
+		m.byHostStatus = st.ByHostStatus
+	}
+	if st.LatencyMs != nil {
+		if len(st.LatencyMs) > latencyWindow {
+			st.LatencyMs = st.LatencyMs[:latencyWindow]
+		}
+		m.latencyMs = st.LatencyMs
+		if st.LatencyHead >= 0 && st.LatencyHead < len(st.LatencyMs) {
+			m.latencyHead = st.LatencyHead
+		}
+	}
+	m.mu.Unlock()
+}
+
 func copyMap(in map[string]uint64) map[string]uint64 {
 	out := make(map[string]uint64, len(in))
 	for k, v := range in {

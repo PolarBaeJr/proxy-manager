@@ -99,6 +99,76 @@ func (s *Store) Record(name, url string, data map[string]any, err error) {
 	s.series[name] = keep
 }
 
+// storeState is the persisted subset of the store: per-target identity +
+// reachability plus the numeric time-series points. Sample.Data (the full
+// /metrics payload) is deliberately stripped from every persisted sample —
+// Record keeps Data on each point in memory, and persisting it would bloat
+// the file massively. Latest/FailCount/Health are also not persisted; they
+// are recomputed within one scrape interval (~5s) after startup.
+type storeState struct {
+	Version int               `json:"version"`
+	SavedAt time.Time         `json:"saved_at"`
+	Targets []persistedTarget `json:"targets"`
+}
+
+type persistedTarget struct {
+	Name        string            `json:"name"`
+	URL         string            `json:"url"`
+	EverReached bool              `json:"ever_reached"`
+	LastOK      time.Time         `json:"last_ok"`
+	Series      []persistedSample `json:"series"`
+}
+
+type persistedSample struct {
+	At    time.Time `json:"at"`
+	OK    bool      `json:"ok"`
+	Err   string    `json:"err,omitempty"`
+	Total uint64    `json:"total"`
+	Delta uint64    `json:"delta"`
+}
+
+const storeStateVersion = 1
+
+// exportState copies the persistable state out under the read lock. The
+// caller marshals and writes outside the lock.
+func (s *Store) exportState() storeState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st := storeState{Version: storeStateVersion, SavedAt: time.Now().UTC()}
+	for name, t := range s.state {
+		pt := persistedTarget{Name: t.Name, URL: t.URL, EverReached: t.EverReached, LastOK: t.LastOK}
+		for _, p := range s.series[name] {
+			pt.Series = append(pt.Series, persistedSample{At: p.At, OK: p.OK, Err: p.Err, Total: p.Total, Delta: p.Delta})
+		}
+		st.Targets = append(st.Targets, pt)
+	}
+	return st
+}
+
+// restoreState installs a saved snapshot, evicting points that fell out of
+// the retention window while the monitor was down.
+func (s *Store) restoreState(st storeState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().Add(-s.window)
+	for _, pt := range st.Targets {
+		s.state[pt.Name] = &TargetState{
+			Name:        pt.Name,
+			URL:         pt.URL,
+			EverReached: pt.EverReached,
+			LastOK:      pt.LastOK,
+		}
+		var series []*Sample
+		for _, p := range pt.Series {
+			if !p.At.After(cutoff) {
+				continue
+			}
+			series = append(series, &Sample{At: p.At, OK: p.OK, Err: p.Err, Total: p.Total, Delta: p.Delta})
+		}
+		s.series[pt.Name] = series
+	}
+}
+
 func classify(st *TargetState) string {
 	// "absent" — we've been told to scrape this target but never reached it.
 	// Treated separately from "down" so we don't flag the stack degraded

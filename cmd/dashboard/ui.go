@@ -655,6 +655,33 @@ async function api(path, opts={}) {
   return r.status === 204 ? null : r.json();
 }
 
+/* ---------- Server-synced UI preferences (pmgr-* keys) ---------- */
+// localStorage stays the fast synchronous source of truth; the server copy
+// just lets prefs follow the user across browsers. Values are raw strings —
+// call sites keep their own JSON.parse/stringify.
+let prefsSynced = false;
+function loadPref(key, def) {
+  return localStorage.getItem(key) ?? def;
+}
+function savePref(key, val) {
+  localStorage.setItem(key, val);
+  // Deliberately NOT api(): its 401 handling would pop auth dialogs on
+  // background writes. A failed sync just means the pref stays local-only.
+  fetch('/api/prefs', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[key]: val}),
+  }).catch(() => {});
+}
+async function syncPrefs() {
+  try {
+    const d = await api('/api/prefs');
+    for (const k of Object.keys(d || {})) {
+      if (k.startsWith('pmgr-')) localStorage.setItem(k, d[k]); // server wins
+    }
+  } catch {}
+}
+
 /* ---------- Native-style in-app confirm / prompt (replace window.confirm/prompt) ---------- */
 // Both return promises and use the existing dialog styling, so the dashboard
 // never falls back to the OS's grey 1990s alert chrome.
@@ -717,6 +744,10 @@ function renderAuthOrMain() {
   $('#auth-screen').hidden = true;
   $('#main-screen').hidden = false;
   renderHeader();
+  if (!prefsSynced) {
+    prefsSynced = true;
+    syncPrefs().then(() => renderActive());
+  }
   renderActive();
 }
 function showAuth(html) {
@@ -932,6 +963,7 @@ function wirePendingConfirm(kind, username) {
 }
 
 async function logout() {
+  prefsSynced = false;
   await fetch('/api/auth/logout', { method:'POST' });
   await refreshAuth();
 }
@@ -1035,7 +1067,7 @@ async function renderActive() {
 // the next .subhead. State persists in localStorage so a section you closed
 // stays closed across reloads and across the 5s auto-refresh.
 function wireCollapsibleSections() {
-  const state = JSON.parse(localStorage.getItem('pmgr-collapsed') || '{}');
+  const state = JSON.parse(loadPref('pmgr-collapsed', '{}'));
   document.querySelectorAll('.subhead').forEach(head => {
     // Stable key independent of dynamic counts ("11 active routes" → "active routes").
     const key = head.textContent.replace(/\d+/g, '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 40);
@@ -1051,9 +1083,9 @@ function wireCollapsibleSections() {
         n.style.display = willCollapse ? 'none' : '';
         n = n.nextElementSibling;
       }
-      const s = JSON.parse(localStorage.getItem('pmgr-collapsed') || '{}');
+      const s = JSON.parse(loadPref('pmgr-collapsed', '{}'));
       if (willCollapse) s[key] = 1; else delete s[key];
-      localStorage.setItem('pmgr-collapsed', JSON.stringify(s));
+      savePref('pmgr-collapsed', JSON.stringify(s));
     };
     // Restore from persisted state.
     if (state[key]) {
@@ -1278,7 +1310,7 @@ async function renderServices() {
     // Per-card collapse: clicking the svc-head folds facts + actionzone to a
     // one-line summary. Persisted in localStorage keyed by service name.
     const collapsedKey = 'pmgr-svc-collapsed';
-    const collapsedState = JSON.parse(localStorage.getItem(collapsedKey) || '{}');
+    const collapsedState = JSON.parse(loadPref(collapsedKey, '{}'));
     const isCollapsed = !!collapsedState[s.name];
     const replicaSummary = '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
       + '<span class="ident dim">' + esc(s.host) + '</span>'
@@ -1438,9 +1470,9 @@ function toggleServiceCard(name) {
   if (!card) return;
   const willCollapse = !card.classList.contains('collapsed');
   card.classList.toggle('collapsed', willCollapse);
-  const s = JSON.parse(localStorage.getItem('pmgr-svc-collapsed') || '{}');
+  const s = JSON.parse(loadPref('pmgr-svc-collapsed', '{}'));
   if (willCollapse) s[name] = 1; else delete s[name];
-  localStorage.setItem('pmgr-svc-collapsed', JSON.stringify(s));
+  savePref('pmgr-svc-collapsed', JSON.stringify(s));
   // Just expanded — refresh its stats panel without waiting for the 5s tick.
   if (!willCollapse) fillServiceStatsPanels().catch(() => {});
 }
@@ -2308,23 +2340,21 @@ function openTarget(n) { statsDetail = n; renderActive(); }
 function closeTarget() { statsDetail = null; renderActive(); }
 function toggleTopHostsFilter(id) {
   let cur;
-  try { cur = JSON.parse(localStorage.getItem('pmgr-topHosts-filters') || '["running"]'); }
+  try { cur = JSON.parse(loadPref('pmgr-topHosts-filters', '["running"]')); }
   catch { cur = ['running']; }
   if (!Array.isArray(cur)) cur = ['running'];
   const s = new Set(cur);
   if (s.has(id)) s.delete(id); else s.add(id);
-  // Force at least one state chip on so the table can't go empty by accident.
-  if (!s.has('running') && !s.has('stopped')) s.add(id === 'running' ? 'stopped' : 'running');
-  localStorage.setItem('pmgr-topHosts-filters', JSON.stringify([...s]));
+  savePref('pmgr-topHosts-filters', JSON.stringify([...s]));
   renderActive();
 }
 function setTopHostsSort(k) {
-  const cur = localStorage.getItem('pmgr-topHosts-sort') || 'req';
-  const dir = localStorage.getItem('pmgr-topHosts-dir') || 'desc';
+  const cur = loadPref('pmgr-topHosts-sort', 'req');
+  const dir = loadPref('pmgr-topHosts-dir', 'desc');
   // Click same column: flip direction. Click new column: pick a sensible default.
   const nextDir = (cur === k) ? (dir === 'desc' ? 'asc' : 'desc') : (k === 'host' ? 'asc' : 'desc');
-  localStorage.setItem('pmgr-topHosts-sort', k);
-  localStorage.setItem('pmgr-topHosts-dir', nextDir);
+  savePref('pmgr-topHosts-sort', k);
+  savePref('pmgr-topHosts-dir', nextDir);
   renderActive();
 }
 function degradedColor(h) { return h === 'down' ? 'var(--red)' : h === 'flaky' ? 'var(--yellow)' : 'var(--accent)'; }
@@ -2393,32 +2423,30 @@ async function renderStatsDetail(name) {
 
   // ---- Top hosts: multi-select filter chips + sortable columns ----
   // Two axes that intersect:
-  //   Class axis   → Running / Stopped / Unrouted select which host classes
-  //                  are shown (union; at least one of running/stopped is
-  //                  always on)
+  //   Class axis   → Running / Stopped / Unrouted. Each host belongs to
+  //                  exactly one class; if any class chip is on, the host's
+  //                  class must be among the selected ones (union). With no
+  //                  class chips on, every class passes.
   //   Modifier     → Errored — filters to hosts with errors on top
   // e.g. Running + Errored = "running services currently erroring."
+  // An empty selection shows everything.
   // Sort keys      → req (default) | err | host, per-key direction persisted.
   let filters;
   try {
-    filters = JSON.parse(localStorage.getItem('pmgr-topHosts-filters') || '["running"]');
-    if (!Array.isArray(filters) || !filters.length) filters = ['running'];
+    filters = JSON.parse(loadPref('pmgr-topHosts-filters', '["running"]'));
+    if (!Array.isArray(filters)) filters = ['running'];
   } catch { filters = ['running']; }
   const on = new Set(filters);
-  // Guarantee at least one state chip so nothing gets accidentally hidden.
-  if (!on.has('running') && !on.has('stopped')) { on.add('running'); }
-  const sortKey = localStorage.getItem('pmgr-topHosts-sort') || 'req';
-  const sortDir = localStorage.getItem('pmgr-topHosts-dir') || 'desc';
+  const sortKey = loadPref('pmgr-topHosts-sort', 'req');
+  const sortDir = loadPref('pmgr-topHosts-dir', 'desc');
 
   const filteredHosts = (hosts || []).filter(h => {
-    const isUnrouted = h.host === '(unrouted)';
-    const isStopped  = stoppedHosts.has(h.host);
-    const hasErr     = (+h.error_pct || 0) > 0;
-    const stateOK    = (on.has('running') && !isStopped && !isUnrouted)
-                    || (on.has('stopped') && isStopped)
-                    || (on.has('unrouted') && isUnrouted);
-    if (!stateOK) return false;
-    if (on.has('errored') && !hasErr) return false;
+    const cls = h.host === '(unrouted)' ? 'unrouted'
+      : stoppedHosts.has(h.host) ? 'stopped'
+      : 'running';
+    const anyClassOn = on.has('running') || on.has('stopped') || on.has('unrouted');
+    if (anyClassOn && !on.has(cls)) return false;
+    if (on.has('errored') && !((+h.error_pct || 0) > 0)) return false;
     return true;
   });
   const sorted = filteredHosts.slice().sort((a, b) => {

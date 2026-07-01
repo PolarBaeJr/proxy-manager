@@ -12,6 +12,8 @@ import (
 )
 
 // AccessLog keeps the last N request records in a lock-free-ish ring buffer.
+// Deliberately RAM-only — unlike the counters in metrics.go, the ring is not
+// persisted across restarts (recent-requests debugging data, not history).
 // Writes are mu-protected; reads copy out the live window. Memory cap is
 // ~ringSize × ~200B → a few hundred KB, fine for our scale.
 const ringSize = 2000

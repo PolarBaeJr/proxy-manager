@@ -9,11 +9,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
@@ -27,6 +32,8 @@ func main() {
 	probeTargets := flag.String("tls-probe-targets", "", "comma-separated TLS probe targets (sni[@host:port]); empty disables cert probing")
 	probeInterval := flag.Duration("tls-probe-interval", 15*time.Minute, "TLS probe interval")
 	probeDial := flag.String("tls-probe-default-dial", "host.docker.internal:443", "default dial target for probe entries without @host:port")
+	statePath := flag.String("state", "/data/monitor-state.json", "store persistence file")
+	stateInterval := flag.Duration("state-interval", 60*time.Second, "how often to snapshot the store to -state")
 	flag.Parse()
 
 	targets := parseTargets(*targetsFlag)
@@ -38,6 +45,15 @@ func main() {
 	defer cancel()
 
 	store := NewStore(*window, *interval)
+	// Restore BEFORE the scraper starts so the first Record() already has the
+	// prior series to compute deltas against.
+	if st, ok := loadStoreState(*statePath); ok {
+		store.restoreState(st)
+		log.Printf("restored monitor state from %s (%d target(s), saved %s)",
+			*statePath, len(st.Targets), st.SavedAt.Format(time.RFC3339))
+	}
+	go persistLoop(ctx, *statePath, *stateInterval, store)
+	saveOnShutdown(*statePath, store)
 	scraper := NewScraper(targets, *interval, store)
 	go scraper.Run(ctx)
 
@@ -142,5 +158,75 @@ func parseTargets(s string) map[string]string {
 		out[pair[:eq]] = pair[eq+1:]
 	}
 	return out
+}
+
+// ---- store persistence: periodic JSON snapshots, best-effort ----
+// Same pattern as the proxy's persist.go — the ~30 duplicated lines per
+// binary are deliberate, the binaries don't share packages.
+
+func loadStoreState(path string) (storeState, bool) {
+	var st storeState
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("monitor state: read %s: %v", path, err)
+		}
+		return storeState{}, false
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		log.Printf("monitor state: parse %s: %v (starting fresh)", path, err)
+		return storeState{}, false
+	}
+	if st.Version != storeStateVersion {
+		log.Printf("monitor state: %s has version %d, want %d (starting fresh)", path, st.Version, storeStateVersion)
+		return storeState{}, false
+	}
+	return st, true
+}
+
+func saveStoreState(path string, s *Store) error {
+	st := s.exportState()
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	// Write to a sibling temp file, then rename — a same-directory rename is
+	// atomic, so readers never see a half-written file.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func persistLoop(ctx context.Context, path string, interval time.Duration, s *Store) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := saveStoreState(path, s); err != nil {
+				log.Printf("monitor state: save: %v", err)
+			}
+		}
+	}
+}
+
+// saveOnShutdown flushes one final snapshot on SIGTERM/interrupt, then exits.
+func saveOnShutdown(path string, s *Store) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
+	go func() {
+		<-ch
+		if err := saveStoreState(path, s); err != nil {
+			log.Printf("monitor state: shutdown save: %v", err)
+		}
+		os.Exit(0)
+	}()
 }
 

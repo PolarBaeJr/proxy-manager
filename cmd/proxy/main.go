@@ -15,13 +15,23 @@ func main() {
 	addr := flag.String("addr", ":8092", "proxy listen address")
 	metricsAddr := flag.String("metrics-addr", ":8094", "internal metrics endpoint listen address")
 	staticConfig := flag.String("config", "/etc/proxy/routes.json", "static routes JSON (ignored if missing)")
+	statePath := flag.String("state", "/data/metrics.json", "metrics persistence file")
+	stateInterval := flag.Duration("state-interval", 30*time.Second, "how often to snapshot metrics to -state")
 	flag.Parse()
 
 	metrics := NewMetrics()
+	if st, ok := loadMetricsState(*statePath); ok {
+		metrics.restoreState(st)
+		log.Printf("restored metrics state from %s (total=%d, %d host(s), saved %s)",
+			*statePath, st.Total, len(st.ByHost), st.SavedAt.Format(time.RFC3339))
+	}
 	access := NewAccessLog()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	go persistLoop(ctx, *statePath, *stateInterval, metrics)
+	saveOnShutdown(*statePath, metrics)
 
 	dc := newDockerClient()
 	router := &Router{}
