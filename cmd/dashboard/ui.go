@@ -268,6 +268,15 @@ details.errd[open] summary{color:#ff7173}
 .hostrow .ep{text-align:right;font-variant-numeric:tabular-nums;font-size:11.5px}
 .hostrow .ep.bad{color:var(--red)} .hostrow .ep.ok{color:var(--muted-2)}
 @media(max-width:680px){.hostrow{grid-template-columns:110px 1fr 50px}.hostrow .ep{display:none}}
+.chip-row{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}
+.chip{background:var(--surface-2);color:var(--muted);border:1px solid var(--border-2);border-radius:var(--radius-pill);padding:4px 10px;font-size:11.5px;cursor:pointer;transition:background .12s,color .12s,border-color .12s}
+.chip:hover{color:var(--text);border-color:var(--border)}
+.chip.active{background:var(--accent);color:#0a0e14;border-color:var(--accent);font-weight:500}
+.chip.active .meta{color:#0a0e14;opacity:.7}
+.th-row{color:var(--muted);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px}
+.th{background:transparent;border:0;color:inherit;font:inherit;text-transform:inherit;letter-spacing:inherit;padding:0;cursor:pointer;text-align:left}
+.th:hover{color:var(--text)}
+.th.active{color:var(--text)}
 
 /* replica control */
 .replica-ctrl{display:inline-flex;align-items:center;gap:0;border:1px solid var(--border-2);border-radius:var(--radius-sm);overflow:hidden;background:var(--surface-2)}
@@ -2297,8 +2306,17 @@ async function renderStats() {
 }
 function openTarget(n) { statsDetail = n; renderActive(); }
 function closeTarget() { statsDetail = null; renderActive(); }
-function toggleTopHostsStopped(v) {
-  localStorage.setItem('pmgr-topHosts-showStopped', v ? '1' : '0');
+function setTopHostsFilter(v) {
+  localStorage.setItem('pmgr-topHosts-filter', v);
+  renderActive();
+}
+function setTopHostsSort(k) {
+  const cur = localStorage.getItem('pmgr-topHosts-sort') || 'req';
+  const dir = localStorage.getItem('pmgr-topHosts-dir') || 'desc';
+  // Click same column: flip direction. Click new column: pick a sensible default.
+  const nextDir = (cur === k) ? (dir === 'desc' ? 'asc' : 'desc') : (k === 'host' ? 'asc' : 'desc');
+  localStorage.setItem('pmgr-topHosts-sort', k);
+  localStorage.setItem('pmgr-topHosts-dir', nextDir);
   renderActive();
 }
 function degradedColor(h) { return h === 'down' ? 'var(--red)' : h === 'flaky' ? 'var(--yellow)' : 'var(--accent)'; }
@@ -2318,11 +2336,10 @@ async function renderStatsDetail(name) {
                  + emptyState(I.activity, 'Target unavailable', 'The monitor could not return details for "' + name + '". It may have just gone away.');
     return;
   }
-  // Cross-reference the services list so the Top hosts widget can hide
-  // hosts whose service is fully stopped — those 503s are honest metrics
-  // but not what the operator wants dominating the error KPI.
+  // Cross-reference the services list so Top hosts can filter by whether
+  // a host's backing service is currently up. Metrics themselves are the
+  // raw truth; the UI just lets the operator choose which slice to see.
   const stoppedHosts = new Set((svcs || []).filter(s => s.all_stopped).map(s => s.host));
-  const showStopped = localStorage.getItem('pmgr-topHosts-showStopped') === '1';
   const m       = t.metrics || {};
   const rate1   = +(t.rate_per_sec_1m || 0);
   const rate5   = +(t.rate_per_sec_5m || 0);
@@ -2366,12 +2383,54 @@ async function renderStatsDetail(name) {
     +   '<table><tbody>' + methodRows + '</tbody></table>'
     + '</div></div>';
 
+  // ---- Top hosts: filter + sort controls, persisted in localStorage ----
+  // Filter modes: all | running | stopped | errored (only rows with errors)
+  // Sort keys : req (default) | err | host  — direction persisted per-key.
+  const filter = localStorage.getItem('pmgr-topHosts-filter') || 'running';
+  const sortKey = localStorage.getItem('pmgr-topHosts-sort') || 'req';
+  const sortDir = localStorage.getItem('pmgr-topHosts-dir') || 'desc';
+
+  const filteredHosts = (hosts || []).filter(h => {
+    const isStopped = stoppedHosts.has(h.host);
+    const hasErr = (+h.error_pct || 0) > 0;
+    if (filter === 'running') return !isStopped;
+    if (filter === 'stopped') return isStopped;
+    if (filter === 'errored') return hasErr;
+    return true; // 'all'
+  });
+  const sorted = filteredHosts.slice().sort((a, b) => {
+    let av, bv;
+    if (sortKey === 'req')      { av = +a.total || 0;      bv = +b.total || 0; }
+    else if (sortKey === 'err') { av = +a.error_pct || 0;  bv = +b.error_pct || 0; }
+    else                        { return (a.host || '').localeCompare(b.host || '') * (sortDir === 'asc' ? 1 : -1); }
+    return (av - bv) * (sortDir === 'asc' ? 1 : -1);
+  });
+
+  const chip = (id, label, count) => {
+    const active = filter === id ? ' active' : '';
+    const badge = count != null ? ' <span class="meta" style="margin-left:4px">' + count + '</span>' : '';
+    return '<button class="chip' + active + '" onclick="setTopHostsFilter(\'' + id + '\')">' + label + badge + '</button>';
+  };
+  const runningCount = (hosts || []).filter(h => !stoppedHosts.has(h.host)).length;
+  const stoppedCount = (hosts || []).filter(h => stoppedHosts.has(h.host)).length;
+  const erroredCount = (hosts || []).filter(h => (+h.error_pct || 0) > 0).length;
+  const chipRow = '<div class="chip-row">'
+    + chip('all',     'All',      (hosts || []).length)
+    + chip('running', 'Running',  runningCount)
+    + chip('stopped', 'Stopped',  stoppedCount)
+    + chip('errored', 'Errored',  erroredCount)
+    + '</div>';
+
+  const arrow = (k) => sortKey === k ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+  const th = (k, label, extraCls) => '<button class="th' + (sortKey === k ? ' active' : '') + '"'
+    + ' onclick="setTopHostsSort(\'' + k + '\')"'
+    + (extraCls ? ' style="' + extraCls + '"' : '') + '>'
+    + label + arrow(k) + '</button>';
+
   let topHostsHtml;
-  const visibleHosts = showStopped ? hosts : (hosts || []).filter(h => !stoppedHosts.has(h.host));
-  const hiddenCount = (hosts || []).length - (visibleHosts || []).length;
-  if (visibleHosts && visibleHosts.length) {
-    const max = visibleHosts.reduce((a, h) => Math.max(a, +h.total || 0), 0) || 1;
-    const rows = visibleHosts.slice(0, 10).map(h => {
+  if (sorted.length) {
+    const max = sorted.reduce((a, h) => Math.max(a, +h.total || 0), 0) || 1;
+    const rows = sorted.slice(0, 20).map(h => {
       const tot = +h.total || 0;
       const ep  = +h.error_pct || 0;
       const w   = Math.max(3, tot / max * 100);
@@ -2383,18 +2442,20 @@ async function renderStatsDetail(name) {
            + '<span class="rq">' + fmt(tot) + '</span>'
            + '<span class="ep ' + epCls + '">' + epTxt + '</span></div>';
     }).join('');
-    const toggle = (hiddenCount > 0 || showStopped)
-      ? '<label class="meta" style="cursor:pointer;user-select:none">'
-        + '<input type="checkbox" ' + (showStopped ? 'checked' : '') + ' onchange="toggleTopHostsStopped(this.checked)" style="vertical-align:middle;margin-right:4px">'
-        + 'show ' + (hiddenCount > 0 ? hiddenCount + ' stopped' : 'stopped') + '</label>'
-      : '';
     topHostsHtml = '<div class="card"><div class="card-head"><div class="ttl">' + I.globe + 'Top hosts</div>'
-                 + '<div class="spacer"></div>' + toggle + '<div class="meta" style="margin-left:12px">by request volume</div></div>'
-                 + '<div class="hostrow" style="color:var(--muted);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px">'
-                 +   '<span>Host</span><span></span><span class="rq">Req</span><span class="ep">Err</span></div>'
+                 + '<div class="spacer"></div><div class="meta">' + sorted.length + ' of ' + (hosts || []).length + '</div></div>'
+                 + chipRow
+                 + '<div class="hostrow th-row">'
+                 +   th('host', 'Host')
+                 +   '<span></span>'
+                 +   th('req',  'Req', 'text-align:right')
+                 +   th('err',  'Err', 'text-align:right')
+                 + '</div>'
                  + '<div class="hostbar">' + rows + '</div></div>';
   } else {
-    topHostsHtml = '';
+    topHostsHtml = '<div class="card"><div class="card-head"><div class="ttl">' + I.globe + 'Top hosts</div><div class="spacer"></div></div>'
+                 + chipRow
+                 + '<p class="empty" style="margin:14px 0 4px">No hosts match this filter.</p></div>';
   }
 
   el.innerHTML = '<button class="linkbtn" style="margin-bottom:14px" onclick="closeTarget()">' + I.rewind + 'Back to targets</button>'
