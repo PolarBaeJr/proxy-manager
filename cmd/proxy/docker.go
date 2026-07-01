@@ -94,47 +94,6 @@ func (c *dockerClient) listEnabledContainers(ctx context.Context) ([]dockerConta
 	return out, json.NewDecoder(body).Decode(&out)
 }
 
-// exitInfo is the subset of /containers/{id}/json we need to distinguish a
-// user-initiated stop from a crash. Docker's list endpoint doesn't return
-// exit code / OOMKilled, so this is one inspect call per exited container.
-type exitInfo struct {
-	Code      int
-	OOMKilled bool
-}
-
-// looksLikeStop returns true when the container's exit conditions match a
-// clean shutdown: exit 0 (self-exit), 143 (SIGTERM handled), or 137 without
-// OOMKilled (SIGKILL after `docker stop` timeout). Anything else — non-zero
-// custom codes, OOM kills, segfaults — is treated as a crash.
-func (e exitInfo) looksLikeStop() bool {
-	if e.OOMKilled {
-		return false
-	}
-	switch e.Code {
-	case 0, 137, 143:
-		return true
-	default:
-		return false
-	}
-}
-
-func (c *dockerClient) inspectExit(ctx context.Context, id string) (exitInfo, error) {
-	body, err := c.get(ctx, "/containers/"+url.PathEscape(id)+"/json")
-	if err != nil {
-		return exitInfo{}, err
-	}
-	defer body.Close()
-	var full struct {
-		State struct {
-			ExitCode  int  `json:"ExitCode"`
-			OOMKilled bool `json:"OOMKilled"`
-		} `json:"State"`
-	}
-	if err := json.NewDecoder(body).Decode(&full); err != nil {
-		return exitInfo{}, err
-	}
-	return exitInfo{Code: full.State.ExitCode, OOMKilled: full.State.OOMKilled}, nil
-}
 
 type dockerEvent struct {
 	Type   string `json:"Type"`

@@ -2297,22 +2297,32 @@ async function renderStats() {
 }
 function openTarget(n) { statsDetail = n; renderActive(); }
 function closeTarget() { statsDetail = null; renderActive(); }
+function toggleTopHostsStopped(v) {
+  localStorage.setItem('pmgr-topHosts-showStopped', v ? '1' : '0');
+  renderActive();
+}
 function degradedColor(h) { return h === 'down' ? 'var(--red)' : h === 'flaky' ? 'var(--yellow)' : 'var(--accent)'; }
 
 async function renderStatsDetail(name) {
   const el = $('#tab-stats');
-  let t, hosts, series;
+  let t, hosts, series, svcs;
   try {
-    [t, hosts, series] = await Promise.all([
+    [t, hosts, series, svcs] = await Promise.all([
       api('/api/monitor/target/' + encodeURIComponent(name)),
       api('/api/monitor/target/' + encodeURIComponent(name) + '/hosts').catch(() => []),
       api('/api/monitor/series?target=' + encodeURIComponent(name) + '&field=delta').catch(() => []),
+      api('/api/services').catch(() => []),
     ]);
   } catch (e) {
     el.innerHTML = '<button class="linkbtn" style="margin-bottom:14px" onclick="closeTarget()">' + I.rewind + 'Back to targets</button>'
                  + emptyState(I.activity, 'Target unavailable', 'The monitor could not return details for "' + name + '". It may have just gone away.');
     return;
   }
+  // Cross-reference the services list so the Top hosts widget can hide
+  // hosts whose service is fully stopped — those 503s are honest metrics
+  // but not what the operator wants dominating the error KPI.
+  const stoppedHosts = new Set((svcs || []).filter(s => s.all_stopped).map(s => s.host));
+  const showStopped = localStorage.getItem('pmgr-topHosts-showStopped') === '1';
   const m       = t.metrics || {};
   const rate1   = +(t.rate_per_sec_1m || 0);
   const rate5   = +(t.rate_per_sec_5m || 0);
@@ -2357,21 +2367,29 @@ async function renderStatsDetail(name) {
     + '</div></div>';
 
   let topHostsHtml;
-  if (hosts && hosts.length) {
-    const max = hosts.reduce((a, h) => Math.max(a, +h.total || 0), 0) || 1;
-    const rows = hosts.slice(0, 10).map(h => {
+  const visibleHosts = showStopped ? hosts : (hosts || []).filter(h => !stoppedHosts.has(h.host));
+  const hiddenCount = (hosts || []).length - (visibleHosts || []).length;
+  if (visibleHosts && visibleHosts.length) {
+    const max = visibleHosts.reduce((a, h) => Math.max(a, +h.total || 0), 0) || 1;
+    const rows = visibleHosts.slice(0, 10).map(h => {
       const tot = +h.total || 0;
       const ep  = +h.error_pct || 0;
       const w   = Math.max(3, tot / max * 100);
       const epCls = ep > 0 ? 'bad' : 'ok';
       const epTxt = ep > 0 ? ep.toFixed(1) + '%' : '—';
-      return '<div class="hostrow"><span class="nm" title="' + esc(h.host) + '">' + esc(h.host) + '</span>'
+      const stoppedTag = stoppedHosts.has(h.host) ? ' <span class="pill muted" style="font-size:10px">stopped</span>' : '';
+      return '<div class="hostrow"><span class="nm" title="' + esc(h.host) + '">' + esc(h.host) + stoppedTag + '</span>'
            + '<div class="track"><i style="width:' + w + '%"></i></div>'
            + '<span class="rq">' + fmt(tot) + '</span>'
            + '<span class="ep ' + epCls + '">' + epTxt + '</span></div>';
     }).join('');
+    const toggle = (hiddenCount > 0 || showStopped)
+      ? '<label class="meta" style="cursor:pointer;user-select:none">'
+        + '<input type="checkbox" ' + (showStopped ? 'checked' : '') + ' onchange="toggleTopHostsStopped(this.checked)" style="vertical-align:middle;margin-right:4px">'
+        + 'show ' + (hiddenCount > 0 ? hiddenCount + ' stopped' : 'stopped') + '</label>'
+      : '';
     topHostsHtml = '<div class="card"><div class="card-head"><div class="ttl">' + I.globe + 'Top hosts</div>'
-                 + '<div class="spacer"></div><div class="meta">by request volume</div></div>'
+                 + '<div class="spacer"></div>' + toggle + '<div class="meta" style="margin-left:12px">by request volume</div></div>'
                  + '<div class="hostrow" style="color:var(--muted);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px">'
                  +   '<span>Host</span><span></span><span class="rq">Req</span><span class="ep">Err</span></div>'
                  + '<div class="hostbar">' + rows + '</div></div>';
