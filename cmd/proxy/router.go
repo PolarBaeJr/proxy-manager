@@ -282,12 +282,14 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		return nil, err
 	}
 	// Per-group state tally so we can decide user-stopped vs crashed for the
-	// no-live-backends case. Only groups with EVERY member in "exited" are
-	// considered user-stopped; a "dead" or "restarting" member means we treat
-	// the whole group as crashed and still count 503s as errors.
-	groupExited := map[string]int{}
-	groupOther := map[string]int{}
+	// no-live-backends case. groupStopped counts exited containers whose
+	// exit info (inspected below) matches a clean shutdown pattern —
+	// exit 0, 143 (SIGTERM), or 137 (SIGKILL without OOM). groupCrashed
+	// counts everything else (non-zero exit, OOM, or containers stuck in
+	// "dead"/"restarting"/similar unusual states).
 	groupRunning := map[string]int{}
+	groupStopped := map[string]int{}
+	groupCrashed := map[string]int{}
 	for _, c := range containers {
 		name := c.name()
 		host := c.Labels[labelHost]
@@ -324,10 +326,22 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		case "running":
 			groupRunning[key]++
 		case "exited":
-			groupExited[key]++
+			// One inspect call per exited container to disambiguate user-stop
+			// (exit 0/143/137, no OOM) from crash (non-zero code or OOM).
+			// Fail-safe: on inspect error, classify as crash so we don't
+			// silently suppress a real problem.
+			info, err := dc.inspectExit(ctx, c.ID)
+			if err != nil {
+				log.Printf("inspect %s: %v — treating as crashed", name, err)
+				groupCrashed[key]++
+			} else if info.looksLikeStop() {
+				groupStopped[key]++
+			} else {
+				groupCrashed[key]++
+			}
 		default:
 			// created, paused, restarting, dead, removing → not a clean stop
-			groupOther[key]++
+			groupCrashed[key]++
 		}
 		if c.State != "running" {
 			continue
@@ -360,9 +374,9 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 	out := make([]*RouteGroup, 0, len(groupsByKey))
 	for key, g := range groupsByKey {
 		sort.SliceStable(g.Backends, func(i, j int) bool { return g.Backends[i].URL < g.Backends[j].URL })
-		// UserStopped only when every matched container is cleanly exited —
-		// zero running, zero in an unusual state (dead/restarting/removing).
-		g.UserStopped = groupRunning[key] == 0 && groupOther[key] == 0 && groupExited[key] > 0
+		// UserStopped only when every matched container is a clean exit —
+		// zero running, zero crashed, at least one exited peacefully.
+		g.UserStopped = groupRunning[key] == 0 && groupCrashed[key] == 0 && groupStopped[key] > 0
 		out = append(out, g)
 	}
 	return out, nil
