@@ -20,7 +20,7 @@ jobs:
           with:
             claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
             show_full_output: true
-            claude_args: '--allowed-tools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"'
+            claude_args: '--model claude-opus-4-8 --allowed-tools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"'
             prompt: |
               You are performing a security review of this pull request diff.
               Your final assistant message is captured by CI, posted verbatim
