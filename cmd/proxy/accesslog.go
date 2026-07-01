@@ -77,14 +77,16 @@ func (a *AccessLog) Snapshot(limit int, since int64) []AccessEntry {
 	return out
 }
 
-// accessWriter captures status, bytes, and the backend URL the router picked.
-// It implements SetBackend so the router can attach the upstream identity
-// without depending on the access-log type directly.
+// accessWriter captures status, bytes, the backend URL the router picked, and
+// whether the request matched no route (so the metrics layer can collapse that
+// traffic into one bucket). It implements SetBackend so the router can attach
+// the upstream identity without depending on the access-log type directly.
 type accessWriter struct {
 	http.ResponseWriter
-	status  int
-	bytes   int64
-	backend string
+	status   int
+	bytes    int64
+	backend  string
+	unrouted bool
 }
 
 func (w *accessWriter) WriteHeader(code int) {
@@ -102,6 +104,7 @@ func (w *accessWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 func (w *accessWriter) SetBackend(url string) { w.backend = url }
+func (w *accessWriter) MarkUnrouted()         { w.unrouted = true }
 
 // withAccessLog wraps a handler, recording one AccessEntry per request after
 // the handler returns. Skips its own /access endpoint (handled on the metrics

@@ -269,8 +269,6 @@ details.errd[open] summary{color:#ff7173}
 .hostrow .ep.bad{color:var(--red)} .hostrow .ep.ok{color:var(--muted-2)}
 @media(max-width:680px){.hostrow{grid-template-columns:110px 1fr 50px}.hostrow .ep{display:none}}
 .chip-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:6px 0 12px}
-.chip-group-label{color:var(--muted-2);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin:0 4px 0 0}
-.chip-sep{width:1px;height:16px;background:var(--border-2);margin:0 6px}
 .chip{background:var(--surface-2);color:var(--muted);border:1px solid var(--border-2);border-radius:var(--radius-pill);padding:4px 10px;font-size:11.5px;cursor:pointer;transition:background .12s,color .12s,border-color .12s}
 .chip:hover{color:var(--text);border-color:var(--border)}
 .chip.active{background:var(--accent);color:#0a0e14;border-color:var(--accent);font-weight:500}
@@ -2395,8 +2393,10 @@ async function renderStatsDetail(name) {
 
   // ---- Top hosts: multi-select filter chips + sortable columns ----
   // Two axes that intersect:
-  //   State axis   → Running and/or Stopped   (at least one must be on)
-  //   Modifier     → Errored                  (when on, only rows with err > 0)
+  //   Class axis   → Running / Stopped / Unrouted select which host classes
+  //                  are shown (union; at least one of running/stopped is
+  //                  always on)
+  //   Modifier     → Errored — filters to hosts with errors on top
   // e.g. Running + Errored = "running services currently erroring."
   // Sort keys      → req (default) | err | host, per-key direction persisted.
   let filters;
@@ -2411,9 +2411,12 @@ async function renderStatsDetail(name) {
   const sortDir = localStorage.getItem('pmgr-topHosts-dir') || 'desc';
 
   const filteredHosts = (hosts || []).filter(h => {
-    const isStopped = stoppedHosts.has(h.host);
-    const hasErr    = (+h.error_pct || 0) > 0;
-    const stateOK   = (on.has('running') && !isStopped) || (on.has('stopped') && isStopped);
+    const isUnrouted = h.host === '(unrouted)';
+    const isStopped  = stoppedHosts.has(h.host);
+    const hasErr     = (+h.error_pct || 0) > 0;
+    const stateOK    = (on.has('running') && !isStopped && !isUnrouted)
+                    || (on.has('stopped') && isStopped)
+                    || (on.has('unrouted') && isUnrouted);
     if (!stateOK) return false;
     if (on.has('errored') && !hasErr) return false;
     return true;
@@ -2423,7 +2426,11 @@ async function renderStatsDetail(name) {
     if (sortKey === 'req')      { av = +a.total || 0;      bv = +b.total || 0; }
     else if (sortKey === 'err') { av = +a.error_pct || 0;  bv = +b.error_pct || 0; }
     else                        { return (a.host || '').localeCompare(b.host || '') * (sortDir === 'asc' ? 1 : -1); }
-    return (av - bv) * (sortDir === 'asc' ? 1 : -1);
+    const diff = av - bv;
+    // Ties break by host name ascending regardless of sortDir, so equal rows
+    // keep a stable order instead of reshuffling on each refresh.
+    if (diff === 0) return (a.host || '').localeCompare(b.host || '');
+    return diff * (sortDir === 'asc' ? 1 : -1);
   });
 
   const chip = (id, label, count) => {
@@ -2431,16 +2438,15 @@ async function renderStatsDetail(name) {
     const badge = count != null ? ' <span class="meta" style="margin-left:4px">' + count + '</span>' : '';
     return '<button class="chip' + active + '" onclick="toggleTopHostsFilter(\'' + id + '\')">' + label + badge + '</button>';
   };
-  const runningCount = (hosts || []).filter(h => !stoppedHosts.has(h.host)).length;
-  const stoppedCount = (hosts || []).filter(h => stoppedHosts.has(h.host)).length;
-  const erroredCount = (hosts || []).filter(h => (+h.error_pct || 0) > 0).length;
+  const runningCount  = (hosts || []).filter(h => !stoppedHosts.has(h.host) && h.host !== '(unrouted)').length;
+  const stoppedCount  = (hosts || []).filter(h => stoppedHosts.has(h.host)).length;
+  const erroredCount  = (hosts || []).filter(h => (+h.error_pct || 0) > 0).length;
+  const unroutedCount = (hosts || []).filter(h => h.host === '(unrouted)').length;
   const chipRow = '<div class="chip-row">'
-    + '<span class="chip-group-label">State</span>'
     + chip('running', 'Running', runningCount)
     + chip('stopped', 'Stopped', stoppedCount)
-    + '<span class="chip-sep"></span>'
-    + '<span class="chip-group-label">Only</span>'
     + chip('errored', 'Errored', erroredCount)
+    + chip('unrouted', 'Unrouted', unroutedCount)
     + '</div>';
 
   const arrow = (k) => sortKey === k ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';

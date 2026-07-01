@@ -272,10 +272,12 @@ func (s *Store) TargetHosts(name string) []map[string]any {
 		entry["errors"] = errs
 		out = append(out, entry)
 	}
-	// Sort by total descending.
+	// Sort by total descending; break ties by host name ascending so the
+	// order is stable across scrapes.
 	for i := 0; i < len(out); i++ {
 		for j := i + 1; j < len(out); j++ {
-			if out[j]["total"].(float64) > out[i]["total"].(float64) {
+			ti, tj := out[i]["total"].(float64), out[j]["total"].(float64)
+			if tj > ti || (tj == ti && out[j]["host"].(string) < out[i]["host"].(string)) {
 				out[i], out[j] = out[j], out[i]
 			}
 		}
