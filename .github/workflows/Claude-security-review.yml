@@ -18,8 +18,34 @@ jobs:
         - uses: anthropics/claude-code-action@v1
           with:
             claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+            claude_args: '--allowed-tools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Read,Grep,Glob"'
+            classify_inline_comments: false
             prompt: |
-              Run /security-review on the diff of this PR against main.
-              Post inline comments on any HIGH or MEDIUM finding.
-              Skip: DoS, defense-in-depth suggestions, style, log spoofing,
-              SSRF that only controls the path, hardening-only findings.
+              You are performing a security review of this pull request.
+
+              STEP 1 — get the diff:
+                `gh pr diff ${{ github.event.pull_request.number }}` (or `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD`)
+
+              STEP 2 — scan EVERY added/changed line for these HIGH-severity issues:
+                - Hardcoded secrets, credentials, tokens, API keys, passwords
+                - Backdoor / bypass logic (any code path that skips auth, 2FA,
+                  authorization, or verification when a magic value is present)
+                - Insecure credential comparison (`==` / `!=` on secrets — should be
+                  crypto/subtle.ConstantTimeCompare or equivalent)
+                - Command injection, SQL injection, path traversal
+                - XSS: user data interpolated into HTML or JS without escaping
+                - CSRF: state-changing endpoint with no token / Origin check
+                - InsecureSkipVerify or disabled cert validation on outbound TLS
+                - Deserialization of untrusted data (yaml.Unmarshal, pickle, eval)
+
+              STEP 3 — post an inline PR review comment on EVERY HIGH finding.
+              Use `mcp__github_inline_comment__create_inline_comment` if available,
+              otherwise `gh api repos/{owner}/{repo}/pulls/{n}/comments`. Include:
+              severity, one-line description, exploit consequence, recommended fix.
+
+              STEP 4 — post ONE summary comment via `gh pr comment` with the total
+              count. Even if you find nothing, post: "No high-severity issues in
+              this diff." So the run is never silent.
+
+              DO NOT skip step 4. The absence of a comment must never be the
+              signal — always post something so the author knows the review ran.
