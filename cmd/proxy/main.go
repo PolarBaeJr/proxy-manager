@@ -73,6 +73,12 @@ func withMetrics(next http.Handler, m *Metrics) http.Handler {
 			aw = &accessWriter{ResponseWriter: w}
 		}
 		next.ServeHTTP(aw, r)
+		// Structural 503 (labelled host, zero live backends) — surfaced via
+		// the dashboard's DOWN pill, would otherwise pin the error rate for
+		// a service the operator has intentionally stopped.
+		if aw.structural {
+			return
+		}
 		host := r.Host
 		if i := indexByte(host, ':'); i >= 0 {
 			host = host[:i]

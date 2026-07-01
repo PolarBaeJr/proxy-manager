@@ -79,13 +79,23 @@ func (a *AccessLog) Snapshot(limit int, since int64) []AccessEntry {
 
 // accessWriter captures status, bytes, and the backend URL the router picked.
 // It implements SetBackend so the router can attach the upstream identity
-// without depending on the access-log type directly.
+// without depending on the access-log type directly. When `structural` is set,
+// withMetrics skips the metric Record() so a "no live backends" 503 doesn't
+// spike the dashboard's error rate — the operator already sees the service is
+// down via the routes/services tabs and that state is a known-and-expected
+// failure, not an upstream fault.
 type accessWriter struct {
 	http.ResponseWriter
-	status  int
-	bytes   int64
-	backend string
+	status     int
+	bytes      int64
+	backend    string
+	structural bool
 }
+
+// MarkStructural is called from the router when the response is a 503 caused
+// by having zero healthy backends (all replicas stopped / crashed). Interface-
+// based so the router doesn't depend on the access-log package.
+func (w *accessWriter) MarkStructural() { w.structural = true }
 
 func (w *accessWriter) WriteHeader(code int) {
 	if w.status == 0 {

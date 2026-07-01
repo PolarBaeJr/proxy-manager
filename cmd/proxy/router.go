@@ -36,6 +36,13 @@ type RouteGroup struct {
 	Service     string
 	Backends    []*Backend
 
+	// UserStopped is true when every matched container is in "exited" state
+	// (Docker stop / user-initiated). Crashes end up in "dead" or repeatedly
+	// "restarting" and leave this false. Only groups with UserStopped=true
+	// skip metric recording on the resulting 503 — crashes still count as
+	// errors so the operator sees them on the dashboard.
+	UserStopped bool
+
 	cursor atomic.Uint64
 }
 
@@ -149,6 +156,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		if tryProxy(w, req, b) {
 			return
+		}
+	}
+	// Only skip metrics for a user-stopped service (every member cleanly
+	// exited). Crashes leave containers in "dead" / "restarting" / a mix,
+	// so UserStopped stays false and those 503s are counted as errors —
+	// that's the signal the operator needs to notice a crash.
+	if group.UserStopped {
+		if m, ok := w.(interface{ MarkStructural() }); ok {
+			m.MarkStructural()
 		}
 	}
 	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
@@ -265,6 +281,13 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 	if err != nil {
 		return nil, err
 	}
+	// Per-group state tally so we can decide user-stopped vs crashed for the
+	// no-live-backends case. Only groups with EVERY member in "exited" are
+	// considered user-stopped; a "dead" or "restarting" member means we treat
+	// the whole group as crashed and still count 503s as errors.
+	groupExited := map[string]int{}
+	groupOther := map[string]int{}
+	groupRunning := map[string]int{}
 	for _, c := range containers {
 		name := c.name()
 		host := c.Labels[labelHost]
@@ -297,6 +320,15 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 			}
 			groupsByKey[key] = g
 		}
+		switch c.State {
+		case "running":
+			groupRunning[key]++
+		case "exited":
+			groupExited[key]++
+		default:
+			// created, paused, restarting, dead, removing → not a clean stop
+			groupOther[key]++
+		}
 		if c.State != "running" {
 			continue
 		}
@@ -326,8 +358,11 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 	}
 
 	out := make([]*RouteGroup, 0, len(groupsByKey))
-	for _, g := range groupsByKey {
+	for key, g := range groupsByKey {
 		sort.SliceStable(g.Backends, func(i, j int) bool { return g.Backends[i].URL < g.Backends[j].URL })
+		// UserStopped only when every matched container is cleanly exited —
+		// zero running, zero in an unusual state (dead/restarting/removing).
+		g.UserStopped = groupRunning[key] == 0 && groupOther[key] == 0 && groupExited[key] > 0
 		out = append(out, g)
 	}
 	return out, nil
