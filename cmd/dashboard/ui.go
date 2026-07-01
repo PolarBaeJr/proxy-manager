@@ -268,7 +268,9 @@ details.errd[open] summary{color:#ff7173}
 .hostrow .ep{text-align:right;font-variant-numeric:tabular-nums;font-size:11.5px}
 .hostrow .ep.bad{color:var(--red)} .hostrow .ep.ok{color:var(--muted-2)}
 @media(max-width:680px){.hostrow{grid-template-columns:110px 1fr 50px}.hostrow .ep{display:none}}
-.chip-row{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}
+.chip-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:6px 0 12px}
+.chip-group-label{color:var(--muted-2);font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;margin:0 4px 0 0}
+.chip-sep{width:1px;height:16px;background:var(--border-2);margin:0 6px}
 .chip{background:var(--surface-2);color:var(--muted);border:1px solid var(--border-2);border-radius:var(--radius-pill);padding:4px 10px;font-size:11.5px;cursor:pointer;transition:background .12s,color .12s,border-color .12s}
 .chip:hover{color:var(--text);border-color:var(--border)}
 .chip.active{background:var(--accent);color:#0a0e14;border-color:var(--accent);font-weight:500}
@@ -2306,8 +2308,16 @@ async function renderStats() {
 }
 function openTarget(n) { statsDetail = n; renderActive(); }
 function closeTarget() { statsDetail = null; renderActive(); }
-function setTopHostsFilter(v) {
-  localStorage.setItem('pmgr-topHosts-filter', v);
+function toggleTopHostsFilter(id) {
+  let cur;
+  try { cur = JSON.parse(localStorage.getItem('pmgr-topHosts-filters') || '["running"]'); }
+  catch { cur = ['running']; }
+  if (!Array.isArray(cur)) cur = ['running'];
+  const s = new Set(cur);
+  if (s.has(id)) s.delete(id); else s.add(id);
+  // Force at least one state chip on so the table can't go empty by accident.
+  if (!s.has('running') && !s.has('stopped')) s.add(id === 'running' ? 'stopped' : 'running');
+  localStorage.setItem('pmgr-topHosts-filters', JSON.stringify([...s]));
   renderActive();
 }
 function setTopHostsSort(k) {
@@ -2383,20 +2393,30 @@ async function renderStatsDetail(name) {
     +   '<table><tbody>' + methodRows + '</tbody></table>'
     + '</div></div>';
 
-  // ---- Top hosts: filter + sort controls, persisted in localStorage ----
-  // Filter modes: all | running | stopped | errored (only rows with errors)
-  // Sort keys : req (default) | err | host  — direction persisted per-key.
-  const filter = localStorage.getItem('pmgr-topHosts-filter') || 'running';
+  // ---- Top hosts: multi-select filter chips + sortable columns ----
+  // Two axes that intersect:
+  //   State axis   → Running and/or Stopped   (at least one must be on)
+  //   Modifier     → Errored                  (when on, only rows with err > 0)
+  // e.g. Running + Errored = "running services currently erroring."
+  // Sort keys      → req (default) | err | host, per-key direction persisted.
+  let filters;
+  try {
+    filters = JSON.parse(localStorage.getItem('pmgr-topHosts-filters') || '["running"]');
+    if (!Array.isArray(filters) || !filters.length) filters = ['running'];
+  } catch { filters = ['running']; }
+  const on = new Set(filters);
+  // Guarantee at least one state chip so nothing gets accidentally hidden.
+  if (!on.has('running') && !on.has('stopped')) { on.add('running'); }
   const sortKey = localStorage.getItem('pmgr-topHosts-sort') || 'req';
   const sortDir = localStorage.getItem('pmgr-topHosts-dir') || 'desc';
 
   const filteredHosts = (hosts || []).filter(h => {
     const isStopped = stoppedHosts.has(h.host);
-    const hasErr = (+h.error_pct || 0) > 0;
-    if (filter === 'running') return !isStopped;
-    if (filter === 'stopped') return isStopped;
-    if (filter === 'errored') return hasErr;
-    return true; // 'all'
+    const hasErr    = (+h.error_pct || 0) > 0;
+    const stateOK   = (on.has('running') && !isStopped) || (on.has('stopped') && isStopped);
+    if (!stateOK) return false;
+    if (on.has('errored') && !hasErr) return false;
+    return true;
   });
   const sorted = filteredHosts.slice().sort((a, b) => {
     let av, bv;
@@ -2407,18 +2427,20 @@ async function renderStatsDetail(name) {
   });
 
   const chip = (id, label, count) => {
-    const active = filter === id ? ' active' : '';
+    const active = on.has(id) ? ' active' : '';
     const badge = count != null ? ' <span class="meta" style="margin-left:4px">' + count + '</span>' : '';
-    return '<button class="chip' + active + '" onclick="setTopHostsFilter(\'' + id + '\')">' + label + badge + '</button>';
+    return '<button class="chip' + active + '" onclick="toggleTopHostsFilter(\'' + id + '\')">' + label + badge + '</button>';
   };
   const runningCount = (hosts || []).filter(h => !stoppedHosts.has(h.host)).length;
   const stoppedCount = (hosts || []).filter(h => stoppedHosts.has(h.host)).length;
   const erroredCount = (hosts || []).filter(h => (+h.error_pct || 0) > 0).length;
   const chipRow = '<div class="chip-row">'
-    + chip('all',     'All',      (hosts || []).length)
-    + chip('running', 'Running',  runningCount)
-    + chip('stopped', 'Stopped',  stoppedCount)
-    + chip('errored', 'Errored',  erroredCount)
+    + '<span class="chip-group-label">State</span>'
+    + chip('running', 'Running', runningCount)
+    + chip('stopped', 'Stopped', stoppedCount)
+    + '<span class="chip-sep"></span>'
+    + '<span class="chip-group-label">Only</span>'
+    + chip('errored', 'Errored', erroredCount)
     + '</div>';
 
   const arrow = (k) => sortKey === k ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
