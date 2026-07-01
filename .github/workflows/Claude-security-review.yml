@@ -19,15 +19,15 @@ jobs:
           uses: anthropics/claude-code-action@v1
           with:
             claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-            use_sticky_comment: true
             show_full_output: true
             claude_args: '--allowed-tools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"'
             prompt: |
-              You MUST perform a security review of this pull request diff.
-              Your final assistant message is posted verbatim as a sticky PR
-              comment — treat it as the review body, not chat.
+              You are performing a security review of this pull request diff.
+              Your final assistant message is captured by CI, posted verbatim
+              as a PR comment, and used to decide whether the merge is blocked.
+              Treat that final message as the review body — not chat.
 
-              STEP 1 — Read every line changed by this PR:
+              STEP 1 — Read every changed line:
                 gh pr diff ${{ github.event.pull_request.number }}
 
               STEP 2 — For each HIGH or MEDIUM security finding, output a block:
@@ -38,9 +38,9 @@ jobs:
                 **Why it matters:** one sentence on the concrete exploit path.
                 **Fix:** the specific change.
 
-              Categories to look for (non-exhaustive):
+              Categories (non-exhaustive):
                 - Hardcoded secrets / credentials / tokens / API keys / passwords
-                  (including any string literal that LOOKS like a bypass token
+                  (including any string literal that looks like a bypass token
                   or magic value used in authentication)
                 - Backdoor / bypass logic — any code path that skips auth, 2FA,
                   authorization, or verification when a specific value is present
@@ -49,41 +49,67 @@ jobs:
                 - Command injection, SQL injection, path traversal
                 - XSS: user data interpolated into HTML/JS without escaping
                 - CSRF: state-changing endpoint with no token / Origin check
-                - InsecureSkipVerify or disabled cert validation on outbound TLS
+                - InsecureSkipVerify or disabled cert validation
                 - Deserialization of untrusted data
                 - Auth-bypass or missing auth on state-changing endpoints
                 - Overly permissive CORS
 
-              STEP 3 — Your final message MUST start with one of these markers
-              (on the first line) so the CI post-step can gate on them:
-
-                REVIEW_STATUS: FAIL   ← if you found ANY high/medium issue
+              STEP 3 — Your FINAL message must start on line 1 with one of:
+                REVIEW_STATUS: FAIL   ← if any high/medium issue exists
                 REVIEW_STATUS: PASS   ← if the diff is clean
 
-              After the marker, include the finding blocks (if any) followed by
-              a one-line summary. Do NOT skip the marker — the CI step below
-              parses it to decide whether to block the merge.
+              After the marker, include the finding blocks (if any) and a
+              one-line summary. Never stay silent — silence is treated as
+              failure by CI.
 
               Skip: style, DoS, hardening-only suggestions, theoretical races,
               log spoofing.
 
-        - name: Gate on review verdict
+        - name: Post review + gate merge
+          if: always()
           env:
             PR_NUMBER: ${{ github.event.pull_request.number }}
+            GH_TOKEN: ${{ github.token }}
           run: |
-            set -euo pipefail
-            # Pull down the sticky comment we just posted and look for the marker.
-            body="$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
-              --jq '[.[] | select(.user.login=="claude[bot]")][-1].body // ""')"
-            if [ -z "$body" ]; then
-              echo "::error::Claude review did not post a sticky comment. Failing so this PR cannot merge silently."
+            set -uo pipefail
+            log=/home/runner/work/_temp/claude-execution-output.json
+            marker="<!-- claude-security-review -->"
+
+            if [ ! -f "$log" ]; then
+              body="$marker"$'\n\n**REVIEW_STATUS: FAIL**\n\n_Claude action did not produce an output file — the review never ran._"
+              gh pr comment "$PR_NUMBER" --body "$body"
+              echo "::error::Claude action produced no output"
               exit 1
             fi
-            marker="$(printf '%s\n' "$body" | head -n 1)"
-            echo "Marker line: $marker"
-            case "$marker" in
-              *"REVIEW_STATUS: PASS"*) echo "Clean review — allowing merge."; exit 0 ;;
-              *"REVIEW_STATUS: FAIL"*) echo "::error::Claude flagged security issues — see the sticky PR comment. Blocking merge."; exit 1 ;;
-              *) echo "::error::Claude did not emit a REVIEW_STATUS marker. Treating as failure."; exit 1 ;;
+
+            # Extract the LAST assistant text block from the transcript.
+            review="$(jq -r '[.[] | select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text] | last // ""' "$log")"
+
+            if [ -z "$review" ]; then
+              body="$marker"$'\n\n**REVIEW_STATUS: FAIL**\n\n_Claude produced no text response — treat as failure until re-run._'
+              gh pr comment "$PR_NUMBER" --body "$body"
+              echo "::error::Claude response was empty"
+              exit 1
+            fi
+
+            # Post (or edit) a single sticky comment identified by the marker.
+            body="$marker"$'\n\n'"$review"
+            existing_id=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+              --jq '[.[] | select(.body | startswith("<!-- claude-security-review -->"))][0].id // empty')
+            if [ -n "$existing_id" ]; then
+              gh api --method PATCH "repos/${{ github.repository }}/issues/comments/${existing_id}" -f body="$body" >/dev/null
+              echo "Updated existing review comment $existing_id"
+            else
+              gh pr comment "$PR_NUMBER" --body "$body"
+              echo "Posted new review comment"
+            fi
+
+            # Gate: block merge if REVIEW_STATUS says FAIL, or the marker is missing.
+            first_line=$(printf '%s\n' "$review" | grep -m1 '^REVIEW_STATUS:' || true)
+            echo "Verdict line: $first_line"
+            case "$first_line" in
+              *"PASS"*) echo "Review clean — allowing merge."; exit 0 ;;
+              *"FAIL"*) echo "::error::Review flagged security issues — blocking merge."; exit 1 ;;
+              *)       echo "::error::Missing REVIEW_STATUS marker — blocking merge."; exit 1 ;;
             esac
           shell: bash
