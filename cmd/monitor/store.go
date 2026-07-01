@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -350,6 +351,11 @@ func (s *Store) Overview() map[string]any {
 		}
 		targets = append(targets, entry)
 	}
+	// Alphabetical by name so the UI card order is stable across polls —
+	// otherwise Go's random map iteration reshuffles the health page.
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i]["name"].(string) < targets[j]["name"].(string)
+	})
 
 	healthy := "up"
 	if !allUp {

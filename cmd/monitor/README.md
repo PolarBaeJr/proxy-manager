@@ -38,6 +38,9 @@ Monitor also computes its own per-target fields:
 | `-targets` | `edge=http://edge:8094/metrics,proxy=http://proxy:8094/metrics` | comma-separated `name=url` |
 | `-interval` | `5s` | scrape cadence |
 | `-window` | `1h` | how much history to retain in memory |
+| `-tls-probe-targets` |   | comma-separated `sni[@host:port]`; empty disables cert probing |
+| `-tls-probe-interval` | `15m` | how often to reprobe cert expiry |
+| `-tls-probe-dial` | `host.docker.internal:443` | default dial target when no `@host:port` is given |
 
 ## Why a separate binary?
 
