@@ -46,7 +46,10 @@ services:
     restart: unless-stopped
     networks: [edge]
     ports:
-      - "8092:8092"
+      # Loopback-only publish: host nginx proxies to 127.0.0.1:8092, but LAN /
+      # internet cannot reach the proxy directly (which would bypass edge's
+      # rate limiter and let X-Forwarded-For be spoofed).
+      - "127.0.0.1:8092:8092"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro     # READ-ONLY
       - ./cmd/proxy/routes.json:/etc/proxy/routes.json:ro
@@ -62,7 +65,10 @@ services:
     restart: unless-stopped
     networks: [edge]
     ports:
-      - "8093:8093"
+      # Loopback-only publish: dashboard is reached through the proxy on the
+      # docker network (Host: dashboard.polardev.org). Direct :8093 access
+      # would leak the plaintext login page + session cookie to any LAN peer.
+      - "127.0.0.1:8093:8093"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock        # read-write (service mgmt)
       - ./cmd/proxy/routes.json:/etc/proxy/routes.json    # rw: dashboard appends onboarded routes here
