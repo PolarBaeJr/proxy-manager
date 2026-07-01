@@ -53,6 +53,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro     # READ-ONLY
       - ./cmd/proxy/routes.json:/etc/proxy/routes.json:ro
+      - ./cmd/proxy/data:/data                           # metrics snapshots (persisted)
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -91,6 +92,8 @@ services:
     restart: unless-stopped
     networks: [edge]
     # No host port — dashboard reaches it via the edge network.
+    volumes:
+      - ./cmd/monitor/data:/data          # store snapshots (persisted)
     extra_hosts:
       - "host.docker.internal:host-gateway"   # for TLS-probing nginx on the host
     command: >

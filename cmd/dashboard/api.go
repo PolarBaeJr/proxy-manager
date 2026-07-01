@@ -15,7 +15,7 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -82,6 +82,35 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 	// Host CPU / memory / disk for the header widget.
 	mux.HandleFunc("/api/stats", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, GetStats())
+	}))
+
+	// ---- Per-user UI preferences (pmgr-* localStorage mirror) ----
+	// Deliberately requireAuth (not requireElevated) for writes: prefs are
+	// cosmetic per-user state written fire-and-forget on every chip click;
+	// requiring elevation would silently drop them whenever it lapses.
+	mux.HandleFunc("/api/prefs", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		info := sessionFromReq(auth, req)
+		if info == nil {
+			http.Error(w, "prefs require a session", http.StatusUnauthorized)
+			return
+		}
+		switch req.Method {
+		case "GET":
+			httpx.WriteJSON(w, http.StatusOK, prefs.Get(info.Username))
+		case "PUT", "POST":
+			var kv map[string]string
+			if err := json.NewDecoder(req.Body).Decode(&kv); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if err := prefs.Merge(info.Username, kv); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, prefs.Get(info.Username))
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
 	}))
 
 	// Proxy through to the monitor binary for traffic metrics. Keeps the auth

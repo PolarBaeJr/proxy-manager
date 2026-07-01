@@ -1,4 +1,6 @@
 .env
-dashboard/data/
-edge/data/
+cmd/dashboard/data/
+cmd/edge/data/
+cmd/proxy/data/
+cmd/monitor/data/
 .DS_Store
