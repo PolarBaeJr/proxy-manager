@@ -73,21 +73,6 @@ func findService(ctx context.Context, dc *dockerClient, name string) (Service, b
 	return Service{}, false, nil
 }
 
-// findMemberByName locates a single container belonging to the named
-// service. Returns (id, found). The match is exact on container name.
-func findMemberByName(ctx context.Context, dc *dockerClient, service, member string) (string, bool, error) {
-	svc, ok, err := findService(ctx, dc, service)
-	if err != nil || !ok {
-		return "", false, err
-	}
-	for _, m := range svc.MemberSummaries {
-		if m.Name == member {
-			return m.ID, true, nil
-		}
-	}
-	return "", false, nil
-}
-
 // stopServiceMembers stops every non-canary container belonging to a
 // service. Canary members are left running so a staged deploy isn't
 // silently killed by a "stop service" click on the live half. Returns

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -65,19 +66,5 @@ func (s *Scraper) scrape(ctx context.Context, url string) (map[string]any, error
 
 type httpStatusErr int
 
-func (e httpStatusErr) Error() string { return "http " + itoa(int(e)) }
+func (e httpStatusErr) Error() string { return "http " + strconv.Itoa(int(e)) }
 func errStatus(n int) error           { return httpStatusErr(n) }
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [16]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = '0' + byte(n%10)
-		n /= 10
-	}
-	return string(b[i:])
-}

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -183,7 +184,7 @@ func parseProbeTargets(s string, defaultDial string) []ProbeTarget {
 	for _, p := range splitTrim(s, ',') {
 		sni := p
 		dial := defaultDial
-		if at := indexByte(p, '@'); at > 0 {
+		if at := strings.IndexByte(p, '@'); at > 0 {
 			sni = p[:at]
 			dial = p[at+1:]
 		}
@@ -197,31 +198,10 @@ func parseProbeTargets(s string, defaultDial string) []ProbeTarget {
 
 func splitTrim(s string, sep byte) []string {
 	var out []string
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i == len(s) || s[i] == sep {
-			seg := s[start:i]
-			// trim
-			for len(seg) > 0 && (seg[0] == ' ' || seg[0] == '\t') {
-				seg = seg[1:]
-			}
-			for len(seg) > 0 && (seg[len(seg)-1] == ' ' || seg[len(seg)-1] == '\t') {
-				seg = seg[:len(seg)-1]
-			}
-			if seg != "" {
-				out = append(out, seg)
-			}
-			start = i + 1
+	for _, seg := range strings.Split(s, string(sep)) {
+		if seg = strings.TrimSpace(seg); seg != "" {
+			out = append(out, seg)
 		}
 	}
 	return out
-}
-
-func indexByte(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
 }

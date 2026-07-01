@@ -55,7 +55,7 @@ a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 code{font-family:var(--font-mono);color:var(--orange)}
 ::selection{background:rgba(0,212,255,.25)}
-.num,td.num,.tnum{font-variant-numeric:tabular-nums}
+.num,td.num{font-variant-numeric:tabular-nums}
 
 /* ============ LAYOUT ============ */
 .wrap{position:relative;z-index:1;max-width:1320px;margin:0 auto;padding:0 28px}
@@ -588,13 +588,11 @@ function isElevated() { return authState.authenticated && authState.elevated_unt
 /* ---------- icons (inline SVG, shared stroke set) ---------- */
 function svg(p, o){ o=o||''; return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" '+o+'>'+p+'</svg>'; }
 const I = {
-  logo:    svg('<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 12l9 5 9-5M3 16l9 5 9-5"/>'),
   layers:  svg('<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 12l9 5 9-5M3 16l9 5 9-5"/>'),
   routes:  svg('<path d="M5 4v12a3 3 0 0 0 3 3h8"/><circle cx="5" cy="4" r="1.6"/><path d="M16 16l3 3-3 3"/>'),
   services:svg('<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>'),
   dns:     svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>'),
   users:   svg('<circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 5.2a3.2 3.2 0 0 1 0 6M16.5 14.4a5.5 5.5 0 0 1 4 5.6"/>'),
-  stats:   svg('<path d="M4 19V5M4 19h16"/><path d="M8 16l3-4 3 2 4-6"/>'),
   cpu:     svg('<rect x="7" y="7" width="10" height="10" rx="1.5"/><path d="M9 3v3M12 3v3M15 3v3M9 18v3M12 18v3M15 18v3M3 9h3M3 12h3M3 15h3M18 9h3M18 12h3M18 15h3"/>'),
   mem:     svg('<rect x="3" y="7" width="18" height="10" rx="1.5"/><path d="M7 7v-2M11 7v-2M15 7v-2M7 21v-4M11 21v-4M15 21v-4"/>'),
   disk:    svg('<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>'),
@@ -608,7 +606,6 @@ const I = {
   x:       svg('<path d="M6 6l12 12M18 6L6 18"/>'),
   alert:   svg('<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17h.01"/>'),
   arrowup: svg('<path d="M12 19V5M6 11l6-6 6 6"/>'),
-  arrowdown:svg('<path d="M12 5v14M6 13l6 6 6-6"/>'),
   dots:    svg('<circle cx="6" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18" cy="12" r="1.6"/>'),
   rocket:  svg('<path d="M5 15c-1 1-1.5 4-1.5 4s3-.5 4-1.5M14 4c4 1 6 3 7 7-2 2-5 4-9 5l-3-3c1-4 3-7 5-9z"/><circle cx="14.5" cy="9.5" r="1.4"/>'),
   swap:    svg('<path d="M4 8h13l-3-3M20 16H7l3 3"/>'),
@@ -621,7 +618,6 @@ const I = {
   activity:svg('<path d="M3 12h4l3 8 4-16 3 8h4"/>'),
   bolt:    svg('<path d="M13 3L4 14h7l-1 7 9-11h-7z"/>'),
   shield:  svg('<path d="M12 3l8 3v6c0 4-3 7-8 9-5-2-8-5-8-9V6z"/><path d="M9 12l2 2 4-4"/>'),
-  link:    svg('<path d="M10 14a4 4 0 0 0 6 .5l2-2a4 4 0 0 0-6-6l-1 1M14 10a4 4 0 0 0-6-.5l-2 2a4 4 0 0 0 6 6l1-1"/>'),
   bookmark:svg('<path d="M6 3h12v18l-6-4-6 4z"/>'),
   terminal:svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>'),
   refresh: svg('<path d="M20 11A8 8 0 0 0 6.3 6.3L4 8.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 13.7 4.7L20 15.4"/><path d="M20 20v-5h-5"/>'),
@@ -1167,19 +1163,6 @@ function statusBarFromCodes(byCode) {
   const leg = keys.map(k => '<span><i class="sw" style="background:' + STC[k] + '"></i>' + k + ' ' + fmt(buckets[k]) + '</span>').join('');
   return '<div class="statusbar">' + bar + '</div><div class="legend">' + leg + '</div>';
 }
-function hostBarsFromObj(byHost) {
-  const entries = Object.entries(byHost || {}).sort((a,b) => b[1] - a[1]).slice(0, 10);
-  if (!entries.length) return '<p class="empty">No host traffic recorded.</p>';
-  const max = entries[0][1] || 1;
-  return '<div class="hostbar">' + entries.map(([host, n]) => {
-    const w = Math.max(3, n / max * 100);
-    return '<div class="hostrow"><span class="nm" title="' + esc(host) + '">' + esc(host) + '</span>'
-         + '<div class="track"><i style="width:' + w + '%"></i></div>'
-         + '<span class="rq">' + fmt(n) + '</span>'
-         + '<span class="ep ok">—</span></div>';
-  }).join('') + '</div>';
-}
-
 /* ---------- Routes ---------- */
 let _lastRoutesHash = '';
 async function renderRoutes() {
@@ -2729,9 +2712,8 @@ function refreshDNSFormShape() {
          + '<div class="hint">Use :: to compress consecutive zero groups.</div></div>';
     if (proxiedRow) proxiedRow.style.display = '';
   } else if (type === 'CNAME') {
-    const def = (window._discoveryLastDomain && nameVal) ? '' : '';
     html = '<div class="field"><label>Target hostname</label>'
-         + '<input id="dns-content" placeholder="origin.example.com" value="' + esc(def) + '" required>'
+         + '<input id="dns-content" placeholder="origin.example.com" value="" required>'
          + '<div class="hint">Must end in a domain you control.</div></div>';
     if (proxiedRow) proxiedRow.style.display = '';
   } else if (type === 'TXT') {
@@ -2795,12 +2777,6 @@ function fmt(n) {
   return String(n);
 }
 function pct(n) { return (Math.round(n * 10) / 10) + '%'; }
-function fmtUptime(s) {
-  if (s < 60) return s + 's';
-  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
-  if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
-  return Math.floor(s/86400) + 'd ' + Math.floor((s%86400)/3600) + 'h';
-}
 function fmtBytes(n) {
   if (!n) return '—';
   if (n >= 1e12) return (n/1e12).toFixed(1) + ' TB';

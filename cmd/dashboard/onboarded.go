@@ -372,11 +372,6 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 				return fmt.Errorf("start %s: %w", cname, err)
 			}
 		}
-		// Re-list to include the new clones.
-		clones, err = c.listAll(ctx, cloneFilter)
-		if err != nil {
-			return err
-		}
 	} else {
 		// Scale down: remove highest-numbered clones until count matches.
 		toRemove := current - desired
@@ -391,7 +386,6 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 				return fmt.Errorf("remove %s: %w", clones[i].name(), err)
 			}
 		}
-		clones = clones[toRemove:]
 	}
 	_ = store.SetReplicas(name, desired)
 	// Re-fetch svc to include updated replica count.

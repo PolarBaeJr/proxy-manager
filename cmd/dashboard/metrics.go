@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,7 +75,7 @@ func (m *Metrics) Snapshot() map[string]any {
 	}
 	status := map[string]uint64{}
 	for k, v := range m.byStatus {
-		status[itoaInt(k)] = v
+		status[strconv.Itoa(k)] = v
 	}
 	method := map[string]uint64{}
 	for k, v := range m.byMethod {
@@ -84,7 +85,7 @@ func (m *Metrics) Snapshot() map[string]any {
 	for h, sts := range m.byHostStatus {
 		hostStatus[h] = map[string]uint64{}
 		for s, c := range sts {
-			hostStatus[h][itoaInt(s)] = c
+			hostStatus[h][strconv.Itoa(s)] = c
 		}
 	}
 	lat := append([]float64(nil), m.latencyMs...)
@@ -118,20 +119,6 @@ func (m *Metrics) Snapshot() map[string]any {
 		},
 		"sample_size": len(lat),
 	}
-}
-
-func itoaInt(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [16]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = '0' + byte(n%10)
-		n /= 10
-	}
-	return string(b[i:])
 }
 
 // metricsServer exposes /metrics on a separate listener, distinct from the
