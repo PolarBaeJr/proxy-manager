@@ -1150,6 +1150,12 @@ async function renderRoutes() {
   if (!groups.length) { el.innerHTML = emptyState(I.routes, 'No routes registered', 'Routes appear here as the proxy discovers Docker labels or static config entries.'); return; }
   let html = '<div class="subhead">' + I.routes + groups.length + ' active route' + (groups.length === 1 ? '' : 's') + '</div>';
   for (const g of groups) {
+    // Aggregate health for the pill: 0 backends or all unhealthy → down.
+    const liveBackends = g.backends.filter(b => b.healthy === true).length;
+    const groupState = g.backends.length === 0 || liveBackends === 0 ? 'down'
+                     : liveBackends === g.backends.length ? 'up'
+                     : 'flaky';
+    const groupPill = healthPill(groupState);
     const head = '<code>' + esc(g.host) + '</code>'
       + (g.path ? ' <code>' + esc(g.path) + '</code>' : '')
       + (g.strip ? ' <span class="tag" title="Strip path prefix before proxying">' + I.scissors + 'strip</span>' : '');
@@ -1167,10 +1173,14 @@ async function renderRoutes() {
            +  '<td><span class="ident dim">' + esc(b.container || '') + '</span></td>'
            +  '<td style="max-width:260px">' + err + '</td></tr>';
     }
+    const downBanner = groupState === 'down'
+      ? '<div class="note warn" style="margin:8px 0 0">' + I.alert + '<div><strong>No live backends</strong> — requests to this route return 503 until a replica comes up.</div></div>'
+      : '';
     html += '<div class="card"><div class="card-head"><div class="ttl">' + head + '</div>'
-         +  '<div class="spacer"></div><div class="meta">' + meta + '</div></div>'
-         +  '<table><thead><tr><th>Health</th><th>Backend</th><th>Weight</th><th>Container</th><th>Last error</th></tr></thead>'
-         +  '<tbody>' + rows + '</tbody></table></div>';
+         +  groupPill + '<div class="spacer"></div><div class="meta">' + meta + '</div></div>'
+         +  downBanner
+         +  (g.backends.length ? '<table><thead><tr><th>Health</th><th>Backend</th><th>Weight</th><th>Container</th><th>Last error</th></tr></thead><tbody>' + rows + '</tbody></table>' : '')
+         +  '</div>';
   }
   el.innerHTML = html;
 }
@@ -1249,7 +1259,11 @@ async function renderServices() {
       }
       memberList += '</div>';
     }
-    if (s.all_stopped) badges += ' <span class="pill muted">' + I.lock + 'stopped</span>';
+    // Live = at least one non-canary member in "running" state. `all_stopped`
+    // is the negation from the backend. Zero live replicas → show a prominent
+    // "down" pill so it's obvious the service is unreachable (any request
+    // hitting the proxy right now gets 503).
+    if (s.all_stopped) badges += ' <span class="pill bad">' + I.alert + 'down</span>';
     const menu = '<div class="menu"><button class="btn icon" onclick="toggleMenu(event,\'m-' + sn + '\')">' + I.dots + '</button>'
                + '<div class="menu-pop" id="m-' + sn + '"><button class="danger" ' + lockedAttr() + ' onclick="deleteSvc(\'' + sn + '\')">' + I.trash + 'Delete service</button></div></div>';
 
