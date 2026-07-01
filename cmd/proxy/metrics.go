@@ -150,7 +150,7 @@ func (m *Metrics) exportState() metricsState {
 	for k, v := range m.byStatus {
 		st.ByStatus[k] = v
 	}
-	st.ByMethod = copyMapStr(m.byMethod)
+	st.ByMethod = copyMap(m.byMethod)
 	st.ByHostStatus = make(map[string]map[int]uint64, len(m.byHostStatus))
 	for h, statuses := range m.byHostStatus {
 		inner := make(map[int]uint64, len(statuses))
