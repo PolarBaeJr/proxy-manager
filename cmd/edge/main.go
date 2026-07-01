@@ -2,10 +2,12 @@
 // Does the nginx-shaped jobs the proxy intentionally skips:
 //   - TLS termination (Let's Encrypt via autocert, or static cert paths)
 //   - HTTP → HTTPS redirect
-//   - Per-IP rate limiting
+//   - Per-IP rate limiting (optionally cluster-wide via peer gossip)
 //   - Request body size cap
 //   - gzip compression of text responses
-//   - Real-IP / X-Forwarded-* header normalization
+//   - Real-IP / X-Forwarded-* header normalization (from RemoteAddr — we
+//     never trust inbound X-Forwarded-* since we are the outermost hop)
+//   - HSTS on TLS responses
 //   - Access log (one JSONL line per request)
 //
 // Hands the request off to an internal upstream (the proxy on :8092).
@@ -21,7 +23,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -42,10 +46,38 @@ func main() {
 	maxBody := flag.Int64("max-body", 10<<20, "max request body bytes")
 	insecure := flag.Bool("insecure", false, "skip TLS, serve plain HTTP on -http-addr (testing only)")
 	metricsAddr := flag.String("metrics-addr", ":8094", "internal metrics endpoint listen address")
+
+	peers := flag.String("peers", "", "comma-separated peer edge base URLs for rate-limit gossip (e.g. http://edge-eu.tailnet:8094)")
+	peerSecret := flag.String("peer-secret", os.Getenv("EDGE_PEER_SECRET"), "shared bearer for peer gossip (also read from EDGE_PEER_SECRET)")
+	peerInterval := flag.Duration("peer-interval", 2*time.Second, "how often to push consumption deltas to peers")
+
+	readTimeout := flag.Duration("read-timeout", 30*time.Second, "server ReadTimeout — full request body must arrive within this window")
+	writeTimeout := flag.Duration("write-timeout", 60*time.Second, "server WriteTimeout — response must complete within this window")
+	idleTimeout := flag.Duration("idle-timeout", 120*time.Second, "server IdleTimeout — keep-alive idle cutoff")
 	flag.Parse()
 
 	metrics := NewMetrics()
-	metricsServer(*metricsAddr, metrics)
+	rl := newRateLimiter(*rateLimit, *rateBurst)
+
+	// Peer gossip: only enabled when a shared secret is present.
+	peerList := splitAndTrim(*peers)
+	var gossip http.Handler
+	if *peerSecret != "" {
+		gossip = gossipHandler(rl, *peerSecret)
+		if len(peerList) > 0 {
+			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			defer cancel()
+			ps := newPeerSync(rl, peerList, *peerSecret, *peerInterval)
+			go ps.Run(ctx)
+			log.Printf("edge peers: gossiping to %d peer(s) every %s", len(peerList), *peerInterval)
+		} else {
+			log.Printf("edge peers: /gossip enabled (receive-only, no outbound peers configured)")
+		}
+	} else if len(peerList) > 0 {
+		log.Printf("edge peers: peers configured but -peer-secret / EDGE_PEER_SECRET empty — gossip disabled")
+	}
+
+	metricsServer(*metricsAddr, metrics, gossip)
 	log.Printf("metrics on %s/metrics", *metricsAddr)
 
 	// Build the request handler chain. Outer-most first.
@@ -53,28 +85,38 @@ func main() {
 	handler = withMaxBody(handler, *maxBody)
 	handler = withGzip(handler)
 	if *rateLimit > 0 {
-		handler = withRateLimit(handler, *rateLimit, *rateBurst)
+		handler = withRateLimit(handler, rl)
 	}
 	handler = withForwardedHeaders(handler)
+	handler = withHSTS(handler)
 	handler = withMetrics(handler, metrics)
 	handler = withAccessLog(handler)
+
+	newServer := func(addr string, h http.Handler, tlsCfg *tls.Config) *http.Server {
+		return &http.Server{
+			Addr:              addr,
+			Handler:           h,
+			TLSConfig:         tlsCfg,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       *readTimeout,
+			WriteTimeout:      *writeTimeout,
+			IdleTimeout:       *idleTimeout,
+		}
+	}
 
 	// ----- Insecure mode (HTTP only) — for local testing, not production. -----
 	if *insecure {
 		log.Printf("edge: insecure HTTP on %s → %s", *httpAddr, *backend)
-		log.Fatal(http.ListenAndServe(*httpAddr, handler))
+		srv := newServer(*httpAddr, handler, nil)
+		log.Fatal(srv.ListenAndServe())
 		return
 	}
 
 	// ----- Static cert mode. -----
 	if *tlsCert != "" && *tlsKey != "" {
 		log.Printf("edge: HTTPS on %s (static cert) → %s", *httpsAddr, *backend)
-		go redirectHTTPSServer(*httpAddr, nil)
-		srv := &http.Server{
-			Addr:              *httpsAddr,
-			Handler:           handler,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
+		go redirectHTTPSServer(*httpAddr, nil, *readTimeout, *writeTimeout, *idleTimeout)
+		srv := newServer(*httpsAddr, handler, &tls.Config{MinVersion: tls.VersionTLS12})
 		if err := srv.ListenAndServeTLS(*tlsCert, *tlsKey); !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
@@ -94,13 +136,8 @@ func main() {
 		Prompt:     autocert.AcceptTOS,
 		HostPolicy: autocert.HostWhitelist(domains...),
 	}
-	go redirectHTTPSServer(*httpAddr, m)
-	srv := &http.Server{
-		Addr:              *httpsAddr,
-		Handler:           handler,
-		TLSConfig:         &tls.Config{GetCertificate: m.GetCertificate, MinVersion: tls.VersionTLS12},
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	go redirectHTTPSServer(*httpAddr, m, *readTimeout, *writeTimeout, *idleTimeout)
+	srv := newServer(*httpsAddr, handler, &tls.Config{GetCertificate: m.GetCertificate, MinVersion: tls.VersionTLS12})
 	log.Printf("edge: HTTPS on %s for %v → %s", *httpsAddr, domains, *backend)
 	if err := srv.ListenAndServeTLS("", ""); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
@@ -109,7 +146,7 @@ func main() {
 
 // redirectHTTPSServer listens on plain HTTP, redirecting everything to HTTPS.
 // When `m` is set, ACME HTTP-01 challenges are served instead of redirecting.
-func redirectHTTPSServer(addr string, m *autocert.Manager) {
+func redirectHTTPSServer(addr string, m *autocert.Manager, read, write, idle time.Duration) {
 	var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		target := "https://" + r.Host + r.URL.RequestURI()
 		http.Redirect(w, r, target, http.StatusMovedPermanently)
@@ -117,7 +154,14 @@ func redirectHTTPSServer(addr string, m *autocert.Manager) {
 	if m != nil {
 		h = m.HTTPHandler(h)
 	}
-	srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       read,
+		WriteTimeout:      write,
+		IdleTimeout:       idle,
+	}
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("HTTP listener (%s): %v", addr, err)
 	}
@@ -167,6 +211,3 @@ func splitAndTrim(s string) []string {
 	}
 	return out
 }
-
-// Used by handlers that need a ctx without an inbound request.
-var _ = context.Background

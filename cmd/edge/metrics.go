@@ -138,14 +138,24 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-func metricsServer(addr string, m *Metrics) {
+func metricsServer(addr string, m *Metrics, gossip http.Handler) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(m.Snapshot())
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	if gossip != nil {
+		mux.Handle("/gossip", gossip)
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() { _ = srv.ListenAndServe() }()
 }
 

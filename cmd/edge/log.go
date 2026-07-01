@@ -18,7 +18,7 @@ func withAccessLog(next http.Handler) http.Handler {
 		fmt.Fprintf(os.Stdout,
 			`{"ts":%q,"ip":%q,"method":%q,"host":%q,"path":%q,"status":%d,"bytes":%d,"ms":%d}`+"\n",
 			start.UTC().Format(time.RFC3339),
-			clientIP(r), r.Method, r.Host, r.URL.RequestURI(),
+			remoteIP(r), r.Method, r.Host, r.URL.RequestURI(),
 			lw.status, lw.bytes, time.Since(start).Milliseconds(),
 		)
 	})
@@ -40,21 +40,31 @@ func (l *logResponseWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// withForwardedHeaders normalizes X-Real-IP / X-Forwarded-* so upstreams see
-// the original client IP + scheme + host even though we've terminated TLS.
+// withForwardedHeaders overwrites X-Real-IP / X-Forwarded-* with values
+// derived from the real TCP peer. We are the outermost hop — any inbound
+// X-Forwarded-* is attacker-supplied, so we do not preserve or append to it.
+// Downstream services can then trust XFF/XFP/XFH as authoritative.
 func withForwardedHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := clientIP(r)
+		ip := remoteIP(r)
 		r.Header.Set("X-Real-IP", ip)
-		if existing := r.Header.Get("X-Forwarded-For"); existing == "" {
-			r.Header.Set("X-Forwarded-For", ip)
-		} else {
-			r.Header.Set("X-Forwarded-For", existing+", "+ip)
-		}
+		r.Header.Set("X-Forwarded-For", ip)
 		if r.TLS != nil {
 			r.Header.Set("X-Forwarded-Proto", "https")
 		} else {
 			r.Header.Set("X-Forwarded-Proto", "http")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withHSTS sets Strict-Transport-Security on TLS responses. Once a browser
+// has seen this header it refuses plaintext to the domain for the max-age
+// window, defeating first-visit downgrade attacks after the first hit.
+func withHSTS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 		next.ServeHTTP(w, r)
 	})

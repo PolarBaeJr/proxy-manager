@@ -30,10 +30,12 @@ services:
       - ./cmd/edge/data:/data           # autocert cert cache (persisted)
     environment:
       EDGE_DOMAINS: ${EDGE_DOMAINS:-}   # e.g. foo.example.com,bar.example.com
+      EDGE_PEER_SECRET: ${EDGE_PEER_SECRET:-}
     command: >
       -tls-domains ${EDGE_DOMAINS:-}
       -backend http://proxy:8092
       -rate 100 -burst 200 -max-body 10485760
+      -peers ${EDGE_PEERS:-}
 
   proxy:
     build:
