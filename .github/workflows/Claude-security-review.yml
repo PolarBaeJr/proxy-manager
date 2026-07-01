@@ -1,0 +1,24 @@
+name: Claude-Security-Review
+
+on:
+    pull_request:
+      types: [opened, synchronize]
+jobs:
+    security-review:
+      runs-on: ubuntu-latest
+      permissions:
+        contents: read
+        pull-requests: write
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+
+        - uses: anthropics/claude-code-action@v1
+          with:
+            claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+            prompt: |
+              Run /security-review on the diff of this PR against main.
+              Post inline comments on any HIGH or MEDIUM finding.
+              Skip: DoS, defense-in-depth suggestions, style, log spoofing,
+              SSRF that only controls the path, hardening-only findings.
