@@ -8,6 +8,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -88,7 +89,7 @@ func withMetrics(next http.Handler, m *Metrics) http.Handler {
 		}
 		next.ServeHTTP(aw, r)
 		host := r.Host
-		if i := indexByte(host, ':'); i >= 0 {
+		if i := strings.IndexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
 		if aw.unrouted {
@@ -100,13 +101,4 @@ func withMetrics(next http.Handler, m *Metrics) http.Handler {
 		}
 		m.Record(host, r.Method, status, aw.bytes, time.Since(start))
 	})
-}
-
-func indexByte(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
 }

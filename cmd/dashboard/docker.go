@@ -873,34 +873,3 @@ func (c *dockerClient) listRoutes(ctx context.Context, configPath string) ([]Rou
 	})
 	return out, nil
 }
-
-// dockerClient also exposes container event stream (used to invalidate caches if we add them later).
-type dockerEvent struct {
-	Type   string `json:"Type"`
-	Action string `json:"Action"`
-}
-
-func (c *dockerClient) streamEvents(ctx context.Context, onAction func(string)) {
-	for {
-		body, err := c.get(ctx, `/events?filters={"type":["container"]}`)
-		if err != nil {
-			log.Printf("event stream: %v — retry 2s", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		dec := json.NewDecoder(body)
-		for {
-			var ev dockerEvent
-			if err := dec.Decode(&ev); err != nil {
-				body.Close()
-				break
-			}
-			onAction(ev.Action)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-	}
-}

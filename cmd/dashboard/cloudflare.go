@@ -88,23 +88,6 @@ func (c *cloudflareClient) fqdn(name string) string {
 	return name + "." + c.domain
 }
 
-func (c *cloudflareClient) findByName(ctx context.Context, name string) (*DNSRecord, error) {
-	body, err := c.do(ctx, "GET", "/zones/"+c.zoneID+"/dns_records?name="+c.fqdn(name), nil)
-	if err != nil {
-		return nil, err
-	}
-	var resp struct {
-		Result []DNSRecord `json:"result"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, err
-	}
-	if len(resp.Result) == 0 {
-		return nil, fmt.Errorf("no record %q", name)
-	}
-	return &resp.Result[0], nil
-}
-
 type CreateDNSRequest struct {
 	Type     string `json:"type"`
 	Name     string `json:"name"`

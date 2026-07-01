@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,14 +74,14 @@ func (m *Metrics) Snapshot() map[string]any {
 	host := copyMap(m.byHost)
 	status := map[string]uint64{}
 	for k, v := range m.byStatus {
-		status[itoa(k)] = v
+		status[strconv.Itoa(k)] = v
 	}
-	method := copyMapStr(m.byMethod)
+	method := copyMap(m.byMethod)
 	hostStatus := map[string]map[string]uint64{}
 	for h, statuses := range m.byHostStatus {
 		hostStatus[h] = map[string]uint64{}
 		for s, c := range statuses {
-			hostStatus[h][itoa(s)] = c
+			hostStatus[h][strconv.Itoa(s)] = c
 		}
 	}
 	lat := append([]float64(nil), m.latencyMs...)
@@ -202,33 +203,11 @@ func copyMap(in map[string]uint64) map[string]uint64 {
 	}
 	return out
 }
-func copyMapStr(in map[string]uint64) map[string]uint64 { return copyMap(in) }
 func maxOr0(s []float64) float64 {
 	if len(s) == 0 {
 		return 0
 	}
 	return s[len(s)-1]
-}
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [16]byte
-	i := len(b)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		i--
-		b[i] = '0' + byte(n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }
 
 // metricsServer starts an HTTP server on addr exposing /metrics (JSON),
