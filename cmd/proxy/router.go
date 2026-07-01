@@ -125,6 +125,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		break
 	}
 	if group == nil {
+		// No route matched: tell the metrics layer to bucket this request as
+		// unrouted so scanner-supplied Host headers can't grow the metrics maps.
+		// Interface-based so this file stays free of accesslog imports.
+		if m, ok := w.(interface{ MarkUnrouted() }); ok {
+			m.MarkUnrouted()
+		}
 		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.")
 		return
 	}

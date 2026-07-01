@@ -60,6 +60,10 @@ func main() {
 	}
 }
 
+// unroutedHost is the synthetic metrics bucket for requests that matched no
+// route. Keeps attacker-controlled Host headers from growing the per-host maps.
+const unroutedHost = "(unrouted)"
+
 // withMetrics wraps the router to record per-request counters + latency. It
 // wraps the response in an *accessWriter when one isn't already in place, so
 // the access-log layer downstream can reuse the same capture.
@@ -76,6 +80,9 @@ func withMetrics(next http.Handler, m *Metrics) http.Handler {
 		host := r.Host
 		if i := indexByte(host, ':'); i >= 0 {
 			host = host[:i]
+		}
+		if aw.unrouted {
+			host = unroutedHost
 		}
 		status := aw.status
 		if status == 0 {
