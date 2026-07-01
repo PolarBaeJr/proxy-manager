@@ -2188,7 +2188,7 @@ async function renderStats() {
   const hash = JSON.stringify({ overview, certs });
   if (hash === _lastStatsHash && el.children.length) return;
   _lastStatsHash = hash;
-  const targets = overview.targets || [];
+  const targets = (overview.targets || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   const live    = targets.filter(t => t.health !== 'absent');
   const absent  = targets.filter(t => t.health === 'absent');
   const healthy = targets.filter(t => t.health === 'up').length;
