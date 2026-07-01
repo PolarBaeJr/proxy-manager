@@ -1259,10 +1259,9 @@ async function renderServices() {
       }
       memberList += '</div>';
     }
-    // Live = at least one non-canary member in "running" state. `all_stopped`
-    // is the negation from the backend. Zero live replicas → show a prominent
-    // "down" pill so it's obvious the service is unreachable (any request
-    // hitting the proxy right now gets 503).
+    // all_stopped == true means every non-canary replica is not running,
+    // so any request hitting the proxy right now gets 503 — show a
+    // prominent "down" pill instead of the muted "stopped" it used to be.
     if (s.all_stopped) badges += ' <span class="pill bad">' + I.alert + 'down</span>';
     const menu = '<div class="menu"><button class="btn icon" onclick="toggleMenu(event,\'m-' + sn + '\')">' + I.dots + '</button>'
                + '<div class="menu-pop" id="m-' + sn + '"><button class="danger" ' + lockedAttr() + ' onclick="deleteSvc(\'' + sn + '\')">' + I.trash + 'Delete service</button></div></div>';
