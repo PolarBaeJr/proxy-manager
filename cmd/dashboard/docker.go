@@ -278,6 +278,21 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 	byName := map[string]*Service{}
 	for _, ct := range containers {
 		name := ct.Labels[labelService]
+		if !validServiceName(name) {
+			// Reject rogue-image XSS: a container whose `proxy.service` label
+			// contains anything outside serviceNameRE never reaches the UI.
+			log.Printf("skip container %s: invalid proxy.service label %q", ct.name(), name)
+			continue
+		}
+		host := ct.Labels[labelHost]
+		if host != "" && !validHostname(host) {
+			log.Printf("skip container %s: invalid proxy.host label %q", ct.name(), host)
+			continue
+		}
+		if p := ct.Labels[labelPath]; p != "" && !validProxyPath(p) {
+			log.Printf("skip container %s: invalid proxy.path label %q", ct.name(), p)
+			continue
+		}
 		isCanary := ct.Labels[labelCanary] == "true"
 		s, ok := byName[name]
 		if !ok {
@@ -291,7 +306,7 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 		} else {
 			port, _ := strconv.Atoi(ct.Labels[labelPort])
 			s.Image = ct.Image
-			s.Host = ct.Labels[labelHost]
+			s.Host = host
 			s.Port = port
 			s.Path = ct.Labels[labelPath]
 			s.Unscalable = ct.Labels[labelUnscalable] == "true"
@@ -436,6 +451,18 @@ func nextReplicaIndex(existing []dockerContainer, service string) int {
 func (c *dockerClient) createService(ctx context.Context, req CreateServiceRequest) error {
 	if req.Name == "" || req.Image == "" || req.Host == "" || req.Port == 0 {
 		return fmt.Errorf("name, image, host, and port are required")
+	}
+	if !validServiceName(req.Name) {
+		return fmt.Errorf("invalid service name (allowed: a-z A-Z 0-9 . _ -, max 63 chars)")
+	}
+	if !validHostname(req.Host) {
+		return fmt.Errorf("invalid hostname (allowed: a-z A-Z 0-9 . -, max 253 chars)")
+	}
+	if req.Path != "" && !validProxyPath(req.Path) {
+		return fmt.Errorf("invalid path (must start with /, allowed: A-Z a-z 0-9 / _ . -)")
+	}
+	if !validPort(req.Port) {
+		return fmt.Errorf("invalid port")
 	}
 	if req.Replicas < 1 {
 		req.Replicas = 1
@@ -783,6 +810,18 @@ func (c *dockerClient) listRoutes(ctx context.Context, configPath string) ([]Rou
 		host := ct.Labels[labelHost]
 		portStr := ct.Labels[labelPort]
 		if host == "" || portStr == "" {
+			continue
+		}
+		if !validHostname(host) {
+			log.Printf("route: skip container %s: invalid proxy.host label %q", ct.name(), host)
+			continue
+		}
+		if svc := ct.Labels[labelService]; svc != "" && !validServiceName(svc) {
+			log.Printf("route: skip container %s: invalid proxy.service label %q", ct.name(), svc)
+			continue
+		}
+		if p := ct.Labels[labelPath]; p != "" && !validProxyPath(p) {
+			log.Printf("route: skip container %s: invalid proxy.path label %q", ct.name(), p)
 			continue
 		}
 		port, err := strconv.Atoi(portStr)

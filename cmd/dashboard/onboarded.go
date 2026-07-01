@@ -252,6 +252,15 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	if req.Host == "" || req.Port <= 0 {
 		return fmt.Errorf("host and port are required")
 	}
+	if !validServiceName(name) {
+		return fmt.Errorf("invalid container name (allowed: a-z A-Z 0-9 . _ -, max 63 chars)")
+	}
+	if !validHostname(req.Host) {
+		return fmt.Errorf("invalid hostname (allowed: a-z A-Z 0-9 . -, max 253 chars)")
+	}
+	if !validPort(req.Port) {
+		return fmt.Errorf("invalid port")
+	}
 	if req.Replicas < 1 {
 		req.Replicas = 1
 	}
