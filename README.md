@@ -1,8 +1,8 @@
 # proxy-manager
 
-> Self-hosted reverse proxy, load balancer, and management dashboard for a single host. Four small Go binaries, no external runtime dependencies.
+> Self-hosted reverse proxy, load balancer, and management dashboard for a single host. Four small Go binaries with a tight dependency footprint (`webauthn` for passkeys, `x/crypto/acme` for TLS autocert, `rsc.io/qr` for TOTP QR codes — that's it).
 
-Built for a Raspberry Pi running 10+ production services. Replaces the usual nginx + Traefik + Portainer + Homepage + assorted bash with ~4000 lines of Go you can read in an afternoon. Container labels are the source of truth — drop two labels on a service and it's routed.
+Built for a Raspberry Pi running 10+ production services. Replaces the usual nginx + Traefik + Portainer + Homepage + assorted bash with ~10k lines of Go you can read in a weekend. Container labels are the source of truth — drop two labels on a service and it's routed.
 
 ---
 
@@ -12,7 +12,7 @@ Built for a Raspberry Pi running 10+ production services. Replaces the usual ngi
 - **Weighted round-robin** across replicas with **automatic failover** and **per-backend health checks**.
 - **Dashboard** with: live route table; scale services up/down; blue/green canary (stage → promote/discard); atomic replace + one-click rollback; Cloudflare DNS edits; per-target traffic stats and TLS cert expiry tracking.
 - **Container logs viewer** (`docker logs` per container, with filter) and **proxy access log** (last 2000 requests with method / host / path / status / bytes / latency / client IP / backend).
-- **Multi-user auth** with PBKDF2 passwords and TOTP 2FA via QR code. Every write requires elevation. Per-user API tokens.
+- **Multi-user auth** with PBKDF2 passwords, TOTP 2FA (QR enrolment), and WebAuthn passkeys. Every write requires elevation. Per-user API tokens.
 - **Audit log** of every action, rate-limited login, **read-only** Docker socket on the request path.
 
 ---
@@ -22,8 +22,9 @@ Built for a Raspberry Pi running 10+ production services. Replaces the usual ngi
 ```
                 ┌──────────────────────────────────────────────┐
   internet ───→ │  edge  :443                       (OPT-IN)   │
-                │  TLS via Let's Encrypt autocert              │
-                │  per-IP rate limit + body size cap           │
+                │  TLS via Let's Encrypt autocert + HSTS       │
+                │  per-IP rate limit (optional peer gossip     │
+                │    for cluster-wide caps) + body size cap    │
                 │  gzip + X-Forwarded-* + access log           │
                 └──────────────────────┬───────────────────────┘
                                        │ HTTP (internal)
@@ -112,10 +113,10 @@ Containers must share the **`edge`** Docker network with the proxy. See `example
 
 ```
 cmd/
-  edge/         outermost TLS / WAF binary       (~600 LOC, opt-in)
+  edge/         outermost TLS / WAF binary       (~800 LOC, opt-in)
   proxy/        request-path binary              (~1000 LOC, exposes /metrics + /access)
-  dashboard/    management UI binary             (~3000 LOC, single-file embedded HTML)
-  monitor/      scrapes proxy + edge metrics     (~500 LOC, time series + cert probe)
+  dashboard/    management UI binary             (~7900 LOC, single-file embedded HTML)
+  monitor/      scrapes proxy + edge metrics     (~800 LOC, time series + cert probe)
 internal/
   httpx/        shared HTTP helpers (WriteJSON / WriteErr)
 examples/
@@ -187,9 +188,11 @@ Tokens are shown once at creation and stored only as SHA-256 hashes. Revoke from
 - Login and setup endpoints are rate-limited per IP.
 - All writes append to `cmd/dashboard/data/audit.log` as JSONL.
 - The proxy's Docker socket mount is **read-only** — RCE on the request path can't create or destroy containers.
-- Cookies are HMAC-signed, HttpOnly, SameSite=Lax. API tokens use constant-time compare against SHA-256 hashes.
+- Cookies are HMAC-signed, HttpOnly, SameSite=Lax. API tokens and peer-gossip bearers use `crypto/subtle.ConstantTimeCompare` against SHA-256 hashes.
+- `proxy.*` container labels are allowlist-validated at ingestion (backend regex + frontend `pattern=`) so a rogue image can't inject HTML/JS into the dashboard by putting a payload in a `LABEL` line.
+- Every PR is auto-reviewed by a Claude security-review GitHub Action; `main` is branch-protected on that check.
 
-There is no TLS on the dashboard itself — front it with nginx + Let's Encrypt, use the opt-in `edge` binary, or only access via SSH tunnel before exposing it publicly.
+The proxy and dashboard bind to `127.0.0.1` on the host (loopback-only) — they're reached over the internal Docker network or through host-side nginx / the opt-in `edge` binary. Neither is exposed to the LAN directly, which is what would otherwise leak the dashboard's plaintext login page.
 
 ---
 
