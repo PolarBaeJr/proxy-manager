@@ -2,7 +2,7 @@ name: Claude-Security-Review
 
 on:
     pull_request:
-      types: [opened, synchronize]
+      types: [opened, synchronize, reopened]
 jobs:
     security-review:
       runs-on: ubuntu-latest
@@ -15,42 +15,75 @@ jobs:
           with:
             fetch-depth: 0
 
-        - uses: anthropics/claude-code-action@v1
+        - id: review
+          uses: anthropics/claude-code-action@v1
           with:
             claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
             use_sticky_comment: true
+            show_full_output: true
             claude_args: '--allowed-tools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"'
             prompt: |
-              Security-review this pull request. Your final message becomes a
-              sticky PR comment — write it as the review itself, not commentary.
+              You MUST perform a security review of this pull request diff.
+              Your final assistant message is posted verbatim as a sticky PR
+              comment — treat it as the review body, not chat.
 
-              1. Run `gh pr diff ${{ github.event.pull_request.number }}` to see
-                 every added / changed line.
+              STEP 1 — Read every line changed by this PR:
+                gh pr diff ${{ github.event.pull_request.number }}
 
-              2. For each finding, use this format:
-                    ### <SEVERITY>: <one-line title>
-                    **File:** `path/to/file.go:LINE`
-                    **What:** one sentence describing the bug.
-                    **Why it matters:** one sentence on the concrete exploit.
-                    **Fix:** the specific change.
+              STEP 2 — For each HIGH or MEDIUM security finding, output a block:
 
-              Look for (non-exhaustive):
-                - Hardcoded secrets, credentials, tokens, API keys, passwords
+                ### <SEVERITY>: <one-line title>
+                **File:** `path/to/file.go:LINE`
+                **What:** one sentence describing the bug.
+                **Why it matters:** one sentence on the concrete exploit path.
+                **Fix:** the specific change.
+
+              Categories to look for (non-exhaustive):
+                - Hardcoded secrets / credentials / tokens / API keys / passwords
+                  (including any string literal that LOOKS like a bypass token
+                  or magic value used in authentication)
                 - Backdoor / bypass logic — any code path that skips auth, 2FA,
                   authorization, or verification when a specific value is present
-                - Insecure credential comparison (`==` / `!=` on secrets, should
-                  be constant-time)
+                - Insecure credential comparison (`==` / `!=` on secrets; use
+                  crypto/subtle.ConstantTimeCompare)
                 - Command injection, SQL injection, path traversal
                 - XSS: user data interpolated into HTML/JS without escaping
                 - CSRF: state-changing endpoint with no token / Origin check
-                - InsecureSkipVerify or disabled cert validation
+                - InsecureSkipVerify or disabled cert validation on outbound TLS
                 - Deserialization of untrusted data
                 - Auth-bypass or missing auth on state-changing endpoints
                 - Overly permissive CORS
 
-              3. If you find NOTHING high or medium, your final message must be
-                 exactly: `✅ No high/medium security issues in this diff.`
-                 (Never stay silent — the sticky comment is the review.)
+              STEP 3 — Your final message MUST start with one of these markers
+              (on the first line) so the CI post-step can gate on them:
 
-              Do not comment on style, DoS, hardening suggestions, or theoretical
-              race conditions.
+                REVIEW_STATUS: FAIL   ← if you found ANY high/medium issue
+                REVIEW_STATUS: PASS   ← if the diff is clean
+
+              After the marker, include the finding blocks (if any) followed by
+              a one-line summary. Do NOT skip the marker — the CI step below
+              parses it to decide whether to block the merge.
+
+              Skip: style, DoS, hardening-only suggestions, theoretical races,
+              log spoofing.
+
+        - name: Gate on review verdict
+          env:
+            PR_NUMBER: ${{ github.event.pull_request.number }}
+          run: |
+            set -euo pipefail
+            # Pull down the sticky comment we just posted and look for the marker.
+            body="$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+              --jq '[.[] | select(.user.login=="claude[bot]")][-1].body // ""')"
+            if [ -z "$body" ]; then
+              echo "::error::Claude review did not post a sticky comment. Failing so this PR cannot merge silently."
+              exit 1
+            fi
+            marker="$(printf '%s\n' "$body" | head -n 1)"
+            echo "Marker line: $marker"
+            case "$marker" in
+              *"REVIEW_STATUS: PASS"*) echo "Clean review — allowing merge."; exit 0 ;;
+              *"REVIEW_STATUS: FAIL"*) echo "::error::Claude flagged security issues — see the sticky PR comment. Blocking merge."; exit 1 ;;
+              *) echo "::error::Claude did not emit a REVIEW_STATUS marker. Treating as failure."; exit 1 ;;
+            esac
+          shell: bash
