@@ -192,7 +192,7 @@ If you rename any of the following, the app breaks. The wiring is hardcoded in t
 
 ## Deliverable format
 
-You output the **complete replacement contents** of `/Users/matthewcheng/Projects/Name later/dashboard/ui.go` as one `Write` (not a diff). Approximate target: 900 lines (the current file is 910). The file must be valid Go:
+You output the **complete replacement contents** of `/Users/matthewcheng/Projects/proxy-manager/dashboard/ui.go` as one `Write` (not a diff). Approximate target: 900 lines (the current file is 910). The file must be valid Go:
 
 ```go
 package main
