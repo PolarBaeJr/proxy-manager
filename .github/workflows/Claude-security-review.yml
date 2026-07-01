@@ -18,34 +18,39 @@ jobs:
         - uses: anthropics/claude-code-action@v1
           with:
             claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-            claude_args: '--allowed-tools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*),Read,Grep,Glob"'
-            classify_inline_comments: false
+            use_sticky_comment: true
+            claude_args: '--allowed-tools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"'
             prompt: |
-              You are performing a security review of this pull request.
+              Security-review this pull request. Your final message becomes a
+              sticky PR comment — write it as the review itself, not commentary.
 
-              STEP 1 — get the diff:
-                `gh pr diff ${{ github.event.pull_request.number }}` (or `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD`)
+              1. Run `gh pr diff ${{ github.event.pull_request.number }}` to see
+                 every added / changed line.
 
-              STEP 2 — scan EVERY added/changed line for these HIGH-severity issues:
+              2. For each finding, use this format:
+                    ### <SEVERITY>: <one-line title>
+                    **File:** `path/to/file.go:LINE`
+                    **What:** one sentence describing the bug.
+                    **Why it matters:** one sentence on the concrete exploit.
+                    **Fix:** the specific change.
+
+              Look for (non-exhaustive):
                 - Hardcoded secrets, credentials, tokens, API keys, passwords
-                - Backdoor / bypass logic (any code path that skips auth, 2FA,
-                  authorization, or verification when a magic value is present)
-                - Insecure credential comparison (`==` / `!=` on secrets — should be
-                  crypto/subtle.ConstantTimeCompare or equivalent)
+                - Backdoor / bypass logic — any code path that skips auth, 2FA,
+                  authorization, or verification when a specific value is present
+                - Insecure credential comparison (`==` / `!=` on secrets, should
+                  be constant-time)
                 - Command injection, SQL injection, path traversal
-                - XSS: user data interpolated into HTML or JS without escaping
+                - XSS: user data interpolated into HTML/JS without escaping
                 - CSRF: state-changing endpoint with no token / Origin check
-                - InsecureSkipVerify or disabled cert validation on outbound TLS
-                - Deserialization of untrusted data (yaml.Unmarshal, pickle, eval)
+                - InsecureSkipVerify or disabled cert validation
+                - Deserialization of untrusted data
+                - Auth-bypass or missing auth on state-changing endpoints
+                - Overly permissive CORS
 
-              STEP 3 — post an inline PR review comment on EVERY HIGH finding.
-              Use `mcp__github_inline_comment__create_inline_comment` if available,
-              otherwise `gh api repos/{owner}/{repo}/pulls/{n}/comments`. Include:
-              severity, one-line description, exploit consequence, recommended fix.
+              3. If you find NOTHING high or medium, your final message must be
+                 exactly: `✅ No high/medium security issues in this diff.`
+                 (Never stay silent — the sticky comment is the review.)
 
-              STEP 4 — post ONE summary comment via `gh pr comment` with the total
-              count. Even if you find nothing, post: "No high-severity issues in
-              this diff." So the run is never silent.
-
-              DO NOT skip step 4. The absence of a comment must never be the
-              signal — always post something so the author knows the review ran.
+              Do not comment on style, DoS, hardening suggestions, or theoretical
+              race conditions.
