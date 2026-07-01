@@ -151,6 +151,13 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+	// Structural 503: labelled host exists but zero healthy backends. Tag the
+	// writer so withMetrics skips this — the dashboard already surfaces the
+	// down state on the routes/services tabs, and counting these as errors
+	// spikes the error-rate KPI for a known-and-expected failure mode.
+	if m, ok := w.(interface{ MarkStructural() }); ok {
+		m.MarkStructural()
+	}
 	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
 }
 
