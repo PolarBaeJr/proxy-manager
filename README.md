@@ -21,53 +21,39 @@ Built for a Raspberry Pi running 10+ production services. Replaces the usual ngi
 ## Architecture
 
 ```
-                ┌──────────────────────────────────────────────┐
-  internet ───→ │  edge  :443                       (OPT-IN)   │
-                │  TLS via Let's Encrypt autocert + HSTS       │
-                │  per-IP rate limit (optional peer gossip     │
-                │    for cluster-wide caps) + body size cap    │
-                │  gzip + X-Forwarded-* + access log           │
-                └──────────────────────┬───────────────────────┘
-                                       │ HTTP (internal)
-                                       ▼
-                ┌──────────────────────────────────────────────┐
-                │  proxy  :8092             (READ-only socket) │
-                │  label discovery + static routes             │
-                │  weighted round-robin + retry                │
-                │  background health checks                    │
-                │  in-memory access log on :8094/access        │
-                └──────────────────────────────────────────────┘
-                                       ▲
-                                       │ container labels
-                                       ▼
-                ┌──────────────────────────────────────────────┐
-                │  dashboard  :8093        (READ-WRITE socket) │
-                │  auth + 2FA + audit + rate-limited login     │
-                │  service mgmt (scale/replace/stage/promote)  │
-                │  DNS via Cloudflare API                      │
-                │  container logs + proxy access log viewers   │
-                │  Stats tab (forwards monitor + cert probe)   │
-                └──────────────────────────────────────────────┘
-                                       │
-                                       │ /api/monitor/*
-                                       ▼
-                ┌──────────────────────────────────────────────┐
-                │  monitor  :8095               (no host port) │
-                │  scrapes proxy + edge + dashboard /metrics   │
-                │  TLS handshake probing for cert expiry       │
-                │  1h rolling time series in memory            │
-                │  health classification: up / flaky / down    │
-                └──────────────────────────────────────────────┘
-
-                ┌──────────────────────────────────────────────┐
-   proxy ─────→ │  auth  :8096                  (no host port) │
-   (redirect    │  SSO login portal at auth.<domain>           │
-    unauth'd    │  + OAuth 2.0 authorization server for MCP    │
-    browsers)   │  verifies creds against dashboard,           │
-                │  reads routed hosts from proxy /routes       │
-                │  issues the HMAC pmgr_sso cookie the proxy   │
-                │  verifies in-process (no shared state)       │
-                └──────────────────────────────────────────────┘
+       internet
+          │  HTTPS
+          ▼
+    ┌────────────────────────────────────────┐
+    │ edge :443                     (OPT-IN)  │  TLS autocert · HSTS · per-IP
+    │ TLS · rate-limit · gzip · X-Forwarded-* │  rate-limit · gzip · body cap
+    └────────────────────┬────────────────────┘
+                         │ HTTP (internal)
+                         ▼
+    ┌────────────────────────────────────────┐   route by Host    ┌──────────────────────────────────────┐
+    │ proxy :8092           (READ-only socket)│──── (public) ─────▶│ app-a   a.example:3000     (public)   │
+    │ label discovery + static routes         │                    └──────────────────────────────────────┘
+    │ weighted round-robin + retry + health   │
+    │ enforces proxy.auth: verifies pmgr_sso  │  cookie OK, then    ┌──────────────────────────────────────┐
+    │ cookie IN-PROCESS (auth never proxies)  │── proxy forwards ─▶│ app-b   b.example:8080   proxy.auth=on │
+    └──┬──────────────────────────────┬───────┘  (else 302 → auth) └──────────────────────────────────────┘
+       │ container labels             │ hosts auth.<domain>;
+       ▼                              ▼ 302s unauth'd browsers here to log in
+    ┌────────────────────────────┐  ┌────────────────────────────────────────┐
+    │ dashboard :8093            │  │ auth :8096              (no host port)  │
+    │ (READ-WRITE socket)        │◀─│ SSO login portal @ auth.<domain>        │
+    │ auth · 2FA · audit · login │  │ + OAuth 2.0 AS for claude.ai MCP        │
+    │ service mgmt · DNS · logs  │  │ verifies creds (POST /api/auth/*),      │
+    │ Stats tab (monitor+certs)  │  │ reads /routes, issues pmgr_sso cookie   │
+    └─────────────┬──────────────┘  │ (the proxy verifies it in-process)     │
+                  │ /api/monitor/*   └────────────────────────────────────────┘
+                  ▼
+    ┌────────────────────────────┐
+    │ monitor :8095              │
+    │ scrapes proxy/edge/dash    │
+    │ /metrics · TLS cert probes │
+    │ 1h series · up/flaky/down  │
+    └────────────────────────────┘
 ```
 
 Binaries stay loosely coupled:
