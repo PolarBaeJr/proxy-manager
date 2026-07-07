@@ -236,6 +236,28 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"username": body.Username, "elevated_until": elev.Unix()})
 	}))
 
+	// Used by the proxy's auth gate to resolve a bearer API token (pmt_...)
+	// to its owning username. Rate-limited like login — token guessing gets
+	// the same treatment as password guessing.
+	mux.HandleFunc("/api/auth/verify-token", rl.limit(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != "POST" {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct{ Token string }
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		u := auth.VerifyToken(body.Token)
+		if u == "" {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		audit(req, u, "auth.token_verified", "")
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"username": u})
+	}))
+
 	mux.HandleFunc("/api/auth/verify-2fa", rl.limit(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "POST" {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)

@@ -36,6 +36,9 @@ type RouteGroup struct {
 	Service     string
 	Backends    []*Backend
 
+	AuthRequired bool
+	AuthUsers    []string // lowercased; empty = any authenticated user
+
 	cursor atomic.Uint64
 }
 
@@ -62,6 +65,9 @@ func (g *RouteGroup) pickHealthy(skip map[*Backend]bool) *Backend {
 type Router struct {
 	mu     sync.RWMutex
 	groups []*RouteGroup
+
+	auth     *authGate // nil = auth gating disabled (proxy.auth hosts fail closed)
+	authWarn sync.Once
 }
 
 func (r *Router) Set(groups []*RouteGroup) {
@@ -133,6 +139,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.")
 		return
+	}
+	if group.AuthRequired {
+		if r.auth == nil {
+			// proxy.auth=true but the gate isn't configured (-auth-domains
+			// unset) — fail closed rather than silently exposing the host.
+			r.authWarn.Do(func() {
+				log.Printf("auth: host %s requires auth but -auth-domains is unset — failing closed with 503", group.Host)
+			})
+			serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
+			return
+		}
+		if !r.auth.authorize(w, req, group) {
+			return
+		}
 	}
 	if group.StripPrefix && group.PathPrefix != "" {
 		req.URL.Path = strings.TrimPrefix(req.URL.Path, group.PathPrefix)
@@ -228,12 +248,14 @@ func (w *errCatchingWriter) Write(b []byte) (int, error) {
 // ---- Assembly: docker labels + static config ----
 
 type staticRoute struct {
-	Host     string   `json:"host"`
-	Path     string   `json:"path,omitempty"`
-	Strip    bool     `json:"strip,omitempty"`
-	Name     string   `json:"name,omitempty"`
-	Backends []string `json:"backends"`
-	Health   string   `json:"health,omitempty"`
+	Host      string   `json:"host"`
+	Path      string   `json:"path,omitempty"`
+	Strip     bool     `json:"strip,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Backends  []string `json:"backends"`
+	Health    string   `json:"health,omitempty"`
+	Auth      bool     `json:"auth,omitempty"`
+	AuthUsers []string `json:"auth_users,omitempty"`
 }
 
 type staticConfig struct {
@@ -253,7 +275,10 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 				key := sr.Host + "|" + sr.Path
 				g, ok := groupsByKey[key]
 				if !ok {
-					g = &RouteGroup{Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name}
+					g = &RouteGroup{
+						Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name,
+						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers),
+					}
 					groupsByKey[key] = g
 				}
 				for _, raw := range sr.Backends {
@@ -306,6 +331,16 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 			}
 			groupsByKey[key] = g
 		}
+		// Auth fields merge across replicas, unlike Strip/Name (first-wins):
+		// ANY replica carrying proxy.auth=true protects the whole group (fail
+		// toward protection), and the allowlist comes from the first replica
+		// that sets proxy.auth.users.
+		if c.Labels[labelAuth] == "true" {
+			g.AuthRequired = true
+		}
+		if len(g.AuthUsers) == 0 {
+			g.AuthUsers = normalizeAuthUsers(strings.Split(c.Labels[labelAuthUsers], ","))
+		}
 		if c.State != "running" {
 			continue
 		}
@@ -340,6 +375,19 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		out = append(out, g)
 	}
 	return out, nil
+}
+
+// normalizeAuthUsers trims, drops empties, and lowercases so membership
+// checks against the signed cookie username are case-insensitive.
+func normalizeAuthUsers(in []string) []string {
+	var out []string
+	for _, u := range in {
+		u = strings.ToLower(strings.TrimSpace(u))
+		if u != "" {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 func makeBackend(rawURL string, weight int, container, healthPath string, u *url.URL, hostHeader string) *Backend {

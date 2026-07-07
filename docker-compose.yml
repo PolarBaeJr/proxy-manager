@@ -1,6 +1,6 @@
 name: pi-stack
 
-# Four binaries (edge is opt-in):
+# Five binaries (edge is opt-in):
 #   edge      :80 / :443  — TLS termination + rate limit + gzip + access log
 #                           OPT-IN: `docker compose --profile edge up -d`
 #   proxy     :8092       — reverse proxy + label-driven LB (read-only docker socket)
@@ -8,6 +8,8 @@ name: pi-stack
 #   dashboard :8093       — auth-gated management UI (read-write docker socket)
 #   monitor   :8095       — scrapes proxy+edge metrics, exposes aggregated stats
 #                           (no public port; dashboard reads from it)
+#   auth      :8096       — SSO login portal for proxy.auth=true hosts
+#                           (no public port; reached via proxy at auth.<domain>)
 
 networks:
   edge:
@@ -56,6 +58,15 @@ services:
       - ./cmd/proxy/data:/data                           # metrics snapshots (persisted)
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      # generate: openssl rand -hex 32 — must match the auth service's secret
+      PMGR_AUTH_SECRET: ${PMGR_AUTH_SECRET:-}
+    # = form so empty env expansions don't swallow the next flag. Auth gating
+    # stays OFF until AUTH_DOMAINS is set (e.g. polardev.org,the-aquarium.com);
+    # all other proxy flags keep their built-in defaults.
+    command: >
+      -auth-domains=${AUTH_DOMAINS:-}
+      -auth-trusted-cidrs=${AUTH_TRUSTED_CIDRS:-}
 
   dashboard:
     build:
@@ -102,3 +113,21 @@ services:
       -window 1h
       -tls-probe-targets ${TLS_PROBE_TARGETS:-}
       -tls-probe-interval 15m
+
+  auth:
+    build:
+      context: .
+      dockerfile: cmd/auth/Dockerfile
+    image: ghcr.io/polarbaejr/proxy-manager-auth:${AUTH_TAG:-latest}
+    container_name: auth
+    restart: unless-stopped
+    networks: [edge]
+    # No host port — reached through the proxy (Host: auth.<domain>).
+    # Stateless: sessions live in the signed cookie, so no volume.
+    environment:
+      # generate: openssl rand -hex 32 — must match the proxy's secret
+      PMGR_AUTH_SECRET: ${PMGR_AUTH_SECRET:-}
+    command: >
+      -cookie-domains=${AUTH_COOKIE_DOMAINS:-polardev.org,the-aquarium.com}
+      -dashboard-url=http://dashboard:8093
+      -routes-url=http://proxy:8094/routes

@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [edge, proxy, dashboard, monitor]
+        service: [edge, proxy, dashboard, monitor, auth]
     steps:
       - uses: actions/checkout@v4
 

@@ -1,0 +1,69 @@
+// auth: SSO login portal for proxy.auth=true hosts.
+// Verifies credentials against the dashboard's /api/auth/login and issues a
+// domain-wide HMAC-signed cookie (pmgr_sso) that the proxy verifies with the
+// same shared PMGR_AUTH_SECRET. Stateless — sessions live in the cookie, so
+// no volume is needed.
+package main
+
+import (
+	"encoding/hex"
+	"errors"
+	"flag"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+func main() {
+	addr := flag.String("addr", ":8096", "listen address")
+	cookieDomains := flag.String("cookie-domains", "polardev.org,the-aquarium.com", "comma-separated parent domains cookies may be set for")
+	dashboardURL := flag.String("dashboard-url", "http://dashboard:8093", "dashboard base URL for credential verification")
+	routesURL := flag.String("routes-url", "http://proxy:8094/routes", "proxy endpoint listing routed hosts (for redirect validation)")
+	sessionLifetime := flag.Duration("session-lifetime", 720*time.Hour, "SSO cookie lifetime")
+	flag.Parse()
+
+	envHex := strings.TrimSpace(os.Getenv("PMGR_AUTH_SECRET"))
+	if envHex == "" {
+		log.Fatal("PMGR_AUTH_SECRET is required (generate: openssl rand -hex 32)")
+	}
+	secret, err := hex.DecodeString(envHex)
+	if err != nil || len(secret) == 0 {
+		log.Fatalf("PMGR_AUTH_SECRET is not valid hex: %v", err)
+	}
+
+	s := &loginServer{
+		secret:       secret,
+		domains:      splitAndTrim(*cookieDomains),
+		dashboardURL: strings.TrimRight(*dashboardURL, "/"),
+		routesURL:    *routesURL,
+		lifetime:     *sessionLifetime,
+		client:       &http.Client{Timeout: 5 * time.Second},
+		routesClient: &http.Client{Timeout: 2 * time.Second},
+	}
+	if len(s.domains) == 0 {
+		log.Fatal("-cookie-domains must list at least one parent domain")
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login", s.handleLogin)
+	mux.HandleFunc("/logout", s.handleLogout)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
+
+	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	log.Printf("auth on %s (cookie domains: %s)", *addr, strings.Join(s.domains, ", "))
+	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+}
+
+func splitAndTrim(csv string) []string {
+	var out []string
+	for _, s := range strings.Split(csv, ",") {
+		if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
