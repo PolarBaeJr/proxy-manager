@@ -29,10 +29,10 @@ jobs:
         with:
           go-version: '1.23'
 
-      # The repo intentionally commits no go.sum; regenerate it the same way
-      # the container builds do before compiling or testing.
-      - name: Resolve dependencies
-        run: go mod tidy
+      # go.sum is committed; download the pinned modules and verify them
+      # against it rather than regenerating.
+      - name: Download dependencies
+        run: go mod download
 
       - name: Build
         run: go build ./...
