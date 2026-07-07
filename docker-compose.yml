@@ -124,11 +124,22 @@ services:
     restart: unless-stopped
     networks: [edge]
     # No host port — reached through the proxy (Host: auth.<domain>).
-    # Stateless: sessions live in the signed cookie, so no volume.
+    # Sessions live in the signed cookie (no state). The only persisted state is
+    # the OPT-IN passkey credential store, written to /data/passkeys.json when
+    # AUTH_PASSKEY_DOMAINS is set; with it empty the volume is never touched.
+    volumes:
+      - ./cmd/auth/data:/data           # opt-in passkey credential store
     environment:
       # generate: openssl rand -hex 32 — must match the proxy's secret
       PMGR_AUTH_SECRET: ${PMGR_AUTH_SECRET:-}
+      # Optional per-domain WebAuthn origins override (e.g.
+      # https://auth.polardev.org,https://auth.the-aquarium.com). Empty ⇒
+      # defaults to https://auth.<domain> for each passkey domain.
+      PASSKEY_RP_ORIGINS: ${PASSKEY_RP_ORIGINS:-}
+    # = form so empty env expansions don't swallow the next flag. Passkeys stay
+    # OFF until AUTH_PASSKEY_DOMAINS is set (e.g. polardev.org,the-aquarium.com).
     command: >
       -cookie-domains=${AUTH_COOKIE_DOMAINS:-polardev.org,the-aquarium.com}
       -dashboard-url=http://dashboard:8093
       -routes-url=http://proxy:8094/routes
+      -passkey-rp-domains=${AUTH_PASSKEY_DOMAINS:-}

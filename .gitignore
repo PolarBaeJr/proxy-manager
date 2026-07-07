@@ -1,4 +1,5 @@
 .env
+cmd/auth/data/
 cmd/dashboard/data/
 cmd/edge/data/
 cmd/proxy/data/
