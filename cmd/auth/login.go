@@ -37,6 +37,7 @@ type loginServer struct {
 	refreshTTL   time.Duration // OAuth refresh token lifetime
 	client       *http.Client // dashboard login calls
 	routesClient *http.Client // proxy /routes fetches
+	passkeyEnabled bool       // true when -passkey-rp-domains is non-empty
 
 	mu       sync.Mutex
 	hosts    map[string]bool // routed hosts from the proxy, lowercased
@@ -66,6 +67,8 @@ const loginPage = `<!doctype html><html lang=en><meta charset=utf-8>
   input:focus{outline:none;border-color:#3f3f3f}
   button{width:100%%;padding:10px;border:0;border-radius:8px;background:#fafafa;color:#0a0a0a;font-weight:600;font-size:14px;font-family:inherit;cursor:pointer}
   button:hover{background:#e2e2e2}
+  button.alt{margin-top:10px;background:#141414;color:#e6e6e6;border:1px solid #262626}
+  button.alt:hover{background:#1c1c1c;border-color:#3f3f3f}
   .msg{margin:0 0 14px;font-size:13px;color:#f87171}
   .msg.ok{color:#4ade80}
 </style>
@@ -83,7 +86,73 @@ const loginPage = `<!doctype html><html lang=en><meta charset=utf-8>
     <input type=hidden name=redirect value="%s">
     <button type=submit>Sign in</button>
   </form>
+  <button type=button id=pk-btn class=alt hidden>Sign in with passkey</button>
 </div>
+<script>
+function b64uToBuf(s) {
+  if (typeof s !== 'string') return s;
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length %% 4) s += '=';
+  const bin = atob(s);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+function bufToB64u(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function decodeGetOptions(o) {
+  o.challenge = b64uToBuf(o.challenge);
+  if (Array.isArray(o.allowCredentials)) o.allowCredentials.forEach(function(c){ c.id = b64uToBuf(c.id); });
+  return o;
+}
+function encodeGetResponse(cred) {
+  return {
+    id: cred.id,
+    rawId: bufToB64u(cred.rawId),
+    type: cred.type,
+    clientExtensionResults: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {},
+    response: {
+      authenticatorData: bufToB64u(cred.response.authenticatorData),
+      clientDataJSON:    bufToB64u(cred.response.clientDataJSON),
+      signature:         bufToB64u(cred.response.signature),
+      userHandle:        cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null,
+    },
+  };
+}
+async function passkeyLogin() {
+  const redirectEl = document.querySelector('input[name=redirect]');
+  const redirect = redirectEl ? redirectEl.value : '';
+  const beginResp = await fetch('/passkey/login/begin', { method: 'POST' });
+  if (!beginResp.ok) throw new Error('begin failed');
+  const begin = await beginResp.json();
+  const opts = decodeGetOptions(begin.options.publicKey);
+  const cred = await navigator.credentials.get({ publicKey: opts });
+  if (!cred) throw new Error('no credential returned');
+  const finishResp = await fetch('/passkey/login/finish?ceremony=' + encodeURIComponent(begin.ceremony)
+            + '&redirect=' + encodeURIComponent(redirect), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(encodeGetResponse(cred)),
+  });
+  if (!finishResp.ok) throw new Error('login failed');
+  const out = await finishResp.json();
+  window.location.assign(out.target || '/login?ok=1');
+}
+document.addEventListener('DOMContentLoaded', function(){
+  if (!window.PublicKeyCredential) return;
+  fetch('/passkey/available').then(function(r){ return r.ok ? r.json() : { available: false }; })
+    .then(function(d){
+      if (!d || !d.available) return;
+      const btn = document.getElementById('pk-btn');
+      btn.hidden = false;
+      btn.addEventListener('click', function(){ passkeyLogin().catch(function(e){ console.error(e); }); });
+    }).catch(function(){});
+});
+</script>
 `
 
 const logoutPage = `<!doctype html><html lang=en><meta charset=utf-8>
@@ -122,6 +191,9 @@ func (s *loginServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 			msg = "<p class=msg>Invalid credentials.</p>"
 		case r.URL.Query().Get("ok") == "1":
 			msg = "<p class=\"msg ok\">Logged in. You can close this tab.</p>"
+			if s.passkeyEnabled {
+				msg += "<p class=msg style=\"color:#8a8a8a\"><a href=\"/passkeys\">Manage passkeys</a></p>"
+			}
 		}
 		s.renderLogin(w, msg, r.URL.Query().Get("redirect"))
 	case "POST":

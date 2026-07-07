@@ -245,6 +245,22 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 		})
 	}))
 
+	// Used by the SSO portal's passkey login as a fail-closed existence check
+	// before minting a cookie: a passkey must not outlive its account. Rate-
+	// limited like login. Reveals only a boolean, never account details.
+	mux.HandleFunc("/api/auth/user-exists", rl.limit(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != "POST" {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct{ Username string }
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]bool{"exists": auth.Exists(body.Username)})
+	}))
+
 	// Used by the proxy's auth gate to resolve a bearer API token (pmt_...)
 	// to its owning username. Rate-limited like login — token guessing gets
 	// the same treatment as password guessing.

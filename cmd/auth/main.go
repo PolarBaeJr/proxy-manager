@@ -24,6 +24,7 @@ func main() {
 	sessionLifetime := flag.Duration("session-lifetime", 720*time.Hour, "SSO cookie lifetime")
 	accessTTL := flag.Duration("access-token-ttl", time.Hour, "OAuth access token lifetime")
 	refreshTTL := flag.Duration("refresh-token-ttl", 720*time.Hour, "OAuth refresh token lifetime")
+	passkeyDomains := flag.String("passkey-rp-domains", "", "comma-separated cookie domains to enable WebAuthn passkeys for (empty = disabled)")
 	flag.Parse()
 
 	envHex := strings.TrimSpace(os.Getenv("PMGR_AUTH_SECRET"))
@@ -64,6 +65,29 @@ func main() {
 	mux.HandleFunc("/oauth/authorize", s.handleAuthorize)
 	mux.HandleFunc("/oauth/token", s.handleToken)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
+
+	// Opt-in WebAuthn passkeys. Empty -passkey-rp-domains ⇒ no store opened, no
+	// routes registered, portal stays byte-for-byte stateless.
+	if pkDomains := splitAndTrim(*passkeyDomains); len(pkDomains) > 0 {
+		store, err := loadPasskeyStore("/data/passkeys.json")
+		if err != nil {
+			log.Fatalf("passkey store: %v", err)
+		}
+		managers := buildPasskeyManagers(pkDomains, os.Getenv("PASSKEY_RP_ORIGINS"))
+		if len(managers) > 0 {
+			s.passkeyEnabled = true
+			registerPasskeyRoutes(mux, s, managers, store, newRateLimiter(), s.dashboardURL)
+			enabled := make([]string, 0, len(managers))
+			for d := range managers {
+				enabled = append(enabled, d)
+			}
+			log.Printf("passkey support enabled (rp domains: %s)", strings.Join(enabled, ", "))
+		} else {
+			log.Print("passkey support disabled (no usable rp domains)")
+		}
+	} else {
+		log.Print("passkey support disabled")
+	}
 
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	log.Printf("auth on %s (cookie domains: %s)", *addr, strings.Join(s.domains, ", "))

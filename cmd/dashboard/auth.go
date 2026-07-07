@@ -393,6 +393,13 @@ func (s *AuthStore) VerifyPassword(username, password string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
+// Exists reports whether the username maps to a real account.
+func (s *AuthStore) Exists(username string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.findUser(username) != nil
+}
+
 // HasTOTP reports whether the user exists and has a TOTP secret enrolled.
 func (s *AuthStore) HasTOTP(username string) bool {
 	s.mu.RLock()
