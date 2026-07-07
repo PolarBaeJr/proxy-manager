@@ -120,20 +120,12 @@ func (a *authGate) denyOAuth(w http.ResponseWriter, reqHost string, hadBearer bo
 }
 
 // authorizeOAuth is the oauth-mode counterpart of the sso branch in
-// authorize(): SSO cookie, then pmt_ API token, then pmga_ OAuth access
-// token. Never redirects to the login page, even for Accept: text/html —
-// MCP clients follow the WWW-Authenticate challenge instead.
+// authorize(). It accepts ONLY a bearer token — a pmt_ dashboard token or a
+// pmga_ OAuth access token — with no SSO cookie and no LAN bypass, so
+// browsers always get the 401 challenge. Never redirects to the login page,
+// even for Accept: text/html — MCP clients follow the WWW-Authenticate
+// challenge instead.
 func (a *authGate) authorizeOAuth(w http.ResponseWriter, req *http.Request, group *RouteGroup, reqHost string) bool {
-	if c, err := req.Cookie(sso.CookieName); err == nil {
-		if user, ok := sso.Verify(c.Value, a.secret); ok {
-			if userAllowed(group, user) {
-				return true
-			}
-			httpx.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
-			return false
-		}
-	}
-
 	authz := req.Header.Get("Authorization")
 	hadBearer := strings.HasPrefix(authz, bearerPrefix)
 	if strings.HasPrefix(authz, bearerPrefix+"pmt_") {
