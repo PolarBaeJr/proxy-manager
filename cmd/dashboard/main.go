@@ -18,6 +18,7 @@ func main() {
 	auditFile := flag.String("audit", "/data/audit.log", "audit log file path")
 	onboardedFile := flag.String("onboarded", "/data/onboarded.json", "onboarded-services state file")
 	releasesFile := flag.String("releases", "/data/releases.json", "release marks (stable-tag pins) state file")
+	imageHistoryFile := flag.String("image-history", "/data/image-history.json", "per-service image version history state file")
 	prefsFile := flag.String("prefs", "/data/prefs.json", "per-user UI preferences state file")
 	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (rw: dashboard appends onboarded routes here)")
 	flag.Parse()
@@ -66,6 +67,11 @@ func main() {
 		log.Fatalf("prefs store: %v", err)
 	}
 
+	imageHistory, err := loadImageHistoryStore(*imageHistoryFile)
+	if err != nil {
+		log.Fatalf("image history store: %v", err)
+	}
+
 	pm, err := newPasskeyManager(os.Getenv("PASSKEY_RP_ID"), os.Getenv("PASSKEY_RP_ORIGINS"))
 	if err != nil {
 		log.Printf("⚠ passkey support disabled: %v", err)
@@ -83,6 +89,9 @@ func main() {
 		if err != nil {
 			return nil
 		}
+		// Piggyback on the same tick to persist per-service image history —
+		// this is what keeps replaced versions findable on the Images panel.
+		imageHistory.Record(svcs, onboarded.List())
 		var imgs []string
 		for _, s := range svcs {
 			if s.Image != "" {
@@ -98,7 +107,7 @@ func main() {
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs)
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory)
 
 	log.Printf("dashboard on %s", *addr)
 	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {

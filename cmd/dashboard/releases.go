@@ -75,6 +75,18 @@ func (s *ReleasesStore) List(imageBase string) []StableMark {
 	return out
 }
 
+// All returns a copy of every stable mark keyed by image base. Used to build
+// the image-deletion protection set: every marked base:tag ref is protected.
+func (s *ReleasesStore) All() map[string][]StableMark {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string][]StableMark, len(s.data.Marks))
+	for base, marks := range s.data.Marks {
+		out[base] = append([]StableMark(nil), marks...)
+	}
+	return out
+}
+
 func (s *ReleasesStore) Mark(imageBase, tag, label, by string) error {
 	if tag == "" {
 		return fmt.Errorf("tag required")
