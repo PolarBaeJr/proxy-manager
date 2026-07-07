@@ -132,8 +132,12 @@ func (a *authGate) authorize(w http.ResponseWriter, req *http.Request, group *Ro
 		}
 	}
 
-	if ip := realClientIP(req, a.xffTrusted); ip != nil && ipInAny(ip, a.trusted) {
-		return true
+	// oauth hosts are bearer-only: the LAN bypass and SSO cookies don't apply,
+	// so browsers always get the 401 challenge instead of silent access.
+	if group.AuthMode != "oauth" {
+		if ip := realClientIP(req, a.xffTrusted); ip != nil && ipInAny(ip, a.trusted) {
+			return true
+		}
 	}
 
 	if len(a.secret) == 0 {
