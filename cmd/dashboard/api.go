@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -524,6 +525,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 						CanaryImage:    o.CanaryImage,
 						CanaryReplicas: o.CanaryReplicas,
 						Onboarded:      true,
+						Unscalable:     o.Host == "",
 					})
 				}
 				httpx.WriteJSON(w, http.StatusOK, svcs)
@@ -787,11 +789,55 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 	registerLogRoutes(mux, dc, auth)
 
 	// ---- Discovery: list containers NOT routed by the proxy (auth-gated) ----
-	registerDiscoveryRoutes(mux, dc, auth)
+	registerDiscoveryRoutes(mux, dc, auth, onb)
 
 	// ---- Onboarding: one-click adopt an unlabelled container as a service ----
 	mux.HandleFunc("/api/discovery/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
 		rest := strings.TrimPrefix(req.URL.Path, "/api/discovery/")
+		info, _ := auth.sessionFrom(req)
+		user := sessionUser(info)
+		// Batch onboarding: adopt every unmanaged container of a compose project
+		// as managed-only (no route, no edge, no env). Idempotent.
+		if rest == "batch-onboard" && req.Method == "POST" {
+			var body struct {
+				Project string `json:"project"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if body.Project == "" || !validServiceName(body.Project) {
+				http.Error(w, "invalid project", http.StatusBadRequest)
+				return
+			}
+			items, err := dc.listUnmanaged(req.Context(), nil)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			targets, skipped := batchOnboardTargets(items, body.Project, func(n string) bool {
+				_, ok := onb.Get(n)
+				return ok
+			})
+			onboarded := []string{}
+			failed := []map[string]string{}
+			for _, name := range targets {
+				if err := onboardManagedOnly(req.Context(), name, dc, onb); err != nil {
+					failed = append(failed, map[string]string{"name": name, "error": err.Error()})
+					continue
+				}
+				onboarded = append(onboarded, name)
+				audit(req, user, "service.onboard", name)
+			}
+			audit(req, user, "service.onboard_batch", fmt.Sprintf("%s onboarded=%d skipped=%d failed=%d", body.Project, len(onboarded), len(skipped), len(failed)))
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
+				"project":   body.Project,
+				"onboarded": onboarded,
+				"skipped":   skipped,
+				"failed":    failed,
+			})
+			return
+		}
 		parts := strings.SplitN(rest, "/", 2)
 		if len(parts) != 2 || parts[1] != "onboard" || req.Method != "POST" {
 			http.NotFound(w, req)
@@ -808,8 +854,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			return
 		}
 		proxyRefresh(proxyURLFromEnv())
-		info, _ := auth.sessionFrom(req)
-		audit(req, sessionUser(info), "service.onboard", name)
+		audit(req, user, "service.onboard", name)
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "onboarded", "name": name})
 	}))
 

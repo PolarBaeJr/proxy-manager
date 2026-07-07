@@ -33,8 +33,12 @@ const (
 // container. The Template fields are captured at onboard time so replicas can
 // be cloned later even if the original is destroyed.
 type OnboardedService struct {
-	Name           string            `json:"name"`              // logical service name (matches container)
-	Host           string            `json:"host"`              // proxy.host equivalent
+	Name string `json:"name"` // logical service name (matches container)
+	// Host is the proxy.host equivalent. An EMPTY Host means the service is
+	// managed-only: adopted for lifecycle/image tracking, with no route, not
+	// on the edge network, and not scalable/replaceable. Adding a route later
+	// (via onboardContainer) upgrades it to a full onboarded service in place.
+	Host           string            `json:"host"`
 	Port           int               `json:"port"`              // internal container port
 	Image          string            `json:"image"`             // currently-live image (clones use this)
 	Env            []string          `json:"env,omitempty"`     // captured at onboard time
@@ -318,6 +322,37 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	return nil
 }
 
+// onboardManagedOnly adopts an existing container for lifecycle/image tracking
+// only: it appears in Services and the Images panel and can be offboarded, but
+// gets NO route, NO edge-network connect, and NO env capture. Routing a member
+// stays a separate explicit action (onboardContainer) afterward.
+func onboardManagedOnly(ctx context.Context, name string, c *dockerClient, store *OnboardedStore) error {
+	if !validServiceName(name) {
+		return fmt.Errorf("invalid container name (allowed: a-z A-Z 0-9 . _ -, max 63 chars)")
+	}
+	containers, err := c.listAll(ctx, fmt.Sprintf(`{"name":["%s"]}`, name))
+	if err != nil {
+		return err
+	}
+	var ct *dockerContainer
+	for i := range containers {
+		if containers[i].name() == name {
+			ct = &containers[i]
+			break
+		}
+	}
+	if ct == nil {
+		return fmt.Errorf("container %q not found", name)
+	}
+	return store.Put(OnboardedService{
+		Name:           name,
+		Image:          ct.Image,
+		Replicas:       1,
+		OriginalRouted: false,
+		CreatedAt:      time.Now().Unix(),
+	})
+}
+
 // scaleOnboarded clones the template image+env into N-1 additional containers
 // named <name>-r<index>, rewrites the route's backend list, and updates the
 // store. Scale-down removes the highest-numbered clones first. The ORIGINAL
@@ -326,6 +361,9 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 	svc, ok := store.Get(name)
 	if !ok {
 		return fmt.Errorf("not an onboarded service")
+	}
+	if svc.Host == "" {
+		return fmt.Errorf("%q is managed-only (no route) — manage it via docker compose", name)
 	}
 	if desired < 1 {
 		return fmt.Errorf("onboarded services must keep at least the original (>= 1)")
@@ -403,6 +441,9 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 // CanaryImage clears and the same container is treated as a regular live
 // backend — it IS the new live, just retained its original name.
 func rebuildOnboardedRoute(ctx context.Context, c *dockerClient, name string, svc OnboardedService, routesPath string) error {
+	if svc.Host == "" {
+		return removeOnboardedRoute(routesPath, name)
+	}
 	backends := []string{}
 	if svc.OriginalRouted {
 		backends = append(backends, fmt.Sprintf("http://%s:%d", name, svc.Port))
@@ -441,6 +482,9 @@ func (c *dockerClient) stageOnboarded(ctx context.Context, name string, req Repl
 	svc, ok := store.Get(name)
 	if !ok {
 		return fmt.Errorf("not onboarded: %s", name)
+	}
+	if svc.Host == "" {
+		return fmt.Errorf("%q is managed-only (no route) — manage it via docker compose", name)
 	}
 	if req.Image == "" {
 		return fmt.Errorf("image is required")
@@ -483,6 +527,9 @@ func (c *dockerClient) promoteOnboarded(ctx context.Context, name string, store 
 	svc, ok := store.Get(name)
 	if !ok {
 		return fmt.Errorf("not onboarded: %s", name)
+	}
+	if svc.Host == "" {
+		return fmt.Errorf("%q is managed-only (no route) — manage it via docker compose", name)
 	}
 	if svc.CanaryImage == "" {
 		return fmt.Errorf("no canary to promote for %q", name)
@@ -548,6 +595,9 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 	svc, ok := store.Get(name)
 	if !ok {
 		return fmt.Errorf("not onboarded: %s", name)
+	}
+	if svc.Host == "" {
+		return fmt.Errorf("%q is managed-only (no route) — manage it via docker compose", name)
 	}
 	if req.Image == "" {
 		return fmt.Errorf("image is required")

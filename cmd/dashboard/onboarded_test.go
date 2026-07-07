@@ -1,9 +1,37 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// TestManagedOnlyGuards proves the lifecycle actions reject a managed-only
+// record (empty Host) BEFORE any Docker IO — the guard sits ahead of listAll,
+// so a zero-value *dockerClient (no socket) never gets called.
+func TestManagedOnlyGuards(t *testing.T) {
+	store, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(OnboardedService{Name: "mo", Host: "", Image: "img", Replicas: 1}); err != nil {
+		t.Fatal(err)
+	}
+	dc := &dockerClient{} // zero value: any Docker call would fail/panic
+	ctx := context.Background()
+	routes := filepath.Join(t.TempDir(), "routes.json")
+
+	check := func(label string, err error) {
+		if err == nil || !strings.Contains(err.Error(), "managed-only") {
+			t.Fatalf("%s: err = %v, want a managed-only error", label, err)
+		}
+	}
+	check("scale", dc.scaleOnboarded(ctx, "mo", 2, store, routes))
+	check("stage", dc.stageOnboarded(ctx, "mo", ReplaceServiceRequest{Image: "x"}, store, routes))
+	check("replace", dc.replaceOnboarded(ctx, "mo", ReplaceServiceRequest{Image: "x"}, store, routes))
+	check("promote", dc.promoteOnboarded(ctx, "mo", store, routes))
+}
 
 func TestNextCloneIndex(t *testing.T) {
 	clones := []dockerContainer{
