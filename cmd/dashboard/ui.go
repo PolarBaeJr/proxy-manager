@@ -296,6 +296,12 @@ details.errd[open] summary{color:#ff7173}
 .svc-card.collapsed .collapse-chev{transform:rotate(-90deg)}
 .svc-card.collapsed .svc-body{display:none}
 .svc-card.collapsed .svc-head{margin-bottom:0}
+
+/* discovery compose-project grouping */
+tr.disc-group{cursor:pointer}
+tr.disc-group .collapse-chev{display:inline-block;width:14px;height:14px;vertical-align:-2px;margin-right:6px;color:var(--muted-2);transition:transform var(--transition-fast);transform:rotate(-90deg)}
+tr.disc-group.open .collapse-chev{transform:rotate(0)}
+tr.disc-child td:first-child{padding-left:28px}
 .svc-head .ic{width:40px;height:40px;border-radius:10px;flex:none;display:grid;place-items:center;background:var(--surface-2);border:1px solid var(--border);color:var(--accent)}
 .svc-head .ic svg{width:20px;height:20px}
 .svc-name{font-size:16px;font-weight:650;letter-spacing:-.01em;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -1430,9 +1436,10 @@ async function renderDiscovery() {
   }
   let html = '<div class="subhead">' + I.layers + unmanaged.length + ' container' + (unmanaged.length === 1 ? '' : 's') + ' without proxy labels</div>';
   html += '<div class="card"><table><thead><tr><th>Container</th><th>Image</th><th>State</th><th>Internal port</th><th style="text-align:right">Add</th></tr></thead><tbody>';
-  for (const u of unmanaged) {
+  function rowHTML(u, extraClass, extraAttrs) {
     const ports = (u.ports && u.ports.length) ? u.ports.join(', ') : '—';
-    html += '<tr><td><span class="ident">' + esc(u.name) + '</span>'
+    return '<tr' + (extraClass ? ' class="' + extraClass + '"' : '') + (extraAttrs ? ' ' + extraAttrs : '') + '>'
+         +  '<td><span class="ident">' + esc(u.name) + '</span>'
          +  (u.project ? ' <span class="meta">· ' + esc(u.project) + '/' + esc(u.service || '') + '</span>' : '')
          +  '</td>'
          +  '<td class="meta">' + esc(u.image) + '</td>'
@@ -1442,6 +1449,42 @@ async function renderDiscovery() {
          +    '<button class="btn sm primary" ' + lockedAttr() + ' onclick="onboardDialog(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')">' + I.plus + 'Onboard' + lk() + '</button>'
          +    ' <button class="btn sm" onclick="discoveryShowLabels(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')" title="Or paste labels into the service\'s docker-compose.yml yourself">YAML</button>'
          +  '</td></tr>';
+  }
+  // Group by compose project: projects with 2+ containers collapse into one
+  // expandable row; singles and unlabeled containers stay flat.
+  const byProj = {};
+  for (const u of unmanaged) {
+    const p = u.project || '';
+    (byProj[p] = byProj[p] || []).push(u);
+  }
+  const entries = [];
+  for (const p of Object.keys(byProj)) {
+    if (p && byProj[p].length >= 2) entries.push({ key: p, group: byProj[p] });
+    else for (const u of byProj[p]) entries.push({ key: u.name, single: u });
+  }
+  entries.sort((a, b) => a.key.localeCompare(b.key));
+  const expanded = JSON.parse(loadPref('pmgr-disc-expanded', '{}'));
+  for (const e of entries) {
+    if (e.single) { html += rowHTML(e.single, '', ''); continue; }
+    const p = e.key;
+    const isOpen = !!expanded[p];
+    const counts = {};
+    for (const u of e.group) counts[u.state] = (counts[u.state] || 0) + 1;
+    const stateTxt = Object.keys(counts).sort().map(st => counts[st] + ' ' + esc(st)).join(', ');
+    const allRunning = (counts.running || 0) === e.group.length;
+    // onclick passes the row itself and the handler reads data-proj — the
+    // project name never sits inside inline JS, where esc() (HTML-escaping
+    // only) couldn't keep it from breaking out of a string literal.
+    html += '<tr class="disc-group' + (isOpen ? ' open' : '') + '" data-proj="' + esc(p) + '" onclick="toggleDiscoveryGroup(this)">'
+         +  '<td><span class="collapse-chev">' + I.chevron + '</span><span class="ident">' + esc(p) + '</span>'
+         +  '<span class="meta"> · ' + e.group.length + ' containers</span></td>'
+         +  '<td class="meta">—</td>'
+         +  '<td><span class="pill ' + (allRunning ? 'ok' : 'muted') + '"><span class="gl"></span>' + stateTxt + '</span></td>'
+         +  '<td class="meta">—</td>'
+         +  '<td></td></tr>';
+    for (const u of e.group) {
+      html += rowHTML(u, 'disc-child', 'data-proj="' + esc(p) + '"' + (isOpen ? '' : ' style="display:none"'));
+    }
   }
   html += '</tbody></table></div>';
   html += '<div class="meta" style="margin-top:8px;font-size:11.5px">Compose-managed containers are left as-is — paste the labels into the service\'s <code>docker-compose.yml</code> and run <code>docker compose up -d</code>.</div>';
@@ -1458,6 +1501,20 @@ function toggleServiceCard(name) {
   savePref('pmgr-svc-collapsed', JSON.stringify(s));
   // Just expanded — refresh its stats panel without waiting for the 5s tick.
   if (!willCollapse) fillServiceStatsPanels().catch(() => {});
+}
+
+function toggleDiscoveryGroup(rowEl) {
+  const p = rowEl.getAttribute('data-proj');
+  const willOpen = !rowEl.classList.contains('open');
+  rowEl.classList.toggle('open', willOpen);
+  // Attribute comparison instead of a CSS selector so project names never
+  // need selector escaping.
+  for (const tr of rowEl.parentNode.querySelectorAll('tr.disc-child')) {
+    if (tr.getAttribute('data-proj') === p) tr.style.display = willOpen ? '' : 'none';
+  }
+  const s = JSON.parse(loadPref('pmgr-disc-expanded', '{}'));
+  if (willOpen) s[p] = 1; else delete s[p];
+  savePref('pmgr-disc-expanded', JSON.stringify(s));
 }
 
 // discoveryShowLabels pops a dialog with the docker-compose labels block the
