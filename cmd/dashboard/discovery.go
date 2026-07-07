@@ -9,7 +9,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"sort"
 	"strings"
 
@@ -99,11 +103,51 @@ func (c *dockerClient) listUnmanaged(ctx context.Context, exclude map[string]boo
 	return out, nil
 }
 
-func registerDiscoveryRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore, onb *OnboardedStore) {
+// routedContainerNames returns the set of bare docker-service names that appear
+// as static backends in routes.json. A backend like "http://auth:8096" yields
+// "auth" — that container is already routed (just not via labels), so Discovery
+// must not offer to onboard it. Backends pointing at host.docker.internal or an
+// IP are host services, not edge-network containers, and are deliberately
+// skipped so they never suppress anything in Discovery.
+func routedContainerNames(routesJSON []byte) map[string]bool {
+	out := map[string]bool{}
+	var f routesFile
+	if err := json.Unmarshal(routesJSON, &f); err != nil {
+		return out
+	}
+	for _, r := range f.Routes {
+		for _, b := range r.Backends {
+			u, err := url.Parse(b)
+			if err != nil {
+				continue
+			}
+			host := u.Hostname()
+			if host == "" || strings.Contains(host, ".") || net.ParseIP(host) != nil {
+				continue
+			}
+			out[host] = true
+		}
+	}
+	return out
+}
+
+func registerDiscoveryRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore, onb *OnboardedStore, routesConfigPath string) {
 	mux.HandleFunc("/api/discovery", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
 		exclude := map[string]bool{}
 		for _, o := range onb.List() {
 			exclude[o.Name] = true
+		}
+		// Also exclude containers already used as a static backend in
+		// routes.json — they're routed, just not via labels. If routes.json
+		// is unreadable, proceed with just the onboarded exclusions.
+		if b, err := os.ReadFile(routesConfigPath); err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("discovery: read routes.json %q: %v", routesConfigPath, err)
+			}
+		} else {
+			for name := range routedContainerNames(b) {
+				exclude[name] = true
+			}
 		}
 		items, err := dc.listUnmanaged(req.Context(), exclude)
 		if err != nil {

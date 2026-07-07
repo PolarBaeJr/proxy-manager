@@ -65,6 +65,36 @@ func TestBatchOnboardTargetsEmptyProject(t *testing.T) {
 	}
 }
 
+func TestRoutedContainerNames(t *testing.T) {
+	routesJSON := []byte(`{
+		"routes": [
+			{"host": "auth.example.com", "backends": ["http://auth:8096"]},
+			{"host": "host.example.com", "backends": ["http://host.docker.internal:54321"]},
+			{"host": "ip.example.com", "backends": ["http://10.0.0.5:3000"]},
+			{"host": "multi.example.com", "backends": ["http://web:8080", "http://worker:9000"]},
+			{"host": "bad.example.com", "backends": ["", "://nope"]}
+		]
+	}`)
+
+	got := routedContainerNames(routesJSON)
+
+	want := map[string]bool{"auth": true, "web": true, "worker": true}
+	if len(got) != len(want) {
+		t.Fatalf("routedContainerNames = %v, want %v", got, want)
+	}
+	for name := range want {
+		if !got[name] {
+			t.Errorf("missing %q in %v", name, got)
+		}
+	}
+	// host.docker.internal (dots) and the IP backend (dots) must NOT be included.
+	for _, unwanted := range []string{"host.docker.internal", "10.0.0.5"} {
+		if got[unwanted] {
+			t.Errorf("%q should not be routed-excluded", unwanted)
+		}
+	}
+}
+
 func TestValidServiceNameRealCompose(t *testing.T) {
 	valid := []string{
 		"supabase_db_badminton_dev",

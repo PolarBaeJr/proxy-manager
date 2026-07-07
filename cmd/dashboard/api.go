@@ -789,7 +789,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 	registerLogRoutes(mux, dc, auth)
 
 	// ---- Discovery: list containers NOT routed by the proxy (auth-gated) ----
-	registerDiscoveryRoutes(mux, dc, auth, onb)
+	registerDiscoveryRoutes(mux, dc, auth, onb, routesConfigPath)
 
 	// ---- Onboarding: one-click adopt an unlabelled container as a service ----
 	mux.HandleFunc("/api/discovery/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
