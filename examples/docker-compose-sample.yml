@@ -28,3 +28,7 @@ services:
       # proxy.health:      "/healthz"   # HTTP health check path
       # proxy.weight:      "2"          # weighted round-robin
       # proxy.unscalable:  "true"       # disable scale buttons in dashboard
+      # --- opt-in SSO forward auth (default: public, no auth) — see README "Access control" ---
+      # proxy.auth:        "true"       # require SSO login (needs a real cookie-domain host)
+      # proxy.auth.users:  "you"        # optional allowlist; empty = any logged-in user
+      # proxy.auth.mode:   "oauth"      # bearer-only (for MCP servers); default is cookie SSO
