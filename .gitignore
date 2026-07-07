@@ -5,3 +5,6 @@ cmd/edge/data/
 cmd/proxy/data/
 cmd/monitor/data/
 .DS_Store
+
+# Claude Code local worktrees / session state
+.claude/
