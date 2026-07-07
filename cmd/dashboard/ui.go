@@ -546,11 +546,13 @@ footer.app code{color:var(--muted)}
           <button data-sub="logs">Container logs</button>
           <button data-sub="access">Access log</button>
           <button data-sub="releases">Releases</button>
+          <button data-sub="images">Images</button>
         </nav>
         <div id="tab-stats"></div>
         <div id="tab-logs" hidden></div>
         <div id="tab-access" hidden></div>
         <div id="tab-releases" hidden></div>
+        <div id="tab-images" hidden></div>
       </section>
       <section id="tab-users" class="tabpane" hidden></section>
     </div>
@@ -1029,7 +1031,7 @@ function switchObsSub(s) {
   if (s !== 'access') accessState.mounted = false;
   if (s !== 'stats') statsDetail = null;
   $$('#obs-subnav button').forEach(b => b.classList.toggle('active', b.dataset.sub === s));
-  ['stats','logs','access','releases'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
+  ['stats','logs','access','releases','images'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
   renderActive();
 }
 
@@ -1055,6 +1057,7 @@ async function renderActive() {
       else if (obsSubTab === 'logs') await renderLogs();
       else if (obsSubTab === 'access') await renderAccess();
       else if (obsSubTab === 'releases') await renderReleases();
+      else if (obsSubTab === 'images') await renderImages();
     } else if (activeTab === 'users') {
       await renderUsers();
     }
@@ -2261,6 +2264,121 @@ async function renderReleases() {
     const cmd = b.dataset.relCmd;
     navigator.clipboard?.writeText(cmd).catch(() => {});
     toast('Copied — paste on the Pi: ' + cmd, 'ok');
+  });
+}
+
+/* ---------- Images (local image phase-out per managed service) ---------- */
+// Hash guard matters here: without it the 5s tick would clobber the keep-N inputs.
+let _lastImagesHash = '';
+async function renderImages() {
+  const el = $('#tab-images');
+  let info;
+  try {
+    info = await api('/api/images');
+  } catch (e) {
+    el.innerHTML = '<div class="card">' + esc(e.message) + '</div>';
+    return;
+  }
+  const hash = JSON.stringify(info);
+  if (hash === _lastImagesHash && el.children.length) return;
+  _lastImagesHash = hash;
+
+  const blurb = '<div class="subhead">' + I.disk + 'Images'
+    + ' <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— local images per service. Mark stable to protect; prune deletes from this disk only, never the registry. Sizes approx.</span>'
+    + '</div>';
+
+  const svcs = info.services || [];
+  const totalBar = '<div class="card"><div class="card-head"><div class="ttl">' + I.disk + '<span>Reclaimable</span>'
+    + ' <span class="pill warn">' + fmtBytes(info.total_reclaimable_bytes || 0) + ' approx</span></div>'
+    + '<div class="spacer"></div>'
+    + '<label style="color:var(--muted);font-size:12px">keep last</label> '
+    + '<input type="number" min="0" max="50" value="3" id="img-prune-all-n" style="width:64px"> '
+    + '<button class="btn danger" data-img-prune="">' + I.scissors + 'Prune all services</button>'
+    + '</div></div>';
+
+  const cards = svcs.map(svc => {
+    const head = '<div class="card-head"><div class="ttl">' + I.layers + '<span>' + esc(svc.service) + '</span>'
+      + ' <span class="pill">' + (svc.entries || []).length + ' version' + ((svc.entries || []).length === 1 ? '' : 's') + '</span>'
+      + ' <span class="pill warn">' + fmtBytes(svc.reclaimable_bytes || 0) + ' reclaimable approx</span></div>'
+      + '<div class="spacer"></div>'
+      + '<label style="color:var(--muted);font-size:12px">keep last</label> '
+      + '<input type="number" min="0" max="50" value="3" data-prune-n="' + esc(svc.service) + '" style="width:64px"> '
+      + '<button class="btn" data-img-prune="' + esc(svc.service) + '">' + I.scissors + 'Prune old</button>'
+      + '</div>';
+    const rows = (svc.entries || []).map(e => {
+      const pills = [];
+      if (e.is_current) pills.push('<span class="pill ok">running</span>');
+      if (e.is_stable)  pills.push('<span class="pill warn">stable</span>');
+      if (e.on_disk)    pills.push('<span class="pill">on disk</span>');
+      if (e.referenced) pills.push('<span class="pill">in use</span>');
+      const markedBy = e.marked_by
+        ? '<div style="color:var(--muted);font-size:12px;margin-top:2px">marked by ' + esc(e.marked_by) + (e.stable_label ? ' — ' + esc(e.stable_label) : '') + '</div>'
+        : '';
+      const idBit = e.short_id ? ' <span class="meta" style="font-size:11.5px">' + esc(e.short_id) + '</span>' : '';
+      const actions = [];
+      if (e.tag && !e.is_stable) actions.push('<button class="btn sm ghost" data-img-mark="' + esc(svc.service) + '" data-tag="' + esc(e.tag) + '">' + I.bookmark + 'Mark stable</button>');
+      if (e.tag && e.is_stable)  actions.push('<button class="btn sm ghost" data-img-unmark="' + esc(svc.service) + '" data-tag="' + esc(e.tag) + '">Unmark</button>');
+      if (e.delete_token)        actions.push('<button class="btn sm danger" data-img-del="' + esc(e.delete_token) + '">' + I.trash + 'Delete</button>');
+      return '<tr>'
+        + '<td><code title="' + esc(e.ref) + '">' + esc(e.tag || e.ref) + '</code>' + idBit + markedBy + '</td>'
+        + '<td>' + (e.on_disk ? fmtBytes(e.size_bytes || 0) : '—') + '</td>'
+        + '<td>' + pills.join(' ') + '</td>'
+        + '<td class="meta">' + (e.last_seen ? new Date(e.last_seen * 1000).toLocaleDateString() : '—') + '</td>'
+        + '<td style="text-align:right">' + actions.join(' ') + '</td>'
+        + '</tr>';
+    }).join('');
+    const body = '<table class="acc-table"><thead><tr>'
+      + '<th>Version</th><th>Size</th><th>Status</th><th>Last seen</th><th style="text-align:right">Actions</th>'
+      + '</tr></thead><tbody>' + (rows || '<tr><td colspan="5" style="color:var(--muted)">No images tracked for this service yet.</td></tr>') + '</tbody></table>';
+    return '<div class="card">' + head + body + '</div>';
+  }).join('');
+
+  el.innerHTML = blurb + totalBar + (cards || '<div class="card">No managed services with tracked images yet.</div>');
+
+  el.querySelectorAll('[data-img-mark]').forEach(b => b.onclick = async () => {
+    const svc = b.dataset.imgMark, tag = b.dataset.tag;
+    const label = await promptDialog('Label for stable ' + svc + ':' + tag + '?', '');
+    if (label === null) return;
+    try {
+      await api('/api/images/mark', { method: 'POST', body: JSON.stringify({ service: svc, tag, label }) });
+      toast('Marked ' + svc + ':' + tag + ' as stable', 'ok');
+      _lastImagesHash = '';
+      renderImages();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  el.querySelectorAll('[data-img-unmark]').forEach(b => b.onclick = async () => {
+    const svc = b.dataset.imgUnmark, tag = b.dataset.tag;
+    if (!(await confirmDialog('Unmark ' + svc + ':' + tag + '? It loses deletion protection.'))) return;
+    try {
+      await api('/api/images/mark', { method: 'DELETE', body: JSON.stringify({ service: svc, tag }) });
+      toast('Unmarked', 'ok');
+      _lastImagesHash = '';
+      renderImages();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  el.querySelectorAll('[data-img-del]').forEach(b => b.onclick = async () => {
+    const token = b.dataset.imgDel;
+    if (!(await confirmDialog('Delete local image ' + token + '? Removes it from this machine only — the registry copy is untouched.', { danger: true }))) return;
+    try {
+      await api('/api/images/delete', { method: 'DELETE', body: JSON.stringify({ token }) });
+      toast('Deleted ' + token, 'ok');
+      _lastImagesHash = '';
+      renderImages();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  el.querySelectorAll('[data-img-prune]').forEach(b => b.onclick = async () => {
+    const svc = b.getAttribute('data-img-prune');
+    const nEl = svc ? el.querySelector('[data-prune-n="' + svc + '"]') : el.querySelector('#img-prune-all-n');
+    const keep = Math.max(0, parseInt((nEl && nEl.value) || '3', 10) || 0);
+    const scope = svc || 'ALL services';
+    if (!(await confirmDialog('Prune old images for ' + scope + '? Keeps stable + running + the ' + keep + ' newest; deletes the rest from local disk (never the registry).', { danger: true, okLabel: 'Prune' }))) return;
+    try {
+      const r = await api('/api/images/prune', { method: 'POST', body: JSON.stringify({ service: svc, keep_n: keep }) });
+      const nDel = (r.deleted || []).length, nFail = (r.failed || []).length;
+      toast('Pruned ' + nDel + ' image(s) — reclaimed ~' + fmtBytes(r.reclaimed_bytes || 0) + (nFail ? ' · ' + nFail + ' failed' : ''), nFail ? 'err' : 'ok');
+      _lastImagesHash = '';
+      renderImages();
+    } catch (e) { toast(e.message, 'err'); }
   });
 }
 

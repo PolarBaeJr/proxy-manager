@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -981,6 +982,222 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			}
 			audit(req, sessionUser(sessionFromReq(auth, req)), "release.unmark", svc+":"+tag)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "unmarked", "tag": tag})
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+
+	// ---- Images / phase-out (per managed service; LOCAL images only) ----
+	// GET    /api/images         → per-service local image inventory + reclaimable bytes
+	// POST   /api/images/mark    → body {"service","tag","label"} — mark a tag stable (protected)
+	// DELETE /api/images/mark    → body {"service","tag"} — unmark
+	// DELETE /api/images/delete  → body {"token"} — delete one local image (token in the
+	//                              body, not the path: refs contain / and :)
+	// POST   /api/images/prune   → body {"service","keep_n"} — keep stable+running+last N,
+	//                              delete the rest (empty service = all)
+	mux.HandleFunc("/api/images", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		svcs, err := dc.listServices(req.Context())
+		if err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		info, err := buildImagesInfo(req.Context(), dc, rs, ih, svcs, onb.List())
+		if err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, info)
+	}))
+	mux.HandleFunc("/api/images/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
+		actor := sessionUser(sessionFromReq(auth, req))
+		sub := strings.TrimPrefix(req.URL.Path, "/api/images/")
+		// Resolve a managed service's image base for mark/unmark (same base
+		// keying the ReleasesStore uses for infra services).
+		resolveBase := func(service string) (string, bool) {
+			svcs, err := dc.listServices(req.Context())
+			if err != nil {
+				return "", false
+			}
+			for _, s := range mergedServices(svcs, onb.List()) {
+				if s.Name == service && s.Image != "" {
+					base, _ := splitImageRef(s.Image)
+					return base, true
+				}
+			}
+			return "", false
+		}
+		switch {
+		case sub == "mark" && req.Method == "POST":
+			var body struct{ Service, Tag, Label string }
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			base, ok := resolveBase(body.Service)
+			if !ok {
+				http.Error(w, "unknown service", http.StatusNotFound)
+				return
+			}
+			if err := rs.Mark(base, body.Tag, body.Label, actor); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(req, actor, "image.mark", body.Service+":"+body.Tag)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "marked", "tag": body.Tag})
+		case sub == "mark" && req.Method == "DELETE":
+			var body struct{ Service, Tag string }
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			base, ok := resolveBase(body.Service)
+			if !ok {
+				http.Error(w, "unknown service", http.StatusNotFound)
+				return
+			}
+			if err := rs.Unmark(base, body.Tag); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(req, actor, "image.unmark", body.Service+":"+body.Tag)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "unmarked", "tag": body.Tag})
+		case sub == "delete" && req.Method == "DELETE":
+			var body struct{ Token string }
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if body.Token == "" {
+				http.Error(w, "token required", http.StatusBadRequest)
+				return
+			}
+			// SAFETY: recompute protection fresh — never from history.
+			svcs, err := dc.listServices(req.Context())
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			protRefs, protIDs, err := protectedSets(req.Context(), dc, rs, mergedServices(svcs, onb.List()))
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if protRefs[body.Token] || protIDs[body.Token] {
+				httpx.WriteJSON(w, http.StatusConflict, map[string]string{
+					"error": "image is protected (in use, current, or marked stable) — not deleted",
+				})
+				return
+			}
+			// A ref token may point at a protected image ID (another tag of a
+			// running image) — resolve and check that too.
+			imgs, err := dc.listImages(req.Context())
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			for _, img := range imgs {
+				for _, rt := range img.RepoTags {
+					if rt == body.Token && protIDs[img.Id] {
+						httpx.WriteJSON(w, http.StatusConflict, map[string]string{
+							"error": "image is in use under another tag — not deleted",
+						})
+						return
+					}
+				}
+			}
+			if err := dc.removeImage(req.Context(), body.Token, false); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(req, actor, "image.delete", body.Token)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted", "token": body.Token})
+		case sub == "prune" && req.Method == "POST":
+			var body struct {
+				Service string `json:"service"`
+				KeepN   int    `json:"keep_n"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			svcs, err := dc.listServices(req.Context())
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			// buildImagesInfo computes the protection sets LIVE right here —
+			// that (not history) decides what imagesToPrune may emit.
+			info, err := buildImagesInfo(req.Context(), dc, rs, ih, svcs, onb.List())
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			deleted := []string{}
+			failed := []map[string]string{}
+			var reclaimed int64
+			doneIDs := map[string]bool{}
+			doneTokens := map[string]bool{}
+			for _, si := range info.Services {
+				if body.Service != "" && si.Service != body.Service {
+					continue
+				}
+				var metas []imgMeta
+				protRefs := map[string]bool{}
+				protIDs := map[string]bool{}
+				for _, e := range si.Entries {
+					if !e.OnDisk {
+						continue
+					}
+					var ls time.Time
+					if e.LastSeen > 0 {
+						ls = time.Unix(e.LastSeen, 0)
+					}
+					metas = append(metas, imgMeta{
+						Ref: e.Ref, ID: e.fullID, Tagged: e.tagged,
+						SizeBytes: e.SizeBytes, LastSeen: ls, Created: e.created,
+					})
+					if e.Protected {
+						protRefs[e.Ref] = true
+						if e.fullID != "" {
+							protIDs[e.fullID] = true
+						}
+					}
+				}
+				sizeByToken := map[string]imgMeta{}
+				for _, m := range metas {
+					if m.Tagged {
+						sizeByToken[m.Ref] = m
+					} else {
+						sizeByToken[m.ID] = m
+					}
+				}
+				for _, token := range imagesToPrune(metas, protRefs, protIDs, body.KeepN) {
+					if doneTokens[token] {
+						continue
+					}
+					doneTokens[token] = true
+					if err := dc.removeImage(req.Context(), token, false); err != nil {
+						failed = append(failed, map[string]string{"token": token, "error": err.Error()})
+						continue
+					}
+					deleted = append(deleted, token)
+					if m, ok := sizeByToken[token]; ok && m.ID != "" && !doneIDs[m.ID] {
+						doneIDs[m.ID] = true
+						reclaimed += m.SizeBytes
+					}
+					audit(req, actor, "image.delete", token)
+				}
+			}
+			target := "all"
+			if body.Service != "" {
+				target = body.Service
+			}
+			audit(req, actor, "image.prune",
+				target+" keep_n="+strconv.Itoa(body.KeepN)+" deleted="+strconv.Itoa(len(deleted))+
+					" failed="+strconv.Itoa(len(failed))+" reclaimed_bytes="+strconv.FormatInt(reclaimed, 10))
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
+				"deleted": deleted, "failed": failed, "reclaimed_bytes": reclaimed,
+			})
 		default:
 			http.Error(w, "not found", http.StatusNotFound)
 		}

@@ -85,6 +85,7 @@ type dockerContainer struct {
 	ID              string            `json:"Id"`
 	Names           []string          `json:"Names"`
 	Image           string            `json:"Image"`
+	ImageID         string            `json:"ImageID"`
 	State           string            `json:"State"`
 	Labels          map[string]string `json:"Labels"`
 	NetworkSettings struct {
@@ -220,6 +221,46 @@ func (c *dockerClient) removeContainer(ctx context.Context, id string) error {
 	return nil
 }
 
+// ---- Local images (for the Images phase-out panel) ----
+
+type dockerImage struct {
+	Id          string   `json:"Id"`
+	RepoTags    []string `json:"RepoTags"`
+	RepoDigests []string `json:"RepoDigests"`
+	Size        int64    `json:"Size"`
+	SharedSize  int64    `json:"SharedSize"`
+	Created     int64    `json:"Created"`
+	Containers  int64    `json:"Containers"`
+}
+
+func (c *dockerClient) listImages(ctx context.Context) ([]dockerImage, error) {
+	body, err := c.get(ctx, "/images/json?shared-size=true")
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	var out []dockerImage
+	return out, json.NewDecoder(body).Decode(&out)
+}
+
+// removeImage deletes a LOCAL image. token is a repo:tag reference (untag
+// semantics — safe when the same ID has other tags) or an image ID (used only
+// for dangling images). force is always passed through as-is; callers keep it
+// false so the daemon's own in-use refusal stays as the backstop.
+func (c *dockerClient) removeImage(ctx context.Context, token string, force bool) error {
+	resp, err := c.do(ctx, "DELETE",
+		"/images/"+url.PathEscape(token)+"?force="+strconv.FormatBool(force)+"&noprune=false", nil)
+	if err != nil {
+		if strings.Contains(err.Error(), ": 409 ") {
+			return fmt.Errorf("image %s is in use or has other tags — not removed", token)
+		}
+		return err
+	}
+	defer resp.Close()
+	_, _ = io.Copy(io.Discard, resp)
+	return nil
+}
+
 // inspectContainer returns just the Env slice for a given container — needed
 // when scaling so the new replica gets the same runtime config as the template.
 func (c *dockerClient) inspectEnv(ctx context.Context, id string) ([]string, error) {
@@ -244,6 +285,7 @@ func (c *dockerClient) inspectEnv(ctx context.Context, id string) ([]string, err
 type Service struct {
 	Name            string            `json:"name"`
 	Image           string            `json:"image"`
+	ImageID         string            `json:"image_id,omitempty"`
 	Host            string            `json:"host"`
 	Port            int               `json:"port"`
 	Path            string            `json:"path,omitempty"`
@@ -306,6 +348,7 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 		} else {
 			port, _ := strconv.Atoi(ct.Labels[labelPort])
 			s.Image = ct.Image
+			s.ImageID = ct.ImageID
 			s.Host = host
 			s.Port = port
 			s.Path = ct.Labels[labelPath]
