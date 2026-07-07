@@ -384,3 +384,128 @@ populated by the per-target endpoints above:
 Drill-in: `/api/monitor/target/proxy` for the hero numbers, `/hosts` for the
 table, `/series?field=delta` for the sparkline.
 
+---
+
+## Addendum — auth architecture
+
+> Context for the redesigner: this section documents the SSO/forward-auth
+> subsystem added after the original brief. It lives **outside** the dashboard
+> UI (its own `cmd/auth` binary + a proxy-side gate) and imposes no new DOM
+> contract on `dashboard/ui.go` — the dashboard's login/2FA/passkey flows are
+> unchanged. It's here so the design intent survives alongside the rest of the
+> handoff, not because the redesign touches it.
+
+### The `cmd/auth` component
+
+A fifth binary, `auth`, is the SSO login portal and OAuth authorization server.
+It has no host port and is reached through the proxy at `auth.<domain>`. It is
+**stateless by default** — sessions live entirely in a signed cookie, so no
+volume is needed; the only optional on-disk state is the passkey credential
+store (below). It is multi-tenant: one process serves every parent domain in
+`-cookie-domains` (e.g. `polardev.org` AND `the-aquarium.com`), and every
+handler resolves the request's own domain first so credentials, cookies, and
+passkeys can never cross a domain boundary.
+
+The portal reuses the proxy's self-contained visual system (the dark,
+JS-free `serveUnavailable`/login page style — `#0a0a0a` canvas, system font
+stack, `pmgr-` mono eyebrow). Any redesign of these pages should stay consistent
+with that language, but they are **not** part of the dashboard SPA and share no
+CSS with it.
+
+### SSO cookie design
+
+- On successful login the portal issues `pmgr_sso`, an **HMAC-signed** blob
+  (`username | expiry`, signed with the shared `PMGR_AUTH_SECRET`), set with
+  `Domain=<parent domain>`, `HttpOnly`, `Secure`, `SameSite=Lax`, ~30-day
+  lifetime.
+- Parent-domain scope means **one login covers every protected `*.<domain>`
+  host**. The browser presents the same cookie to `grafana.<domain>`,
+  `n8n.<domain>`, etc.
+- Verification is **stateless and in-process in the proxy**: the proxy holds the
+  same secret and validates the cookie's HMAC on the request path with no call
+  back to the auth binary. Consequence for coupling: minting a session needs the
+  auth binary up, but *checking* one does not — the request path has no runtime
+  dependency on `cmd/auth`.
+
+### Label-driven opt-in enforcement (proxy `ServeHTTP`)
+
+Enforcement is per-host and **default-off**. Three container labels drive it,
+parsed in `cmd/proxy/docker.go` into the `RouteGroup`:
+
+- `proxy.auth=true` — require a logged-in user. Absent/false ⇒ the host is
+  public and the gate is never consulted.
+- `proxy.auth.users=alice,bob` — optional allowlist; empty ⇒ any authenticated
+  user.
+- `proxy.auth.mode=oauth` — switch the host to bearer-only OAuth (below).
+
+In `Router.ServeHTTP`, OAuth well-known endpoints are intercepted first (so they
+win over any path-prefixed route and skip the gate), then the matched group's
+auth policy is applied by `authGate.authorize`. Cookie-mode order: SSO cookie →
+`pmt_` bearer → deny. Browsers (`Accept: text/html`) are 302'd to
+`auth.<domain>/login?redirect=…`; everything else gets a `401` JSON with
+`WWW-Authenticate: Bearer`. A valid cookie for the **wrong** user returns `403`
+(not a redirect) so the browser doesn't loop back with the same cookie.
+
+### OAuth authorization server for MCP
+
+For `proxy.auth.mode=oauth` hosts (MCP servers — claude.ai connectors, Claude
+Code, MCP Inspector), `cmd/auth` is a minimal, **stateless** OAuth 2.0 AS for
+public clients:
+
+- **Dynamic client registration** (RFC 7591): the returned `client_id` is a
+  signed blob carrying the redirect URIs and name — nothing is stored server-side.
+- **PKCE S256 required**; authorization-code grant with a consent page, plus
+  refresh-token rotation.
+- **All tokens are HMAC blobs** signed with the shared secret. The proxy
+  verifies `pmga_` access tokens **in-process** and checks the token audience
+  against the request host (or the `*` wildcard minted when no `resource` was
+  given). The only server-side state is a bounded used-JTI set making codes and
+  refresh tokens single-use, and it degrades safely (a wiped entry just
+  re-allows a token that still verifies).
+- **Resource metadata** (RFC 9728): the proxy serves
+  `/.well-known/oauth-protected-resource` for oauth-mode hosts, pointing MCP
+  clients at `auth.<domain>` as the authorization server. Oauth-mode denials
+  return a `401` challenge with the `resource_metadata` URL (never a login
+  redirect), so clients discover the AS instead of seeing an HTML page.
+
+### Passkeys (opt-in, portal-level)
+
+Distinct from the dashboard's own WebAuthn passkeys, the portal has its **own**
+passkey layer, enabled only when `AUTH_PASSKEY_DOMAINS` is set (default off).
+One `*Manager` per cookie domain, **RP ID = the bare parent domain** (e.g.
+`polardev.org`, not `auth.polardev.org`) with `RPOrigins=[https://auth.<domain>]`,
+so a credential is bound to one domain and can never validate against another.
+Credentials are keyed by `(domain, lowercased-username)` and persisted to
+`/data/passkeys.json`. Registration requires a live SSO session; login uses a
+resident/discoverable key with user-verification required, making a single
+gesture inherently two-factor. A user may register multiple passkeys, and
+passkey login is an alternative to password + TOTP.
+
+**Deleted-user existence check.** Because the passkey store is separate from the
+dashboard user store, passkey login makes a **fail-closed existence check**
+against the dashboard (`/api/auth/user-exists`) *after* the WebAuthn assertion
+verifies but *before* minting the cookie. Any failure — network error, non-200,
+or `exists=false` — yields `403` and no cookie, so a passkey belonging to a
+since-deleted account cannot mint a session.
+
+### Security properties
+
+- **Fail-closed.** A missing `PMGR_AUTH_SECRET` or an unrecognized domain
+  returns `503`, never open access. A `proxy.auth=true` host with the gate
+  unconfigured (`-auth-domains` unset) also fails closed with `503`.
+- **Bearer-only oauth mode.** Oauth-mode hosts accept only a bearer token
+  (`pmt_` dashboard token or `pmga_` access token) — no SSO cookie, no LAN
+  bypass — so a browser always gets the discovery challenge rather than silent
+  access.
+- **LAN bypass, spoof-resistant.** `-auth-trusted-cidrs` lets configured client
+  IPs skip auth on cookie-mode hosts only. The decision uses a hardened
+  client-IP resolver (`realClientIP`) that trusts `X-Forwarded-For` only when
+  the TCP peer is a configured upstream CIDR and then takes the rightmost hop —
+  everything left of it is client-controlled and ignored.
+- **CSRF + same-origin.** Login, consent, and passkey ceremonies use a
+  double-submit CSRF token plus an Origin/Referer same-origin check.
+- **Open-redirect defense.** Post-login redirects are accepted only for absolute
+  `https` URLs under the cookie domain that are also currently routed by the
+  proxy (`/routes`), soft-skipping the routed check only when `/routes` is
+  unreachable.
+
