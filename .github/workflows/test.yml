@@ -1,12 +1,10 @@
 name: test
 
 on:
+  # No path filter on PRs: `test` is a required status check, and a required
+  # check that is skipped by a path filter blocks the PR forever (it never
+  # reports). Running on every PR is cheap (~30s) and always reports.
   pull_request:
-    paths:
-      - 'cmd/**'
-      - 'internal/**'
-      - 'go.mod'
-      - '.github/workflows/test.yml'
   push:
     branches: [main]
     paths:
