@@ -393,6 +393,14 @@ func (s *AuthStore) VerifyPassword(username, password string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
+// HasTOTP reports whether the user exists and has a TOTP secret enrolled.
+func (s *AuthStore) HasTOTP(username string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	u := s.findUser(username)
+	return u != nil && u.TOTPSecret != ""
+}
+
 func (s *AuthStore) VerifyTOTP(username, code string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -406,6 +414,12 @@ func (s *AuthStore) VerifyTOTP(username, code string) bool {
 // verifyTOTPSecret checks a code against a raw secret (used by both verified
 // users and pending users awaiting confirmation).
 func verifyTOTPSecret(secret, code string) bool {
+	// No secret enrolled means no code can ever be valid. Without this guard
+	// an empty secret would still yield a deterministic (attacker-computable)
+	// TOTP stream via HMAC with an empty key.
+	if secret == "" {
+		return false
+	}
 	now := time.Now().Unix() / totpPeriodSeconds
 	for drift := -totpAllowedDrift; drift <= totpAllowedDrift; drift++ {
 		if subtle.ConstantTimeCompare([]byte(totp(secret, now+int64(drift))), []byte(code)) == 1 {

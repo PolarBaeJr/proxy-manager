@@ -227,13 +227,22 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return
 		}
+		// totp_enrolled / code_valid let callers (the SSO login service)
+		// enforce 2FA themselves: enrolled user + invalid code must not get
+		// an SSO session, even though the password alone opens a (non-
+		// elevated) dashboard session.
+		enrolled := auth.HasTOTP(body.Username)
+		codeValid := body.Code != "" && auth.VerifyTOTP(body.Username, body.Code)
 		var elev time.Time
-		if body.Code != "" && auth.VerifyTOTP(body.Username, body.Code) {
+		if codeValid {
 			elev = time.Now().Add(elevatedLifetime)
 		}
 		setSessionCookie(w, auth.newCookie(body.Username, elev))
 		audit(req, body.Username, "auth.login_ok", "")
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"username": body.Username, "elevated_until": elev.Unix()})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{
+			"username": body.Username, "elevated_until": elev.Unix(),
+			"totp_enrolled": enrolled, "code_valid": codeValid,
+		})
 	}))
 
 	// Used by the proxy's auth gate to resolve a bearer API token (pmt_...)
