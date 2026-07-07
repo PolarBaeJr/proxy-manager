@@ -33,12 +33,17 @@ type loginServer struct {
 	dashboardURL string
 	routesURL    string
 	lifetime     time.Duration
+	accessTTL    time.Duration // OAuth access token lifetime
+	refreshTTL   time.Duration // OAuth refresh token lifetime
 	client       *http.Client // dashboard login calls
 	routesClient *http.Client // proxy /routes fetches
 
 	mu       sync.Mutex
 	hosts    map[string]bool // routed hosts from the proxy, lowercased
 	hostsAt  time.Time
+
+	jtiMu   sync.Mutex
+	usedJTI map[string]time.Time // consumed code/refresh JTIs → their expiry
 }
 
 // loginPage is rendered via Fprintf: %s = message HTML, %s = CSRF token (hex),

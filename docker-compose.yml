@@ -8,7 +8,8 @@ name: pi-stack
 #   dashboard :8093       — auth-gated management UI (read-write docker socket)
 #   monitor   :8095       — scrapes proxy+edge metrics, exposes aggregated stats
 #                           (no public port; dashboard reads from it)
-#   auth      :8096       — SSO login portal for proxy.auth=true hosts
+#   auth      :8096       — SSO login portal + OAuth authorization server
+#                           for proxy.auth=true hosts
 #                           (no public port; reached via proxy at auth.<domain>)
 
 networks:
