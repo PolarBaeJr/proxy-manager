@@ -45,7 +45,7 @@ var infraContainerNames = map[string]bool{
 	"proxy": true, "dashboard": true, "monitor": true, "edge": true,
 }
 
-func (c *dockerClient) listUnmanaged(ctx context.Context) ([]discoveryItem, error) {
+func (c *dockerClient) listUnmanaged(ctx context.Context, exclude map[string]bool) ([]discoveryItem, error) {
 	body, err := c.get(ctx, "/containers/json?all=false")
 	if err != nil {
 		return nil, err
@@ -63,6 +63,11 @@ func (c *dockerClient) listUnmanaged(ctx context.Context) ([]discoveryItem, erro
 		}
 		name := ct.name()
 		if infraContainerNames[name] {
+			continue
+		}
+		// Skip containers already adopted (managed-only or routed) and the
+		// dashboard's own clone containers.
+		if exclude[name] || strings.HasPrefix(name, "goproxy-onb-") {
 			continue
 		}
 		// Distinct internal ports, smallest first (3000 before 5432 etc).
@@ -94,9 +99,13 @@ func (c *dockerClient) listUnmanaged(ctx context.Context) ([]discoveryItem, erro
 	return out, nil
 }
 
-func registerDiscoveryRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore) {
+func registerDiscoveryRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore, onb *OnboardedStore) {
 	mux.HandleFunc("/api/discovery", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-		items, err := dc.listUnmanaged(req.Context())
+		exclude := map[string]bool{}
+		for _, o := range onb.List() {
+			exclude[o.Name] = true
+		}
+		items, err := dc.listUnmanaged(req.Context(), exclude)
 		if err != nil {
 			httpx.WriteErr(w, err)
 			return
@@ -107,6 +116,37 @@ func registerDiscoveryRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthSto
 		}
 		httpx.WriteJSON(w, http.StatusOK, items)
 	}))
+}
+
+// skippedItem is one container the batch-onboard skipped, with a human reason.
+type skippedItem struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+}
+
+// batchOnboardTargets selects the containers of a compose project to adopt as
+// managed-only. It returns the names to onboard (sorted, deterministic) and the
+// ones skipped with a reason: already onboarded, or an invalid container name.
+func batchOnboardTargets(items []discoveryItem, project string, alreadyOnboarded func(string) bool) (targets []string, skipped []skippedItem) {
+	targets = []string{}
+	skipped = []skippedItem{}
+	for _, it := range items {
+		if it.Project != project {
+			continue
+		}
+		if alreadyOnboarded(it.Name) {
+			skipped = append(skipped, skippedItem{Name: it.Name, Reason: "already onboarded"})
+			continue
+		}
+		if !validServiceName(it.Name) {
+			skipped = append(skipped, skippedItem{Name: it.Name, Reason: "invalid container name"})
+			continue
+		}
+		targets = append(targets, it.Name)
+	}
+	sort.Strings(targets)
+	sort.Slice(skipped, func(i, j int) bool { return skipped[i].Name < skipped[j].Name })
+	return targets, skipped
 }
 
 // trimSha hides the "@sha256:…" suffix some images carry — visual clutter for

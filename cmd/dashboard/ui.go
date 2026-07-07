@@ -1239,20 +1239,26 @@ async function renderServices() {
   for (const s of svcs) {
     const sn = esc(s.name);
     const canary = !!s.canary_image;
+    // Managed-only: adopted for lifecycle/image tracking with no route. No
+    // traffic is routed, so canary/replace/stop/stats make no sense.
+    const managed = s.onboarded && !s.host;
     let badges = '';
     if (s.update_available) badges += ' <span class="pill warn">' + I.arrowup + 'update available</span>';
     if (canary)             badges += ' <span class="pill info"><span class="gl"></span>canary live</span>';
-    if (s.onboarded)        badges += ' <span class="pill muted" title="Adopted from an unlabelled container — replace/canary disabled">' + I.rocket + 'onboarded</span>';
+    if (managed)            badges += ' <span class="pill muted" title="Adopted for lifecycle/image tracking only — no traffic routed">' + I.rocket + 'managed · no route</span>';
+    else if (s.onboarded)   badges += ' <span class="pill muted" title="Adopted from an unlabelled container — replace/canary disabled">' + I.rocket + 'onboarded</span>';
     let facts = '<table class="facts">';
-    facts += '<tr><td>Host</td><td><span class="ident">' + esc(s.host) + (s.path ? esc(s.path) : '') + '</span></td></tr>';
+    facts += '<tr><td>Host</td><td>' + (managed ? '<span class="meta">—</span>' : '<span class="ident">' + esc(s.host) + (s.path ? esc(s.path) : '') + '</span>') + '</td></tr>';
     if (canary)              facts += '<tr><td>Canary</td><td><span class="ident" style="color:#5eb4ff">' + esc(s.canary_image) + '</span> <span class="meta">· ' + s.canary_replicas + ' replica' + (s.canary_replicas === 1 ? '' : 's') + '</span></td></tr>';
     else if (s.previous_image) facts += '<tr><td>Previous</td><td><span class="ident dim">' + esc(s.previous_image) + '</span></td></tr>';
-    facts += '<tr><td>Port</td><td class="num">' + s.port + '</td></tr>';
+    facts += '<tr><td>Port</td><td' + (managed ? ' class="meta">—' : ' class="num">' + s.port) + '</td></tr>';
     facts += '<tr><td>Replicas</td><td>' + replicaCtrl(s) + '</td></tr>';
     facts += '</table>';
 
     let actions;
-    if (canary) {
+    if (managed) {
+      actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="onboardDialog(\'' + sn + '\', ' + (s.port || 0) + ')">' + I.rocket + 'Add route…' + lk() + '</button>';
+    } else if (canary) {
       actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="promoteCanary(\'' + sn + '\')">' + I.check + 'Promote canary' + lk() + '</button>'
               + '<button class="btn" ' + lockedAttr() + ' onclick="discardCanary(\'' + sn + '\')">' + I.x + 'Discard' + lk() + '</button>';
     } else {
@@ -1319,7 +1325,7 @@ async function renderServices() {
          +    facts
          +    memberList
          +    '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
-         +    '<div class="svc-stats" data-host="' + esc(s.host) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>'
+         +    (managed ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
          +  '</div>'
          +  '</div>';
   }
@@ -1427,9 +1433,11 @@ function renderServiceStatsPanel(stats, recent) {
 // Discovery — runs only when the user opens the Discovery sub-tab. Pulls the
 // unmanaged-container list and shows a copy-pasteable labels dialog per row.
 let _lastDiscoveryHash = '';
+let _lastDiscoveryPayload = [];
 async function renderDiscovery() {
   const el = $('#tab-discovery');
   const unmanaged = await api('/api/discovery').catch(() => []);
+  _lastDiscoveryPayload = unmanaged || [];
   const hash = JSON.stringify(unmanaged);
   if (hash === _lastDiscoveryHash && el.children.length) return;
   _lastDiscoveryHash = hash;
@@ -1484,7 +1492,7 @@ async function renderDiscovery() {
          +  '<td class="meta">—</td>'
          +  '<td><span class="pill ' + (allRunning ? 'ok' : 'muted') + '"><span class="gl"></span>' + stateTxt + '</span></td>'
          +  '<td class="meta">—</td>'
-         +  '<td></td></tr>';
+         +  '<td style="text-align:right"><button class="btn sm" ' + lockedAttr() + ' data-proj="' + esc(p) + '" onclick="batchOnboardDialog(event, this)" title="Adopt every container for lifecycle/image tracking — no routes created">' + I.rocket + 'Onboard all' + lk() + '</button></td></tr>';
     for (const u of e.group) {
       html += rowHTML(u, 'disc-child', 'data-proj="' + esc(p) + '"' + (isOpen ? '' : ' style="display:none"'));
     }
@@ -1518,6 +1526,44 @@ function toggleDiscoveryGroup(rowEl) {
   const s = JSON.parse(loadPref('pmgr-disc-expanded', '{}'));
   if (willOpen) s[p] = 1; else delete s[p];
   savePref('pmgr-disc-expanded', JSON.stringify(s));
+}
+
+// batchOnboardDialog adopts EVERY container of a compose project as
+// managed-only: they show up in Services + the Images panel and accumulate
+// image history, but no routes are created and nothing joins the edge network.
+function batchOnboardDialog(ev, btn) {
+  ev.stopPropagation(); // the group row itself has an onclick
+  const proj = btn.getAttribute('data-proj');
+  const members = (_lastDiscoveryPayload || []).filter(u => (u.project || '') === proj);
+  const d = document.getElementById('dlg-token-reveal');
+  let list = '';
+  for (const u of members) list += '<li><span class="ident">' + esc(u.name) + '</span></li>';
+  d.innerHTML = ''
+    + '<div class="dlg"><div class="dlg-head"><div class="di">' + I.rocket + '</div>'
+    + '<div><h3>Onboard all — ' + esc(proj) + '</h3><div class="dsub">Adopt for lifecycle + image tracking only</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.x + '</button></div>'
+    + '<div class="dlg-body">'
+    +   '<div class="note">' + I.alert + '<div><strong>' + members.length + ' container' + (members.length === 1 ? '' : 's') + ' become managed</strong> — they appear in Services and the Images panel and accumulate image history. NO routes are created, nothing joins the edge network, and compose files are left untouched. Route a member later from its Services card.</div></div>'
+    +   '<ul class="member-names">' + list + '</ul>'
+    + '</div><div class="dialog-actions">'
+    + '<button type="button" class="btn" onclick="document.getElementById(\'dlg-token-reveal\').close()">Cancel</button>'
+    + '<button type="button" class="btn primary" id="batch-onb-confirm">' + I.check + 'Onboard all</button>'
+    + '</div></div>';
+  d.showModal();
+  document.getElementById('batch-onb-confirm').onclick = async () => {
+    try {
+      const r = await api('/api/discovery/batch-onboard', {
+        method: 'POST',
+        body: JSON.stringify({ project: proj }),
+      });
+      const onb = (r.onboarded || []).length, sk = (r.skipped || []).length, fl = (r.failed || []).length;
+      toast('Onboarded ' + onb + ' · skipped ' + sk + ' · failed ' + fl, fl ? 'err' : 'ok');
+      if (fl) for (const f of r.failed) toast(f.name + ': ' + f.error, 'err');
+      d.close();
+      _lastDiscoveryHash = '';
+      renderDiscovery();
+    } catch (e) { toast(e.message, 'err'); }
+  };
 }
 
 // discoveryShowLabels pops a dialog with the docker-compose labels block the
