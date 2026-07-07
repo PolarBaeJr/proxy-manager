@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -211,14 +212,32 @@ func maxOr0(s []float64) float64 {
 }
 
 // metricsServer starts an HTTP server on addr exposing /metrics (JSON),
-// /access (per-request log ring), and /refresh (rebuild the router from
-// labels + routes.json on demand). Bind to internal addresses only.
-func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func()) {
+// /access (per-request log ring), /refresh (rebuild the router from
+// labels + routes.json on demand), and /routes (currently routed hosts —
+// the auth binary uses it to validate login redirects). Bind to internal
+// addresses only.
+func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(m.Snapshot())
 	})
+	if snapshot != nil {
+		mux.HandleFunc("/routes", func(w http.ResponseWriter, _ *http.Request) {
+			seen := map[string]bool{}
+			hosts := []string{}
+			for _, g := range snapshot() {
+				h := strings.ToLower(g.Host)
+				if h != "" && !seen[h] {
+					seen[h] = true
+					hosts = append(hosts, h)
+				}
+			}
+			sort.Strings(hosts)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"hosts": hosts})
+		})
+	}
 	if a != nil {
 		mux.HandleFunc("/access", accessHandler(a))
 	}

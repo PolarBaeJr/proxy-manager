@@ -1,5 +1,10 @@
 {
   "routes": [
+    { "name": "auth (SSO login)", "host": "auth.polardev.org",
+      "backends": ["http://auth:8096"] },
+    { "name": "auth (SSO login)", "host": "auth.the-aquarium.com",
+      "backends": ["http://auth:8096"] },
+
     { "name": "badminton (prod) /supabase", "host": "badminton.polardev.org", "path": "/supabase", "strip": true,
       "backends": ["http://host.docker.internal:54321"] },
     { "name": "badminton (staging) /supabase", "host": "test.polardev.org", "path": "/supabase", "strip": true,

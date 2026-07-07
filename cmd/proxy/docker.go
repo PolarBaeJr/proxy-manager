@@ -19,15 +19,17 @@ const (
 	// Network all label-discovered containers join so the proxy can reach them.
 	managedNetwork = "edge"
 
-	labelEnable  = "proxy.enable"
-	labelHost    = "proxy.host"
-	labelPort    = "proxy.port"
-	labelPath    = "proxy.path"
-	labelStrip   = "proxy.strip"
-	labelName    = "proxy.name"
-	labelWeight  = "proxy.weight"
-	labelHealth  = "proxy.health"
-	labelService = "proxy.service"
+	labelEnable    = "proxy.enable"
+	labelHost      = "proxy.host"
+	labelPort      = "proxy.port"
+	labelPath      = "proxy.path"
+	labelStrip     = "proxy.strip"
+	labelName      = "proxy.name"
+	labelWeight    = "proxy.weight"
+	labelHealth    = "proxy.health"
+	labelService   = "proxy.service"
+	labelAuth      = "proxy.auth"
+	labelAuthUsers = "proxy.auth.users"
 )
 
 // dockerClient is the proxy's READ-ONLY view of the Docker daemon.

@@ -4,10 +4,12 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -18,6 +20,10 @@ func main() {
 	staticConfig := flag.String("config", "/etc/proxy/routes.json", "static routes JSON (ignored if missing)")
 	statePath := flag.String("state", "/data/metrics.json", "metrics persistence file")
 	stateInterval := flag.Duration("state-interval", 30*time.Second, "how often to snapshot metrics to -state")
+	authDomains := flag.String("auth-domains", "", "comma-separated parent domains with an auth.<domain> login host (empty = auth gate disabled)")
+	authTrustedCIDRs := flag.String("auth-trusted-cidrs", "", "comma-separated CIDRs that bypass auth entirely (e.g. LAN ranges)")
+	authXFFTrustedCIDRs := flag.String("auth-xff-trusted-cidrs", "127.0.0.0/8,172.16.0.0/12", "comma-separated CIDRs of peers whose X-Forwarded-For is trusted")
+	authVerifyTokenURL := flag.String("auth-verify-token-url", "http://dashboard:8093/api/auth/verify-token", "dashboard endpoint used to verify bearer API tokens")
 	flag.Parse()
 
 	metrics := NewMetrics()
@@ -36,6 +42,18 @@ func main() {
 
 	dc := newDockerClient()
 	router := &Router{}
+	if *authDomains != "" {
+		var secret []byte
+		if envHex := strings.TrimSpace(os.Getenv("PMGR_AUTH_SECRET")); envHex != "" {
+			if b, err := hex.DecodeString(envHex); err == nil {
+				secret = b
+			} else {
+				log.Printf("auth: PMGR_AUTH_SECRET is not valid hex (%v) — protected hosts will fail closed", err)
+			}
+		}
+		router.auth = newAuthGate(secret, *authDomains, *authTrustedCIDRs, *authXFFTrustedCIDRs, *authVerifyTokenURL)
+		log.Printf("auth gate enabled for domain(s) %s", *authDomains)
+	}
 	refresh := func() {
 		groups, err := assembleGroups(ctx, dc, *staticConfig)
 		if err != nil {
@@ -53,7 +71,7 @@ func main() {
 
 	// Pass refresh into the metrics server so /refresh can be hit by the
 	// dashboard after it edits routes.json — saves a docker restart.
-	metricsServer(*metricsAddr, metrics, access, refresh)
+	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot)
 	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
 	go dc.streamEvents(ctx, func(action string) {

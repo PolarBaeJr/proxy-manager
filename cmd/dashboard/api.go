@@ -227,13 +227,44 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return
 		}
+		// totp_enrolled / code_valid let callers (the SSO login service)
+		// enforce 2FA themselves: enrolled user + invalid code must not get
+		// an SSO session, even though the password alone opens a (non-
+		// elevated) dashboard session.
+		enrolled := auth.HasTOTP(body.Username)
+		codeValid := body.Code != "" && auth.VerifyTOTP(body.Username, body.Code)
 		var elev time.Time
-		if body.Code != "" && auth.VerifyTOTP(body.Username, body.Code) {
+		if codeValid {
 			elev = time.Now().Add(elevatedLifetime)
 		}
 		setSessionCookie(w, auth.newCookie(body.Username, elev))
 		audit(req, body.Username, "auth.login_ok", "")
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"username": body.Username, "elevated_until": elev.Unix()})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{
+			"username": body.Username, "elevated_until": elev.Unix(),
+			"totp_enrolled": enrolled, "code_valid": codeValid,
+		})
+	}))
+
+	// Used by the proxy's auth gate to resolve a bearer API token (pmt_...)
+	// to its owning username. Rate-limited like login — token guessing gets
+	// the same treatment as password guessing.
+	mux.HandleFunc("/api/auth/verify-token", rl.limit(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != "POST" {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct{ Token string }
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		u := auth.VerifyToken(body.Token)
+		if u == "" {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		audit(req, u, "auth.token_verified", "")
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"username": u})
 	}))
 
 	mux.HandleFunc("/api/auth/verify-2fa", rl.limit(func(w http.ResponseWriter, req *http.Request) {
