@@ -144,6 +144,10 @@ func (a *authGate) authorize(w http.ResponseWriter, req *http.Request, group *Ro
 		return false
 	}
 
+	if group.AuthMode == "oauth" {
+		return a.authorizeOAuth(w, req, group, reqHost)
+	}
+
 	if c, err := req.Cookie(sso.CookieName); err == nil {
 		if user, ok := sso.Verify(c.Value, a.secret); ok {
 			if userAllowed(group, user) {

@@ -22,6 +22,8 @@ func main() {
 	dashboardURL := flag.String("dashboard-url", "http://dashboard:8093", "dashboard base URL for credential verification")
 	routesURL := flag.String("routes-url", "http://proxy:8094/routes", "proxy endpoint listing routed hosts (for redirect validation)")
 	sessionLifetime := flag.Duration("session-lifetime", 720*time.Hour, "SSO cookie lifetime")
+	accessTTL := flag.Duration("access-token-ttl", time.Hour, "OAuth access token lifetime")
+	refreshTTL := flag.Duration("refresh-token-ttl", 720*time.Hour, "OAuth refresh token lifetime")
 	flag.Parse()
 
 	envHex := strings.TrimSpace(os.Getenv("PMGR_AUTH_SECRET"))
@@ -39,8 +41,11 @@ func main() {
 		dashboardURL: strings.TrimRight(*dashboardURL, "/"),
 		routesURL:    *routesURL,
 		lifetime:     *sessionLifetime,
+		accessTTL:    *accessTTL,
+		refreshTTL:   *refreshTTL,
 		client:       &http.Client{Timeout: 5 * time.Second},
 		routesClient: &http.Client{Timeout: 2 * time.Second},
+		usedJTI:      map[string]time.Time{},
 	}
 	if len(s.domains) == 0 {
 		log.Fatal("-cookie-domains must list at least one parent domain")
@@ -49,6 +54,15 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/logout", s.handleLogout)
+	// Trailing-slash registrations catch the path-suffixed metadata variants
+	// (issuer URLs with a path component).
+	mux.HandleFunc("/.well-known/oauth-authorization-server", s.handleASMetadata)
+	mux.HandleFunc("/.well-known/oauth-authorization-server/", s.handleASMetadata)
+	mux.HandleFunc("/.well-known/openid-configuration", s.handleASMetadata)
+	mux.HandleFunc("/.well-known/openid-configuration/", s.handleASMetadata)
+	mux.HandleFunc("/oauth/register", s.handleRegister)
+	mux.HandleFunc("/oauth/authorize", s.handleAuthorize)
+	mux.HandleFunc("/oauth/token", s.handleToken)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}

@@ -38,6 +38,7 @@ type RouteGroup struct {
 
 	AuthRequired bool
 	AuthUsers    []string // lowercased; empty = any authenticated user
+	AuthMode     string   // "" = sso (cookie or login redirect), "oauth" = bearer-first MCP mode
 
 	cursor atomic.Uint64
 }
@@ -119,6 +120,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mu.RUnlock()
 
 	reqHost := hostOnly(req.Host)
+	// OAuth resource-server metadata (and the legacy AS-metadata fallback)
+	// must be answered before path-prefix matching AND before auth — clients
+	// fetch it unauthenticated from the protected host itself.
+	if r.handleOAuthWellKnown(w, req, groups, reqHost) {
+		return
+	}
 	var group *RouteGroup
 	for _, g := range groups {
 		if !strings.EqualFold(reqHost, g.Host) {
@@ -256,6 +263,7 @@ type staticRoute struct {
 	Health    string   `json:"health,omitempty"`
 	Auth      bool     `json:"auth,omitempty"`
 	AuthUsers []string `json:"auth_users,omitempty"`
+	AuthMode  string   `json:"auth_mode,omitempty"`
 }
 
 type staticConfig struct {
@@ -277,7 +285,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 				if !ok {
 					g = &RouteGroup{
 						Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name,
-						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers),
+						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers), AuthMode: sr.AuthMode,
 					}
 					groupsByKey[key] = g
 				}
@@ -337,6 +345,9 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		// that sets proxy.auth.users.
 		if c.Labels[labelAuth] == "true" {
 			g.AuthRequired = true
+		}
+		if c.Labels[labelAuthMode] == "oauth" {
+			g.AuthMode = "oauth"
 		}
 		if len(g.AuthUsers) == 0 {
 			g.AuthUsers = normalizeAuthUsers(strings.Split(c.Labels[labelAuthUsers], ","))
