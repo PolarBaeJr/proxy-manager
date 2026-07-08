@@ -65,6 +65,20 @@ func main() {
 	mux.HandleFunc("/oauth/authorize", s.handleAuthorize)
 	mux.HandleFunc("/oauth/token", s.handleToken)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
+	// Bare root is the catch-all: send someone who typed just the login host
+	// straight to the login page (carrying any ?redirect= through). Genuinely
+	// unknown paths still get an honest 404 rather than a surprise redirect.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		target := "/login"
+		if q := r.URL.RawQuery; q != "" {
+			target += "?" + q
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+	})
 
 	// Opt-in WebAuthn passkeys. Empty -passkey-rp-domains ⇒ no store opened, no
 	// routes registered, portal stays byte-for-byte stateless.
