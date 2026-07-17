@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 )
 
 // fakeDocker returns a dockerClient whose transport dials an httptest server
@@ -204,6 +208,86 @@ func TestServeHTTPLongestPrefix(t *testing.T) {
 	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, httptest.NewRequest("GET", "http://a.example.org/other", nil))
 	if rec.Body.String() != "root" {
 		t.Fatalf("/other → %q, want root", rec.Body.String())
+	}
+}
+
+// TestServeHTTPWebSocketUpgrade drives a real protocol upgrade through the full
+// production writer chain — withMetrics → withAccessLog → Router → errCatchingWriter.
+// Both accessWriter and errCatchingWriter must forward Hijack() or the upgrade
+// fails and the reverse proxy's ErrorHandler falsely marks the backend unhealthy.
+// httptest.NewRecorder is not a Hijacker, so this test needs real TCP sockets.
+func TestServeHTTPWebSocketUpgrade(t *testing.T) {
+	// Backend that speaks a minimal WebSocket-style handshake: on an Upgrade
+	// request it hijacks the conn, writes 101, then echoes one line back.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Header.Get("Connection"), "Upgrade") {
+			http.Error(w, "expected upgrade", http.StatusBadRequest)
+			return
+		}
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("backend hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = buf.Flush()
+		line, _ := buf.ReadString('\n')
+		_, _ = buf.WriteString("echo:" + line)
+		_ = buf.Flush()
+	}))
+	defer backend.Close()
+
+	r := &Router{}
+	group := mkGroup(t, "ws.example.org", "", false, backend.URL)
+	r.Set([]*RouteGroup{group})
+
+	// Front server wearing the exact same middleware stack as production.
+	handler := withMetrics(withAccessLog(r, NewAccessLog()), NewMetrics())
+	front := httptest.NewServer(handler)
+	defer front.Close()
+
+	conn, err := net.Dial("tcp", front.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial front: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: ws.example.org\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status line: %v", err)
+	}
+	if !strings.Contains(status, "101") {
+		t.Fatalf("status line = %q, want 101 Switching Protocols", strings.TrimSpace(status))
+	}
+	// Drain the rest of the response headers up to the blank line.
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read headers: %v", err)
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	// Bytes must flow both ways over the hijacked connection.
+	fmt.Fprintf(conn, "ping\n")
+	echo, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if strings.TrimSpace(echo) != "echo:ping" {
+		t.Fatalf("echo = %q, want echo:ping", strings.TrimSpace(echo))
+	}
+
+	// The actual bug symptom: a failed upgrade trips ErrorHandler, which marks
+	// the backend unhealthy and causes spurious 503s on later requests.
+	if !group.Backends[0].healthy() {
+		t.Fatal("backend was marked unhealthy — upgrade tripped the ErrorHandler")
 	}
 }
 

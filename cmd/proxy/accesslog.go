@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -89,6 +91,24 @@ type accessWriter struct {
 	bytes    int64
 	backend  string
 	unrouted bool
+}
+
+// Hijack forwards to the embedded ResponseWriter so WebSocket / protocol
+// upgrades survive this wrapper. accessWriter embeds the http.ResponseWriter
+// *interface*, so Hijack isn't promoted even though the concrete server writer
+// implements it — without this method *accessWriter fails the http.Hijacker
+// assertion, the upgrade fails, and the reverse proxy's ErrorHandler falsely
+// marks the backend unhealthy. This is the outer half of the fix whose inner
+// half lives on errCatchingWriter in router.go.
+func (w *accessWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("proxy: underlying ResponseWriter does not support hijacking")
+	}
+	// A hijacked connection switches protocols (101) and its bytes flow
+	// directly over the raw conn, bypassing this wrapper's accounting.
+	w.status = http.StatusSwitchingProtocols
+	return hj.Hijack()
 }
 
 func (w *accessWriter) WriteHeader(code int) {
