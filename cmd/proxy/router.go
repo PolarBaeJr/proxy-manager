@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -250,6 +252,17 @@ func (w *errCatchingWriter) WriteHeader(code int) {
 func (w *errCatchingWriter) Write(b []byte) (int, error) {
 	w.wroteHeader = true
 	return w.ResponseWriter.Write(b)
+}
+
+// Hijack forwards to the underlying ResponseWriter so WebSocket / protocol
+// upgrades (e.g. Supabase Realtime) work through the proxy. Without this the
+// reverse proxy can't switch protocols, fails the upgrade, and — via the
+// ErrorHandler — falsely marks the backend unhealthy, causing spurious 503s.
+func (w *errCatchingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("proxy: underlying ResponseWriter does not support hijacking")
 }
 
 // ---- Assembly: docker labels + static config ----
