@@ -47,6 +47,7 @@ type OnboardedService struct {
 	Labels         map[string]string `json:"labels,omitempty"`         // original labels we want to preserve
 	Replicas       int               `json:"replicas"`                 // currently routed backend count (>= 1)
 	PreviousImage  string            `json:"previous_image,omitempty"` // set on replace/promote — for rollback
+	AutoUpdate     bool              `json:"auto_update,omitempty"`    // opted in to unattended updates
 	CanaryImage    string            `json:"canary_image,omitempty"`   // non-empty while a canary is staged
 	CanaryReplicas int               `json:"canary_replicas,omitempty"`
 	// OriginalRouted flips to false once a replace/promote drops the original
@@ -133,6 +134,19 @@ func (s *OnboardedStore) SetReplicas(name string, n int) error {
 	for i := range s.items {
 		if s.items[i].Name == name {
 			s.items[i].Replicas = n
+			return s.save()
+		}
+	}
+	return fmt.Errorf("not onboarded: %s", name)
+}
+
+// SetAutoUpdate flips the unattended-update opt-in for one service.
+func (s *OnboardedStore) SetAutoUpdate(name string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.items {
+		if s.items[i].Name == name {
+			s.items[i].AutoUpdate = enabled
 			return s.save()
 		}
 	}

@@ -98,8 +98,9 @@ func (ic *imageChecker) Check(ctx context.Context, image string) {
 }
 
 // Loop runs Check on every image returned by allImages, on a tick. Idempotent;
-// safe to call once at startup.
-func (ic *imageChecker) Loop(ctx context.Context, allImages func() []string) {
+// safe to call once at startup. afterCycle (optional) runs synchronously after
+// each scan — same goroutine, so cycles never overlap.
+func (ic *imageChecker) Loop(ctx context.Context, allImages func() []string, afterCycle func(context.Context)) {
 	do := func() {
 		seen := map[string]bool{}
 		for _, img := range allImages() {
@@ -108,6 +109,9 @@ func (ic *imageChecker) Loop(ctx context.Context, allImages func() []string) {
 			}
 			seen[img] = true
 			ic.Check(ctx, img)
+		}
+		if afterCycle != nil {
+			afterCycle(ctx)
 		}
 	}
 	do()

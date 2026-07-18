@@ -101,6 +101,7 @@ Drop these on any container you want routed:
 | `proxy.health=/healthz` |   | HTTP probe (default: TCP connect) |
 | `proxy.service=myapp` |   | group key — unlocks scale/replace/canary in dashboard |
 | `proxy.unscalable=true` |   | singleton (DB, bot, gateway) — disables scale buttons |
+| `proxy.autoupdate=true` |   | opt-in unattended updates — dashboard re-pulls + replaces when a newer registry digest appears (10-min poll) |
 | `proxy.name=Friendly` |   | dashboard label |
 | `proxy.auth=true` |   | require SSO login (default: public, no auth) — see [Access control](#access-control-opt-in-sso) |
 | `proxy.auth.users=alice,bob` |   | optional allowlist; empty = any authenticated user |

@@ -1244,6 +1244,13 @@ async function renderServices() {
     const managed = s.onboarded && !s.host;
     let badges = '';
     if (s.update_available) badges += ' <span class="pill warn">' + I.arrowup + 'update available</span>';
+    if (s.auto_update) {
+      // Static title strings only — chosen by comparison, never interpolated.
+      const auTitle = (s.labels && s.labels['proxy.autoupdate'] === 'true')
+        ? 'Auto-update enabled via the proxy.autoupdate label — newer digests are pulled + replaced automatically'
+        : 'Auto-update enabled from the dashboard — newer digests are pulled + replaced automatically';
+      badges += ' <span class="pill ok" title="' + auTitle + '">' + I.arrowup + 'auto-update</span>';
+    }
     if (canary)             badges += ' <span class="pill info"><span class="gl"></span>canary live</span>';
     if (managed)            badges += ' <span class="pill muted" title="Adopted for lifecycle/image tracking only — no traffic routed">' + I.rocket + 'managed · no route</span>';
     else if (s.onboarded)   badges += ' <span class="pill muted" title="Adopted from an unlabelled container — replace/canary disabled">' + I.rocket + 'onboarded</span>';
@@ -1275,6 +1282,13 @@ async function renderServices() {
               + (s.all_stopped
                   ? '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\')">' + I.bolt + 'Start service' + lk() + '</button>'
                   : '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\')">' + I.lock + 'Stop service' + lk() + '</button>')
+              // Auto-update toggle: onboarded services only. Label-sourced
+              // opt-ins (proxy.autoupdate=true) are managed in compose, not here.
+              + (s.onboarded && !(s.labels && s.labels['proxy.autoupdate'] === 'true')
+                  ? (s.auto_update
+                      ? '<button class="btn" ' + lockedAttr() + ' onclick="toggleAutoUpdate(\'' + sn + '\', false)">' + I.arrowup + 'Auto-update: on' + lk() + '</button>'
+                      : '<button class="btn ghost" ' + lockedAttr() + ' onclick="toggleAutoUpdate(\'' + sn + '\', true)">' + I.arrowup + 'Auto-update: off' + lk() + '</button>')
+                  : '')
               + (s.previous_image ? '<button class="linkbtn" ' + lockedAttr() + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\')">' + I.rewind + 'Rollback</button>' : '');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
@@ -1729,6 +1743,18 @@ async function oneClickUpdate(name, image) {
       method: 'POST', body: JSON.stringify({ image: image })
     });
     toast('updated ' + name, 'ok');
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// toggleAutoUpdate — flip the per-onboarded-service unattended-update opt-in.
+async function toggleAutoUpdate(name, enabled) {
+  try {
+    await api('/api/services/' + encodeURIComponent(name) + '/autoupdate', {
+      method: 'POST', body: JSON.stringify({ enabled: enabled })
+    });
+    toast(enabled ? 'auto-update enabled for ' + name : 'auto-update disabled for ' + name, 'ok');
     _lastServicesHash = '';
     renderActive();
   } catch (e) { toast(e.message, 'err'); }

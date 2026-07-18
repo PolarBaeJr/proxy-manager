@@ -81,6 +81,10 @@ func (rl *rateLimiter) gc() {
 }
 
 func clientIP(r *http.Request) string {
+	if r == nil {
+		// Internal actors (e.g. the auto-updater) audit without a request.
+		return "internal"
+	}
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		// First entry is the original client (set by trusted proxy).
 		for i := 0; i < len(fwd); i++ {

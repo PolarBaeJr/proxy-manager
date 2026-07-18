@@ -486,12 +486,6 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 					httpx.WriteErr(w, err)
 					return
 				}
-				// Enrich with image-checker results.
-				for i := range svcs {
-					if st := ic.Get(svcs[i].Image); st != nil && st.UpdateAvailable {
-						svcs[i].UpdateAvailable = true
-					}
-				}
 				// Merge in onboarded services. If a labeled service already
 				// has the same name (auto-promoted via the lifecycle Stop
 				// path), DON'T append a second entry — just mark the
@@ -506,6 +500,8 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				for _, o := range onb.List() {
 					if i, ok := labeledIdx[o.Name]; ok {
 						svcs[i].Onboarded = true
+						// Opt-in from either source (label or dashboard toggle) wins.
+						svcs[i].AutoUpdate = svcs[i].AutoUpdate || o.AutoUpdate
 						if svcs[i].PreviousImage == "" {
 							svcs[i].PreviousImage = o.PreviousImage
 						}
@@ -522,11 +518,19 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 						Port:           o.Port,
 						Replicas:       o.Replicas,
 						PreviousImage:  o.PreviousImage,
+						AutoUpdate:     o.AutoUpdate,
 						CanaryImage:    o.CanaryImage,
 						CanaryReplicas: o.CanaryReplicas,
 						Onboarded:      true,
 						Unscalable:     o.Host == "",
 					})
+				}
+				// Enrich with image-checker results AFTER the merge so
+				// onboarded-only entries get the update badge too.
+				for i := range svcs {
+					if st := ic.Get(svcs[i].Image); st != nil && st.UpdateAvailable {
+						svcs[i].UpdateAvailable = true
+					}
 				}
 				httpx.WriteJSON(w, http.StatusOK, svcs)
 			})(w, req)
@@ -605,6 +609,31 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			ic.Check(req.Context(), body.Image)
 			audit(req, sessionUser(info), "service.replace", name+" => "+body.Image)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "replaced", "image": body.Image})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "autoupdate" && req.Method == "POST" {
+			var body struct {
+				Enabled bool `json:"enabled"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			o, ok := onb.Get(name)
+			if !ok {
+				http.Error(w, "not an onboarded service — set the proxy.autoupdate label in compose for label-managed services", http.StatusNotFound)
+				return
+			}
+			if o.Host == "" {
+				http.Error(w, "managed-only service (no route) — auto-update needs a routed onboarded service", http.StatusBadRequest)
+				return
+			}
+			if err := onb.SetAutoUpdate(name, body.Enabled); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			audit(req, sessionUser(info), "service.autoupdate_set", name+" => "+strconv.FormatBool(body.Enabled))
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
 			return
 		}
 		if len(parts) == 2 && parts[1] == "stage" && req.Method == "POST" {
