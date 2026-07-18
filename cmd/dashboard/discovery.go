@@ -90,13 +90,22 @@ func (c *dockerClient) listUnmanaged(ctx context.Context, exclude map[string]boo
 		if len(ports) > 0 {
 			best = ports[0]
 		}
+		// Only surface the proxy.path label as a pre-fill if it's a valid
+		// route path. An unvalidated label reaches an inline onclick handler in
+		// the UI, where esc()'s HTML-entity encoding does NOT prevent JS-string
+		// breakout — so a hostile container could inject script. Drop anything
+		// that doesn't pass validRoutePath.
+		labelPathVal := ct.Labels[labelPath]
+		if !validRoutePath(labelPathVal) {
+			labelPathVal = ""
+		}
 		out = append(out, discoveryItem{
 			Name:    name,
 			Image:   ct.Image,
 			State:   ct.State,
 			Port:    best,
 			Ports:   ports,
-			Path:    ct.Labels[labelPath],
+			Path:    labelPathVal,
 			Project: ct.Labels["com.docker.compose.project"],
 			Service: ct.Labels["com.docker.compose.service"],
 		})
