@@ -6,5 +6,12 @@ cmd/proxy/data/
 cmd/monitor/data/
 .DS_Store
 
+# Compiled service binaries (root-level `go build` output)
+/auth
+/proxy
+/dashboard
+/edge
+/monitor
+
 # Claude Code local worktrees / session state
 .claude/
