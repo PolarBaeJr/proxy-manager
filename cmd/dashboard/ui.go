@@ -1257,7 +1257,7 @@ async function renderServices() {
 
     let actions;
     if (managed) {
-      actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="onboardDialog(\'' + sn + '\', ' + (s.port || 0) + ')">' + I.rocket + 'Add route…' + lk() + '</button>';
+      actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="onboardDialog(\'' + sn + '\', ' + (s.port || 0) + ', \'' + esc(s.path || '') + '\')">' + I.rocket + 'Add route…' + lk() + '</button>';
     } else if (canary) {
       actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="promoteCanary(\'' + sn + '\')">' + I.check + 'Promote canary' + lk() + '</button>'
               + '<button class="btn" ' + lockedAttr() + ' onclick="discardCanary(\'' + sn + '\')">' + I.x + 'Discard' + lk() + '</button>';
@@ -1457,7 +1457,7 @@ async function renderDiscovery() {
          +  '<td><span class="pill ' + (u.state === 'running' ? 'ok' : 'muted') + '"><span class="gl"></span>' + esc(u.state) + '</span></td>'
          +  '<td class="meta">' + esc(ports) + '</td>'
          +  '<td style="text-align:right">'
-         +    '<button class="btn sm primary" ' + lockedAttr() + ' onclick="onboardDialog(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')">' + I.plus + 'Onboard' + lk() + '</button>'
+         +    '<button class="btn sm primary" ' + lockedAttr() + ' onclick="onboardDialog(\'' + esc(u.name) + '\', ' + (u.port || 0) + ', \'' + esc(u.path || '') + '\')">' + I.plus + 'Onboard' + lk() + '</button>'
          +    ' <button class="btn sm" onclick="discoveryShowLabels(\'' + esc(u.name) + '\', ' + (u.port || 0) + ')" title="Or paste labels into the service\'s docker-compose.yml yourself">YAML</button>'
          +  '</td></tr>';
   }
@@ -1574,7 +1574,7 @@ function batchOnboardDialog(ev, btn) {
 // write a static route pointing at <container-name>:<port>, register as a
 // service so Replicas can be scaled. Does NOT touch the user's compose file
 // or recreate their container. Reversible from the service's Delete button.
-function onboardDialog(name, port) {
+function onboardDialog(name, port, prefillPath) {
   const dom = (window._discoveryLastDomain || 'polardev.org');
   const d = document.getElementById('dlg-token-reveal');
   d.innerHTML = ''
@@ -1585,6 +1585,13 @@ function onboardDialog(name, port) {
     +   '<div class="field-row">'
     +     '<div class="field"><label>Hostname</label><input id="onb-host" pattern="[a-zA-Z0-9.-]{1,253}" maxlength="253" value="' + esc(name) + '.' + esc(dom) + '" required></div>'
     +     '<div class="field tight"><label>Internal port</label><input id="onb-port" type="number" min="1" max="65535" value="' + (port || 80) + '" required></div>'
+    +   '</div>'
+    +   '<div class="field"><label>Path prefix</label>'
+    +     '<input id="onb-path" pattern="/[A-Za-z0-9/_.-]{0,511}" maxlength="512" value="' + esc(prefillPath || '/') + '">'
+    +     '<div class="hint">Route only requests under this path on the host. Leave as <code>/</code> to catch all.</div>'
+    +   '</div>'
+    +   '<div class="field"><label><input id="onb-strip" type="checkbox"> Strip path prefix</label>'
+    +     '<div class="hint">Strip the path prefix before forwarding to the container.</div>'
     +   '</div>'
     +   '<div class="field"><label>Initial replicas</label>'
     +     '<input id="onb-replicas" type="number" min="1" max="20" value="1">'
@@ -1600,11 +1607,13 @@ function onboardDialog(name, port) {
     e.preventDefault();
     const host = document.getElementById('onb-host').value.trim();
     const portN = parseInt(document.getElementById('onb-port').value) || 0;
+    const path = document.getElementById('onb-path').value.trim();
+    const strip = document.getElementById('onb-strip').checked;
     const reps  = Math.max(1, parseInt(document.getElementById('onb-replicas').value) || 1);
     try {
       await api('/api/discovery/' + encodeURIComponent(name) + '/onboard', {
         method:'POST',
-        body: JSON.stringify({ host, port: portN, replicas: reps }),
+        body: JSON.stringify({ host, port: portN, path, strip, replicas: reps }),
       });
       toast('Onboarded ' + name + ' — now serving ' + host);
       d.close();

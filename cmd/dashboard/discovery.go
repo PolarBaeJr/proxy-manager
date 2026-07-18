@@ -40,6 +40,7 @@ type discoveryItem struct {
 	State   string `json:"state"`
 	Port    int    `json:"port"`              // best-guess internal port; 0 if unknown
 	Ports   []int  `json:"ports,omitempty"`   // all distinct internal ports
+	Path    string `json:"path,omitempty"`    // proxy.path label, if present
 	Project string `json:"project,omitempty"` // docker-compose project, if any
 	Service string `json:"service,omitempty"` // docker-compose service, if any
 }
@@ -95,6 +96,7 @@ func (c *dockerClient) listUnmanaged(ctx context.Context, exclude map[string]boo
 			State:   ct.State,
 			Port:    best,
 			Ports:   ports,
+			Path:    ct.Labels[labelPath],
 			Project: ct.Labels["com.docker.compose.project"],
 			Service: ct.Labels["com.docker.compose.service"],
 		})

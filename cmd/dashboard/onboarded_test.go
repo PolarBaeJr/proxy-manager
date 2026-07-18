@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -72,8 +73,8 @@ func TestUpsertOnboardedRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Insert.
-	if err := upsertOnboardedRoute(path, "myapp", "myapp.example.org", []string{"http://myapp:3000"}); err != nil {
+	// Insert with a path prefix + strip.
+	if err := upsertOnboardedRoute(path, "myapp", "myapp.example.org", "/admin", true, []string{"http://myapp:3000"}); err != nil {
 		t.Fatal(err)
 	}
 	f, err := readRoutesFile(path)
@@ -83,9 +84,17 @@ func TestUpsertOnboardedRoute(t *testing.T) {
 	if len(f.Routes) != 2 {
 		t.Fatalf("after insert routes = %d, want 2", len(f.Routes))
 	}
+	for _, r := range f.Routes {
+		if r.Onboarded == "myapp" {
+			if r.Path != "/admin" || !r.Strip {
+				t.Fatalf("inserted entry path/strip = %q/%v, want /admin/true", r.Path, r.Strip)
+			}
+		}
+	}
 
 	// Update in place — count unchanged, host updated, curated preserved.
-	if err := upsertOnboardedRoute(path, "myapp", "new.example.org", []string{"http://myapp:4000"}); err != nil {
+	// Empty path + strip=false must be omitted from the marshaled JSON.
+	if err := upsertOnboardedRoute(path, "myapp", "new.example.org", "", false, []string{"http://myapp:4000"}); err != nil {
 		t.Fatal(err)
 	}
 	f, _ = readRoutesFile(path)
@@ -98,6 +107,9 @@ func TestUpsertOnboardedRoute(t *testing.T) {
 			curatedOK = true
 		}
 		if r.Onboarded == "myapp" && r.Host == "new.example.org" && r.Backends[0] == "http://myapp:4000" {
+			if r.Path != "" || r.Strip {
+				t.Fatalf("updated entry path/strip = %q/%v, want empty/false", r.Path, r.Strip)
+			}
 			onboardedOK = true
 		}
 	}
@@ -106,6 +118,14 @@ func TestUpsertOnboardedRoute(t *testing.T) {
 	}
 	if !onboardedOK {
 		t.Fatal("onboarded entry not updated in place")
+	}
+	// The empty path/strip must not appear in the raw file (omitempty).
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"path"`) || strings.Contains(string(raw), `"strip"`) {
+		t.Fatalf("routes.json should omit empty path/strip, got:\n%s", raw)
 	}
 }
 

@@ -39,13 +39,15 @@ type OnboardedService struct {
 	// on the edge network, and not scalable/replaceable. Adding a route later
 	// (via onboardContainer) upgrades it to a full onboarded service in place.
 	Host           string            `json:"host"`
-	Port           int               `json:"port"`              // internal container port
-	Image          string            `json:"image"`             // currently-live image (clones use this)
-	Env            []string          `json:"env,omitempty"`     // captured at onboard time
-	Labels         map[string]string `json:"labels,omitempty"`  // original labels we want to preserve
-	Replicas       int               `json:"replicas"`          // currently routed backend count (>= 1)
-	PreviousImage  string            `json:"previous_image,omitempty"`  // set on replace/promote — for rollback
-	CanaryImage    string            `json:"canary_image,omitempty"`    // non-empty while a canary is staged
+	Port           int               `json:"port"` // internal container port
+	Path           string            `json:"path,omitempty"`
+	Strip          bool              `json:"strip,omitempty"`
+	Image          string            `json:"image"`                    // currently-live image (clones use this)
+	Env            []string          `json:"env,omitempty"`            // captured at onboard time
+	Labels         map[string]string `json:"labels,omitempty"`         // original labels we want to preserve
+	Replicas       int               `json:"replicas"`                 // currently routed backend count (>= 1)
+	PreviousImage  string            `json:"previous_image,omitempty"` // set on replace/promote — for rollback
+	CanaryImage    string            `json:"canary_image,omitempty"`   // non-empty while a canary is staged
 	CanaryReplicas int               `json:"canary_replicas,omitempty"`
 	// OriginalRouted flips to false once a replace/promote drops the original
 	// from the route. The original container keeps running; we just stop
@@ -179,7 +181,7 @@ func writeRoutesFile(path string, f routesFile) error {
 
 // upsertOnboardedRoute rewrites the routes.json entry tagged onboarded=<name>.
 // If no such entry exists, appends one. Returns the new full file.
-func upsertOnboardedRoute(path, name, host string, backends []string) error {
+func upsertOnboardedRoute(path, name, host, routePath string, strip bool, backends []string) error {
 	f, err := readRoutesFile(path)
 	if err != nil {
 		return err
@@ -187,6 +189,8 @@ func upsertOnboardedRoute(path, name, host string, backends []string) error {
 	entry := routesEntry{
 		Name:      "onboarded: " + name,
 		Host:      host,
+		Path:      routePath,
+		Strip:     strip,
 		Backends:  backends,
 		Onboarded: name,
 	}
@@ -249,6 +253,8 @@ func (c *dockerClient) disconnectFromEdge(ctx context.Context, containerID strin
 type OnboardRequest struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
+	Path     string `json:"path,omitempty"`
+	Strip    bool   `json:"strip,omitempty"`
 	Replicas int    `json:"replicas,omitempty"`
 }
 
@@ -264,6 +270,9 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	}
 	if !validPort(req.Port) {
 		return fmt.Errorf("invalid port")
+	}
+	if !validRoutePath(req.Path) {
+		return fmt.Errorf("invalid path (must be empty or start with / — allowed: a-z A-Z 0-9 / _ . -, max 512 chars)")
 	}
 	if req.Replicas < 1 {
 		req.Replicas = 1
@@ -298,6 +307,8 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 		Name:           name,
 		Host:           req.Host,
 		Port:           req.Port,
+		Path:           req.Path,
+		Strip:          req.Strip,
 		Image:          image,
 		Env:            env,
 		Replicas:       1,
@@ -310,7 +321,7 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	// Write the static route entry using the container's DNS name (resolves
 	// inside the edge network as long as the container is connected).
 	backend := fmt.Sprintf("http://%s:%d", name, req.Port)
-	if err := upsertOnboardedRoute(routesPath, name, req.Host, []string{backend}); err != nil {
+	if err := upsertOnboardedRoute(routesPath, name, req.Host, req.Path, req.Strip, []string{backend}); err != nil {
 		return fmt.Errorf("update routes.json: %w", err)
 	}
 	// Scale to requested replicas (will clone if >1).
@@ -472,7 +483,7 @@ func rebuildOnboardedRoute(ctx context.Context, c *dockerClient, name string, sv
 	if len(backends) == 0 {
 		return removeOnboardedRoute(routesPath, name)
 	}
-	return upsertOnboardedRoute(routesPath, name, svc.Host, backends)
+	return upsertOnboardedRoute(routesPath, name, svc.Host, svc.Path, svc.Strip, backends)
 }
 
 // stageOnboarded spins up N=Replicas canary containers with new image+env and
