@@ -30,3 +30,8 @@ func validServiceName(s string) bool { return serviceNameRE.MatchString(s) }
 func validHostname(s string) bool    { return hostnameRE.MatchString(s) }
 func validProxyPath(s string) bool   { return proxyPathRE.MatchString(s) }
 func validPort(p int) bool           { return p > 0 && p <= 65535 }
+
+// validRoutePath additionally permits an empty string, which the router treats
+// as a host-wide catch-all (equivalent to "/"). Any non-empty value must still
+// be a well-formed proxy path (leading `/`, no metacharacters).
+func validRoutePath(s string) bool { return s == "" || validProxyPath(s) }

@@ -50,6 +50,21 @@ func TestValidProxyPath(t *testing.T) {
 	}
 }
 
+func TestValidRoutePath(t *testing.T) {
+	good := []string{"", "/", "/admin", "/a/b-c_d.e"}
+	for _, s := range good {
+		if !validRoutePath(s) {
+			t.Errorf("validRoutePath(%q) = false, want true", s)
+		}
+	}
+	bad := []string{"admin", "/a b", "/a?b", "/<x>", "/" + strings.Repeat("a", 512)}
+	for _, s := range bad {
+		if validRoutePath(s) {
+			t.Errorf("validRoutePath(%q) = true, want false", s)
+		}
+	}
+}
+
 func TestValidPort(t *testing.T) {
 	for _, p := range []int{0, -1, 65536, 100000} {
 		if validPort(p) {
