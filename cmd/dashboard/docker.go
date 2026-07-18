@@ -34,6 +34,7 @@ const (
 	labelUnscalable = "proxy.unscalable" // when "true", dashboard greys out +/- buttons
 	labelPrevImage  = "proxy.previous_image" // set on Replace; enables one-click Rollback
 	labelCanary     = "proxy.canary"         // "true" → staged replicas, served alongside live
+	labelAutoUpdate = "proxy.autoupdate"     // "true" → engine replaces on newer registry digest
 )
 
 // dockerClient is the dashboard's READ-WRITE view of the Docker daemon.
@@ -293,6 +294,7 @@ type Service struct {
 	Unscalable      bool              `json:"unscalable,omitempty"`
 	PreviousImage   string            `json:"previous_image,omitempty"`   // for one-click rollback
 	UpdateAvailable bool              `json:"update_available,omitempty"` // set by image checker
+	AutoUpdate      bool              `json:"auto_update,omitempty"`      // opted in to unattended updates
 	CanaryImage     string            `json:"canary_image,omitempty"`     // non-empty when a stage is in progress
 	CanaryReplicas  int               `json:"canary_replicas,omitempty"`
 	Onboarded       bool              `json:"onboarded,omitempty"`        // adopted from an unlabelled container
@@ -354,6 +356,7 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 			s.Path = ct.Labels[labelPath]
 			s.Unscalable = ct.Labels[labelUnscalable] == "true"
 			s.PreviousImage = ct.Labels[labelPrevImage]
+			s.AutoUpdate = ct.Labels[labelAutoUpdate] == "true"
 			s.Replicas++
 		}
 	}

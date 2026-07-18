@@ -83,7 +83,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Background: poll registries every 10 min for newer image digests.
+	// Background: poll registries every 10 min for newer image digests, then
+	// let the auto-updater act on any opted-in service with a newer digest.
+	au := newAutoUpdater(dc, ic, onboarded, *staticConfig, proxyURLFromEnv())
 	go ic.Loop(ctx, func() []string {
 		svcs, err := dc.listServices(ctx)
 		if err != nil {
@@ -101,8 +103,18 @@ func main() {
 				imgs = append(imgs, s.CanaryImage)
 			}
 		}
+		// Onboarded-only services aren't label-discovered — include their
+		// images so they get update badges (and auto-updates) too.
+		for _, o := range onboarded.List() {
+			if o.Image != "" {
+				imgs = append(imgs, o.Image)
+			}
+			if o.CanaryImage != "" {
+				imgs = append(imgs, o.CanaryImage)
+			}
+		}
 		return imgs
-	})
+	}, au.runOnce)
 
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
