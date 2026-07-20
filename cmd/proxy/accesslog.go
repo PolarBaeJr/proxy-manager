@@ -87,10 +87,11 @@ func (a *AccessLog) Snapshot(limit int, since int64) []AccessEntry {
 // the upstream identity without depending on the access-log type directly.
 type accessWriter struct {
 	http.ResponseWriter
-	status   int
-	bytes    int64
-	backend  string
-	unrouted bool
+	status      int
+	bytes       int64
+	backend     string
+	unrouted    bool
+	ratelimited bool
 }
 
 // Hijack forwards to the embedded ResponseWriter so WebSocket / protocol
@@ -127,6 +128,7 @@ func (w *accessWriter) Write(b []byte) (int, error) {
 }
 func (w *accessWriter) SetBackend(url string) { w.backend = url }
 func (w *accessWriter) MarkUnrouted()         { w.unrouted = true }
+func (w *accessWriter) MarkRateLimited()      { w.ratelimited = true }
 
 // withAccessLog wraps a handler, recording one AccessEntry per request after
 // the handler returns. Skips its own /access endpoint (handled on the metrics

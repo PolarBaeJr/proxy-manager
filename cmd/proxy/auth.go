@@ -144,7 +144,7 @@ func (a *authGate) authorize(w http.ResponseWriter, req *http.Request, group *Ro
 		a.warnNoSecret.Do(func() {
 			log.Printf("auth: PMGR_AUTH_SECRET unset — protected hosts fail closed with 503")
 		})
-		serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
+		serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.", 300)
 		return false
 	}
 

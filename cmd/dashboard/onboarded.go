@@ -165,6 +165,9 @@ type routesEntry struct {
 	Strip    bool     `json:"strip,omitempty"`
 	Backends []string `json:"backends"`
 	Health   string   `json:"health,omitempty"`
+	// Round-tripped for the proxy — the dashboard rewrites whole entries, so
+	// without this field an upsert would silently strip a user-set rate cap.
+	Ratelimit string `json:"ratelimit,omitempty"`
 	// Marker: routes the dashboard wrote, so we can rewrite/delete them
 	// without touching user-curated entries.
 	Onboarded string `json:"onboarded,omitempty"` // matches OnboardedService.Name
@@ -210,6 +213,9 @@ func upsertOnboardedRoute(path, name, host, routePath string, strip bool, backen
 	}
 	for i, r := range f.Routes {
 		if r.Onboarded == name {
+			// Preserve the rate cap across rewrites — entry is built fresh and
+			// would otherwise drop it.
+			entry.Ratelimit = r.Ratelimit
 			f.Routes[i] = entry
 			return writeRoutesFile(path, f)
 		}

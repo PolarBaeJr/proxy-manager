@@ -24,6 +24,7 @@ func main() {
 	authTrustedCIDRs := flag.String("auth-trusted-cidrs", "", "comma-separated CIDRs that bypass auth entirely (e.g. LAN ranges)")
 	authXFFTrustedCIDRs := flag.String("auth-xff-trusted-cidrs", "127.0.0.0/8,172.16.0.0/12", "comma-separated CIDRs of peers whose X-Forwarded-For is trusted")
 	authVerifyTokenURL := flag.String("auth-verify-token-url", "http://dashboard:8093/api/auth/verify-token", "dashboard endpoint used to verify bearer API tokens")
+	rateLimitGlobal := flag.String("ratelimit-global", "", `whole-proxy aggregate request cap as "rps" or "rps:burst" (empty = disabled)`)
 	flag.Parse()
 
 	metrics := NewMetrics()
@@ -42,6 +43,16 @@ func main() {
 
 	dc := newDockerClient()
 	router := &Router{}
+	router.limits = newLimiterRegistry()
+	if *rateLimitGlobal != "" {
+		spec, ok := parseRateSpec(*rateLimitGlobal)
+		if !ok {
+			// Operator config error — refuse to start rather than run unlimited.
+			log.Fatalf(`bad -ratelimit-global %q: want "rps" or "rps:burst" with 1 <= rps <= burst`, *rateLimitGlobal)
+		}
+		router.global = newTokenBucket(spec, nil)
+		log.Printf("global rate limit: %d req/s (burst %d)", spec.RPS, spec.Burst)
+	}
 	if *authDomains != "" {
 		var secret []byte
 		if envHex := strings.TrimSpace(os.Getenv("PMGR_AUTH_SECRET")); envHex != "" {
@@ -112,6 +123,9 @@ func withMetrics(next http.Handler, m *Metrics) http.Handler {
 		}
 		if aw.unrouted {
 			host = unroutedHost
+		}
+		if aw.ratelimited {
+			m.RecordRateLimited(host)
 		}
 		status := aw.status
 		if status == 0 {
