@@ -3010,14 +3010,12 @@ async function refreshStats() {
     const cpuPct  = Math.max(0, Math.min(100, s.cpu_pct || 0));
     const memPct  = s.mem_total  ? 100 * s.mem_used  / s.mem_total  : 0;
     const diskPct = s.disk_total ? 100 * s.disk_used / s.disk_total : 0;
-    const memGB   = (s.mem_used  / 1073741824).toFixed(1);
-    const memTotG = (s.mem_total / 1073741824).toFixed(1);
-    const diskGB  = (s.disk_used  / 1073741824).toFixed(1);
-    const diskTotT= (s.disk_total / 1099511627776).toFixed(1);
+    const [memUsed,  memUnit]  = splitBytes(s.mem_used);
+    const [diskUsed, diskUnit] = splitBytes(s.disk_used);
     $('#sys-stats').innerHTML =
         tileMarkup(I.cpu,  'CPU',    '<span class="num">' + cpuPct.toFixed(0) + '</span><small>% load</small>', cpuPct)
-      + tileMarkup(I.mem,  'Memory', '<span class="num">' + memGB + '</span><small>/ ' + memTotG + ' GB used · ' + fmtBytes(s.mem_free) + ' free</small>', memPct)
-      + tileMarkup(I.disk, 'Disk',   '<span class="num">' + diskGB + '</span><small>/ ' + diskTotT + ' TB used · ' + fmtBytes(s.disk_free) + ' free</small>', diskPct);
+      + tileMarkup(I.mem,  'Memory', '<span class="num">' + memUsed  + '</span><small>' + memUnit  + ' used / ' + fmtBytes(s.mem_total)  + ' · ' + fmtBytes(s.mem_free)  + ' free</small>', memPct)
+      + tileMarkup(I.disk, 'Disk',   '<span class="num">' + diskUsed + '</span><small>' + diskUnit + ' used / ' + fmtBytes(s.disk_total) + ' · ' + fmtBytes(s.disk_free) + ' free</small>', diskPct);
   } catch (e) { /* silent */ }
 }
 
@@ -3033,12 +3031,19 @@ function fmt(n) {
   return String(n);
 }
 function pct(n) { return (Math.round(n * 10) / 10) + '%'; }
+// splitBytes returns [value, unit] using one consistent decimal scale (kB=1e3),
+// so a headline number and its caption never disagree on units the way the old
+// per-tile divisors did (GiB headline vs TiB total vs decimal-TB free).
+function splitBytes(n) {
+  if (!n) return ['—', ''];
+  if (n >= 1e12) return [(n/1e12).toFixed(1), 'TB'];
+  if (n >= 1e9)  return [(n/1e9).toFixed(1), 'GB'];
+  if (n >= 1e6)  return [(n/1e6).toFixed(0), 'MB'];
+  return [String(n), 'B'];
+}
 function fmtBytes(n) {
-  if (!n) return '—';
-  if (n >= 1e12) return (n/1e12).toFixed(1) + ' TB';
-  if (n >= 1e9)  return (n/1e9).toFixed(1) + ' GB';
-  if (n >= 1e6)  return (n/1e6).toFixed(0) + ' MB';
-  return n + ' B';
+  const [v, u] = splitBytes(n);
+  return u ? v + ' ' + u : v;
 }
 
 /* ---------- boot ---------- */
