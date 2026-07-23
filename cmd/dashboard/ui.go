@@ -1436,7 +1436,7 @@ function renderServiceStatsPanel(stats, recent) {
         + '<td class="path" title="' + esc(r.path) + '">' + esc(r.path) + '</td>'
         + '<td><span class="sc ' + statusClass(r.status) + '">' + r.status + '</span></td>'
         + '<td class="ms' + msCls + '">' + ms + '</td>'
-        + '<td class="meta" title="' + esc(r.backend || '') + '">' + esc((r.backend || '').replace(/^https?:\/\//, '').slice(0, 28)) + '</td>'
+        + (function(){ const bl = backendLabel(r); return '<td class="meta" title="' + esc(bl.title) + '">' + esc(bl.text) + '</td>'; })()
         + '</tr>';
     }
     html += '</tbody></table></div>';
@@ -2261,7 +2261,7 @@ function paintAccess() {
       + '<td class="ms' + msCls + '">' + ms + '<small style="color:var(--muted-2)">ms</small></td>'
       + '<td class="by">' + fmt(r.bytes || 0) + '</td>'
       + '<td class="meta">' + esc(r.ip || '') + '</td>'
-      + '<td class="meta" title="' + esc(r.backend || '') + '">' + esc((r.backend || '').replace(/^https?:\/\//, '').slice(0, 28)) + '</td>'
+      + (function(){ const bl = backendLabel(r); return '<td class="meta" title="' + esc(bl.title) + '">' + esc(bl.text) + '</td>'; })()
       + '<td class="ua" title="' + esc(r.ua || '') + '">' + esc((r.ua || '').slice(0, 24)) + '</td>'
       + '</tr>';
   }).join('');
@@ -3033,6 +3033,14 @@ function fmt(n) {
   return String(n);
 }
 function pct(n) { return (Math.round(n * 10) / 10) + '%'; }
+function backendLabel(r) {
+  const url = (r.backend || '').replace(/^https?:\/\//, '');
+  const c = r.container || '';
+  // Prefer the container name; fall back to the URL for static/manual routes.
+  const text = (c && c !== 'static') ? c : url;
+  const title = c && c !== 'static' ? (c + '  ·  ' + url) : url; // full context on hover
+  return { text: text.slice(0, 32), title: title };
+}
 function fmtBytes(n) {
   if (!n) return '—';
   if (n >= 1e12) return (n/1e12).toFixed(1) + ' TB';

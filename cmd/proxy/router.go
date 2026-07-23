@@ -179,8 +179,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		tried[b] = true
 		// Tell whichever wrapping writer cares (access log) which upstream we picked.
 		// Interface-based so this file stays free of accesslog imports.
-		if setter, ok := w.(interface{ SetBackend(string) }); ok {
-			setter.SetBackend(b.URL)
+		if setter, ok := w.(interface{ SetBackend(string, string) }); ok {
+			setter.SetBackend(b.URL, b.Container)
 		}
 		if tryProxy(w, req, b) {
 			return
