@@ -17,15 +17,17 @@ import (
 type Metrics struct {
 	mu sync.Mutex
 
-	StartedAt    time.Time
-	Total        atomic.Uint64
-	BytesOut     atomic.Uint64
-	InFlight     atomic.Int64
+	StartedAt   time.Time
+	Total       atomic.Uint64
+	BytesOut    atomic.Uint64
+	InFlight    atomic.Int64
+	RateLimited atomic.Uint64
 
-	byHost       map[string]uint64
-	byStatus     map[int]uint64
-	byMethod     map[string]uint64
-	byHostStatus map[string]map[int]uint64 // host → status → count
+	byHost            map[string]uint64
+	byStatus          map[int]uint64
+	byMethod          map[string]uint64
+	byHostStatus      map[string]map[int]uint64 // host → status → count
+	byHostRateLimited map[string]uint64         // host → 429s from the aggregate limiter
 
 	// Latency reservoir — last 1000 observations. Cheap percentile estimation.
 	latencyMs    []float64
@@ -36,13 +38,23 @@ const latencyWindow = 1000
 
 func NewMetrics() *Metrics {
 	return &Metrics{
-		StartedAt:    time.Now(),
-		byHost:       map[string]uint64{},
-		byStatus:     map[int]uint64{},
-		byMethod:     map[string]uint64{},
-		byHostStatus: map[string]map[int]uint64{},
-		latencyMs:    make([]float64, 0, latencyWindow),
+		StartedAt:         time.Now(),
+		byHost:            map[string]uint64{},
+		byStatus:          map[int]uint64{},
+		byMethod:          map[string]uint64{},
+		byHostStatus:      map[string]map[int]uint64{},
+		byHostRateLimited: map[string]uint64{},
+		latencyMs:         make([]float64, 0, latencyWindow),
 	}
+}
+
+// RecordRateLimited counts a 429 from the aggregate rate limiter, on top of
+// the regular Record the middleware also performs.
+func (m *Metrics) RecordRateLimited(host string) {
+	m.RateLimited.Add(1)
+	m.mu.Lock()
+	m.byHostRateLimited[host]++
+	m.mu.Unlock()
 }
 
 func (m *Metrics) Record(host, method string, status int, bytes int64, dur time.Duration) {
@@ -98,15 +110,17 @@ func (m *Metrics) Snapshot() map[string]any {
 		return lat[i]
 	}
 	return map[string]any{
-		"started_at":     m.StartedAt.UTC().Format(time.RFC3339),
-		"uptime_seconds": int64(time.Since(m.StartedAt).Seconds()),
-		"total":          m.Total.Load(),
-		"bytes_out":      m.BytesOut.Load(),
-		"in_flight":      m.InFlight.Load(),
-		"by_host":        host,
-		"by_status":      status,
-		"by_method":      method,
-		"by_host_status": hostStatus,
+		"started_at":           m.StartedAt.UTC().Format(time.RFC3339),
+		"uptime_seconds":       int64(time.Since(m.StartedAt).Seconds()),
+		"total":                m.Total.Load(),
+		"bytes_out":            m.BytesOut.Load(),
+		"in_flight":            m.InFlight.Load(),
+		"by_host":              host,
+		"by_status":            status,
+		"by_method":            method,
+		"by_host_status":       hostStatus,
+		"rate_limited":         m.RateLimited.Load(),
+		"rate_limited_by_host": copyMap(m.byHostRateLimited),
 		"latency_ms": map[string]float64{
 			"p50": pct(0.50),
 			"p90": pct(0.90),
@@ -132,6 +146,9 @@ type metricsState struct {
 	ByHostStatus map[string]map[int]uint64 `json:"by_host_status"`
 	LatencyMs    []float64                 `json:"latency_ms"`
 	LatencyHead  int                       `json:"latency_head"`
+	// Optional (added later) — absent in older snapshots; version stays 1.
+	RateLimited       uint64            `json:"rate_limited,omitempty"`
+	ByHostRateLimited map[string]uint64 `json:"rate_limited_by_host,omitempty"`
 }
 
 const metricsStateVersion = 1
@@ -162,6 +179,8 @@ func (m *Metrics) exportState() metricsState {
 	}
 	st.LatencyMs = append([]float64(nil), m.latencyMs...)
 	st.LatencyHead = m.latencyHead
+	st.RateLimited = m.RateLimited.Load()
+	st.ByHostRateLimited = copyMap(m.byHostRateLimited)
 	m.mu.Unlock()
 	return st
 }
@@ -194,7 +213,11 @@ func (m *Metrics) restoreState(st metricsState) {
 			m.latencyHead = st.LatencyHead
 		}
 	}
+	if st.ByHostRateLimited != nil {
+		m.byHostRateLimited = st.ByHostRateLimited
+	}
 	m.mu.Unlock()
+	m.RateLimited.Store(st.RateLimited)
 }
 
 func copyMap(in map[string]uint64) map[string]uint64 {

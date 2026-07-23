@@ -99,6 +99,7 @@ Drop these on any container you want routed:
 | `proxy.strip=true` |   | strip prefix before forwarding |
 | `proxy.weight=2` |   | weighted RR (default 1) |
 | `proxy.health=/healthz` |   | HTTP probe (default: TCP connect) |
+| `proxy.ratelimit=100` |   | aggregate req/s cap for the route — all clients combined, **not per-IP**; optional `100:250` = rps:burst; admission-only (a WebSocket costs one token at connect) |
 | `proxy.service=myapp` |   | group key — unlocks scale/replace/canary in dashboard |
 | `proxy.unscalable=true` |   | singleton (DB, bot, gateway) — disables scale buttons |
 | `proxy.autoupdate=true` |   | opt-in unattended updates — dashboard re-pulls + replaces when a newer registry digest appears (10-min poll) |
@@ -108,6 +109,8 @@ Drop these on any container you want routed:
 | `proxy.auth.mode=oauth` |   | bearer-only OAuth mode for MCP servers (default is cookie SSO) |
 
 Containers must share the **`edge`** Docker network with the proxy. See `examples/docker-compose-sample.yml`.
+
+Static routes in `routes.json` take the same cap via a `"ratelimit": "100"` (or `"100:250"`) field, and the proxy's `-ratelimit-global` flag adds an optional whole-proxy ceiling in the same `rps`/`rps:burst` syntax (default: off).
 
 ---
 

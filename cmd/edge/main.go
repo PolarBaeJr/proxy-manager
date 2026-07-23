@@ -43,6 +43,7 @@ func main() {
 
 	rateLimit := flag.Int("rate", 100, "sustained requests per second per IP (0 = disabled)")
 	rateBurst := flag.Int("burst", 200, "burst capacity per IP")
+	maxInFlight := flag.Int("max-inflight", 512, "max concurrent in-flight requests across all clients (0 = disabled)")
 	maxBody := flag.Int64("max-body", 10<<20, "max request body bytes")
 	insecure := flag.Bool("insecure", false, "skip TLS, serve plain HTTP on -http-addr (testing only)")
 	metricsAddr := flag.String("metrics-addr", ":8094", "internal metrics endpoint listen address")
@@ -84,6 +85,9 @@ func main() {
 	var handler http.Handler = newForwarder(*backend)
 	handler = withMaxBody(handler, *maxBody)
 	handler = withGzip(handler)
+	if *maxInFlight > 0 {
+		handler = withMaxInFlight(handler, *maxInFlight)
+	}
 	if *rateLimit > 0 {
 		handler = withRateLimit(handler, rl)
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net"
 	"net/http"
@@ -42,7 +43,10 @@ type RouteGroup struct {
 	AuthUsers    []string // lowercased; empty = any authenticated user
 	AuthMode     string   // "" = sso (cookie or login redirect), "oauth" = bearer-first MCP mode
 
-	cursor atomic.Uint64
+	RateLimit *rateSpec // aggregate cap for the whole route; nil = unlimited
+
+	cursor  atomic.Uint64
+	limiter *tokenBucket // attached by Router.Set from the persistent registry
 }
 
 func (g *RouteGroup) pickHealthy(skip map[*Backend]bool) *Backend {
@@ -71,6 +75,9 @@ type Router struct {
 
 	auth     *authGate // nil = auth gating disabled (proxy.auth hosts fail closed)
 	authWarn sync.Once
+
+	limits *limiterRegistry // per-route aggregate rate buckets; outlives group rebuilds
+	global *tokenBucket     // nil = no whole-proxy ceiling (-ratelimit-global)
 }
 
 func (r *Router) Set(groups []*RouteGroup) {
@@ -78,6 +85,10 @@ func (r *Router) Set(groups []*RouteGroup) {
 		return len(groups[i].PathPrefix) > len(groups[j].PathPrefix)
 	})
 	r.mu.Lock()
+	if r.limits == nil {
+		r.limits = newLimiterRegistry()
+	}
+	limits := r.limits
 	prev := r.groups
 	r.groups = groups
 	r.mu.Unlock()
@@ -97,6 +108,21 @@ func (r *Router) Set(groups []*RouteGroup) {
 			}
 		}
 	}
+
+	// Rate-limit buckets are carried across rebuilds via the registry, same
+	// spirit as the health reseed above: a refresh replaces every RouteGroup,
+	// and re-attaching the SAME bucket is what keeps a drained route drained —
+	// a rebuild must never grant a free refill.
+	live := map[string]bool{}
+	for _, g := range groups {
+		if g.RateLimit == nil {
+			continue
+		}
+		key := g.Host + "|" + g.PathPrefix
+		g.limiter = limits.acquire(key, *g.RateLimit)
+		live[key] = true
+	}
+	limits.prune(live)
 }
 
 func (r *Router) Snapshot() []*RouteGroup {
@@ -122,6 +148,32 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mu.RUnlock()
 
 	reqHost := hostOnly(req.Host)
+	// Whole-proxy ceiling first — before well-known intercepts, matching, and
+	// auth — so an overload sheds every request equally cheaply.
+	if r.global != nil {
+		if ok, retry := r.global.allow(); !ok {
+			if m, ok := w.(interface{ MarkRateLimited() }); ok {
+				m.MarkRateLimited()
+			}
+			// Cheap host-only scan: unknown hosts must still collapse into the
+			// unrouted metrics bucket or scanner traffic during an overload
+			// would grow the per-host maps.
+			known := false
+			for _, g := range groups {
+				if strings.EqualFold(reqHost, g.Host) {
+					known = true
+					break
+				}
+			}
+			if !known {
+				if m, ok := w.(interface{ MarkUnrouted() }); ok {
+					m.MarkUnrouted()
+				}
+			}
+			serveUnavailable(w, http.StatusTooManyRequests, reqHost, "Too many requests — slow down.", retryAfterSeconds(retry))
+			return
+		}
+	}
 	// OAuth resource-server metadata (and the legacy AS-metadata fallback)
 	// must be answered before path-prefix matching AND before auth — clients
 	// fetch it unauthenticated from the protected host itself.
@@ -146,8 +198,19 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if m, ok := w.(interface{ MarkUnrouted() }); ok {
 			m.MarkUnrouted()
 		}
-		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.")
+		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.", 300)
 		return
+	}
+	// Per-route cap runs BEFORE auth: an over-limit route sheds load without
+	// paying for cookie/bearer verification.
+	if group.limiter != nil {
+		if ok, retry := group.limiter.allow(); !ok {
+			if m, ok := w.(interface{ MarkRateLimited() }); ok {
+				m.MarkRateLimited()
+			}
+			serveUnavailable(w, http.StatusTooManyRequests, reqHost, "Too many requests — slow down.", retryAfterSeconds(retry))
+			return
+		}
 	}
 	if group.AuthRequired {
 		if r.auth == nil {
@@ -156,7 +219,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			r.authWarn.Do(func() {
 				log.Printf("auth: host %s requires auth but -auth-domains is unset — failing closed with 503", group.Host)
 			})
-			serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
+			serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.", 300)
 			return
 		}
 		if !r.auth.authorize(w, req, group) {
@@ -189,27 +252,33 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Metrics are the raw truth — count every 503 honestly. The dashboard
 	// UI is the layer that lets the operator choose to hide stopped-service
 	// hosts from the Top hosts / error-rate view via a toggle.
-	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
+	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.", 300)
 }
 
-// serveUnavailable writes a small styled HTML page with a 5-minute
-// meta-refresh so the browser silently retries in the background. Used
-// when a host has no healthy backends (all replicas stopped, container
-// crashed, etc.) or when the host has no route at all. The page is
-// intentionally minimal — no JS, no external assets — so it works even
-// when the only thing the proxy can do is fail.
-func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
+// serveUnavailable writes a small styled HTML page with a meta-refresh (same
+// interval as the Retry-After header) so the browser silently retries in the
+// background. Used when a host has no healthy backends (all replicas stopped,
+// container crashed, etc.), when the host has no route at all, or on a 429
+// from the aggregate rate limiter. The page is intentionally minimal — no JS,
+// no external assets — so it works even when the only thing the proxy can do
+// is fail.
+func serveUnavailable(w http.ResponseWriter, status int, host, reason string, retryAfter int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Retry-After", "300")
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	w.WriteHeader(status)
+	// Host comes straight off the wire — escape it everywhere it lands in HTML.
+	host = html.EscapeString(host)
 	title := "Service unavailable"
-	if status == http.StatusNotFound {
+	switch status {
+	case http.StatusNotFound:
 		title = "Not found"
+	case http.StatusTooManyRequests:
+		title = "Too many requests"
 	}
 	fmt.Fprintf(w, `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<meta http-equiv=refresh content="300">
+<meta http-equiv=refresh content="%d">
 <title>%d %s · %s</title>
 <style>
   :root{color-scheme:dark}
@@ -225,7 +294,7 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
   <h1>%s</h1>
   <p>%s</p>
 </div>
-`, status, title, host, status, http.StatusText(status), title, reason)
+`, retryAfter, status, title, host, status, http.StatusText(status), title, reason)
 }
 
 func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
@@ -277,6 +346,7 @@ type staticRoute struct {
 	Auth      bool     `json:"auth,omitempty"`
 	AuthUsers []string `json:"auth_users,omitempty"`
 	AuthMode  string   `json:"auth_mode,omitempty"`
+	Ratelimit string   `json:"ratelimit,omitempty"` // "rps" or "rps:burst", aggregate for the route
 }
 
 type staticConfig struct {
@@ -301,6 +371,13 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers), AuthMode: sr.AuthMode,
 					}
 					groupsByKey[key] = g
+				}
+				if g.RateLimit == nil && sr.Ratelimit != "" {
+					if spec, ok := parseRateSpec(sr.Ratelimit); ok {
+						g.RateLimit = &spec
+					} else {
+						log.Printf("static route %s: bad ratelimit %q — ignoring (unlimited)", sr.Host, sr.Ratelimit)
+					}
 				}
 				for _, raw := range sr.Backends {
 					u, err := url.Parse(raw)
@@ -364,6 +441,14 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		}
 		if len(g.AuthUsers) == 0 {
 			g.AuthUsers = normalizeAuthUsers(strings.Split(c.Labels[labelAuthUsers], ","))
+		}
+		// Rate limit is first-wins across replicas (like Strip/Name).
+		if g.RateLimit == nil && c.Labels[labelRateLimit] != "" {
+			if spec, ok := parseRateSpec(c.Labels[labelRateLimit]); ok {
+				g.RateLimit = &spec
+			} else {
+				log.Printf("%s: bad %s=%q — ignoring (unlimited)", name, labelRateLimit, c.Labels[labelRateLimit])
+			}
 		}
 		if c.State != "running" {
 			continue
