@@ -21,15 +21,16 @@ import (
 const ringSize = 2000
 
 type AccessEntry struct {
-	Time      int64  `json:"t"`         // epoch milliseconds
+	Time      int64  `json:"t"` // epoch milliseconds
 	Method    string `json:"method"`
 	Host      string `json:"host"`
 	Path      string `json:"path"`
 	Status    int    `json:"status"`
 	Bytes     int64  `json:"bytes"`
-	LatencyMs int64  `json:"ms"`        // wall clock from request enter to handler return
-	ClientIP  string `json:"ip"`        // first X-Forwarded-For hop, else RemoteAddr
-	Backend   string `json:"backend"`   // URL of the upstream picked, "-" on no-route
+	LatencyMs int64  `json:"ms"`                  // wall clock from request enter to handler return
+	ClientIP  string `json:"ip"`                  // first X-Forwarded-For hop, else RemoteAddr
+	Backend   string `json:"backend"`             // URL of the upstream picked, "-" on no-route
+	Container string `json:"container,omitempty"` // container name serving the request; empty/"static" for manual routes
 	UA        string `json:"ua,omitempty"`
 }
 
@@ -87,10 +88,11 @@ func (a *AccessLog) Snapshot(limit int, since int64) []AccessEntry {
 // the upstream identity without depending on the access-log type directly.
 type accessWriter struct {
 	http.ResponseWriter
-	status   int
-	bytes    int64
-	backend  string
-	unrouted bool
+	status    int
+	bytes     int64
+	backend   string
+	container string
+	unrouted  bool
 }
 
 // Hijack forwards to the embedded ResponseWriter so WebSocket / protocol
@@ -125,8 +127,8 @@ func (w *accessWriter) Write(b []byte) (int, error) {
 	w.bytes += int64(n)
 	return n, err
 }
-func (w *accessWriter) SetBackend(url string) { w.backend = url }
-func (w *accessWriter) MarkUnrouted()         { w.unrouted = true }
+func (w *accessWriter) SetBackend(url, container string) { w.backend = url; w.container = container }
+func (w *accessWriter) MarkUnrouted()                    { w.unrouted = true }
 
 // withAccessLog wraps a handler, recording one AccessEntry per request after
 // the handler returns. Skips its own /access endpoint (handled on the metrics
@@ -162,6 +164,7 @@ func withAccessLog(next http.Handler, log *AccessLog) http.Handler {
 			LatencyMs: time.Since(start).Milliseconds(),
 			ClientIP:  clientIP(r),
 			Backend:   backend,
+			Container: aw.container,
 			UA:        truncate(r.UserAgent(), 160),
 		})
 	})
@@ -216,4 +219,3 @@ func accessHandler(a *AccessLog) http.HandlerFunc {
 		})
 	}
 }
-
