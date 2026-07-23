@@ -2259,7 +2259,7 @@ function paintAccess() {
       + '<td class="path" title="' + esc(r.path || '') + '">' + esc(r.path || '') + '</td>'
       + '<td><span class="sc ' + statusClass(r.status) + '">' + (r.status || 0) + '</span></td>'
       + '<td class="ms' + msCls + '">' + ms + '<small style="color:var(--muted-2)">ms</small></td>'
-      + '<td class="by">' + fmt(r.bytes || 0) + '</td>'
+      + '<td class="by">' + fmtBytes(r.bytes || 0) + '</td>'
       + '<td class="meta">' + esc(r.ip || '') + '</td>'
       + '<td class="meta" title="' + esc(r.backend || '') + '">' + esc((r.backend || '').replace(/^https?:\/\//, '').slice(0, 28)) + '</td>'
       + '<td class="ua" title="' + esc(r.ua || '') + '">' + esc((r.ua || '').slice(0, 24)) + '</td>'
