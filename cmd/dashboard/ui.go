@@ -1175,13 +1175,35 @@ function statusBarFromCodes(byCode) {
 /* ---------- Routes ---------- */
 let _lastRoutesHash = '';
 async function renderRoutes() {
-  const groups = await api('/api/routes');
+  const [groups, maint] = await Promise.all([api('/api/routes'), api('/api/maintenance')]);
   const el = $('#tab-routes');
-  const hash = JSON.stringify(groups);
+  // Both feeds are in the hash: a flag flipped from the shell (or another
+  // browser) has to repaint the badge even when the routes are unchanged.
+  const hash = JSON.stringify([groups, maint]);
   if (hash === _lastRoutesHash && el.children.length) return;
   _lastRoutesHash = hash;
-  if (!groups.length) { el.innerHTML = emptyState(I.routes, 'No routes registered', 'Routes appear here as the proxy discovers Docker labels or static config entries.'); return; }
-  let html = '<div class="subhead">' + I.routes + groups.length + ' active route' + (groups.length === 1 ? '' : 's') + '</div>';
+  const inMaint = new Set((maint.hosts || []).map(h => h.toLowerCase()));
+  // Flags whose route group is gone — typically set with /usr/local/bin/maint
+  // for a service since removed. Without their own card they'd be unclearable.
+  const routed = new Set(groups.map(g => (g.host || '').toLowerCase()));
+  const orphans = [...inMaint].filter(h => !routed.has(h));
+  let orphanHTML = '';
+  if (maint.configured && orphans.length) {
+    let rows = '';
+    for (const h of orphans) {
+      rows += '<div class="member-row"><span class="ident">' + esc(h) + '</span><span class="spacer"></span>'
+           +  '<button class="btn sm" ' + lockedAttr() + ' data-maint-host="' + esc(h) + '" data-maint-on="1">' + I.check + 'Clear' + lk() + '</button></div>';
+    }
+    orphanHTML = '<div class="card"><div class="card-head"><div class="ttl">Maintenance flags without a route</div>'
+      + '<span class="pill bad">' + I.alert + orphans.length + ' flag' + (orphans.length === 1 ? '' : 's') + '</span></div>'
+      + '<div class="note warn" style="margin:8px 0 0">' + I.alert + '<div>These hosts serve the 503 page but no longer match a route — clear them unless the service is coming back.</div></div>'
+      + '<div class="member-list">' + rows + '</div></div>';
+  }
+  if (!groups.length) {
+    el.innerHTML = orphanHTML + emptyState(I.routes, 'No routes registered', 'Routes appear here as the proxy discovers Docker labels or static config entries.');
+    return;
+  }
+  let html = orphanHTML + '<div class="subhead">' + I.routes + groups.length + ' active route' + (groups.length === 1 ? '' : 's') + '</div>';
   for (const g of groups) {
     // Aggregate health for the pill: 0 backends or all unhealthy → down.
     const liveBackends = g.backends.filter(b => b.healthy === true).length;
@@ -1189,6 +1211,8 @@ async function renderRoutes() {
                      : liveBackends === g.backends.length ? 'up'
                      : 'flaky';
     const groupPill = healthPill(groupState);
+    const maintOn = inMaint.has((g.host || '').toLowerCase());
+    const maintPill = maintOn ? ' <span class="pill bad">' + I.alert + 'maintenance</span>' : '';
     const head = '<code>' + esc(g.host) + '</code>'
       + (g.path ? ' <code>' + esc(g.path) + '</code>' : '')
       + (g.strip ? ' <span class="tag" title="Strip path prefix before proxying">' + I.scissors + 'strip</span>' : '');
@@ -1209,9 +1233,20 @@ async function renderRoutes() {
     const downBanner = groupState === 'down'
       ? '<div class="note warn" style="margin:8px 0 0">' + I.alert + '<div><strong>No live backends</strong> — requests to this route return 503 until a replica comes up.</div></div>'
       : '';
+    const maintBanner = maintOn
+      ? '<div class="note warn" style="margin:8px 0 0">' + I.alert + '<div><strong>Maintenance mode</strong> — public visitors get the 503 page; loopback / Tailscale / LAN bypass it.</div></div>'
+      : '';
+    // Delegated click (see the data-maint-host handler): no host string is
+    // ever interpolated into an onclick attribute.
+    const maintBtn = maint.configured
+      ? '<button class="btn sm' + (maintOn ? '' : ' ghost') + '" ' + lockedAttr()
+        + ' data-maint-host="' + esc(g.host) + '" data-maint-on="' + (maintOn ? '1' : '0') + '">'
+        + I.alert + (maintOn ? 'Maintenance: on' : 'Maintenance: off') + lk() + '</button>'
+      : '';
     html += '<div class="card"><div class="card-head"><div class="ttl">' + head + '</div>'
-         +  groupPill + '<div class="spacer"></div><div class="meta">' + meta + '</div></div>'
-         +  downBanner
+         +  groupPill + maintPill + '<div class="spacer"></div><div class="meta">' + meta + '</div>'
+         +  (maintBtn ? '<div class="btn-row" style="margin-left:10px">' + maintBtn + '</div>' : '') + '</div>'
+         +  downBanner + maintBanner
          +  (g.backends.length ? '<table><thead><tr><th>Health</th><th>Backend</th><th>Weight</th><th>Container</th><th>Last error</th></tr></thead><tbody>' + rows + '</tbody></table>' : '')
          +  '</div>';
   }
@@ -1756,6 +1791,30 @@ async function toggleAutoUpdate(name, enabled) {
     });
     toast(enabled ? 'auto-update enabled for ' + name : 'auto-update disabled for ' + name, 'ok');
     _lastServicesHash = '';
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// toggleMaintenance — create/remove the nginx flag file for a host. Delegated
+// off data-maint-host so the host never rides inside an onclick attribute; the
+// buttons contain inline SVG, so match with closest() rather than e.target.
+// data-maint-on is the CURRENT state and the handler always asks for the
+// opposite — which is why the orphan card's "Clear" button carries 1, not 0.
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest ? e.target.closest('[data-maint-host]') : null;
+  if (!btn || btn.disabled) return;
+  toggleMaintenance(btn.dataset.maintHost, btn.dataset.maintOn !== '1');
+});
+async function toggleMaintenance(host, enable) {
+  // One host can own several route cards (groups are keyed host+path), so the
+  // switch is never per-card — say so before taking a site down.
+  if (enable && !(await confirmDialog(
+      'Put ' + host + ' into maintenance? Every route on this host returns the 503 page to public visitors; loopback / Tailscale / LAN still get through.',
+      {title: 'Maintenance mode', okLabel: 'Enable'}))) return;
+  try {
+    await api('/api/maintenance/' + encodeURIComponent(host), { method: enable ? 'POST' : 'DELETE' });
+    toast(enable ? 'maintenance on for ' + host : 'maintenance off for ' + host, 'ok');
+    _lastRoutesHash = '';
     renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }

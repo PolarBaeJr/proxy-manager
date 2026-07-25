@@ -88,6 +88,14 @@ services:
       - ./cmd/dashboard/data:/data                       # auth.json + audit.log (persisted)
       - /proc:/host-proc:ro                              # host CPU + memory stats
       - /mnt/ssd:/host-root:ro                           # host disk stats (SSD)
+      # Maintenance mode: nginx returns 503 for any host with a marker file
+      # here (snippets/maintenance.conf tests -f per request — no reload).
+      # Mounted rw because the dashboard creates/removes those markers; it
+      # never reads their contents. Overridable because the default path only
+      # exists on the Pi — a literal path would have Docker CREATE it on a dev
+      # machine, and the dashboard would then report maintenance "configured"
+      # while writing flags that no nginx ever reads.
+      - ${MAINT_HOST_DIR:-/etc/nginx/maint.d}:/etc/maint.d
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CLOUDFLARE_ZONE_ID:   ${CLOUDFLARE_ZONE_ID:-}
@@ -95,6 +103,7 @@ services:
       CLOUDFLARE_ZONES:     ${CLOUDFLARE_ZONES:-}   # extra zones: domain:zoneid[:token], comma-separated
       MONITOR_URL:          http://monitor:8095     # for the Stats tab
       PROXY_URL:            http://proxy:8094       # for the Access tab (proxy /access)
+      MAINT_DIR:            /etc/maint.d            # nginx maintenance flag files
 
   monitor:
     build:
