@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -41,12 +42,12 @@ func main() {
 
 	dc := newDockerClient()
 
-	var cf *cloudflareClient
-	if tok := os.Getenv("CLOUDFLARE_API_TOKEN"); tok != "" {
-		if zone := os.Getenv("CLOUDFLARE_ZONE_ID"); zone != "" {
-			cf = newCloudflareClient(tok, zone, os.Getenv("CLOUDFLARE_DOMAIN"))
-			log.Printf("cloudflare integration enabled for zone %s", zone)
-		}
+	cf, cfMsgs := newCloudflareRegistryFromEnv(os.Getenv)
+	for _, m := range cfMsgs {
+		log.Printf("%s", m)
+	}
+	if cf != nil {
+		log.Printf("cloudflare integration enabled for zone(s) %s", strings.Join(cf.Domains(), ", "))
 	}
 
 	limiter := newRateLimiter()

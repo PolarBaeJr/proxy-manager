@@ -75,8 +75,9 @@ Known token gaps to fix in the redesign: hardcoded blues (`#82baff`, `#2563eb`, 
   - Right-aligned `.btn-row` of actions: either `Promote canary (.primary)` + `Discard canary`, or `Stage new version (.primary)` + `Replace` + optional `Rollback to <image>`, plus `Delete service (.danger)`.
 
 ### DNS tab (`#tab-dns`)
-- Disabled state (no Cloudflare creds) shows an empty message.
-- `.btn-row` with primary `+ New record` button + zone meta indicator.
+- Disabled state (no Cloudflare creds) shows an empty message naming `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ZONE_ID` and `CLOUDFLARE_ZONES` (the multi-zone form).
+- `.btn-row` with primary `+ New record` button + one `.chip` per configured zone (the selected one `.active`, persisted in the `pmgr-dns-zone` pref) + record count.
+- A zone the API token isn't scoped for keeps its chip (with a `.pill.warn` "no access" marker) and swaps the table for an inline "Zone unavailable" card, so the rest of the tab stays usable.
 - Single `.card` wrapping a `<table>`: Type | Name | Content | Proxied | Actions. Type as `.pill.muted`, Proxied as `.pill.ok` ("on") or `.pill.muted` ("off"), per-row `Edit (.btn)` + `Delete (.btn.danger)`.
 
 ### Users tab (`#tab-users`)
@@ -354,7 +355,7 @@ The `health` field on every target now takes one of FOUR values:
 |---|---|
 | `GET /api/services` | list managed services (with replicas, update_available, canary_image, previous_image, unscalable, etc.) |
 | `GET /api/routes` | list routes from labels + static config |
-| `GET /api/cf/records` | Cloudflare DNS records |
+| `GET /api/cf/records` | Cloudflare DNS records. Optional `?zone=<domain>` selects one of the configured zones; omitted means the primary (legacy `CLOUDFLARE_*`) zone. The same param applies to the create/update/delete calls. |
 | `GET /api/users` | list users (no secrets) |
 | `GET /api/users/tokens` | current user's API tokens (no raw value) |
 

@@ -24,11 +24,16 @@ var (
 	// URL path prefix used for label-based routing. Must start with `/`,
 	// alnum + / _ . - only. No query, no fragment, no encoded characters.
 	proxyPathRE = regexp.MustCompile(`^/[A-Za-z0-9/_.-]{0,511}$`)
+
+	// Cloudflare DNS record id — a hex-ish opaque token that gets appended to
+	// the Cloudflare API URL, so nothing path-ish may pass.
+	cfRecordIDRE = regexp.MustCompile(`^[A-Za-z0-9]{1,64}$`)
 )
 
 func validServiceName(s string) bool { return serviceNameRE.MatchString(s) }
 func validHostname(s string) bool    { return hostnameRE.MatchString(s) }
 func validProxyPath(s string) bool   { return proxyPathRE.MatchString(s) }
+func validCFRecordID(s string) bool  { return cfRecordIDRE.MatchString(s) }
 func validPort(p int) bool           { return p > 0 && p <= 65535 }
 
 // validRoutePath additionally permits an empty string, which the router treats

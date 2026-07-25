@@ -17,7 +17,7 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -811,7 +811,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 
 	// ---- Cloudflare ----
 	mux.HandleFunc("/api/cf/enabled", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"enabled": cf != nil, "domain": cfDomain(cf)})
+		// Pure local-config read (the UI polls this every 5s) — "domain" stays
+		// the default zone so pre-multi-zone readers keep working.
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"enabled": cf != nil, "domain": cfDomain(cf), "zones": cf.Status()})
 	}))
 
 	// ---- Container logs (read-only; auth-gated) ----
@@ -913,30 +915,48 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			http.Error(w, "cloudflare not configured", http.StatusServiceUnavailable)
 			return
 		}
+		// Zone resolution happens INSIDE the auth closures — doing it out here
+		// would make ?zone= an unauthenticated zone-enumeration oracle.
 		switch req.Method {
 		case "GET":
 			auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-				recs, err := cf.List(req.Context())
+				zc, domain, ok := cfZoneFromReq(cf, req)
+				if !ok {
+					http.Error(w, "unknown zone", http.StatusNotFound)
+					return
+				}
+				recs, err := zc.List(req.Context())
+				cf.noteResult(domain, err)
 				if err != nil {
-					httpx.WriteErr(w, err)
+					writeCFErr(w, domain, err)
 					return
 				}
 				httpx.WriteJSON(w, http.StatusOK, recs)
 			})(w, req)
 		case "POST":
 			auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
+				zc, domain, ok := cfZoneFromReq(cf, req)
+				if !ok {
+					http.Error(w, "unknown zone", http.StatusNotFound)
+					return
+				}
 				var body CreateDNSRequest
 				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 					httpx.WriteErr(w, err)
 					return
 				}
-				rec, err := cf.Create(req.Context(), body)
+				if err := zc.validateName(body.Name); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				rec, err := zc.Create(req.Context(), body)
+				cf.noteResult(domain, err)
 				if err != nil {
-					httpx.WriteErr(w, err)
+					writeCFErr(w, domain, err)
 					return
 				}
 				info, _ := auth.sessionFrom(req)
-				audit(req, sessionUser(info), "dns.create", body.Name)
+				audit(req, sessionUser(info), "dns.create", body.Name+" ("+domain+")")
 				httpx.WriteJSON(w, http.StatusOK, rec)
 			})(w, req)
 		default:
@@ -950,8 +970,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 			return
 		}
 		id := strings.TrimPrefix(req.URL.Path, "/api/cf/records/")
-		if id == "" {
+		if !validCFRecordID(id) {
 			http.NotFound(w, req)
+			return
+		}
+		zc, domain, ok := cfZoneFromReq(cf, req)
+		if !ok {
+			http.Error(w, "unknown zone", http.StatusNotFound)
 			return
 		}
 		info, _ := auth.sessionFrom(req)
@@ -962,19 +987,22 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareClient, auth *AuthStore, rl
 				httpx.WriteErr(w, err)
 				return
 			}
-			rec, err := cf.Update(req.Context(), id, body)
+			rec, err := zc.Update(req.Context(), id, body)
+			cf.noteResult(domain, err)
 			if err != nil {
-				httpx.WriteErr(w, err)
+				writeCFErr(w, domain, err)
 				return
 			}
-			audit(req, sessionUser(info), "dns.update", id)
+			audit(req, sessionUser(info), "dns.update", id+" ("+domain+")")
 			httpx.WriteJSON(w, http.StatusOK, rec)
 		case "DELETE":
-			if err := cf.Delete(req.Context(), id); err != nil {
-				httpx.WriteErr(w, err)
+			err := zc.Delete(req.Context(), id)
+			cf.noteResult(domain, err)
+			if err != nil {
+				writeCFErr(w, domain, err)
 				return
 			}
-			audit(req, sessionUser(info), "dns.delete", id)
+			audit(req, sessionUser(info), "dns.delete", id+" ("+domain+")")
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1298,10 +1326,38 @@ func sessionUser(info *sessionInfo) string {
 	return info.Username
 }
 
-func cfDomain(cf *cloudflareClient) string {
-	if cf == nil {
-		return ""
+func cfDomain(cf *cloudflareRegistry) string {
+	return cf.DefaultDomain()
+}
+
+// cfZoneFromReq resolves the optional ?zone=<domain> selector. The value is
+// only ever a registry key — it never reaches a Cloudflare URL. An absent zone
+// means the default, so single-zone callers behave exactly as before.
+func cfZoneFromReq(cf *cloudflareRegistry, req *http.Request) (*cloudflareClient, string, bool) {
+	domain := strings.ToLower(strings.TrimSpace(req.URL.Query().Get("zone")))
+	c, ok := cf.Lookup(domain)
+	if !ok {
+		return nil, domain, false
 	}
-	return cf.domain
+	if domain == "" {
+		domain = cf.DefaultDomain()
+	}
+	return c, domain, true
+}
+
+// writeCFErr maps a Cloudflare failure onto the response. Cloudflare's own
+// 401/403 must NOT be reflected: 401 and 403 are the dashboard's own auth
+// vocabulary (the UI's api() helper treats them as "session expired" and "2FA
+// required"), so a token that isn't scoped for one zone would pop an auth
+// dialog on every 5s poll. It's an upstream credential problem — 502.
+func writeCFErr(w http.ResponseWriter, domain string, err error) {
+	switch code := cfStatus(err); code {
+	case 0:
+		httpx.WriteErr(w, err)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		http.Error(w, "token lacks permission for zone "+domain, http.StatusBadGateway)
+	default:
+		http.Error(w, err.Error(), code)
+	}
 }
 

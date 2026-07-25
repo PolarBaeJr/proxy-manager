@@ -1829,20 +1829,44 @@ async function renderDNS() {
   const status = await api('/api/cf/enabled');
   const el = $('#tab-dns');
   if (!status.enabled) {
-    el.innerHTML = emptyState(I.dns, 'Cloudflare not configured', 'Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID to manage DNS records from the dashboard.');
+    el.innerHTML = emptyState(I.dns, 'Cloudflare not configured', 'Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID (or CLOUDFLARE_ZONES for several domains) to manage DNS records from the dashboard.');
     return;
   }
+  // Pre-multi-zone servers only report a single "domain".
+  const zones = status.zones || (status.domain ? [{domain: status.domain, ok: true}] : []);
+  // A zone that disappeared from the config must not leave the tab stuck on it.
+  let zone = loadPref('pmgr-dns-zone', status.domain || '');
+  if (!zones.some(z => z.domain === zone)) zone = status.domain || (zones.length ? zones[0].domain : '');
   // Surface the zone domain to the New DNS dialog so its name-preview hint
-  // can show "→ myapp.polardev.org" as you type.
-  window._cfZone = status.domain || '';
-  const recs = await api('/api/cf/records');
-  const hash = JSON.stringify(recs);
+  // can show "→ myapp.polardev.org" as you type. The dialog is wired once at
+  // init, so a zone change has to re-run the shape pass — but only then, since
+  // it rebuilds the content field and would wipe whatever is typed in it.
+  const zoneChanged = window._cfZone !== zone;
+  window._cfZone = zone;
+  if (zoneChanged) refreshDNSFormShape();
+  // A zone the token isn't scoped for must degrade to an inline card — letting
+  // it throw would blank the whole tab via renderActive's catch.
+  let recs = null, zoneErr = '';
+  try {
+    recs = await api('/api/cf/records?zone=' + encodeURIComponent(zone));
+  } catch (e) { zoneErr = e.message; }
+  // Hash includes the zone: two zones that both return [] are not the same view.
+  const hash = JSON.stringify({zone, recs, zoneErr});
   if (hash === _lastDNSHash && el.children.length) return;
   _lastDNSHash = hash;
+  const zoneChips = zones.map(z =>
+      '<button class="chip' + (z.domain === zone ? ' active' : '') + '" onclick="selectDNSZone(\'' + esc(z.domain) + '\')">'
+    + esc(z.domain || '(default zone)')
+    + (z.ok === false ? ' <span class="pill warn"><span class="gl"></span>no access</span>' : '')
+    + '</button>').join('');
   let html = '<div class="btn-row top">'
-    + '<button class="btn primary" ' + lockedAttr() + ' onclick="document.getElementById(\'dlg-new-dns\').showModal()">' + I.plus + 'New record' + lk() + '</button>'
-    + (status.domain ? '<span class="pill muted">' + I.globe + 'zone ' + esc(status.domain) + '</span>' : '')
-    + '<span class="meta">' + recs.length + ' record' + (recs.length === 1 ? '' : 's') + '</span></div>';
+    + '<button class="btn primary" ' + lockedAttr() + ' onclick="openNewDNS()">' + I.plus + 'New record' + lk() + '</button>'
+    + zoneChips
+    + '<span class="meta">' + (recs ? recs.length + ' record' + (recs.length === 1 ? '' : 's') : '') + '</span></div>';
+  if (recs === null) {
+    el.innerHTML = html + emptyState(I.dns, 'Zone unavailable', zoneErr || ('token lacks permission for ' + zone));
+    return;
+  }
   const typeColor = { A:'#5eb4ff', AAAA:'#5eb4ff', CNAME:'var(--accent)', TXT:'var(--muted)', MX:'var(--yellow)' };
   let rows = '';
   for (const r of recs) {
@@ -1852,8 +1876,8 @@ async function renderDNS() {
          +  '<td class="col-clip"><span class="ident dim">' + esc(r.content) + '</span></td>'
          +  '<td>' + (r.proxied ? '<span class="pill ok"><span class="gl"></span>proxied</span>' : '<span class="pill muted"><span class="gl"></span>dns only</span>') + '</td>'
          +  '<td><div class="btn-row" style="justify-content:flex-end">'
-         +    '<button class="btn sm" ' + lockedAttr() + ' onclick="editDNS(\'' + esc(r.id) + '\', \'' + esc(r.content) + '\')">' + I.edit + 'Edit</button>'
-         +    '<button class="btn sm danger" ' + lockedAttr() + ' onclick="deleteDNS(\'' + esc(r.id) + '\', \'' + esc(r.name) + '\')">' + I.trash + '</button>'
+         +    '<button class="btn sm" ' + lockedAttr() + ' onclick="editDNS(\'' + esc(r.id) + '\', \'' + esc(r.content) + '\', \'' + esc(zone) + '\')">' + I.edit + 'Edit</button>'
+         +    '<button class="btn sm danger" ' + lockedAttr() + ' onclick="deleteDNS(\'' + esc(r.id) + '\', \'' + esc(r.name) + '\', \'' + esc(zone) + '\')">' + I.trash + '</button>'
          +  '</div></td></tr>';
   }
   html += '<div class="card"><table><thead><tr><th>Type</th><th>Name</th><th>Content</th><th>Proxied</th><th style="text-align:right">Actions</th></tr></thead>'
@@ -1861,18 +1885,31 @@ async function renderDNS() {
   el.innerHTML = html;
 }
 
-async function editDNS(id, currentContent) {
+function selectDNSZone(d) {
+  savePref('pmgr-dns-zone', d);
+  _lastDNSHash = '';
+  renderActive();
+}
+function openNewDNS() {
+  const dlg = document.getElementById('dlg-new-dns');
+  const sub = dlg.querySelector('.dsub');
+  if (sub) sub.textContent = window._cfZone ? ('Create a record in ' + window._cfZone) : 'Create a record in the Cloudflare zone';
+  refreshDNSFormShape();
+  dlg.showModal();
+}
+
+async function editDNS(id, currentContent, zone) {
   const v = await promptDialog('New content:', currentContent, {title: 'Edit DNS content', okLabel: 'Save'});
   if (v === null || v === currentContent) return;
   try {
-    await api('/api/cf/records/' + id, { method:'PATCH', body: JSON.stringify({content: v}) });
+    await api('/api/cf/records/' + id + '?zone=' + encodeURIComponent(zone || ''), { method:'PATCH', body: JSON.stringify({content: v}) });
     toast('updated'); renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
-async function deleteDNS(id, name) {
+async function deleteDNS(id, name, zone) {
   if (!(await confirmDialog('Delete DNS record "' + name + '"?', {title: 'Delete DNS record', danger: true}))) return;
   try {
-    await api('/api/cf/records/' + id, { method:'DELETE' });
+    await api('/api/cf/records/' + id + '?zone=' + encodeURIComponent(zone || ''), { method:'DELETE' });
     toast('deleted'); renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -2932,7 +2969,7 @@ function wireDialogForms() {
     const orig = submitBtn ? submitBtn.innerHTML : '';
     if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Creating…'; }
     try {
-      await api('/api/cf/records', { method:'POST', body: JSON.stringify(body) });
+      await api('/api/cf/records?zone=' + encodeURIComponent(window._cfZone || ''), { method:'POST', body: JSON.stringify(body) });
       toast('created ' + type + ' ' + name);
       $('#dlg-new-dns').close();
       renderActive();
