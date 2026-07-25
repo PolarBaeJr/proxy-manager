@@ -106,6 +106,8 @@ Drop these on any container you want routed:
 | `proxy.auth=true` |   | require SSO login (default: public, no auth) — see [Access control](#access-control-opt-in-sso) |
 | `proxy.auth.users=alice,bob` |   | optional allowlist; empty = any authenticated user |
 | `proxy.auth.mode=oauth` |   | bearer-only OAuth mode for MCP servers (default is cookie SSO) |
+| `proxy.ratelimit=true` |   | per-client-IP rate limit (default: off) — spoof-resistant client IP, `429` when exceeded |
+| `proxy.ratelimit.rpm=60` |   | requests per minute per IP (default 60 if enabled without a value) |
 
 Containers must share the **`edge`** Docker network with the proxy. See `examples/docker-compose-sample.yml`.
 

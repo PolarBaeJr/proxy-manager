@@ -64,6 +64,11 @@ Known token gaps to fix in the redesign: hardcoded blues (`#82baff`, `#2563eb`, 
 ### Routes tab (`#tab-routes`)
 - One `.card` per route group. `.card-head` = `<code>host</code> <code>path</code>` + optional `.tag` "strip" + meta line "N backend(s) · service: ...".
 - Backends `<table>`: Health | Backend | Weight | Container | Last error. Health column uses `.pill ok | bad | muted`. Last error rendered in `.err`.
+- Maintenance mode (nginx serves a 503 page for any host with a flag file; loopback / Tailscale / LAN bypass it):
+  - A host in maintenance gets a `.pill.bad` "maintenance" next to the health pill, plus a `.note.warn` banner in the card alongside the existing "No live backends" one.
+  - Each card carries a `.btn.sm` toggle ("Maintenance: on/off", `.ghost` when off), `lockedAttr()`-gated like every other mutation. It's a delegated handler keyed off `data-maint-host` / `data-maint-on`, not an inline `onclick`. Hidden entirely when `GET /api/maintenance` reports `configured:false`.
+  - Turning it on confirms first and says the switch covers ALL routes on that host (one host can own several cards).
+  - Flags with no matching route group (e.g. set from the shell for a deleted service) get their own card at the top of the pane with a per-host "Clear" button — it renders even when there are no routes at all.
 - Empty state: `<p class="empty">No routes registered.</p>`.
 
 ### Services tab (`#tab-services`)
@@ -75,8 +80,9 @@ Known token gaps to fix in the redesign: hardcoded blues (`#82baff`, `#2563eb`, 
   - Right-aligned `.btn-row` of actions: either `Promote canary (.primary)` + `Discard canary`, or `Stage new version (.primary)` + `Replace` + optional `Rollback to <image>`, plus `Delete service (.danger)`.
 
 ### DNS tab (`#tab-dns`)
-- Disabled state (no Cloudflare creds) shows an empty message.
-- `.btn-row` with primary `+ New record` button + zone meta indicator.
+- Disabled state (no Cloudflare creds) shows an empty message naming `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ZONE_ID` and `CLOUDFLARE_ZONES` (the multi-zone form).
+- `.btn-row` with primary `+ New record` button + one `.chip` per configured zone (the selected one `.active`, persisted in the `pmgr-dns-zone` pref) + record count.
+- A zone the API token isn't scoped for keeps its chip (with a `.pill.warn` "no access" marker) and swaps the table for an inline "Zone unavailable" card, so the rest of the tab stays usable.
 - Single `.card` wrapping a `<table>`: Type | Name | Content | Proxied | Actions. Type as `.pill.muted`, Proxied as `.pill.ok` ("on") or `.pill.muted` ("off"), per-row `Edit (.btn)` + `Delete (.btn.danger)`.
 
 ### Users tab (`#tab-users`)
@@ -354,7 +360,10 @@ The `health` field on every target now takes one of FOUR values:
 |---|---|
 | `GET /api/services` | list managed services (with replicas, update_available, canary_image, previous_image, unscalable, etc.) |
 | `GET /api/routes` | list routes from labels + static config |
-| `GET /api/cf/records` | Cloudflare DNS records |
+| `GET /api/cf/records` | Cloudflare DNS records. Optional `?zone=<domain>` selects one of the configured zones; omitted means the primary (legacy `CLOUDFLARE_*`) zone. The same param applies to the create/update/delete calls. |
+| `GET /api/maintenance` | `{"configured":bool,"hosts":[...]}` — hosts currently serving the nginx 503 page. Polled with `/api/routes` every 5s; never errors, so the tab can't be blanked by a bad read. |
+| `POST /api/maintenance/{host}` | enable maintenance for a host (elevated). Only hosts the proxy actually routes are accepted; unknown → 404. |
+| `DELETE /api/maintenance/{host}` | clear maintenance for a host (elevated). Bounded by the flag directory, not the route list, so a stopped service's flag can still be cleared. |
 | `GET /api/users` | list users (no secrets) |
 | `GET /api/users/tokens` | current user's API tokens (no raw value) |
 

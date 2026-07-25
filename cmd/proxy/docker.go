@@ -31,6 +31,8 @@ const (
 	labelAuth      = "proxy.auth"
 	labelAuthUsers = "proxy.auth.users"
 	labelAuthMode  = "proxy.auth.mode"
+	labelRateLimit = "proxy.ratelimit"
+	labelRateRPM   = "proxy.ratelimit.rpm"
 )
 
 // dockerClient is the proxy's READ-ONLY view of the Docker daemon.

@@ -35,6 +35,34 @@ func TestValidHostname(t *testing.T) {
 	}
 }
 
+func TestValidMaintHost(t *testing.T) {
+	good := []string{"a", "myapp.polardev.org", "sub.the-aquarium.com", "1.2.3.4", strings.Repeat("a", 253)}
+	for _, s := range good {
+		if !validMaintHost(s) {
+			t.Errorf("validMaintHost(%q) = false, want true", s)
+		}
+	}
+	bad := []string{
+		"", ".", "..", "...", "-x", "x-", ".x", "x.", "a/b", `a\b`, "/etc/passwd",
+		// Embedded "..": matches maintHostRE, so only the Contains check stops it.
+		"a..b", "x..y.polardev.org",
+		"MyApp.polardev.org", "a b", "a:80", "<x>", "a\x00b", strings.Repeat("a", 254),
+	}
+	for _, s := range bad {
+		if validMaintHost(s) {
+			t.Errorf("validMaintHost(%q) = true, want false", s)
+		}
+	}
+	// Why the second validator exists: hostnameRE admits values that escape a
+	// directory once joined, so validHostname must never gate a filename.
+	if !validHostname("..") {
+		t.Errorf(`validHostname("..") = false; the maintenance validator exists because it is true`)
+	}
+	if validMaintHost("..") {
+		t.Errorf(`validMaintHost("..") = true, want false`)
+	}
+}
+
 func TestValidProxyPath(t *testing.T) {
 	good := []string{"/", "/api", "/a/b-c_d.e", "/" + strings.Repeat("a", 511)}
 	for _, s := range good {

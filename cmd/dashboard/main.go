@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -41,12 +42,20 @@ func main() {
 
 	dc := newDockerClient()
 
-	var cf *cloudflareClient
-	if tok := os.Getenv("CLOUDFLARE_API_TOKEN"); tok != "" {
-		if zone := os.Getenv("CLOUDFLARE_ZONE_ID"); zone != "" {
-			cf = newCloudflareClient(tok, zone, os.Getenv("CLOUDFLARE_DOMAIN"))
-			log.Printf("cloudflare integration enabled for zone %s", zone)
-		}
+	cf, cfMsgs := newCloudflareRegistryFromEnv(os.Getenv)
+	for _, m := range cfMsgs {
+		log.Printf("%s", m)
+	}
+	if cf != nil {
+		log.Printf("cloudflare integration enabled for zone(s) %s", strings.Join(cf.Domains(), ", "))
+	}
+
+	maint, maintMsgs := newMaintFromEnv(os.Getenv)
+	for _, m := range maintMsgs {
+		log.Printf("%s", m)
+	}
+	if maint != nil {
+		log.Printf("maintenance mode enabled (flag dir %s)", maint.dir)
 	}
 
 	limiter := newRateLimiter()
@@ -119,7 +128,7 @@ func main() {
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory)
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint)
 
 	log.Printf("dashboard on %s", *addr)
 	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {

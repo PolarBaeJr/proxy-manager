@@ -42,6 +42,10 @@ type RouteGroup struct {
 	AuthUsers    []string // lowercased; empty = any authenticated user
 	AuthMode     string   // "" = sso (cookie or login redirect), "oauth" = bearer-first MCP mode
 
+	RateLimit bool
+	RateRPM   int
+	limiter   *rateLimiter
+
 	cursor atomic.Uint64
 }
 
@@ -69,6 +73,11 @@ type Router struct {
 	mu     sync.RWMutex
 	groups []*RouteGroup
 
+	// limiters persist across refreshes, keyed by group key host+"|"+path, so
+	// config edits don't reset per-IP buckets. Guarded by mu.
+	limiters   map[string]*rateLimiter
+	xffTrusted []*net.IPNet
+
 	auth     *authGate // nil = auth gating disabled (proxy.auth hosts fail closed)
 	authWarn sync.Once
 }
@@ -79,6 +88,34 @@ func (r *Router) Set(groups []*RouteGroup) {
 	})
 	r.mu.Lock()
 	prev := r.groups
+	// Reconcile per-service limiters, preserving bucket state across refreshes.
+	// Done under the same lock, with g.limiter assigned before r.groups is
+	// published, so ServeHTTP never reads a group whose limiter isn't wired up.
+	if r.limiters == nil {
+		r.limiters = map[string]*rateLimiter{}
+	}
+	live := map[string]bool{}
+	for _, g := range groups {
+		if !g.RateLimit {
+			continue
+		}
+		key := g.Host + "|" + g.PathPrefix
+		live[key] = true
+		if rl, ok := r.limiters[key]; ok {
+			rl.SetRate(g.RateRPM)
+			g.limiter = rl
+		} else {
+			rl := newRateLimiter(g.RateRPM)
+			r.limiters[key] = rl
+			g.limiter = rl
+		}
+	}
+	for key, rl := range r.limiters {
+		if !live[key] {
+			rl.Stop()
+			delete(r.limiters, key)
+		}
+	}
 	r.groups = groups
 	r.mu.Unlock()
 
@@ -112,6 +149,20 @@ func hostOnly(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// rlKey is the per-IP rate-limit bucket key. It reuses realClientIP's
+// XFF-trust logic so a client behind a trusted hop is keyed by its real IP,
+// and an untrusted peer can't mint fresh buckets by rotating X-Forwarded-For.
+func rlKey(req *http.Request, xffTrusted []*net.IPNet) string {
+	if ip := realClientIP(req, xffTrusted); ip != nil {
+		return ip.String()
+	}
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		return req.RemoteAddr
+	}
+	return host
 }
 
 const maxRetries = 3
@@ -148,6 +199,14 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.")
 		return
+	}
+	if group.limiter != nil {
+		key := rlKey(req, r.xffTrusted)
+		if !group.limiter.Allow(key) {
+			w.Header().Set("Retry-After", "10")
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
 	}
 	if group.AuthRequired {
 		if r.auth == nil {
@@ -277,6 +336,8 @@ type staticRoute struct {
 	Auth      bool     `json:"auth,omitempty"`
 	AuthUsers []string `json:"auth_users,omitempty"`
 	AuthMode  string   `json:"auth_mode,omitempty"`
+	RateLimit bool     `json:"ratelimit,omitempty"`
+	RateRPM   int      `json:"ratelimit_rpm,omitempty"`
 }
 
 type staticConfig struct {
@@ -299,6 +360,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 					g = &RouteGroup{
 						Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name,
 						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers), AuthMode: sr.AuthMode,
+						RateLimit: sr.RateLimit, RateRPM: sr.RateRPM,
 					}
 					groupsByKey[key] = g
 				}
@@ -365,6 +427,20 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		if len(g.AuthUsers) == 0 {
 			g.AuthUsers = normalizeAuthUsers(strings.Split(c.Labels[labelAuthUsers], ","))
 		}
+		// Rate-limit fields merge across replicas the same way auth does: ANY
+		// replica carrying proxy.ratelimit=true throttles the whole group, and
+		// the rpm comes from the first replica that sets a valid one.
+		if c.Labels[labelRateLimit] == "true" {
+			g.RateLimit = true
+		}
+		if rpmStr := c.Labels[labelRateRPM]; rpmStr != "" && g.RateRPM == 0 {
+			rpm, err := strconv.Atoi(rpmStr)
+			if err != nil || rpm <= 0 {
+				log.Printf("skip %s: bad %s=%q", name, labelRateRPM, rpmStr)
+			} else {
+				g.RateRPM = rpm
+			}
+		}
 		if c.State != "running" {
 			continue
 		}
@@ -395,6 +471,10 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 
 	out := make([]*RouteGroup, 0, len(groupsByKey))
 	for _, g := range groupsByKey {
+		// Footgun guard: an enabled limiter must never have capacity 0.
+		if g.RateLimit && g.RateRPM <= 0 {
+			g.RateRPM = 60
+		}
 		sort.SliceStable(g.Backends, func(i, j int) bool { return g.Backends[i].URL < g.Backends[j].URL })
 		out = append(out, g)
 	}
