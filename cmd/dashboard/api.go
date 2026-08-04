@@ -813,7 +813,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	mux.HandleFunc("/api/cf/enabled", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
 		// Pure local-config read (the UI polls this every 5s) — "domain" stays
 		// the default zone so pre-multi-zone readers keep working.
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"enabled": cf != nil, "domain": cfDomain(cf), "zones": cf.Status()})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"enabled": cf.Usable(), "domain": cfDomain(cf), "zones": cf.Status()})
 	}))
 
 	// ---- Container logs (read-only; auth-gated) ----

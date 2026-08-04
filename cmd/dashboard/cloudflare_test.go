@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -512,5 +514,108 @@ func TestCloudflareStatusSource(t *testing.T) {
 	}
 	if src["pinned.org"] != "env" || src["found.org"] != "cloudflare" {
 		t.Fatalf("sources = %v", src)
+	}
+}
+
+// Lookup hands a *cloudflareClient to a request handler and then drops the read
+// lock, so a concurrent Sync must never mutate the struct that handler is
+// reading. Run under -race; without the pointer swap in Sync this trips.
+func TestCloudflareSyncRaceWithLookup(t *testing.T) {
+	ids := []string{"z1", "z2"}
+	var n int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Alternate the zone id so Sync actually takes the refresh branch.
+		id := ids[atomic.AddInt64(&n, 1)%2]
+		w.Write([]byte(`{"success":true,"result":[{"id":"` + id + `","name":"a.org","status":"active"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	r, _ := newCloudflareRegistryFromEnv(func(k string) string {
+		return map[string]string{"CLOUDFLARE_API_TOKEN": "tok"}[k]
+	})
+	r.discover.baseURL = srv.URL
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if c, ok := r.Lookup("a.org"); ok {
+					// Exactly what a handler does with the returned client.
+					_ = c.zoneID + c.token + c.baseURL
+				}
+			}
+		}()
+	}
+	for i := 0; i < 25; i++ {
+		if err := r.Sync(context.Background()); err != nil {
+			t.Errorf("sync: %v", err)
+			break
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// A legacy CLOUDFLARE_ZONE_ID with no CLOUDFLARE_DOMAIN is keyed by zone id;
+// discovery finds the same zone by name and must not add a second chip.
+func TestCloudflareSyncNoDuplicateForZoneIDKeyedEntry(t *testing.T) {
+	r := zoneStub(t, map[string]string{
+		"CLOUDFLARE_API_TOKEN": "tok",
+		"CLOUDFLARE_ZONE_ID":   "z1",
+		// CLOUDFLARE_DOMAIN deliberately unset -> entry is keyed "z1".
+	}, `[{"id":"z1","name":"a.org","status":"active"}]`)
+
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if got := r.Domains(); len(got) != 1 {
+		t.Fatalf("domains = %v, want one entry", got)
+	}
+	// And it must survive reconciliation rather than being culled as unseen.
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync 2: %v", err)
+	}
+	if got := r.Domains(); len(got) != 1 {
+		t.Fatalf("domains = %v after second sync", got)
+	}
+}
+
+// A token that can't enumerate zones and pins none leaves a live-but-empty
+// registry; the DNS tab must read that as off, not as an empty zone list.
+func TestCloudflareUsable(t *testing.T) {
+	var nilReg *cloudflareRegistry
+	if nilReg.Usable() {
+		t.Error("nil registry reports usable")
+	}
+	r, _ := newCloudflareRegistryFromEnv(func(k string) string {
+		return map[string]string{"CLOUDFLARE_API_TOKEN": "tok"}[k]
+	})
+	if r == nil {
+		t.Fatal("token alone should build a registry")
+	}
+	if r.Usable() {
+		t.Error("zero-zone registry reports usable")
+	}
+	// Lookup of the default must fail cleanly rather than nil-deref later.
+	if c, ok := r.Lookup(""); ok || c != nil {
+		t.Errorf("Lookup(\"\") = %v, %v; want nil, false", c, ok)
+	}
+	if got := r.DefaultDomain(); got != "" {
+		t.Errorf("DefaultDomain = %q, want empty", got)
+	}
+	r.discover.baseURL = ""
+	if err := r.Sync(context.Background()); err == nil {
+		t.Error("want error syncing against an unreachable endpoint")
 	}
 }

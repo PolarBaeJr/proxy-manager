@@ -324,6 +324,17 @@ func newCloudflareRegistryFromEnv(getenv func(string) string) (*cloudflareRegist
 	return r, msgs
 }
 
+// keyForZoneID finds an existing entry pointing at the same Cloudflare zone,
+// whatever key it happens to be registered under. Caller holds the lock.
+func (r *cloudflareRegistry) keyForZoneID(id string) (string, bool) {
+	for key, st := range r.byDomain {
+		if st.client.zoneID == id {
+			return key, true
+		}
+	}
+	return "", false
+}
+
 func (r *cloudflareRegistry) add(key string, c *cloudflareClient) {
 	r.order = append(r.order, key)
 	r.byDomain[key] = &cfZoneState{client: c, ok: true, fromEnv: true}
@@ -360,11 +371,25 @@ func (r *cloudflareRegistry) Sync(ctx context.Context) error {
 		}
 		seen[name] = true
 		if st, ok := r.byDomain[name]; ok {
-			// Refresh the zone id in place so a domain moved between accounts
-			// keeps working, but leave env entries and their tokens alone.
-			if !st.fromEnv {
-				st.client.zoneID = z.ID
+			// Refresh the zone id so a domain moved between accounts keeps
+			// working, but leave env entries and their tokens alone.
+			//
+			// Swap the whole client rather than assigning through the pointer:
+			// Lookup hands the *cloudflareClient to a request handler and then
+			// releases the read lock, so mutating a field a handler may be
+			// reading is a race. Replacing the pointer is covered by the write
+			// lock held here, and an in-flight handler simply finishes against
+			// the old client.
+			if !st.fromEnv && st.client.zoneID != z.ID {
+				st.client = newCloudflareClient(r.discoverToken, z.ID, name)
 			}
+			continue
+		}
+		// A legacy CLOUDFLARE_ZONE_ID with no CLOUDFLARE_DOMAIN is keyed by its
+		// zone id, so the same zone would otherwise be added a second time
+		// under its name — two chips in the DNS tab for one zone.
+		if key, dup := r.keyForZoneID(z.ID); dup {
+			seen[key] = true
 			continue
 		}
 		r.order = append(r.order, name)
@@ -450,6 +475,19 @@ func (r *cloudflareRegistry) DefaultDomain() string {
 		return ""
 	}
 	return c.domain
+}
+
+// Usable reports whether any zone is actually registered. A token with no
+// pinned zones yields a live-but-empty registry until discovery lands (or
+// permanently, if the token lacks account-level Zone:Read), and the DNS tab
+// must read that as "off" rather than showing itself with nothing in it.
+func (r *cloudflareRegistry) Usable() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.order) > 0
 }
 
 // Domains lists the registered zone keys in registration order (default first).
