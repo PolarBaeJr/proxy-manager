@@ -1183,6 +1183,9 @@ async function renderRoutes() {
   if (hash === _lastRoutesHash && el.children.length) return;
   _lastRoutesHash = hash;
   const inMaint = new Set((maint.hosts || []).map(h => h.toLowerCase()));
+  // Hosts shipping their own 503 page (proxy.maintenance label, or a file
+  // dropped by hand). Everything else falls back to the shared default.
+  const hasPage = new Set((maint.pages || []).map(h => h.toLowerCase()));
   // Flags whose route group is gone — typically set with /usr/local/bin/maint
   // for a service since removed. Without their own card they'd be unclearable.
   const routed = new Set(groups.map(g => (g.host || '').toLowerCase()));
@@ -1213,6 +1216,10 @@ async function renderRoutes() {
     const groupPill = healthPill(groupState);
     const maintOn = inMaint.has((g.host || '').toLowerCase());
     const maintPill = maintOn ? ' <span class="pill bad">' + I.alert + 'maintenance</span>' : '';
+    // Shown whether or not maintenance is on — it tells the operator what
+    // WOULD be served, which is what they want to know before flipping it.
+    const pagePill = hasPage.has((g.host || '').toLowerCase())
+      ? ' <span class="pill" title="Serves its own maintenance page instead of the default">custom 503</span>' : '';
     const head = '<code>' + esc(g.host) + '</code>'
       + (g.path ? ' <code>' + esc(g.path) + '</code>' : '')
       + (g.strip ? ' <span class="tag" title="Strip path prefix before proxying">' + I.scissors + 'strip</span>' : '');
@@ -1233,8 +1240,11 @@ async function renderRoutes() {
     const downBanner = groupState === 'down'
       ? '<div class="note warn" style="margin:8px 0 0">' + I.alert + '<div><strong>No live backends</strong> — requests to this route return 503 until a replica comes up.</div></div>'
       : '';
+    const ownPage = hasPage.has((g.host || '').toLowerCase());
     const maintBanner = maintOn
-      ? '<div class="note warn" style="margin:8px 0 0">' + I.alert + '<div><strong>Maintenance mode</strong> — public visitors get the 503 page; loopback / Tailscale / LAN bypass it.</div></div>'
+      ? '<div class="note warn" style="margin:8px 0 0">' + I.alert + '<div><strong>Maintenance mode</strong> — public visitors get '
+        + (ownPage ? 'this app&rsquo;s own 503 page' : 'the default 503 page')
+        + '; loopback / Tailscale / LAN bypass it.</div></div>'
       : '';
     // Delegated click (see the data-maint-host handler): no host string is
     // ever interpolated into an onclick attribute.
@@ -1244,7 +1254,7 @@ async function renderRoutes() {
         + I.alert + (maintOn ? 'Maintenance: on' : 'Maintenance: off') + lk() + '</button>'
       : '';
     html += '<div class="card"><div class="card-head"><div class="ttl">' + head + '</div>'
-         +  groupPill + maintPill + '<div class="spacer"></div><div class="meta">' + meta + '</div>'
+         +  groupPill + maintPill + pagePill + '<div class="spacer"></div><div class="meta">' + meta + '</div>'
          +  (maintBtn ? '<div class="btn-row" style="margin-left:10px">' + maintBtn + '</div>' : '') + '</div>'
          +  downBanner + maintBanner
          +  (g.backends.length ? '<table><thead><tr><th>Health</th><th>Backend</th><th>Weight</th><th>Container</th><th>Last error</th></tr></thead><tbody>' + rows + '</tbody></table>' : '')

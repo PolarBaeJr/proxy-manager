@@ -47,6 +47,8 @@ func main() {
 		log.Printf("%s", m)
 	}
 	if cf != nil {
+		// Discovery (started below) usually adds to this list within a second;
+		// what's logged here is only what the env pinned.
 		log.Printf("cloudflare integration enabled for zone(s) %s", strings.Join(cf.Domains(), ", "))
 	}
 
@@ -56,6 +58,14 @@ func main() {
 	}
 	if maint != nil {
 		log.Printf("maintenance mode enabled (flag dir %s)", maint.dir)
+	}
+
+	maintPages, maintPageMsgs := newMaintPageFromEnv(os.Getenv)
+	for _, m := range maintPageMsgs {
+		log.Printf("%s", m)
+	}
+	if maintPages != nil {
+		log.Printf("per-app maintenance pages enabled (page dir %s)", maintPages.dir)
 	}
 
 	limiter := newRateLimiter()
@@ -128,7 +138,17 @@ func main() {
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint)
+	// Background: keep the DNS zone list matching the Cloudflare account, so a
+	// newly added domain needs no env edit or restart.
+	go cf.SyncLoop(ctx)
+
+	// Background: copy each proxy.maintenance app's own 503 page onto disk
+	// ahead of time — it has to already be there when the app goes down.
+	if maintPages != nil {
+		go maintPages.SyncLoop(ctx, dc)
+	}
+
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages)
 
 	log.Printf("dashboard on %s", *addr)
 	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {

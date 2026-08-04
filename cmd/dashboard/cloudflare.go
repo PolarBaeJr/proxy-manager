@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -15,6 +16,10 @@ import (
 )
 
 const cfBaseURL = "https://api.cloudflare.com/client/v4"
+
+// cfZoneSyncInterval paces zone discovery. Zones are added to an account by
+// hand, minutes apart at most, so this is slow on purpose.
+const cfZoneSyncInterval = 5 * time.Minute
 
 type cloudflareClient struct {
 	token   string
@@ -189,6 +194,10 @@ type cfZoneState struct {
 	client  *cloudflareClient
 	ok      bool
 	lastErr string
+	// fromEnv marks a zone pinned by CLOUDFLARE_ZONE_ID / CLOUDFLARE_ZONES.
+	// Discovery may never overwrite or remove one: an env entry can carry an
+	// explicit per-zone token that a listing can't infer.
+	fromEnv bool
 }
 
 // parseCloudflareZones parses CLOUDFLARE_ZONES: comma-separated entries of
@@ -222,6 +231,33 @@ func parseCloudflareZones(spec, defaultToken string) ([]*cloudflareClient, []str
 	return clients, skipped
 }
 
+// cfZone is one entry from GET /zones.
+type cfZone struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
+// ListZones asks Cloudflare which zones this token can see. It's what makes
+// adding a domain a zero-config operation: put the domain in the Cloudflare
+// account the token is scoped for and the dashboard picks it up on its own.
+//
+// Uses the client's token but none of its zone state, so any client with a
+// usable token can serve as the discovery client.
+func (c *cloudflareClient) ListZones(ctx context.Context) ([]cfZone, error) {
+	body, err := c.do(ctx, "GET", "/zones?per_page=50", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Result []cfZone `json:"result"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Result, nil
+}
+
 // cloudflareRegistry maps a domain to the client that can edit its zone. The
 // domain is only ever a map key — it never reaches a Cloudflare URL.
 type cloudflareRegistry struct {
@@ -229,6 +265,13 @@ type cloudflareRegistry struct {
 	order    []string
 	byDomain map[string]*cfZoneState
 	def      string
+
+	// discoverToken is the token Sync registers newly found zones with — the
+	// account-wide CLOUDFLARE_API_TOKEN. Empty disables discovery entirely.
+	discoverToken string
+	// discover lists the account's zones. Held as a field rather than built
+	// per call so a test can point it at a stub server.
+	discover *cloudflareClient
 }
 
 // newCloudflareRegistryFromEnv builds the registry from the legacy single-zone
@@ -238,7 +281,11 @@ func newCloudflareRegistryFromEnv(getenv func(string) string) (*cloudflareRegist
 	var msgs []string
 	r := &cloudflareRegistry{byDomain: map[string]*cfZoneState{}}
 
-	defToken := getenv("CLOUDFLARE_API_TOKEN")
+	defToken := strings.TrimSpace(getenv("CLOUDFLARE_API_TOKEN"))
+	if defToken != "" {
+		r.discoverToken = defToken
+		r.discover = newCloudflareClient(defToken, "", "")
+	}
 	if zoneID := getenv("CLOUDFLARE_ZONE_ID"); zoneID != "" && defToken != "" {
 		domain := strings.ToLower(strings.TrimSpace(getenv("CLOUDFLARE_DOMAIN")))
 		key := domain
@@ -265,10 +312,13 @@ func newCloudflareRegistryFromEnv(getenv func(string) string) (*cloudflareRegist
 		r.add(c.domain, c)
 	}
 
-	if len(r.order) == 0 {
+	// A bare token with no zone vars is now a valid config: Sync will populate
+	// the registry from the account. Without one there is nothing to discover
+	// with, so an empty registry stays nil and the integration reports off.
+	if len(r.order) == 0 && defToken == "" {
 		return nil, msgs
 	}
-	if r.def == "" {
+	if r.def == "" && len(r.order) > 0 {
 		r.def = r.order[0]
 	}
 	return r, msgs
@@ -276,7 +326,98 @@ func newCloudflareRegistryFromEnv(getenv func(string) string) (*cloudflareRegist
 
 func (r *cloudflareRegistry) add(key string, c *cloudflareClient) {
 	r.order = append(r.order, key)
-	r.byDomain[key] = &cfZoneState{client: c, ok: true}
+	r.byDomain[key] = &cfZoneState{client: c, ok: true, fromEnv: true}
+}
+
+// Sync reconciles the registry against the zones the token can currently see,
+// so adding a domain to the Cloudflare account is the only step needed to get
+// it into the DNS tab — no env edit, no redeploy.
+//
+// Reconciling (not just adding) is the point: a zone removed from the account
+// has to leave the registry too, or the UI keeps a dead chip that the browser's
+// saved zone preference can pin itself to.
+//
+// Env-pinned zones are never touched, in either direction.
+func (r *cloudflareRegistry) Sync(ctx context.Context) error {
+	if r == nil || r.discover == nil {
+		return nil
+	}
+	zones, err := r.discover.ListZones(ctx)
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	seen := map[string]bool{}
+	for _, z := range zones {
+		name := strings.ToLower(strings.TrimSpace(z.Name))
+		// A pending / moved / deactivated zone would accept API calls but not
+		// actually serve DNS, so surfacing it as editable would be misleading.
+		if name == "" || z.ID == "" || z.Status != "active" {
+			continue
+		}
+		seen[name] = true
+		if st, ok := r.byDomain[name]; ok {
+			// Refresh the zone id in place so a domain moved between accounts
+			// keeps working, but leave env entries and their tokens alone.
+			if !st.fromEnv {
+				st.client.zoneID = z.ID
+			}
+			continue
+		}
+		r.order = append(r.order, name)
+		r.byDomain[name] = &cfZoneState{
+			client: newCloudflareClient(r.discoverToken, z.ID, name),
+			ok:     true,
+		}
+	}
+
+	kept := r.order[:0]
+	for _, key := range r.order {
+		st := r.byDomain[key]
+		if st.fromEnv || seen[key] {
+			kept = append(kept, key)
+			continue
+		}
+		delete(r.byDomain, key)
+	}
+	r.order = kept
+
+	// The default zone must always name a live entry: DefaultDomain and every
+	// Lookup("") call route through it.
+	if _, ok := r.byDomain[r.def]; !ok {
+		r.def = ""
+		if len(r.order) > 0 {
+			r.def = r.order[0]
+		}
+	}
+	return nil
+}
+
+// SyncLoop discovers zones at startup and re-checks on a slow timer — a domain
+// added to Cloudflare shows up without a restart, and one removed disappears.
+func (r *cloudflareRegistry) SyncLoop(ctx context.Context) {
+	if r == nil || r.discover == nil {
+		return
+	}
+	t := time.NewTicker(cfZoneSyncInterval)
+	defer t.Stop()
+	for {
+		if err := r.Sync(ctx); err != nil {
+			// Most likely the token lacks the account-level Zone:Read scope.
+			// Not fatal: env-configured zones keep working exactly as before.
+			log.Printf("⚠ cloudflare zone discovery: %v", err)
+		} else {
+			log.Printf("cloudflare zones: %s", strings.Join(r.Domains(), ", "))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // Lookup resolves a domain to its client. An empty domain means the default
@@ -362,10 +503,17 @@ func (r *cloudflareRegistry) Status() []map[string]any {
 	out := make([]map[string]any, 0, len(r.order))
 	for _, key := range r.order {
 		st := r.byDomain[key]
+		source := "cloudflare"
+		if st.fromEnv {
+			source = "env"
+		}
 		out = append(out, map[string]any{
 			"domain": st.client.domain,
 			"ok":     st.ok,
 			"error":  st.lastErr,
+			// Where the zone came from — safe to expose (unlike the zone id),
+			// and it explains to the operator why a chip appeared on its own.
+			"source": source,
 		})
 	}
 	return out

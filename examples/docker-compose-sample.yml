@@ -28,6 +28,10 @@ services:
       # proxy.health:      "/healthz"   # HTTP health check path
       # proxy.weight:      "2"          # weighted round-robin
       # proxy.unscalable:  "true"       # disable scale buttons in dashboard
+      # proxy.maintenance: "/app/maintenance.html"  # this app's own 503 page,
+      #   read from inside the image and served while the host is in
+      #   maintenance. Must be self-contained (inline CSS — only this one file
+      #   is copied out). Omit to get the shared default page.
       # --- opt-in SSO forward auth (default: public, no auth) — see README "Access control" ---
       # proxy.auth:        "true"       # require SSO login (needs a real cookie-domain host)
       # proxy.auth.users:  "you"        # optional allowlist; empty = any logged-in user

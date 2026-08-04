@@ -96,6 +96,13 @@ services:
       # machine, and the dashboard would then report maintenance "configured"
       # while writing flags that no nginx ever reads.
       - ${MAINT_HOST_DIR:-/etc/nginx/maint.d}:/etc/maint.d
+      # Per-app maintenance pages: the dashboard copies each proxy.maintenance
+      # app's own 503 page here as <host>/index.html, and nginx prefers it over
+      # the shared default (snippets/maintenance.conf try_files). Deliberately
+      # the hosts/ SUBDIRECTORY, not /var/www/maintenance itself — that keeps
+      # the default page outside anything the dashboard can write. Same
+      # override-and-don't-create reasoning as the flag dir above.
+      - ${MAINT_PAGE_HOST_DIR:-/var/www/maintenance/hosts}:/var/www/maint-pages
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CLOUDFLARE_ZONE_ID:   ${CLOUDFLARE_ZONE_ID:-}
@@ -104,6 +111,7 @@ services:
       MONITOR_URL:          http://monitor:8095     # for the Stats tab
       PROXY_URL:            http://proxy:8094       # for the Access tab (proxy /access)
       MAINT_DIR:            /etc/maint.d            # nginx maintenance flag files
+      MAINT_PAGE_DIR:       /var/www/maint-pages    # per-host custom 503 pages
 
   monitor:
     build:
