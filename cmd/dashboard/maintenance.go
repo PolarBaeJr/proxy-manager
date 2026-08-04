@@ -160,7 +160,7 @@ func (m *maintStore) Off(host string) error {
 	return nil
 }
 
-func registerMaintenanceRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore, m *maintStore, onb *OnboardedStore, routesConfigPath string) {
+func registerMaintenanceRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore, m *maintStore, mp *maintPageStore, onb *OnboardedStore, routesConfigPath string) {
 	mux.HandleFunc("/api/maintenance", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
 		hosts := []string{}
 		if m != nil {
@@ -173,7 +173,18 @@ func registerMaintenanceRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthS
 				hosts = got
 			}
 		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"configured": m != nil, "hosts": hosts})
+		// pages: hosts that will serve their own page instead of the shared
+		// default. Read-only and advisory — the switch itself is unaffected.
+		pages := []string{}
+		if mp != nil {
+			got, err := mp.List()
+			if err != nil {
+				log.Printf("maintenance page: list %q: %v", mp.dir, err)
+			} else {
+				pages = got
+			}
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"configured": m != nil, "hosts": hosts, "pages": pages})
 	}))
 
 	mux.HandleFunc("/api/maintenance/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {

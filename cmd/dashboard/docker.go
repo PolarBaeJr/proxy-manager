@@ -35,6 +35,7 @@ const (
 	labelPrevImage  = "proxy.previous_image" // set on Replace; enables one-click Rollback
 	labelCanary     = "proxy.canary"         // "true" → staged replicas, served alongside live
 	labelAutoUpdate = "proxy.autoupdate"     // "true" → engine replaces on newer registry digest
+	// labelMaintPage lives in maintpage.go, next to the sync that consumes it.
 )
 
 // dockerClient is the dashboard's READ-WRITE view of the Docker daemon.

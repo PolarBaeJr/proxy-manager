@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -306,5 +309,313 @@ func TestCreateNameZoneMismatch(t *testing.T) {
 	nod := newCloudflareClient("tok", "zoneABC", "")
 	if err := nod.validateName("app.other.com"); err != nil {
 		t.Errorf("validateName with empty domain = %v, want nil", err)
+	}
+}
+
+// ---- Zone auto-discovery ----
+
+// zoneStub serves GET /zones and returns a registry pointed at it.
+func zoneStub(t *testing.T, env map[string]string, zones string) *cloudflareRegistry {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/zones" {
+			http.NotFound(w, req)
+			return
+		}
+		w.Write([]byte(`{"success":true,"result":` + zones + `}`))
+	}))
+	t.Cleanup(srv.Close)
+	r, _ := newCloudflareRegistryFromEnv(func(k string) string { return env[k] })
+	if r == nil {
+		t.Fatal("registry is nil")
+	}
+	if r.discover != nil {
+		r.discover.baseURL = srv.URL
+	}
+	return r
+}
+
+// The headline behaviour: a token alone is enough config, and every active
+// zone in the account shows up without an env edit or a restart.
+func TestCloudflareSyncDiscoversZones(t *testing.T) {
+	r := zoneStub(t, map[string]string{"CLOUDFLARE_API_TOKEN": "tok"},
+		`[{"id":"z1","name":"polardev.org","status":"active"},
+		  {"id":"z2","name":"polardemo.com","status":"active"}]`)
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	got := r.Domains()
+	if len(got) != 2 {
+		t.Fatalf("domains = %v", got)
+	}
+	// With no CLOUDFLARE_ZONE_ID to pin one, the default must still resolve.
+	if r.DefaultDomain() == "" {
+		t.Fatal("default domain is empty after discovery")
+	}
+	if c, ok := r.Lookup("polardemo.com"); !ok || c.zoneID != "z2" {
+		t.Fatalf("lookup polardemo.com = %v ok=%v", c, ok)
+	}
+}
+
+// A zone that isn't serving DNS yet would accept API calls but do nothing
+// useful, so it must not appear as an editable zone.
+func TestCloudflareSyncSkipsInactiveZones(t *testing.T) {
+	r := zoneStub(t, map[string]string{"CLOUDFLARE_API_TOKEN": "tok"},
+		`[{"id":"z1","name":"live.org","status":"active"},
+		  {"id":"z2","name":"pending.org","status":"pending"},
+		  {"id":"z3","name":"moved.org","status":"moved"}]`)
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if got := r.Domains(); len(got) != 1 || got[0] != "live.org" {
+		t.Fatalf("domains = %v, want [live.org]", got)
+	}
+}
+
+// Env zones carry an explicit per-zone token that a listing can't infer, so
+// discovery must neither overwrite nor drop them.
+func TestCloudflareSyncPreservesEnvZones(t *testing.T) {
+	r := zoneStub(t, map[string]string{
+		"CLOUDFLARE_API_TOKEN": "tok",
+		"CLOUDFLARE_ZONES":     "pinned.org:envzone:othertoken",
+	}, `[{"id":"discovered","name":"pinned.org","status":"active"}]`)
+
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	c, ok := r.Lookup("pinned.org")
+	if !ok {
+		t.Fatal("env zone disappeared")
+	}
+	if c.zoneID != "envzone" || c.token != "othertoken" {
+		t.Fatalf("env zone overwritten: zoneID=%q token=%q", c.zoneID, c.token)
+	}
+
+	// And it survives a pass where the account no longer lists it at all.
+	r.discover.baseURL = emptyZoneServer(t)
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync 2: %v", err)
+	}
+	if _, ok := r.Lookup("pinned.org"); !ok {
+		t.Fatal("env zone removed by reconciliation")
+	}
+}
+
+func emptyZoneServer(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`{"success":true,"result":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// A zone removed from the account has to leave the registry, or the DNS tab
+// keeps a dead chip that the browser's saved zone preference can pin to.
+func TestCloudflareSyncRemovesVanishedZones(t *testing.T) {
+	r := zoneStub(t, map[string]string{"CLOUDFLARE_API_TOKEN": "tok"},
+		`[{"id":"z1","name":"a.org","status":"active"},{"id":"z2","name":"b.org","status":"active"}]`)
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(r.Domains()) != 2 {
+		t.Fatalf("setup: domains = %v", r.Domains())
+	}
+
+	r.discover.baseURL = emptyZoneServer(t)
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync 2: %v", err)
+	}
+	if got := r.Domains(); len(got) != 0 {
+		t.Fatalf("domains = %v, want empty", got)
+	}
+	// Default must not keep naming a deleted entry.
+	if c := r.Default(); c != nil {
+		t.Fatalf("default = %v, want nil", c)
+	}
+}
+
+// Sync must be idempotent — repeated passes can't accumulate duplicates.
+func TestCloudflareSyncIdempotent(t *testing.T) {
+	r := zoneStub(t, map[string]string{"CLOUDFLARE_API_TOKEN": "tok"},
+		`[{"id":"z1","name":"a.org","status":"active"}]`)
+	for i := 0; i < 3; i++ {
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatalf("sync %d: %v", i, err)
+		}
+	}
+	if got := r.Domains(); len(got) != 1 {
+		t.Fatalf("domains = %v after 3 syncs", got)
+	}
+}
+
+// A token without the account-level Zone:Read scope must degrade to "env zones
+// only", not take the integration down.
+func TestCloudflareSyncErrorKeepsEnvZones(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"success":false}`, http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	r, _ := newCloudflareRegistryFromEnv(func(k string) string {
+		return map[string]string{
+			"CLOUDFLARE_API_TOKEN": "tok",
+			"CLOUDFLARE_ZONE_ID":   "z0",
+			"CLOUDFLARE_DOMAIN":    "polardev.org",
+		}[k]
+	})
+	r.discover.baseURL = srv.URL
+	if err := r.Sync(context.Background()); err == nil {
+		t.Fatal("want error from forbidden zone listing")
+	}
+	if got := r.Domains(); len(got) != 1 || got[0] != "polardev.org" {
+		t.Fatalf("domains = %v, want [polardev.org]", got)
+	}
+}
+
+// No token means nothing to discover with, and no zone vars means nothing
+// configured — the integration stays off rather than half-on.
+func TestCloudflareRegistryNilWithoutToken(t *testing.T) {
+	r, _ := newCloudflareRegistryFromEnv(func(string) string { return "" })
+	if r != nil {
+		t.Fatalf("want nil registry, got %v", r.Domains())
+	}
+	// Nil must be safe for the background loop and Sync alike.
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync on nil registry: %v", err)
+	}
+}
+
+// Status feeds the browser. It may gain a source field but must never grow a
+// zone id or token.
+func TestCloudflareStatusSource(t *testing.T) {
+	r := zoneStub(t, map[string]string{
+		"CLOUDFLARE_API_TOKEN": "tok",
+		"CLOUDFLARE_ZONE_ID":   "envzone",
+		"CLOUDFLARE_DOMAIN":    "pinned.org",
+	}, `[{"id":"secretzoneid","name":"found.org","status":"active"}]`)
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	blob, err := json.Marshal(r.Status())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(blob), "secretzoneid") || strings.Contains(string(blob), "envzone") ||
+		strings.Contains(string(blob), "tok\"") {
+		t.Fatalf("status leaks zone id or token: %s", blob)
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(blob, &got); err != nil {
+		t.Fatal(err)
+	}
+	src := map[string]string{}
+	for _, z := range got {
+		src[z["domain"].(string)] = z["source"].(string)
+	}
+	if src["pinned.org"] != "env" || src["found.org"] != "cloudflare" {
+		t.Fatalf("sources = %v", src)
+	}
+}
+
+// Lookup hands a *cloudflareClient to a request handler and then drops the read
+// lock, so a concurrent Sync must never mutate the struct that handler is
+// reading. Run under -race; without the pointer swap in Sync this trips.
+func TestCloudflareSyncRaceWithLookup(t *testing.T) {
+	ids := []string{"z1", "z2"}
+	var n int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Alternate the zone id so Sync actually takes the refresh branch.
+		id := ids[atomic.AddInt64(&n, 1)%2]
+		w.Write([]byte(`{"success":true,"result":[{"id":"` + id + `","name":"a.org","status":"active"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	r, _ := newCloudflareRegistryFromEnv(func(k string) string {
+		return map[string]string{"CLOUDFLARE_API_TOKEN": "tok"}[k]
+	})
+	r.discover.baseURL = srv.URL
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if c, ok := r.Lookup("a.org"); ok {
+					// Exactly what a handler does with the returned client.
+					_ = c.zoneID + c.token + c.baseURL
+				}
+			}
+		}()
+	}
+	for i := 0; i < 25; i++ {
+		if err := r.Sync(context.Background()); err != nil {
+			t.Errorf("sync: %v", err)
+			break
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// A legacy CLOUDFLARE_ZONE_ID with no CLOUDFLARE_DOMAIN is keyed by zone id;
+// discovery finds the same zone by name and must not add a second chip.
+func TestCloudflareSyncNoDuplicateForZoneIDKeyedEntry(t *testing.T) {
+	r := zoneStub(t, map[string]string{
+		"CLOUDFLARE_API_TOKEN": "tok",
+		"CLOUDFLARE_ZONE_ID":   "z1",
+		// CLOUDFLARE_DOMAIN deliberately unset -> entry is keyed "z1".
+	}, `[{"id":"z1","name":"a.org","status":"active"}]`)
+
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if got := r.Domains(); len(got) != 1 {
+		t.Fatalf("domains = %v, want one entry", got)
+	}
+	// And it must survive reconciliation rather than being culled as unseen.
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatalf("sync 2: %v", err)
+	}
+	if got := r.Domains(); len(got) != 1 {
+		t.Fatalf("domains = %v after second sync", got)
+	}
+}
+
+// A token that can't enumerate zones and pins none leaves a live-but-empty
+// registry; the DNS tab must read that as off, not as an empty zone list.
+func TestCloudflareUsable(t *testing.T) {
+	var nilReg *cloudflareRegistry
+	if nilReg.Usable() {
+		t.Error("nil registry reports usable")
+	}
+	r, _ := newCloudflareRegistryFromEnv(func(k string) string {
+		return map[string]string{"CLOUDFLARE_API_TOKEN": "tok"}[k]
+	})
+	if r == nil {
+		t.Fatal("token alone should build a registry")
+	}
+	if r.Usable() {
+		t.Error("zero-zone registry reports usable")
+	}
+	// Lookup of the default must fail cleanly rather than nil-deref later.
+	if c, ok := r.Lookup(""); ok || c != nil {
+		t.Errorf("Lookup(\"\") = %v, %v; want nil, false", c, ok)
+	}
+	if got := r.DefaultDomain(); got != "" {
+		t.Errorf("DefaultDomain = %q, want empty", got)
+	}
+	r.discover.baseURL = ""
+	if err := r.Sync(context.Background()); err == nil {
+		t.Error("want error syncing against an unreachable endpoint")
 	}
 }
