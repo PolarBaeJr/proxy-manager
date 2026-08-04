@@ -273,6 +273,10 @@ details.errd[open] summary{color:#ff7173}
 .chip:hover{color:var(--text);border-color:var(--border)}
 .chip.active{background:var(--accent);color:#0a0e14;border-color:var(--accent);font-weight:500}
 .chip.active .meta{color:#0a0e14;opacity:.7}
+.zone-select{appearance:none;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;padding:8px 30px 8px 13px;border-radius:var(--radius-sm);background-color:var(--surface-2);color:var(--text);border:1px solid var(--border-2);transition:border-color var(--transition-fast);background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238a8a8a' stroke-width='1.6'%3E%3Cpath d='M4 6.5 8 10.5 12 6.5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 9px center;background-size:13px}
+.zone-select:hover{border-color:var(--border)}
+.zone-select:focus{outline:none;border-color:var(--accent-2);box-shadow:var(--focus-ring)}
+.zone-select.bad{border-color:var(--red)}
 .th-row{color:var(--muted);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px}
 .th{background:transparent;border:0;color:inherit;font:inherit;text-transform:inherit;letter-spacing:inherit;padding:0;cursor:pointer;text-align:left}
 .th:hover{color:var(--text)}
@@ -1898,7 +1902,10 @@ async function renderDNS() {
   const status = await api('/api/cf/enabled');
   const el = $('#tab-dns');
   if (!status.enabled) {
-    el.innerHTML = emptyState(I.dns, 'Cloudflare not configured', 'Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID (or CLOUDFLARE_ZONES for several domains) to manage DNS records from the dashboard.');
+    // Discovery is the primary path now, so the token is the thing to name —
+    // "enabled" is false either because there is no token, or because the one
+    // set can't enumerate zones and pins none.
+    el.innerHTML = emptyState(I.dns, 'No Cloudflare zones', 'Set CLOUDFLARE_API_TOKEN to a token with Zone:Read and Zone.DNS:Edit — every active zone in the account is picked up automatically. CLOUDFLARE_ZONES still pins a zone that needs its own token.');
     return;
   }
   // Pre-multi-zone servers only report a single "domain".
@@ -1910,6 +1917,7 @@ async function renderDNS() {
   // can show "→ myapp.polardev.org" as you type. The dialog is wired once at
   // init, so a zone change has to re-run the shape pass — but only then, since
   // it rebuilds the content field and would wipe whatever is typed in it.
+  const selected = zones.find(z => z.domain === zone);
   const zoneChanged = window._cfZone !== zone;
   window._cfZone = zone;
   if (zoneChanged) refreshDNSFormShape();
@@ -1920,17 +1928,26 @@ async function renderDNS() {
     recs = await api('/api/cf/records?zone=' + encodeURIComponent(zone));
   } catch (e) { zoneErr = e.message; }
   // Hash includes the zone: two zones that both return [] are not the same view.
-  const hash = JSON.stringify({zone, recs, zoneErr});
+  const hash = JSON.stringify({zone, zones, recs, zoneErr});
   if (hash === _lastDNSHash && el.children.length) return;
   _lastDNSHash = hash;
-  const zoneChips = zones.map(z =>
-      '<button class="chip' + (z.domain === zone ? ' active' : '') + '" onclick="selectDNSZone(\'' + esc(z.domain) + '\')">'
-    + esc(z.domain || '(default zone)')
-    + (z.ok === false ? ' <span class="pill warn"><span class="gl"></span>no access</span>' : '')
-    + '</button>').join('');
+  // One dropdown rather than a chip per zone: auto-discovery means the list
+  // grows on its own, and a wrapping chip row pushes the table down the page.
+  // Sorted alphabetically to stay scannable; the unnamed legacy zone (keyed by
+  // zone id, so it carries no domain) sorts first as the odd one out.
+  const sortedZones = zones.slice().sort((a, b) => (a.domain || '').localeCompare(b.domain || ''));
+  const zonePicker = '<select class="zone-select' + (selected && selected.ok === false ? ' bad' : '') + '"'
+    + ' aria-label="Cloudflare zone" title="Cloudflare zone" onchange="selectDNSZone(this.value)">'
+    + sortedZones.map(z =>
+        // An <option> can't carry markup, so a zone the token isn't scoped for
+        // says so in its own text instead of the pill the chip used to show.
+        '<option value="' + esc(z.domain) + '"' + (z.domain === zone ? ' selected' : '') + '>'
+        + esc(z.domain || '(default zone)') + (z.ok === false ? ' \u2014 no access' : '')
+        + '</option>').join('')
+    + '</select>';
   let html = '<div class="btn-row top">'
     + '<button class="btn primary" ' + lockedAttr() + ' onclick="openNewDNS()">' + I.plus + 'New record' + lk() + '</button>'
-    + zoneChips
+    + zonePicker
     + '<span class="meta">' + (recs ? recs.length + ' record' + (recs.length === 1 ? '' : 's') : '') + '</span></div>';
   if (recs === null) {
     el.innerHTML = html + emptyState(I.dns, 'Zone unavailable', zoneErr || ('token lacks permission for ' + zone));
