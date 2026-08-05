@@ -1456,6 +1456,12 @@ async function renderServices() {
               + (s.all_stopped
                   ? '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\')">' + I.bolt + 'Start service' + lk() + '</button>'
                   : '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\')">' + I.lock + 'Stop service' + lk() + '</button>')
+              // Add env: recreates the replicas on the SAME image with the new
+              // variables merged in. Disabled while stopped — the recreate
+              // clones a live replica's config, so there has to be one.
+              + (s.all_stopped
+                  ? '<button class="btn" disabled title="Start the service first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
+                  : '<button class="btn" ' + lockedAttr() + ' onclick="openAddEnv(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.plus + 'Add env…' + lk() + '</button>')
               // Auto-update toggle: onboarded services only. Label-sourced
               // opt-ins (proxy.autoupdate=true) are managed in compose, not here.
               + (s.onboarded && !(s.labels && s.labels['proxy.autoupdate'] === 'true')
@@ -1966,6 +1972,52 @@ async function lifecycleReplica(svc, member, act) {
     renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
+// setReplaceDialogMode reshapes the shared replace/stage/env dialog.
+//
+// 'env' hides the image field entirely: the whole point is to keep the current
+// image and only change the environment. The field must also drop its
+// required attribute while hidden — a hidden required input blocks submit
+// with an error the browser cannot even show ("not focusable").
+function setReplaceDialogMode(mode, name) {
+  const dlg = $('#dlg-replace-service');
+  const f = $('#form-replace-service');
+  const imgField = document.getElementById('field-new-image');
+  const envOnly = mode === 'env';
+  if (imgField) imgField.hidden = envOnly;
+  if (f && f.image) {
+    if (envOnly) f.image.removeAttribute('required');
+    else f.image.setAttribute('required', '');
+  }
+  const titles = {
+    replace: ['Replace service', 'Swap the running image for ' + name],
+    stage:   ['Stage new version (canary)', 'Deploy a canary alongside ' + name + ' for promotion'],
+    env:     ['Add environment variables', 'Recreates ' + name + ' on the same image with the new env merged in'],
+  };
+  const t = titles[mode] || titles.replace;
+  dlg.querySelector('h3').textContent = t[0];
+  const sub = dlg.querySelector('.dsub');
+  if (sub) sub.textContent = t[1];
+  const btn = f && f.querySelector('button[type="submit"]');
+  if (btn) btn.innerHTML = I.check + (envOnly ? 'Add + restart' : (mode === 'stage' ? 'Stage' : 'Replace'));
+}
+
+// openAddEnv adds variables to a running service.
+//
+// Docker cannot change a running container's environment, so this is not a
+// restart — the replicas are recreated from the SAME image with the merged env,
+// which is exactly the replace path (new ones up first, then the old removed).
+// That also means the conflict picker applies here unchanged.
+function openAddEnv(name, currentImage) {
+  const f = $('#form-replace-service');
+  f.serviceName.value = name;
+  f.currentImage.value = currentImage;
+  f.image.value = currentImage; // same version; only the env changes
+  f.env.value = '';
+  clearEnvChoices();
+  f.dataset.mode = 'env';
+  setReplaceDialogMode('env', name);
+  $('#dlg-replace-service').showModal();
+}
 function openReplace(name, currentImage) {
   const f = $('#form-replace-service');
   f.serviceName.value = name;
@@ -1974,9 +2026,7 @@ function openReplace(name, currentImage) {
   f.env.value = '';
   clearEnvChoices();
   f.dataset.mode = 'replace';
-  $('#dlg-replace-service').querySelector('h3').textContent = 'Replace service';
-  const sub = $('#dlg-replace-service').querySelector('.dsub');
-  if (sub) sub.textContent = 'Swap the running image for ' + name;
+  setReplaceDialogMode('replace', name);
   $('#dlg-replace-service').showModal();
 }
 function openStage(name, currentImage) {
@@ -1987,9 +2037,7 @@ function openStage(name, currentImage) {
   f.env.value = '';
   clearEnvChoices();
   f.dataset.mode = 'stage';
-  $('#dlg-replace-service').querySelector('h3').textContent = 'Stage new version (canary)';
-  const sub = $('#dlg-replace-service').querySelector('.dsub');
-  if (sub) sub.textContent = 'Deploy a canary alongside ' + name + ' for promotion';
+  setReplaceDialogMode('stage', name);
   $('#dlg-replace-service').showModal();
 }
 
@@ -3039,7 +3087,7 @@ function buildDialogs() {
     + '<form id="form-replace-service" data-mode="replace"><div class="dlg-body">'
     + '<input type="hidden" name="serviceName">'
     + '<div class="field"><label>Current image</label><input name="currentImage" disabled></div>'
-    + '<div class="field"><label>New image</label><input name="image" placeholder="ghcr.io/org/app:tag" required></div>'
+    + '<div class="field" id="field-new-image"><label>New image</label><input name="image" placeholder="ghcr.io/org/app:tag" required></div>'
     + '<div class="field"><label>Env edits <span class="hint" style="display:inline">(KEY=VALUE per line — merged onto the current env; blank keeps everything as-is)</span></label><textarea name="env"></textarea></div>'
     + '<div id="env-conflicts" hidden></div>'
     + '</div><div class="dialog-actions">'
@@ -3135,7 +3183,13 @@ function wireDialogForms() {
     for (const [k, v] of Object.entries(choices.pick)) {
       if (v === null) delete env[k]; else env[k] = v;
     }
+    // Adding env is a replace that deliberately reuses the current image.
+    const envOnly = f.dataset.mode === 'env';
     const mode = f.dataset.mode === 'stage' ? 'stage' : 'replace';
+    if (envOnly && !Object.keys(env).length) {
+      toast('add at least one KEY=VALUE line', 'err');
+      return;
+    }
     // Long-running on the server (pull + create + start + 3s settle), so show
     // a busy state on the submit button or the user thinks the dialog froze.
     const submitBtn = f.querySelector('button[type="submit"]');
@@ -3151,12 +3205,12 @@ function wireDialogForms() {
         }),
       });
       clearEnvChoices();
-      toast((mode === 'stage' ? 'staged ' : 'replaced ') + f.serviceName.value + ' → ' + f.image.value);
+      toast(envOnly
+        ? 'env updated on ' + f.serviceName.value + ' — replicas recreated'
+        : (mode === 'stage' ? 'staged ' : 'replaced ') + f.serviceName.value + ' → ' + f.image.value);
       $('#dlg-replace-service').close();
       f.dataset.mode = 'replace';
-      $('#dlg-replace-service').querySelector('h3').textContent = 'Replace service';
-      const sub = $('#dlg-replace-service').querySelector('.dsub');
-      if (sub) sub.textContent = 'Spins up new replicas, waits, then removes the old. Env edits merge onto the current env.';
+      setReplaceDialogMode('replace', f.serviceName.value);
       renderActive();
     } catch (e) {
       // 409 = the merge found keys whose value disagrees with what the service
