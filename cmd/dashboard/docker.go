@@ -399,8 +399,16 @@ type CreateServiceRequest struct {
 // Spins up new containers first, briefly waits, then removes the old ones —
 // approximation of a rolling deploy on a single host.
 type ReplaceServiceRequest struct {
-	Image string            `json:"image"`         // required
-	Env   map[string]string `json:"env,omitempty"` // if nil, copy from template
+	Image string `json:"image"` // required
+	// Env carries EDITS, not a replacement set: entries are merged onto the
+	// env the service is currently running (see serviceenv.go). Nil/empty
+	// means "keep the current env exactly", which is what the auto-updater
+	// sends. A key whose value disagrees with the running one is refused as
+	// an envConflictError until the caller acknowledges it below.
+	Env map[string]string `json:"env,omitempty"`
+	// EnvAck lists keys the caller was shown a conflict for and deliberately
+	// chose to overwrite. Anything not listed still conflicts.
+	EnvAck []string `json:"env_ack,omitempty"`
 }
 
 // guardUnscalable refuses to scale a service that has any container labeled
@@ -585,19 +593,16 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	}
 	tpl := existing[0]
 
-	// Resolve env. If the caller passed env, use only that. Otherwise copy from
-	// the template container so the new replicas start with the same config.
-	var env []string
-	if len(req.Env) > 0 {
-		for k, v := range req.Env {
-			env = append(env, k+"="+v)
-		}
-	} else {
-		got, err := c.inspectEnv(ctx, tpl.ID)
-		if err != nil {
-			return fmt.Errorf("inspect template env: %w", err)
-		}
-		env = got
+	// Resolve env by merging any edits onto what the template is running.
+	// Read unconditionally: the merge needs the current values to compare
+	// against, not just as a fallback when no edits were sent.
+	base, err := c.inspectEnv(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template env: %w", err)
+	}
+	env, err := mergeEnv(base, req.Env, req.EnvAck)
+	if err != nil {
+		return err
 	}
 
 	c.pullImage(ctx, req.Image)
@@ -670,16 +675,13 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 	}
 	tpl := live[0]
 
-	var env []string
-	if len(req.Env) > 0 {
-		for k, v := range req.Env {
-			env = append(env, k+"="+v)
-		}
-	} else {
-		env, err = c.inspectEnv(ctx, tpl.ID)
-		if err != nil {
-			return fmt.Errorf("inspect template env: %w", err)
-		}
+	base, err := c.inspectEnv(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template env: %w", err)
+	}
+	env, err := mergeEnv(base, req.Env, req.EnvAck)
+	if err != nil {
+		return err
 	}
 
 	canaryLabels := map[string]string{}

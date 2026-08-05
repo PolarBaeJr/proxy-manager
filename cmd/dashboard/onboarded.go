@@ -517,13 +517,9 @@ func (c *dockerClient) stageOnboarded(ctx context.Context, name string, req Repl
 	if svc.CanaryImage != "" {
 		return fmt.Errorf("%q already has a canary — promote or discard first", name)
 	}
-	var env []string
-	if len(req.Env) > 0 {
-		for k, v := range req.Env {
-			env = append(env, k+"="+v)
-		}
-	} else {
-		env = svc.Env
+	env, err := mergeEnv(c.onboardedBaseEnv(ctx, name, svc), req.Env, req.EnvAck)
+	if err != nil {
+		return err
 	}
 	c.pullImage(ctx, req.Image)
 	for i := 1; i <= svc.Replicas; i++ {
@@ -630,13 +626,9 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 	if svc.CanaryImage != "" {
 		return fmt.Errorf("%q has a canary in flight — promote or discard first", name)
 	}
-	var env []string
-	if len(req.Env) > 0 {
-		for k, v := range req.Env {
-			env = append(env, k+"="+v)
-		}
-	} else {
-		env = svc.Env
+	env, err := mergeEnv(c.onboardedBaseEnv(ctx, name, svc), req.Env, req.EnvAck)
+	if err != nil {
+		return err
 	}
 	c.pullImage(ctx, req.Image)
 	// Spin up replacements named -r2 to avoid colliding with existing -1..N.
@@ -758,4 +750,41 @@ func proxyRefresh(proxyURL string) {
 	}
 	client := http.Client{Timeout: 2 * time.Second}
 	_, _ = client.Post(proxyURL+"/refresh", "application/json", nil)
+}
+
+// onboardedBaseEnv is the env an onboarded service is ACTUALLY running.
+//
+// OnboardedService.Env is only a snapshot taken at onboard time and is never
+// refreshed when a container is recreated, so it drifts. That matters now that
+// env is merged rather than replaced: a conflict dialog built on the snapshot
+// would ask the user to choose against a "current" value nothing is running.
+//
+// Prefers a live non-canary clone, then the original container (named for the
+// service itself), and only falls back to the stored snapshot when neither can
+// be read — better a stale base than no base, since the caller would otherwise
+// create replicas with an empty environment.
+func (c *dockerClient) onboardedBaseEnv(ctx context.Context, name string, svc OnboardedService) []string {
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
+	if err == nil {
+		cPrefix := fmt.Sprintf("goproxy-onb-%s-c", name)
+		for _, ct := range all {
+			if strings.HasPrefix(ct.name(), cPrefix) {
+				continue // canary replica — not the live config
+			}
+			if env, err := c.inspectEnv(ctx, ct.ID); err == nil && len(env) > 0 {
+				return env
+			}
+		}
+	}
+	if orig, err := c.listAll(ctx, fmt.Sprintf(`{"name":["%s"]}`, name)); err == nil {
+		for _, ct := range orig {
+			if ct.name() != name {
+				continue
+			}
+			if env, err := c.inspectEnv(ctx, ct.ID); err == nil && len(env) > 0 {
+				return env
+			}
+		}
+	}
+	return svc.Env
 }
