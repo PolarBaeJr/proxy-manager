@@ -395,6 +395,10 @@ type CreateServiceRequest struct {
 	Env        map[string]string `json:"env,omitempty"`
 }
 
+// replaceSettleDelay is how long replaceService lets new containers come up
+// before removing the old ones.
+var replaceSettleDelay = 5 * time.Second
+
 // ReplaceServiceRequest swaps a service's image (and optionally env) in place.
 // Spins up new containers first, briefly waits, then removes the old ones —
 // approximation of a rolling deploy on a single host.
@@ -644,7 +648,8 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 
 	// Give the new containers a few seconds to bind their ports / accept connections
 	// before we tear down the old. Crude — production would health-check here.
-	time.Sleep(5 * time.Second)
+	// A package var only so tests can shrink it; nothing else reassigns it.
+	time.Sleep(replaceSettleDelay)
 
 	for _, ct := range existing {
 		_ = c.stopContainer(ctx, ct.ID)
