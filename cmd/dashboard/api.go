@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -75,8 +76,8 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			status = http.StatusServiceUnavailable
 		}
 		httpx.WriteJSON(w, status, map[string]any{
-			"status":   overall,
-			"targets":  targets,
+			"status":     overall,
+			"targets":    targets,
 			"checked_at": time.Now().UTC().Format(time.RFC3339),
 		})
 	})
@@ -144,7 +145,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		// hits monitor's /api/target/proxy and so on for /hosts /errors /series.
 		mux.HandleFunc("/api/monitor/target/", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
 			sub := strings.TrimPrefix(req.URL.Path, "/api/monitor/target/")
-			fwd("/api/target/" + sub)(w, req)
+			fwd("/api/target/"+sub)(w, req)
 		}))
 	}
 
@@ -366,7 +367,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 					http.Error(w, "token creation requires a logged-in session (not another token)", http.StatusUnauthorized)
 					return
 				}
-				var body struct{ Label string `json:"label"` }
+				var body struct {
+					Label string `json:"label"`
+				}
 				_ = json.NewDecoder(req.Body).Decode(&body)
 				raw, t, err := auth.CreateToken(info.Username, body.Label)
 				if err != nil {
@@ -594,12 +597,12 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			}
 			if _, ok := onb.Get(name); ok {
 				if err := dc.replaceOnboarded(req.Context(), name, body, onb, routesConfigPath); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
+					writeServiceErr(w, err)
 					return
 				}
 				proxyRefresh(proxyURLFromEnv())
 			} else if err := dc.replaceService(req.Context(), name, body); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				writeServiceErr(w, err)
 				return
 			}
 			// Re-check the image-checker immediately so the "update available"
@@ -644,12 +647,12 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			}
 			if _, ok := onb.Get(name); ok {
 				if err := dc.stageOnboarded(req.Context(), name, body, onb, routesConfigPath); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
+					writeServiceErr(w, err)
 					return
 				}
 				proxyRefresh(proxyURLFromEnv())
 			} else if err := dc.stageCanary(req.Context(), name, body); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				writeServiceErr(w, err)
 				return
 			}
 			audit(req, sessionUser(info), "service.stage", name+" => "+body.Image)
@@ -1329,6 +1332,22 @@ func sessionUser(info *sessionInfo) string {
 	return info.Username
 }
 
+// writeServiceErr maps a service-mutation failure onto the response. An
+// unresolved env conflict becomes a 409 carrying every conflicting key, which
+// the dashboard renders as a keep-mine/keep-current picker; everything else
+// keeps the existing 400.
+func writeServiceErr(w http.ResponseWriter, err error) {
+	var ce *envConflictError
+	if errors.As(err, &ce) {
+		httpx.WriteJSON(w, http.StatusConflict, map[string]any{
+			"error":     err.Error(),
+			"conflicts": ce.Conflicts,
+		})
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
 func cfDomain(cf *cloudflareRegistry) string {
 	return cf.DefaultDomain()
 }
@@ -1363,4 +1382,3 @@ func writeCFErr(w http.ResponseWriter, domain string, err error) {
 		http.Error(w, err.Error(), code)
 	}
 }
-

@@ -277,6 +277,10 @@ details.errd[open] summary{color:#ff7173}
 .zone-select:hover{border-color:var(--border)}
 .zone-select:focus{outline:none;border-color:var(--accent-2);box-shadow:var(--focus-ring)}
 .zone-select.bad{border-color:var(--red)}
+.env-choice{display:flex;align-items:center;gap:9px;padding:6px 9px;margin-top:5px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer}
+.env-choice:hover{border-color:var(--border-2)}
+.env-choice input{margin:0;flex:none}
+.env-choice .ident{word-break:break-all}
 .th-row{color:var(--muted);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px}
 .th{background:transparent;border:0;color:inherit;font:inherit;text-transform:inherit;letter-spacing:inherit;padding:0;cursor:pointer;text-align:left}
 .th:hover{color:var(--text)}
@@ -656,9 +660,15 @@ async function api(path, opts={}) {
   if (r.status === 403) { needs2FA(); throw new Error('2FA required'); }
   if (!r.ok) {
     const txt = await r.text();
-    let msg = txt;
-    try { msg = JSON.parse(txt).error || txt; } catch {}
-    throw new Error(msg);
+    let msg = txt, data = null;
+    try { data = JSON.parse(txt); msg = data.error || txt; } catch {}
+    // Carry the status and parsed body on the Error so a caller can handle a
+    // structured failure (e.g. 409 env conflicts). Existing callers keep
+    // reading e.message and are unaffected.
+    const err = new Error(msg);
+    err.status = r.status;
+    err.data = data;
+    throw err;
   }
   return r.status === 204 ? null : r.json();
 }
@@ -1176,6 +1186,121 @@ function statusBarFromCodes(byCode) {
   const leg = keys.map(k => '<span><i class="sw" style="background:' + STC[k] + '"></i>' + k + ' ' + fmt(buckets[k]) + '</span>').join('');
   return '<div class="statusbar">' + bar + '</div><div class="legend">' + leg + '</div>';
 }
+/* ---------- Env edits for Replace / Stage ---------- */
+// Env is MERGED onto what the service is running, not swapped for it, so the
+// only thing needing a decision is a key whose value disagrees. Two sources of
+// disagreement, answered by the same picker:
+//
+//   duplicate  the same key twice in the textarea. Only visible here — the
+//              server receives a map and can no longer see it. Choosing a
+//              value does NOT authorise overwriting the running container;
+//              if it also collides there, the server still asks.
+//   conflict   the key already has a different value on the running service.
+//              Returned as a 409. Choosing "use your edit" DOES authorise the
+//              overwrite, and the key goes into env_ack.
+//
+// Questions accumulate: a duplicate answered on the first submit must survive
+// the 409 that the second submit may trigger, so rendering appends rows for
+// keys not already being asked about rather than replacing the panel.
+
+// parseEnvEdits reads the KEY=VALUE textarea. Returns the edits plus any key
+// given more than one DISTINCT value; a key repeated with the same value is
+// harmless and passes through silently.
+function parseEnvEdits(text) {
+  const seen = new Map();
+  for (const line of String(text || '').split('\n')) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const i = t.indexOf('=');
+    if (i <= 0) continue;
+    const k = t.slice(0, i).trim();
+    const v = t.slice(i + 1).trim();
+    if (!k) continue;
+    if (!seen.has(k)) seen.set(k, []);
+    const vals = seen.get(k);
+    if (!vals.includes(v)) vals.push(v);
+  }
+  const edits = {}, dups = [];
+  for (const [k, vals] of seen) {
+    edits[k] = vals[vals.length - 1];
+    if (vals.length > 1) dups.push({ key: k, values: vals });
+  }
+  return { edits, dups };
+}
+
+// envChoicePending reports whether the picker is already asking about a key,
+// so an answered question is never re-asked (and never silently reset).
+function envChoicePending(key) {
+  const box = document.getElementById('env-conflicts');
+  return !!(box && box.querySelector('input[name="envchoice-' + CSS.escape(key) + '"]'));
+}
+
+// renderEnvChoices appends rows for keys not already on screen. Deliberately
+// not a nested <dialog>: stacking them fights the browser, and this form's
+// submit button already owns its busy-state save/restore.
+//   options[].value === null  -> "leave the running value alone"
+//   item.ack === true         -> picking a value authorises overwriting it
+function renderEnvChoices(items) {
+  const box = document.getElementById('env-conflicts');
+  if (!box) return;
+  const fresh = items.filter(it => !envChoicePending(it.key));
+  if (!fresh.length) return;
+  if (box.hidden) {
+    box.innerHTML = '<div class="note warn" style="margin:4px 0 10px">' + I.alert
+      + '<div><strong>Which value should the new containers use?</strong> '
+      + 'Nothing is applied until you choose and submit again.</div></div>';
+    box.hidden = false;
+  }
+  let html = '';
+  for (const it of fresh) {
+    html += '<div class="field"><label>' + esc(it.key)
+      + ' <span class="hint" style="display:inline">(' + esc(it.note) + ')</span></label>';
+    it.options.forEach((o, i) => {
+      // The chosen value rides in the radio's own value attribute, so what is
+      // submitted is exactly what was on screen when the user picked.
+      // "keep what is running" is flagged with a data attribute rather than a
+      // sentinel value: any in-band marker can collide with a real env value,
+      // and a NUL one does not even survive HTML attribute parsing (the parser
+      // rewrites U+0000 to U+FFFD).
+      html += '<label class="env-choice">'
+        + '<input type="radio" name="envchoice-' + esc(it.key) + '"'
+        + ' value="' + esc(o.value === null ? '' : o.value) + '"'
+        + (o.value === null ? ' data-keep="1"' : '')
+        + (o.value !== null && it.ack ? ' data-ack="1"' : '')
+        + (i === 0 ? ' checked' : '') + '>'
+        + '<span class="ident">' + esc(o.label) + '</span>'
+        + (o.hint ? '<span class="hint" style="display:inline;margin-left:8px">' + esc(o.hint) + '</span>' : '')
+        + '</label>';
+    });
+    html += '</div>';
+  }
+  box.insertAdjacentHTML('beforeend', html);
+}
+
+// readEnvChoices collects the picker's answers.
+//   pick[key] = null   -> drop the edit, keep what is running
+//   pick[key] = value  -> use this value
+//   ack                -> only keys whose question was a server-side conflict;
+//                         resolving a textarea duplicate must not pre-authorise
+//                         overwriting the running container.
+function readEnvChoices() {
+  const box = document.getElementById('env-conflicts');
+  const pick = {}, ack = [];
+  if (!box || box.hidden) return { pick, ack };
+  for (const el of box.querySelectorAll('input[type=radio]:checked')) {
+    const key = el.name.replace(/^envchoice-/, '');
+    if (el.dataset.keep) { pick[key] = null; continue; }
+    pick[key] = el.value;
+    if (el.dataset.ack) ack.push(key);
+  }
+  return { pick, ack };
+}
+
+function clearEnvChoices() {
+  const box = document.getElementById('env-conflicts');
+  if (box) { box.innerHTML = ''; box.hidden = true; }
+}
+
 /* ---------- Routes ---------- */
 let _lastRoutesHash = '';
 async function renderRoutes() {
@@ -1847,6 +1972,7 @@ function openReplace(name, currentImage) {
   f.currentImage.value = currentImage;
   f.image.value = '';
   f.env.value = '';
+  clearEnvChoices();
   f.dataset.mode = 'replace';
   $('#dlg-replace-service').querySelector('h3').textContent = 'Replace service';
   const sub = $('#dlg-replace-service').querySelector('.dsub');
@@ -1859,6 +1985,7 @@ function openStage(name, currentImage) {
   f.currentImage.value = currentImage;
   f.image.value = '';
   f.env.value = '';
+  clearEnvChoices();
   f.dataset.mode = 'stage';
   $('#dlg-replace-service').querySelector('h3').textContent = 'Stage new version (canary)';
   const sub = $('#dlg-replace-service').querySelector('.dsub');
@@ -2907,13 +3034,14 @@ function buildDialogs() {
   // Replace / stage
   $('#dlg-replace-service').innerHTML =
     '<div class="dlg"><div class="dlg-head"><div class="di">' + I.swap + '</div>'
-    + '<div><h3>Replace service</h3><div class="dsub">Spins up new replicas, waits, then removes the old. Env is copied unless overridden.</div></div>'
+    + '<div><h3>Replace service</h3><div class="dsub">Spins up new replicas, waits, then removes the old. Env edits merge onto the current env.</div></div>'
     + '<button class="x" type="button" onclick="document.getElementById(\'dlg-replace-service\').close()">' + I.x + '</button></div>'
     + '<form id="form-replace-service" data-mode="replace"><div class="dlg-body">'
     + '<input type="hidden" name="serviceName">'
     + '<div class="field"><label>Current image</label><input name="currentImage" disabled></div>'
     + '<div class="field"><label>New image</label><input name="image" placeholder="ghcr.io/org/app:tag" required></div>'
-    + '<div class="field"><label>Env override <span class="hint" style="display:inline">(KEY=VALUE per line — leave blank to keep current)</span></label><textarea name="env"></textarea></div>'
+    + '<div class="field"><label>Env edits <span class="hint" style="display:inline">(KEY=VALUE per line — merged onto the current env; blank keeps everything as-is)</span></label><textarea name="env"></textarea></div>'
+    + '<div id="env-conflicts" hidden></div>'
     + '</div><div class="dialog-actions">'
     +   '<button type="button" class="btn" onclick="document.getElementById(\'dlg-replace-service\').close()">Cancel</button>'
     +   '<button type="submit" class="btn primary">' + I.check + 'Replace</button>'
@@ -2984,12 +3112,28 @@ function wireDialogForms() {
   $('#form-replace-service').onsubmit = async (e) => {
     e.preventDefault();
     const f = e.target;
-    const env = {};
-    if (f.env.value.trim()) {
-      for (const line of f.env.value.split('\n')) {
-        const [k, ...rest] = line.split('=');
-        if (k && rest.length) env[k.trim()] = rest.join('=').trim();
-      }
+    const parsed = parseEnvEdits(f.env.value);
+    const choices = readEnvChoices();
+    // Two lines setting the same key to different values: the server only ever
+    // sees a map, so this can only be caught here. Skip keys already answered —
+    // the textarea is unchanged between submits, so they would otherwise be
+    // re-asked forever.
+    const dups = parsed.dups.filter(d => !(d.key in choices.pick));
+    if (dups.length) {
+      renderEnvChoices(dups.map(d => ({
+        key: d.key,
+        note: 'listed ' + d.values.length + ' times in your edits',
+        ack: false, // picking here resolves YOUR lines, not the running value
+        options: d.values.map(v => ({ label: v === '' ? '(empty)' : v, value: v })),
+      })));
+      toast('duplicate key' + (dups.length === 1 ? '' : 's') + ' in your env edits — pick which value to keep', 'err');
+      return;
+    }
+    const env = parsed.edits;
+    // A resolved conflict either overwrites (keep the key, acknowledge it) or
+    // defers to what is running (drop the key so nothing changes).
+    for (const [k, v] of Object.entries(choices.pick)) {
+      if (v === null) delete env[k]; else env[k] = v;
     }
     const mode = f.dataset.mode === 'stage' ? 'stage' : 'replace';
     // Long-running on the server (pull + create + start + 3s settle), so show
@@ -3000,17 +3144,38 @@ function wireDialogForms() {
     try {
       await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/' + mode, {
         method: 'POST',
-        body: JSON.stringify({ image: f.image.value, env: Object.keys(env).length ? env : null }),
+        body: JSON.stringify({
+          image: f.image.value,
+          env: Object.keys(env).length ? env : null,
+          env_ack: choices.ack.length ? choices.ack : undefined,
+        }),
       });
+      clearEnvChoices();
       toast((mode === 'stage' ? 'staged ' : 'replaced ') + f.serviceName.value + ' → ' + f.image.value);
       $('#dlg-replace-service').close();
       f.dataset.mode = 'replace';
       $('#dlg-replace-service').querySelector('h3').textContent = 'Replace service';
       const sub = $('#dlg-replace-service').querySelector('.dsub');
-      if (sub) sub.textContent = 'Spins up new replicas, waits, then removes the old. Env is copied unless overridden.';
+      if (sub) sub.textContent = 'Spins up new replicas, waits, then removes the old. Env edits merge onto the current env.';
       renderActive();
     } catch (e) {
-      toast(e.message, 'err');
+      // 409 = the merge found keys whose value disagrees with what the service
+      // is running. Ask rather than guess; the dialog stays open so the user
+      // answers in place and re-submits.
+      if (e.status === 409 && e.data && e.data.conflicts) {
+        renderEnvChoices(e.data.conflicts.map(c => ({
+          key: c.key,
+          note: 'already set on the running service',
+          ack: true, // choosing your value here authorises overwriting it
+          options: [
+            { label: c.current === '' ? '(empty)' : c.current, value: null, hint: 'keep current' },
+            { label: c.incoming === '' ? '(empty)' : c.incoming, value: c.incoming, hint: 'use your edit' },
+          ],
+        })));
+        toast(e.data.conflicts.length + ' env conflict' + (e.data.conflicts.length === 1 ? '' : 's') + ' — choose which to keep', 'err');
+      } else {
+        toast(e.message, 'err');
+      }
     } finally {
       if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; }
     }
