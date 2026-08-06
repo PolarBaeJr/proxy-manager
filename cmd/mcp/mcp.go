@@ -1,0 +1,238 @@
+// Minimal MCP server over Streamable HTTP.
+//
+// Only the subset the spec requires of a tools-only server is implemented:
+// initialize, tools/list, tools/call, ping, and the initialized notification.
+// No resources, no prompts, no sampling, no server-initiated messages — so the
+// SSE half of the transport is deliberately absent and GET returns 405, which
+// the spec explicitly allows.
+//
+// Auth is NOT handled here. The proxy fronts this with proxy.auth.mode=oauth
+// and rejects anything without a token whose audience names this exact
+// host+path, so by the time a request arrives it is already authorized. Binding
+// to a path is what keeps one MCP's token from opening another's.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sort"
+	"strings"
+)
+
+const (
+	// protocolVersion is the spec revision this server implements. A client
+	// asking for something else still gets this back — per spec the client
+	// then decides whether it can proceed.
+	protocolVersion = "2025-06-18"
+
+	// JSON-RPC error codes. -32000..-32099 is the implementation-defined
+	// range; the rest are from the JSON-RPC 2.0 spec.
+	errParse          = -32700
+	errInvalidRequest = -32600
+	errMethodNotFound = -32601
+	errInvalidParams  = -32602
+	errInternal       = -32603
+)
+
+type rpcRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"` // absent => notification
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type rpcResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  any             `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+// Tool is one callable exposed to the model.
+type Tool struct {
+	Name        string         `json:"name"`
+	Title       string         `json:"title,omitempty"`
+	Description string         `json:"description"`
+	InputSchema map[string]any `json:"inputSchema"`
+
+	// Mutating marks a tool that changes the homelab. These are only
+	// registered when writes are enabled, so a read-only deployment cannot
+	// call one even by guessing its name.
+	Mutating bool `json:"-"`
+
+	Handler func(args map[string]any) (string, error) `json:"-"`
+}
+
+// Server is the tool registry plus the HTTP entry point.
+type Server struct {
+	name    string
+	version string
+	tools   map[string]Tool
+}
+
+func NewServer(name, version string) *Server {
+	return &Server{name: name, version: version, tools: map[string]Tool{}}
+}
+
+func (s *Server) Register(t Tool) { s.tools[t.Name] = t }
+
+// toolList is sorted so tools/list is stable between calls — an unstable
+// ordering shows up as spurious diffs in client-side tool caches.
+func (s *Server) toolList() []Tool {
+	out := make([]Tool, 0, len(s.tools))
+	for _, t := range s.tools {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		// No server-initiated messages, so there is nothing to stream. The
+		// spec allows refusing the SSE channel outright.
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "this MCP server is POST-only (no SSE channel)", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req rpcRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeRPC(w, rpcResponse{JSONRPC: "2.0", Error: &rpcError{errParse, "parse error: " + err.Error()}})
+		return
+	}
+	if req.JSONRPC != "2.0" {
+		writeRPC(w, rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{errInvalidRequest, "jsonrpc must be \"2.0\""}})
+		return
+	}
+
+	// A notification has no id and MUST NOT be answered. 202 with no body is
+	// what the transport expects.
+	if len(req.ID) == 0 {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	result, rerr := s.dispatch(req)
+	if rerr != nil {
+		writeRPC(w, rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: rerr})
+		return
+	}
+	writeRPC(w, rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result})
+}
+
+func (s *Server) dispatch(req rpcRequest) (any, *rpcError) {
+	switch req.Method {
+	case "initialize":
+		return map[string]any{
+			"protocolVersion": protocolVersion,
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo":      map[string]any{"name": s.name, "version": s.version},
+		}, nil
+
+	case "ping":
+		return map[string]any{}, nil
+
+	case "tools/list":
+		return map[string]any{"tools": s.toolList()}, nil
+
+	case "tools/call":
+		var p struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return nil, &rpcError{errInvalidParams, "bad params: " + err.Error()}
+		}
+		t, ok := s.tools[p.Name]
+		if !ok {
+			// Names of unregistered write tools are not leaked here — an
+			// unknown name is an unknown name whether or not writes are off.
+			return nil, &rpcError{errMethodNotFound, "unknown tool: " + p.Name}
+		}
+		out, err := t.Handler(p.Arguments)
+		if err != nil {
+			// A tool failure is a RESULT with isError, not a protocol error:
+			// the model needs to see what went wrong so it can adapt.
+			log.Printf("tool %s: %v", p.Name, err)
+			return map[string]any{
+				"content": []map[string]any{{"type": "text", "text": "error: " + err.Error()}},
+				"isError": true,
+			}, nil
+		}
+		return map[string]any{
+			"content": []map[string]any{{"type": "text", "text": out}},
+		}, nil
+	}
+	return nil, &rpcError{errMethodNotFound, "unknown method: " + req.Method}
+}
+
+func writeRPC(w http.ResponseWriter, resp rpcResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ---- argument helpers ----
+
+func argString(args map[string]any, key string) (string, error) {
+	v, ok := args[key]
+	if !ok {
+		return "", fmt.Errorf("missing required argument %q", key)
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("argument %q must be a string", key)
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", fmt.Errorf("argument %q must not be empty", key)
+	}
+	return s, nil
+}
+
+// argInt accepts a JSON number (which decodes to float64) and rejects a
+// fractional value rather than silently truncating a replica count.
+func argInt(args map[string]any, key string) (int, error) {
+	v, ok := args[key]
+	if !ok {
+		return 0, fmt.Errorf("missing required argument %q", key)
+	}
+	f, ok := v.(float64)
+	if !ok {
+		return 0, fmt.Errorf("argument %q must be a number", key)
+	}
+	if f != float64(int(f)) {
+		return 0, fmt.Errorf("argument %q must be a whole number", key)
+	}
+	return int(f), nil
+}
+
+func argBool(args map[string]any, key string) (bool, error) {
+	v, ok := args[key]
+	if !ok {
+		return false, fmt.Errorf("missing required argument %q", key)
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return false, fmt.Errorf("argument %q must be a boolean", key)
+	}
+	return b, nil
+}
+
+func schema(props map[string]any, required ...string) map[string]any {
+	if required == nil {
+		required = []string{}
+	}
+	return map[string]any{"type": "object", "properties": props, "required": required}
+}
+
+func prop(typ, desc string) map[string]any {
+	return map[string]any{"type": typ, "description": desc}
+}
