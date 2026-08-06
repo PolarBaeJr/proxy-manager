@@ -34,21 +34,21 @@ func TestVerifyOAuthBearer(t *testing.T) {
 	host := "mcp.polardev.org"
 
 	wildcard := sso.SignAccess(sso.AccessClaims{Username: "alice", Audience: "*", Exp: authFuture().Unix()}, authTestSecret)
-	if u, ok := a.verifyOAuthBearer(wildcard, host); !ok || u != "alice" {
+	if u, ok := a.verifyOAuthBearer(wildcard, host, ""); !ok || u != "alice" {
 		t.Fatalf("wildcard aud: got %q ok=%v", u, ok)
 	}
 
 	exact := sso.SignAccess(sso.AccessClaims{Username: "bob", Audience: host, Exp: authFuture().Unix()}, authTestSecret)
-	if u, ok := a.verifyOAuthBearer(exact, host); !ok || u != "bob" {
+	if u, ok := a.verifyOAuthBearer(exact, host, ""); !ok || u != "bob" {
 		t.Fatalf("exact aud: got %q ok=%v", u, ok)
 	}
 
 	mismatch := sso.SignAccess(sso.AccessClaims{Username: "bob", Audience: "other.polardev.org", Exp: authFuture().Unix()}, authTestSecret)
-	if _, ok := a.verifyOAuthBearer(mismatch, host); ok {
+	if _, ok := a.verifyOAuthBearer(mismatch, host, ""); ok {
 		t.Fatal("audience mismatch should be rejected")
 	}
 
-	if _, ok := a.verifyOAuthBearer("pmga_garbage", host); ok {
+	if _, ok := a.verifyOAuthBearer("pmga_garbage", host, ""); ok {
 		t.Fatal("bad token should be rejected")
 	}
 }
@@ -94,7 +94,7 @@ func TestDenyOAuthChallenge(t *testing.T) {
 	host := "mcp.polardev.org"
 
 	rec := httptest.NewRecorder()
-	a.denyOAuth(rec, host, false)
+	a.denyOAuth(rec, host, "", false)
 	wa := rec.Header().Get("WWW-Authenticate")
 	if !strings.Contains(wa, `resource_metadata="https://mcp.polardev.org`+protectedResourcePath+`"`) {
 		t.Fatalf("challenge = %q, missing resource_metadata", wa)
@@ -104,7 +104,7 @@ func TestDenyOAuthChallenge(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	a.denyOAuth(rec, host, true)
+	a.denyOAuth(rec, host, "", true)
 	if !strings.Contains(rec.Header().Get("WWW-Authenticate"), `error="invalid_token"`) {
 		t.Fatalf("challenge with bearer = %q, want invalid_token", rec.Header().Get("WWW-Authenticate"))
 	}
