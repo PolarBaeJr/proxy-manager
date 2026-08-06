@@ -110,6 +110,42 @@ Drop these on any container you want routed:
 | `proxy.ratelimit=true` |   | per-client-IP rate limit (default: off) — spoof-resistant client IP, `429` when exceeded |
 | `proxy.ratelimit.rpm=60` |   | requests per minute per IP (default 60 if enabled without a value) |
 
+### MCP servers
+
+Several MCP servers share one host, one path each:
+
+```
+mcp.<domain>/mcp/dashboard     this repo's cmd/mcp
+mcp.<domain>/mcp/<name>        any other MCP server
+```
+
+Label a container into the convention:
+
+```yaml
+labels:
+  proxy.enable:    "true"
+  proxy.host:      "mcp.example.com"
+  proxy.port:      "8097"
+  proxy.path:      "/mcp/<name>"     # lowercase; matching is case-sensitive
+  proxy.strip:     "true"            # the server sees "/" as its root
+  proxy.auth:      "true"
+  proxy.auth.mode: "oauth"
+```
+
+Two things make this safe rather than merely tidy:
+
+- Routes are matched **longest prefix first**, so `/mcp/<name>` wins over any
+  host-wide route on the same host.
+- OAuth tokens are bound to **host + path**, not just host, so a token minted
+  for `/mcp/obsidian` is rejected at `/mcp/dashboard`. A client must send the
+  RFC 8707 `resource` parameter, which the proxy advertises in its
+  `/.well-known/oauth-protected-resource<path>` metadata and in the 401
+  challenge. Tokens with no resource (the `"*"` wildcard) are refused on
+  path-mounted routes.
+
+`cmd/mcp` is read-only unless `MCP_ALLOW_WRITES=true`. Its dashboard API token
+bypasses 2FA, so the write tools stay opt-in.
+
 Containers must share the **`edge`** Docker network with the proxy. See `examples/docker-compose-sample.yml`.
 
 ---

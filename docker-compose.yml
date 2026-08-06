@@ -8,6 +8,8 @@ name: pi-stack
 #   dashboard :8093       — auth-gated management UI (read-write docker socket)
 #   monitor   :8095       — scrapes proxy+edge metrics, exposes aggregated stats
 #                           (no public port; dashboard reads from it)
+#   mcp       :8097       — MCP server exposing dashboard ops as tools
+#                           (no public port; proxied at mcp.<domain>/mcp/dashboard)
 #   auth      :8096       — SSO login portal + OAuth authorization server
 #                           for proxy.auth=true hosts
 #                           (no public port; reached via proxy at auth.<domain>)
@@ -132,6 +134,41 @@ services:
       -window 1h
       -tls-probe-targets ${TLS_PROBE_TARGETS:-}
       -tls-probe-interval 15m
+
+  mcp:
+    build:
+      context: .
+      dockerfile: cmd/mcp/Dockerfile
+    image: ghcr.io/polarbaejr/proxy-manager-mcp:${MCP_TAG:-latest}
+    container_name: mcp
+    restart: unless-stopped
+    networks: [edge]
+    # No host port — reached through the proxy at mcp.<domain>/mcp/dashboard.
+    # Never publish this directly: it does no auth of its own (the proxy's
+    # oauth mode does it) and it holds a dashboard API token.
+    labels:
+      proxy.enable:       "true"
+      proxy.host:         "${MCP_HOST:-mcp.polardev.org}"
+      proxy.port:         "8097"
+      # The /mcp/<name> convention: one MCP host, one path per server. The
+      # proxy sorts routes by prefix length, so this wins over any host-wide
+      # route on the same host, and oauth tokens are bound to host+prefix so
+      # one server's token cannot open another's.
+      proxy.path:         "/mcp/dashboard"
+      proxy.strip:        "true"
+      proxy.service:      "mcp"
+      proxy.unscalable:   "true"
+      proxy.auth:         "true"
+      proxy.auth.mode:    "oauth"
+    environment:
+      DASHBOARD_URL:   http://dashboard:8093
+      # Create in the dashboard (token creation needs a logged-in session, so
+      # it cannot be automated). This token bypasses 2FA — treat it as a
+      # homelab root credential.
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:-}
+      # Unset => read-only tools only. Set to true to also expose maintenance,
+      # scale, start/stop, autoupdate and canary stage/promote/discard.
+      MCP_ALLOW_WRITES: ${MCP_ALLOW_WRITES:-}
 
   auth:
     build:
