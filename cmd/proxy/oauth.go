@@ -92,15 +92,39 @@ func (a *authGate) redirectASMetadata(w http.ResponseWriter, req *http.Request) 
 	http.Redirect(w, req, "https://auth."+parent+req.URL.Path, http.StatusFound)
 }
 
-// verifyOAuthBearer checks a pmga_ access token against the shared secret
-// and this host: the audience must be the request host or the "*" wildcard
-// minted when no resource parameter was given.
-func (a *authGate) verifyOAuthBearer(token, reqHost string) (string, bool) {
+// oauthResource is the RFC 8707 resource identifier for a routed group,
+// without the scheme: the host for a host-wide route, host+prefix for a
+// path-mounted one. It is what a token's audience must name.
+func oauthResource(reqHost, pathPrefix string) string {
+	return strings.ToLower(reqHost) + strings.TrimSuffix(pathPrefix, "/")
+}
+
+// verifyOAuthBearer checks a pmga_ access token against the shared secret and
+// the resource being requested.
+//
+// For a PATH-MOUNTED route the audience must name that exact resource
+// (host+prefix). The "*" wildcard — minted when a client sends no resource
+// parameter — is deliberately NOT accepted there: several MCP servers share
+// one host under different prefixes, so a wildcard token would be a key to all
+// of them, and honouring it would make the prefix decorative. Clients get the
+// exact resource to ask for from the challenge and the RFC 9728 metadata, so a
+// spec-compliant one always sends it.
+//
+// Host-wide routes keep the original behaviour, wildcard included, so existing
+// single-MCP-per-host setups are unaffected.
+func (a *authGate) verifyOAuthBearer(token, reqHost, pathPrefix string) (string, bool) {
 	claims, ok := sso.VerifyAccess(token, a.secret)
 	if !ok {
 		return "", false
 	}
-	if claims.Audience != "*" && !strings.EqualFold(claims.Audience, reqHost) {
+	want := oauthResource(reqHost, pathPrefix)
+	if pathPrefix != "" {
+		if !strings.EqualFold(claims.Audience, want) {
+			return "", false
+		}
+		return claims.Username, true
+	}
+	if claims.Audience != "*" && !strings.EqualFold(claims.Audience, want) {
 		return "", false
 	}
 	return claims.Username, true
@@ -110,8 +134,13 @@ func (a *authGate) verifyOAuthBearer(token, reqHost string) (string, bool) {
 // the resource-metadata URL that starts the client's discovery flow
 // (RFC 9728 §5.1), plus error="invalid_token" when a bearer was presented
 // but rejected.
-func (a *authGate) denyOAuth(w http.ResponseWriter, reqHost string, hadBearer bool) {
-	challenge := fmt.Sprintf("Bearer resource_metadata=%q", "https://"+reqHost+protectedResourcePath)
+// pathPrefix is appended to the metadata URL so a client denied at
+// /mcp/dashboard is pointed at that sub-resource's metadata rather than the
+// host's. Without it the client would request a host-wide token and then be
+// rejected by verifyOAuthBearer for the very resource it was told to ask about.
+func (a *authGate) denyOAuth(w http.ResponseWriter, reqHost, pathPrefix string, hadBearer bool) {
+	metaURL := "https://" + reqHost + protectedResourcePath + strings.TrimSuffix(pathPrefix, "/")
+	challenge := fmt.Sprintf("Bearer resource_metadata=%q", metaURL)
 	if hadBearer {
 		challenge += `, error="invalid_token"`
 	}
@@ -137,7 +166,7 @@ func (a *authGate) authorizeOAuth(w http.ResponseWriter, req *http.Request, grou
 			return false
 		}
 	} else if strings.HasPrefix(authz, bearerPrefix+sso.AccessTokenPrefix) {
-		if user, ok := a.verifyOAuthBearer(strings.TrimPrefix(authz, bearerPrefix), reqHost); ok {
+		if user, ok := a.verifyOAuthBearer(strings.TrimPrefix(authz, bearerPrefix), reqHost, group.PathPrefix); ok {
 			if userAllowed(group, user) {
 				return true
 			}
@@ -146,6 +175,6 @@ func (a *authGate) authorizeOAuth(w http.ResponseWriter, req *http.Request, grou
 		}
 	}
 
-	a.denyOAuth(w, reqHost, hadBearer)
+	a.denyOAuth(w, reqHost, group.PathPrefix, hadBearer)
 	return false
 }

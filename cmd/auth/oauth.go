@@ -19,6 +19,7 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -298,6 +299,14 @@ func (s *loginServer) validateAuthzParams(v url.Values) (p authzParams, hardErr,
 // absent → "*" (all protected hosts); present → must be https, under a
 // cookie domain, and routed by the proxy (soft-skipped when /routes is
 // unreachable, like validRedirect).
+//
+// The PATH is preserved, not discarded: several MCP servers can share one host
+// under different prefixes (mcp.example/mcp/a, mcp.example/mcp/b), and the
+// proxy binds path-mounted routes to an exact host+prefix audience. Dropping
+// the path here would mint a token valid on every one of them.
+//
+// A bare host, "/" or an empty path all yield the host alone, so host-wide
+// resources keep producing exactly the audience they did before.
 func (s *loginServer) validateResource(raw string) (audience string, ok bool) {
 	if raw == "" {
 		return "*", true
@@ -313,7 +322,28 @@ func (s *loginServer) validateResource(raw string) (audience string, ok bool) {
 	if hosts, ok := s.routedHosts(); ok && !hosts[host] {
 		return "", false
 	}
-	return host, true
+	return host + normalizeResourcePath(u.Path), true
+}
+
+// normalizeResourcePath reduces a resource URL's path to the canonical form
+// used in the audience, or "" for anything host-wide.
+//
+// path.Clean collapses "." and ".." and duplicate slashes, so two spellings of
+// the same resource cannot mint audiences that fail to compare equal. A path
+// that escapes the root is rejected to "" rather than allowed to walk upward
+// into a different resource.
+func normalizeResourcePath(p string) string {
+	if p == "" || p == "/" {
+		return ""
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	c := path.Clean(p)
+	if c == "/" || c == "." || strings.HasPrefix(c, "..") {
+		return ""
+	}
+	return c
 }
 
 func (s *loginServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
