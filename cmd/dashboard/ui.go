@@ -1186,6 +1186,21 @@ function statusBarFromCodes(byCode) {
   const leg = keys.map(k => '<span><i class="sw" style="background:' + STC[k] + '"></i>' + k + ' ' + fmt(buckets[k]) + '</span>').join('');
   return '<div class="statusbar">' + bar + '</div><div class="legend">' + leg + '</div>';
 }
+// normalizeImageRef cleans what people actually paste into an image field.
+// Copying a line out of a README or shell history brings the command with it
+// ("docker pull ghcr.io/org/app:tag"), and Docker then rejects the whole string
+// as an invalid reference with a message that does not mention the real cause.
+// Stripping is friendlier than refusing, and unambiguous: a leading verb like
+// this can never be part of a valid image reference.
+function normalizeImageRef(v) {
+  let s = String(v == null ? '' : v).trim();
+  s = s.replace(/^(sudo\s+)?docker\s+(pull|run|image\s+pull)\s+/i, '');
+  s = s.replace(/^(sudo\s+)?podman\s+(pull|run)\s+/i, '');
+  // Shell copy-paste sometimes brings quotes or a trailing backslash.
+  s = s.replace(/^["']|["']$/g, '').replace(/\\$/, '');
+  return s.trim();
+}
+
 /* ---------- Env edits for Replace / Stage ---------- */
 // Env is MERGED onto what the service is running, not swapped for it, so the
 // only thing needing a decision is a key whose value disagrees. Two sources of
@@ -3157,6 +3172,12 @@ function wireDialogForms() {
     } catch (e) { toast(e.message, 'err'); }
   };
 
+  // Reflect the cleaned value back into the field on blur, so a pasted
+  // "docker pull ..." visibly becomes the reference that will be sent rather
+  // than being silently rewritten at submit time.
+  const replImage = $('#form-replace-service') && $('#form-replace-service').image;
+  if (replImage) replImage.onblur = () => { replImage.value = normalizeImageRef(replImage.value); };
+
   $('#form-replace-service').onsubmit = async (e) => {
     e.preventDefault();
     const f = e.target;
@@ -3199,7 +3220,7 @@ function wireDialogForms() {
       await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/' + mode, {
         method: 'POST',
         body: JSON.stringify({
-          image: f.image.value,
+          image: normalizeImageRef(f.image.value),
           env: Object.keys(env).length ? env : null,
           env_ack: choices.ack.length ? choices.ack : undefined,
         }),
