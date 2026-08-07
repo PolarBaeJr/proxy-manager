@@ -64,6 +64,11 @@ services:
     environment:
       # generate: openssl rand -hex 32 — must match the auth service's secret
       PMGR_AUTH_SECRET: ${PMGR_AUTH_SECRET:-}
+      # generate separately: openssl rand -hex 32 — must match the dashboard's.
+      # Signs the "who did the proxy authenticate" assertion forwarded to
+      # backends. Deliberately NOT the same secret: a backend that can verify
+      # attributions must not thereby be able to forge sessions or OAuth tokens.
+      PMGR_ACTOR_SECRET: ${PMGR_ACTOR_SECRET:-}
     # = form so empty env expansions don't swallow the next flag. Auth gating
     # stays OFF until AUTH_DOMAINS is set (e.g. polardev.org,the-aquarium.com);
     # all other proxy flags keep their built-in defaults.
@@ -114,6 +119,10 @@ services:
       PROXY_URL:            http://proxy:8094       # for the Access tab (proxy /access)
       MAINT_DIR:            /etc/maint.d            # nginx maintenance flag files
       MAINT_PAGE_DIR:       /var/www/maint-pages    # per-host custom 503 pages
+      # Verifies the proxy's attribution assertion so an action taken through
+      # another backend (the MCP server) is audited against the person who
+      # asked, not the shared API token. AUDIT ONLY — never authorization.
+      PMGR_ACTOR_SECRET:    ${PMGR_ACTOR_SECRET:-}
 
   monitor:
     build:

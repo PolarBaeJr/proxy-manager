@@ -33,11 +33,19 @@ func audit(r *http.Request, user, action, target string) {
 	if auditF == nil {
 		return
 	}
+	// A call arriving from another backend on a person's behalf is recorded
+	// against that person, not the shared credential it authenticated with.
+	// Both fall back to the direct values when there is no valid assertion.
+	user = auditUser(r, user)
+	ip := clientIP(r)
+	if real := actorIP(r); real != "" {
+		ip = real
+	}
 	auditMu.Lock()
 	defer auditMu.Unlock()
 	fmt.Fprintf(auditF,
 		`{"ts":%q,"user":%q,"action":%q,"target":%q,"ip":%q}`+"\n",
 		time.Now().UTC().Format(time.RFC3339),
-		user, action, target, clientIP(r),
+		user, action, target, ip,
 	)
 }

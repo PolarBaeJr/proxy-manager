@@ -165,4 +165,3 @@ func registerLogRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore) {
 		})
 	}))
 }
-

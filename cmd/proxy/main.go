@@ -54,7 +54,21 @@ func main() {
 				log.Printf("auth: PMGR_AUTH_SECRET is not valid hex (%v) — protected hosts will fail closed", err)
 			}
 		}
-		router.auth = newAuthGate(secret, *authDomains, *authTrustedCIDRs, *authXFFTrustedCIDRs, *authVerifyTokenURL)
+		// Attribution secret: lets the proxy tell a backend WHO it authenticated so
+		// a service-to-service call can be audited against a person. Deliberately
+		// separate from PMGR_AUTH_SECRET — a backend holding this one can verify
+		// attributions but cannot forge SSO cookies or OAuth access tokens.
+		// Unset simply means no actor header is ever sent.
+		var actorSecret []byte
+		if envHex := strings.TrimSpace(os.Getenv("PMGR_ACTOR_SECRET")); envHex != "" {
+			b, err := hex.DecodeString(envHex)
+			if err != nil {
+				log.Printf("auth: PMGR_ACTOR_SECRET is not valid hex (%v) — attribution disabled", err)
+			} else {
+				actorSecret = b
+			}
+		}
+		router.auth = newAuthGate(secret, actorSecret, *authDomains, *authTrustedCIDRs, *authXFFTrustedCIDRs, *authVerifyTokenURL)
 		log.Printf("auth gate enabled for domain(s) %s", *authDomains)
 	}
 	refresh := func() {

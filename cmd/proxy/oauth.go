@@ -160,6 +160,7 @@ func (a *authGate) authorizeOAuth(w http.ResponseWriter, req *http.Request, grou
 	if strings.HasPrefix(authz, bearerPrefix+"pmt_") {
 		if user := a.verifyBearer(strings.TrimPrefix(authz, bearerPrefix)); user != "" {
 			if userAllowed(group, user) {
+				a.stampActor(req, user)
 				return true
 			}
 			httpx.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
@@ -168,6 +169,7 @@ func (a *authGate) authorizeOAuth(w http.ResponseWriter, req *http.Request, grou
 	} else if strings.HasPrefix(authz, bearerPrefix+sso.AccessTokenPrefix) {
 		if user, ok := a.verifyOAuthBearer(strings.TrimPrefix(authz, bearerPrefix), reqHost, group.PathPrefix); ok {
 			if userAllowed(group, user) {
+				a.stampActor(req, user)
 				return true
 			}
 			httpx.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})

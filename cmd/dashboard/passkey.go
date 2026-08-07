@@ -26,11 +26,11 @@ import (
 
 // StoredCredential is the persisted shape of one passkey for a user.
 type StoredCredential struct {
-	ID         []byte   `json:"id"`              // raw credential ID
-	PublicKey  []byte   `json:"public_key"`      // COSE-encoded public key
+	ID         []byte   `json:"id"`         // raw credential ID
+	PublicKey  []byte   `json:"public_key"` // COSE-encoded public key
 	AAGUID     []byte   `json:"aaguid,omitempty"`
 	SignCount  uint32   `json:"sign_count"`
-	Label      string   `json:"label"`           // user-supplied nickname
+	Label      string   `json:"label"` // user-supplied nickname
 	Transports []string `json:"transports,omitempty"`
 	CreatedAt  int64    `json:"created_at"`
 	LastUsedAt int64    `json:"last_used_at,omitempty"`
@@ -62,8 +62,9 @@ const ceremonyTTL = 5 * time.Minute
 
 // newPasskeyManager builds the WebAuthn config from env vars, falling back to
 // localhost defaults so the dashboard works out of the box over an SSH tunnel.
-//   PASSKEY_RP_ID      = "dashboard.example.com"  (no scheme/port)
-//   PASSKEY_RP_ORIGINS = "https://dashboard.example.com,http://localhost:8093"
+//
+//	PASSKEY_RP_ID      = "dashboard.example.com"  (no scheme/port)
+//	PASSKEY_RP_ORIGINS = "https://dashboard.example.com,http://localhost:8093"
 func newPasskeyManager(rpID, rpOrigins string) (*passkeyManager, error) {
 	if rpID == "" {
 		rpID = "localhost"
@@ -486,4 +487,3 @@ func registerPasskeyRoutes(mux *http.ServeMux, auth *AuthStore, pm *passkeyManag
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	}))
 }
-

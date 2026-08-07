@@ -40,6 +40,10 @@ func main() {
 		log.Printf("⚠ audit log unavailable: %v", err)
 	}
 
+	for _, m := range initActorSecret(os.Getenv) {
+		log.Printf("%s", m)
+	}
+
 	dc := newDockerClient()
 
 	cf, cfMsgs := newCloudflareRegistryFromEnv(os.Getenv)

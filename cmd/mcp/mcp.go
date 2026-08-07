@@ -13,6 +13,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -67,7 +68,10 @@ type Tool struct {
 	// call one even by guessing its name.
 	Mutating bool `json:"-"`
 
-	Handler func(args map[string]any) (string, error) `json:"-"`
+	// ctx carries the caller's attribution assertion; handlers pass it to the
+	// dashboard client so an action is audited against the person who asked,
+	// not against the shared service token.
+	Handler func(ctx context.Context, args map[string]any) (string, error) `json:"-"`
 }
 
 // Server is the tool registry plus the HTTP entry point.
@@ -103,6 +107,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The proxy strips any client-supplied value and sets this only after it
+	// has authenticated someone, so whatever arrives here came from the proxy.
+	// It is still only ever an audit label — nothing is authorized on it.
+	r = r.WithContext(withActor(r.Context(), r.Header.Get(actorHeader)))
+
 	var req rpcRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeRPC(w, rpcResponse{JSONRPC: "2.0", Error: &rpcError{errParse, "parse error: " + err.Error()}})
@@ -120,7 +129,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, rerr := s.dispatch(req)
+	result, rerr := s.dispatch(r.Context(), req)
 	if rerr != nil {
 		writeRPC(w, rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: rerr})
 		return
@@ -128,7 +137,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeRPC(w, rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result})
 }
 
-func (s *Server) dispatch(req rpcRequest) (any, *rpcError) {
+func (s *Server) dispatch(ctx context.Context, req rpcRequest) (any, *rpcError) {
 	switch req.Method {
 	case "initialize":
 		return map[string]any{
@@ -157,7 +166,7 @@ func (s *Server) dispatch(req rpcRequest) (any, *rpcError) {
 			// unknown name is an unknown name whether or not writes are off.
 			return nil, &rpcError{errMethodNotFound, "unknown tool: " + p.Name}
 		}
-		out, err := t.Handler(p.Arguments)
+		out, err := t.Handler(ctx, p.Arguments)
 		if err != nil {
 			// A tool failure is a RESULT with isError, not a protocol error:
 			// the model needs to see what went wrong so it can adapt.
@@ -235,4 +244,23 @@ func schema(props map[string]any, required ...string) map[string]any {
 
 func prop(typ, desc string) map[string]any {
 	return map[string]any{"type": typ, "description": desc}
+}
+
+// actorHeader is set by the proxy and carries a signed assertion naming the
+// authenticated caller. This server neither verifies nor interprets it — it is
+// opaque here and forwarded verbatim to the dashboard, which holds the secret.
+const actorHeader = "X-Pmgr-Actor"
+
+type actorKey struct{}
+
+func withActor(ctx context.Context, assertion string) context.Context {
+	if assertion == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, actorKey{}, assertion)
+}
+
+func actorFrom(ctx context.Context) string {
+	v, _ := ctx.Value(actorKey{}).(string)
+	return v
 }
