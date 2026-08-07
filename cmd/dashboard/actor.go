@@ -58,6 +58,15 @@ func initActorSecret(getenv func(string) string) []string {
 // The fallback must never fail the request: an expired or malformed assertion
 // degrades attribution, it does not break a deploy.
 func auditUser(req *http.Request, fallback string) string {
+	// Internal actors audit without a request — the auto-updater calls
+	// audit(nil, ...) on both its success and failure paths. clientIP already
+	// guards this case; these two did not, so enabling actor attribution turned
+	// every auto-update into a nil dereference that killed the dashboard
+	// process. The updater then never got past "replacing", and no container
+	// was ever updated again.
+	if req == nil {
+		return fallback
+	}
 	if len(actorSecret) == 0 {
 		return fallback
 	}
@@ -81,6 +90,10 @@ func auditUser(req *http.Request, fallback string) string {
 // the request's own. Without it an audited MCP action shows the MCP
 // container's IP, which is misleading in a different way than a wrong name.
 func actorIP(req *http.Request) string {
+	// Same nil-request case as auditUser above.
+	if req == nil {
+		return ""
+	}
 	if len(actorSecret) == 0 {
 		return ""
 	}
