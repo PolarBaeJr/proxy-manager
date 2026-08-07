@@ -33,6 +33,13 @@ func audit(r *http.Request, user, action, target string) {
 	if auditF == nil {
 		return
 	}
+	// Handlers pass sessionUser(sessionFrom(req)), which is empty whenever the
+	// request was authenticated by an API token rather than a cookie. Fall back
+	// to the principal the auth wrapper resolved so token-driven actions are
+	// attributed instead of being logged with no user at all.
+	if user == "" {
+		user = principalFrom(r)
+	}
 	// A call arriving from another backend on a person's behalf is recorded
 	// against that person, not the shared credential it authenticated with.
 	// Both fall back to the direct values when there is no valid assertion.
