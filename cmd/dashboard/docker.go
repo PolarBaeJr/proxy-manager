@@ -31,7 +31,7 @@ const (
 	labelName       = "proxy.name"
 	labelWeight     = "proxy.weight"
 	labelService    = "proxy.service"
-	labelUnscalable = "proxy.unscalable" // when "true", dashboard greys out +/- buttons
+	labelUnscalable = "proxy.unscalable"     // when "true", dashboard greys out +/- buttons
 	labelPrevImage  = "proxy.previous_image" // set on Replace; enables one-click Rollback
 	labelCanary     = "proxy.canary"         // "true" → staged replicas, served alongside live
 	labelAutoUpdate = "proxy.autoupdate"     // "true" → engine replaces on newer registry digest
@@ -178,7 +178,9 @@ func (c *dockerClient) createContainer(ctx context.Context, name string, body cr
 		return "", err
 	}
 	defer resp.Close()
-	var out struct{ ID string `json:"Id"` }
+	var out struct {
+		ID string `json:"Id"`
+	}
 	return out.ID, json.NewDecoder(resp).Decode(&out)
 }
 
@@ -298,21 +300,21 @@ type Service struct {
 	AutoUpdate      bool              `json:"auto_update,omitempty"`      // opted in to unattended updates
 	CanaryImage     string            `json:"canary_image,omitempty"`     // non-empty when a stage is in progress
 	CanaryReplicas  int               `json:"canary_replicas,omitempty"`
-	Onboarded       bool              `json:"onboarded,omitempty"`        // adopted from an unlabelled container
+	Onboarded       bool              `json:"onboarded,omitempty"` // adopted from an unlabelled container
 	Members         []dockerContainer `json:"-"`
 	Labels          map[string]string `json:"labels,omitempty"`
-	MemberSummaries []ServiceMember   `json:"member_summaries"`           // per-replica name/state for UI
-	AllStopped      bool              `json:"all_stopped,omitempty"`      // true if every non-canary member is stopped
+	MemberSummaries []ServiceMember   `json:"member_summaries"`      // per-replica name/state for UI
+	AllStopped      bool              `json:"all_stopped,omitempty"` // true if every non-canary member is stopped
 }
 
 // ServiceMember is one container's surface for the UI — name (DNS-routable),
 // state ("running", "exited", "created", "paused"…), and whether it's the
 // canary or a normal replica.
 type ServiceMember struct {
-	Name    string `json:"name"`
-	ID      string `json:"id"`
-	State   string `json:"state"`
-	IsCanary bool  `json:"is_canary,omitempty"`
+	Name     string `json:"name"`
+	ID       string `json:"id"`
+	State    string `json:"state"`
+	IsCanary bool   `json:"is_canary,omitempty"`
 }
 
 func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {

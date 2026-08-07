@@ -11,6 +11,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,7 +38,7 @@ func newDashClient(base, token string) *dashClient {
 	}
 }
 
-func (c *dashClient) do(method, path string, body any) ([]byte, error) {
+func (c *dashClient) do(ctx context.Context, method, path string, body any) ([]byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -46,12 +47,17 @@ func (c *dashClient) do(method, path string, body any) ([]byte, error) {
 		}
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.base+path, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rdr)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
+	// Attribution only. The token above is what authorizes the call; this just
+	// tells the dashboard which person to name in the audit record.
+	if a := actorFrom(ctx); a != "" {
+		req.Header.Set(actorHeader, a)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -91,8 +97,8 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 		Title:       "List services",
 		Description: "List every service the proxy manages: image, replica count, running count, host, whether an image update is available, and canary state.",
 		InputSchema: schema(map[string]any{}),
-		Handler: func(map[string]any) (string, error) {
-			b, err := c.do("GET", "/api/services", nil)
+		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
+			b, err := c.do(ctx, "GET", "/api/services", nil)
 			if err != nil {
 				return "", err
 			}
@@ -105,8 +111,8 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 		Title:       "List routes",
 		Description: "List the host/path routes the proxy currently serves and their backends. Includes both container-label routes and static ones.",
 		InputSchema: schema(map[string]any{}),
-		Handler: func(map[string]any) (string, error) {
-			b, err := c.do("GET", "/api/routes", nil)
+		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
+			b, err := c.do(ctx, "GET", "/api/routes", nil)
 			if err != nil {
 				return "", err
 			}
@@ -122,7 +128,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			"container": prop("string", "Exact container name."),
 			"tail":      prop("number", "How many trailing lines to return (default 200, max 2000)."),
 		}, "container"),
-		Handler: func(args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "container")
 			if err != nil {
 				return "", err
@@ -139,7 +145,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if tail > 2000 {
 				tail = 2000
 			}
-			b, err := c.do("GET", "/api/logs/"+url.PathEscape(name)+"?tail="+fmt.Sprint(tail), nil)
+			b, err := c.do(ctx, "GET", "/api/logs/"+url.PathEscape(name)+"?tail="+fmt.Sprint(tail), nil)
 			if err != nil {
 				return "", err
 			}
@@ -152,8 +158,8 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 		Title:       "Maintenance status",
 		Description: "Show which hosts are currently serving the maintenance page, and which have their own custom page.",
 		InputSchema: schema(map[string]any{}),
-		Handler: func(map[string]any) (string, error) {
-			b, err := c.do("GET", "/api/maintenance", nil)
+		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
+			b, err := c.do(ctx, "GET", "/api/maintenance", nil)
 			if err != nil {
 				return "", err
 			}
@@ -168,7 +174,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 		InputSchema: schema(map[string]any{
 			"zone": prop("string", "Zone domain, e.g. polardev.org. Omit for the default."),
 		}),
-		Handler: func(args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			zone := ""
 			if _, ok := args["zone"]; ok {
 				var err error
@@ -176,7 +182,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 					return "", err
 				}
 			}
-			b, err := c.do("GET", "/api/cf/records?zone="+url.QueryEscape(zone), nil)
+			b, err := c.do(ctx, "GET", "/api/cf/records?zone="+url.QueryEscape(zone), nil)
 			if err != nil {
 				return "", err
 			}
@@ -199,7 +205,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			"host":    prop("string", "Hostname, e.g. sfubadminton.com."),
 			"enabled": prop("boolean", "true to turn maintenance on, false to turn it off."),
 		}, "host", "enabled"),
-		Handler: func(args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			host, err := argString(args, "host")
 			if err != nil {
 				return "", err
@@ -212,7 +218,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if on {
 				method = "POST"
 			}
-			b, err := c.do(method, "/api/maintenance/"+url.PathEscape(host), nil)
+			b, err := c.do(ctx, method, "/api/maintenance/"+url.PathEscape(host), nil)
 			if err != nil {
 				return "", err
 			}
@@ -229,7 +235,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			"service":  prop("string", "Service name from list_services."),
 			"replicas": prop("number", "Desired replica count (>= 0)."),
 		}, "service", "replicas"),
-		Handler: func(args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
@@ -241,7 +247,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if n < 0 {
 				return "", fmt.Errorf("replicas must not be negative")
 			}
-			b, err := c.do("POST", "/api/services/"+url.PathEscape(name)+"/scale", map[string]any{"replicas": n})
+			b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/scale", map[string]any{"replicas": n})
 			if err != nil {
 				return "", err
 			}
@@ -258,7 +264,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			"service": prop("string", "Service name from list_services."),
 			"action":  map[string]any{"type": "string", "enum": []string{"start", "stop"}, "description": "start or stop"},
 		}, "service", "action"),
-		Handler: func(args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
@@ -270,7 +276,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if action != "start" && action != "stop" {
 				return "", fmt.Errorf("action must be \"start\" or \"stop\", got %q", action)
 			}
-			b, err := c.do("POST", "/api/services/"+url.PathEscape(name)+"/"+action, nil)
+			b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/"+action, nil)
 			if err != nil {
 				return "", err
 			}
@@ -287,7 +293,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			"service": prop("string", "Service name from list_services."),
 			"enabled": prop("boolean", "true to enable unattended updates."),
 		}, "service", "enabled"),
-		Handler: func(args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
@@ -296,7 +302,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
-			b, err := c.do("POST", "/api/services/"+url.PathEscape(name)+"/autoupdate", map[string]any{"enabled": on})
+			b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/autoupdate", map[string]any{"enabled": on})
 			if err != nil {
 				return "", err
 			}
@@ -313,7 +319,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			"service": prop("string", "Service name from list_services."),
 			"image":   prop("string", "Full image reference including tag."),
 		}, "service", "image"),
-		Handler: func(args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
@@ -322,7 +328,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
-			b, err := c.do("POST", "/api/services/"+url.PathEscape(name)+"/stage", map[string]any{"image": image})
+			b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/stage", map[string]any{"image": image})
 			if err != nil {
 				return "", err
 			}
@@ -339,7 +345,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			"service": prop("string", "Service name from list_services."),
 			"action":  map[string]any{"type": "string", "enum": []string{"promote", "discard"}, "description": "promote or discard"},
 		}, "service", "action"),
-		Handler: func(args map[string]any) (string, error) {
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
@@ -350,13 +356,13 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			}
 			switch action {
 			case "promote":
-				b, err := c.do("POST", "/api/services/"+url.PathEscape(name)+"/promote", nil)
+				b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/promote", nil)
 				if err != nil {
 					return "", err
 				}
 				return pretty(b), nil
 			case "discard":
-				b, err := c.do("DELETE", "/api/services/"+url.PathEscape(name)+"/canary", nil)
+				b, err := c.do(ctx, "DELETE", "/api/services/"+url.PathEscape(name)+"/canary", nil)
 				if err != nil {
 					return "", err
 				}

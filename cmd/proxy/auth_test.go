@@ -120,7 +120,7 @@ func TestAuthorize(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gate := newAuthGate(authTestSecret, "", c.trustedCSV, "", verifySrv.URL)
+			gate := newAuthGate(authTestSecret, nil, "", c.trustedCSV, "", verifySrv.URL)
 			group := &RouteGroup{Host: authTestHost, AuthRequired: true, AuthMode: c.mode, AuthUsers: c.authUsers}
 
 			req := httptest.NewRequest(http.MethodGet, "http://"+authTestHost+"/", nil)

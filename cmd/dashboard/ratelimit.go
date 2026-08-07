@@ -20,7 +20,7 @@ const (
 )
 
 type bucket struct {
-	tokens    int
+	tokens     int
 	lastRefill time.Time
 	lastSeen   time.Time
 }

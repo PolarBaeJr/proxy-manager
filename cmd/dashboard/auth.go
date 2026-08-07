@@ -58,9 +58,9 @@ type User struct {
 // creation time and never stored — we only keep its SHA-256 hash.
 // Token format: pmt_<base64url-of-32-random-bytes>
 type APIToken struct {
-	ID         string `json:"id"`         // short hex prefix for display + delete lookup
-	Label      string `json:"label"`      // user-supplied description
-	Hash       string `json:"hash"`       // hex-encoded sha256(rawToken)
+	ID         string `json:"id"`    // short hex prefix for display + delete lookup
+	Label      string `json:"label"` // user-supplied description
+	Hash       string `json:"hash"`  // hex-encoded sha256(rawToken)
 	CreatedAt  int64  `json:"created_at"`
 	LastUsedAt int64  `json:"last_used_at,omitempty"`
 }

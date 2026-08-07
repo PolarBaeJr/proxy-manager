@@ -34,12 +34,17 @@ type bearerEntry struct {
 }
 
 type authGate struct {
-	secret     []byte       // shared HMAC secret; nil = fail closed on protected hosts
-	domains    []string     // parent domains that have an auth.<domain> login host
-	trusted    []*net.IPNet // client IPs that bypass auth entirely (LAN)
-	xffTrusted []*net.IPNet // peers whose X-Forwarded-For we believe (edge, loopback)
-	verifyURL  string       // dashboard endpoint for bearer-token verification
-	client     *http.Client
+	secret []byte // shared HMAC secret; nil = fail closed on protected hosts
+	// actorSecret signs the attribution assertion forwarded to backends. Kept
+	// separate from `secret` on purpose: a backend that can verify assertions
+	// must not thereby be able to forge SSO cookies or OAuth access tokens.
+	// Empty = attribution disabled, requests are proxied with no actor header.
+	actorSecret []byte
+	domains     []string     // parent domains that have an auth.<domain> login host
+	trusted     []*net.IPNet // client IPs that bypass auth entirely (LAN)
+	xffTrusted  []*net.IPNet // peers whose X-Forwarded-For we believe (edge, loopback)
+	verifyURL   string       // dashboard endpoint for bearer-token verification
+	client      *http.Client
 
 	warnNoSecret sync.Once
 	warnAuthHost sync.Once
@@ -48,7 +53,7 @@ type authGate struct {
 	bearers map[[32]byte]bearerEntry
 }
 
-func newAuthGate(secret []byte, domainsCSV, trustedCSV, xffTrustedCSV, verifyURL string) *authGate {
+func newAuthGate(secret, actorSecret []byte, domainsCSV, trustedCSV, xffTrustedCSV, verifyURL string) *authGate {
 	var domains []string
 	for _, d := range strings.Split(domainsCSV, ",") {
 		if d = strings.ToLower(strings.TrimSpace(d)); d != "" {
@@ -56,13 +61,14 @@ func newAuthGate(secret []byte, domainsCSV, trustedCSV, xffTrustedCSV, verifyURL
 		}
 	}
 	return &authGate{
-		secret:     secret,
-		domains:    domains,
-		trusted:    parseCIDRList(trustedCSV),
-		xffTrusted: parseCIDRList(xffTrustedCSV),
-		verifyURL:  verifyURL,
-		client:     &http.Client{Timeout: 2 * time.Second},
-		bearers:    map[[32]byte]bearerEntry{},
+		secret:      secret,
+		actorSecret: actorSecret,
+		domains:     domains,
+		trusted:     parseCIDRList(trustedCSV),
+		xffTrusted:  parseCIDRList(xffTrustedCSV),
+		verifyURL:   verifyURL,
+		client:      &http.Client{Timeout: 2 * time.Second},
+		bearers:     map[[32]byte]bearerEntry{},
 	}
 }
 
@@ -117,6 +123,33 @@ func realClientIP(r *http.Request, xffTrusted []*net.IPNet) net.IP {
 	return peer
 }
 
+// ActorHeader carries the signed attribution assertion to backends. The proxy
+// strips any inbound value from every request (see Router.ServeHTTP) and sets
+// it only after establishing who the caller is.
+const ActorHeader = "X-Pmgr-Actor"
+
+// actorTTL only has to cover client -> proxy -> backend -> backend, all of
+// which happen while the request is in flight.
+const actorTTL = 2 * time.Minute
+
+// stampActor attaches the assertion. A no-op when attribution is unconfigured
+// or the user is unknown (the LAN bypass authorizes without identifying
+// anyone) — an absent header is honest, a placeholder one is not.
+func (a *authGate) stampActor(req *http.Request, user string) {
+	if a == nil || len(a.actorSecret) == 0 || user == "" {
+		return
+	}
+	ip := ""
+	if v := realClientIP(req, a.xffTrusted); v != nil {
+		ip = v.String()
+	}
+	req.Header.Set(ActorHeader, sso.SignActor(sso.ActorClaims{
+		Username: user,
+		IP:       ip,
+		Exp:      time.Now().Add(actorTTL).Unix(),
+	}, a.actorSecret))
+}
+
 // authorize enforces auth for a protected group. Returns true to let the
 // request through; on false the response has already been written.
 func (a *authGate) authorize(w http.ResponseWriter, req *http.Request, group *RouteGroup) bool {
@@ -155,6 +188,7 @@ func (a *authGate) authorize(w http.ResponseWriter, req *http.Request, group *Ro
 	if c, err := req.Cookie(sso.CookieName); err == nil {
 		if user, ok := sso.Verify(c.Value, a.secret); ok {
 			if userAllowed(group, user) {
+				a.stampActor(req, user)
 				return true
 			}
 			// Valid session, wrong user: 403, not a login redirect — the
@@ -167,6 +201,7 @@ func (a *authGate) authorize(w http.ResponseWriter, req *http.Request, group *Ro
 	if authz := req.Header.Get("Authorization"); strings.HasPrefix(authz, bearerPrefix+"pmt_") {
 		if user := a.verifyBearer(strings.TrimPrefix(authz, bearerPrefix)); user != "" {
 			if userAllowed(group, user) {
+				a.stampActor(req, user)
 				return true
 			}
 			httpx.WriteJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})

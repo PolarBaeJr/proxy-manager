@@ -21,6 +21,7 @@ const (
 	AuthCodePrefix     = "pmgc_"
 	AccessTokenPrefix  = "pmga_"
 	RefreshTokenPrefix = "pmgf_"
+	ActorPrefix        = "pmgact_"
 )
 
 // Per-type HMAC tags (never on the wire, only mixed into the MAC).
@@ -29,6 +30,7 @@ const (
 	tagCode    = "pmgr-oauth-code-v1"
 	tagAccess  = "pmgr-oauth-at-v1"
 	tagRefresh = "pmgr-oauth-rt-v1"
+	tagActor   = "pmgr-actor-v1"
 )
 
 func blobMAC(tag string, payload, secret []byte) []byte {
@@ -161,6 +163,42 @@ func VerifyRefresh(raw string, secret []byte) (RefreshClaims, bool) {
 	var c RefreshClaims
 	if !ok || json.Unmarshal(payload, &c) != nil || expired(c.Exp) {
 		return RefreshClaims{}, false
+	}
+	return c, true
+}
+
+// ---- Actor assertion ----
+
+// ActorClaims says WHO the proxy authenticated, so a backend calling another
+// backend on their behalf can attribute the action to a person rather than to
+// the shared service credential it authenticates with.
+//
+// This is an ATTRIBUTION token, never an authorization one. Nothing may grant
+// access on the strength of it: whoever holds the service credential could
+// otherwise mint an assertion naming any user and act as them, turning a
+// missing audit label into privilege escalation.
+//
+// Signed with its own secret rather than the SSO/OAuth one, so a backend that
+// can verify assertions still cannot forge sessions or access tokens.
+type ActorClaims struct {
+	Username string `json:"u"`
+	// IP is the real client address the proxy saw. Without it an audit record
+	// would show the calling service's container IP, which is misleading in a
+	// different way than a wrong username.
+	IP  string `json:"ip,omitempty"`
+	Exp int64  `json:"exp"`
+}
+
+func SignActor(c ActorClaims, secret []byte) string {
+	payload, _ := json.Marshal(c)
+	return signBlob(ActorPrefix, tagActor, payload, secret)
+}
+
+func VerifyActor(raw string, secret []byte) (ActorClaims, bool) {
+	payload, ok := verifyBlob(raw, ActorPrefix, tagActor, secret)
+	var c ActorClaims
+	if !ok || json.Unmarshal(payload, &c) != nil || expired(c.Exp) {
+		return ActorClaims{}, false
 	}
 	return c, true
 }

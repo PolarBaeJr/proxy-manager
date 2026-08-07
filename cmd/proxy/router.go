@@ -168,6 +168,13 @@ func rlKey(req *http.Request, xffTrusted []*net.IPNet) string {
 const maxRetries = 3
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Strip any client-supplied attribution header before ANY routing or auth
+	// decision, on every request — gated, ungated, matched or not. The
+	// signature stops a forged assertion being believed; this is what stops a
+	// backend ever seeing an attacker-controlled value in the header at all.
+	// Only the proxy may set it, and only after it knows who is calling.
+	req.Header.Del(ActorHeader)
+
 	r.mu.RLock()
 	groups := r.groups
 	r.mu.RUnlock()
