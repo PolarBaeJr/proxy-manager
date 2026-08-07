@@ -305,6 +305,11 @@ type Service struct {
 	Labels          map[string]string `json:"labels,omitempty"`
 	MemberSummaries []ServiceMember   `json:"member_summaries"`      // per-replica name/state for UI
 	AllStopped      bool              `json:"all_stopped,omitempty"` // true if every non-canary member is stopped
+	// Backends are the upstream URLs the proxy picks for this service, in the
+	// same "http://ip:port" form it records in the access log. Several
+	// services can share one host (badminton.polardev.org fans out to four),
+	// so host alone cannot attribute a request — the UI matches on these.
+	Backends []string `json:"backends,omitempty"`
 }
 
 // ServiceMember is one container's surface for the UI — name (DNS-routable),
@@ -379,6 +384,7 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 		}
 		sort.Slice(s.MemberSummaries, func(i, j int) bool { return s.MemberSummaries[i].Name < s.MemberSummaries[j].Name })
 		s.AllStopped = allStopped
+		s.Backends = serviceBackends(s)
 		out = append(out, *s)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -928,4 +934,37 @@ func (c *dockerClient) listRoutes(ctx context.Context, configPath string) ([]Rou
 		return out[i].Path < out[j].Path
 	})
 	return out, nil
+}
+
+// serviceBackends reconstructs the upstream URLs the proxy would route to for
+// a service: one per running non-canary replica, formatted exactly as
+// cmd/proxy builds them ("http://%s:%d", ip, port).
+//
+// Canary replicas are included — they serve live traffic alongside the primary
+// while staged, so their requests belong to this service too.
+//
+// Stopped members contribute nothing: they hold no IP and serve no traffic.
+func serviceBackends(s *Service) []string {
+	if s.Port == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range s.Members {
+		if m.State != "running" {
+			continue
+		}
+		for _, n := range m.NetworkSettings.Networks {
+			if n.IPAddress == "" {
+				continue
+			}
+			u := fmt.Sprintf("http://%s:%d", n.IPAddress, s.Port)
+			if !seen[u] {
+				seen[u] = true
+				out = append(out, u)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }

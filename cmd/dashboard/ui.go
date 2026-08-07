@@ -1186,6 +1186,21 @@ function statusBarFromCodes(byCode) {
   const leg = keys.map(k => '<span><i class="sw" style="background:' + STC[k] + '"></i>' + k + ' ' + fmt(buckets[k]) + '</span>').join('');
   return '<div class="statusbar">' + bar + '</div><div class="legend">' + leg + '</div>';
 }
+// normalizeImageRef cleans what people actually paste into an image field.
+// Copying a line out of a README or shell history brings the command with it
+// ("docker pull ghcr.io/org/app:tag"), and Docker then rejects the whole string
+// as an invalid reference with a message that does not mention the real cause.
+// Stripping is friendlier than refusing, and unambiguous: a leading verb like
+// this can never be part of a valid image reference.
+function normalizeImageRef(v) {
+  let s = String(v == null ? '' : v).trim();
+  s = s.replace(/^(sudo\s+)?docker\s+(pull|run|image\s+pull)\s+/i, '');
+  s = s.replace(/^(sudo\s+)?podman\s+(pull|run)\s+/i, '');
+  // Shell copy-paste sometimes brings quotes or a trailing backslash.
+  s = s.replace(/^["']|["']$/g, '').replace(/\\$/, '');
+  return s.trim();
+}
+
 /* ---------- Env edits for Replace / Stage ---------- */
 // Env is MERGED onto what the service is running, not swapped for it, so the
 // only thing needing a decision is a key whose value disagrees. Two sources of
@@ -1519,7 +1534,7 @@ async function renderServices() {
          +    facts
          +    memberList
          +    '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
-         +    (managed ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
+         +    (managed ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-backends="' + esc((s.backends || []).join(' ')) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
          +  '</div>'
          +  '</div>';
   }
@@ -1543,15 +1558,37 @@ function paintServicePanelIfChanged(panel, html) {
   panel.innerHTML = html;
 }
 
+// recentForPanel narrows host-wide access entries to the ones this service
+// actually served, by matching the upstream the proxy picked.
+//
+// A host can fan out to several services (badminton.polardev.org routes to
+// four), so grouping by host alone put every neighbour's requests — including
+// static routes to entirely different backends — on every card.
+//
+// With no known backends (every replica stopped) nothing is claimed: showing
+// the host's traffic would be attributing other services' requests to one that
+// is serving none.
+function recentForPanel(panel, hostEntries) {
+  const raw = (panel.dataset.backends || '').trim();
+  if (!raw) return [];
+  const mine = new Set(raw.split(/\s+/));
+  const out = [];
+  for (const e of hostEntries) {
+    if (mine.has(e.backend)) out.push(e);
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
 async function fillServiceStatsPanels() {
   const panels = document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats');
   if (!panels.length) return;
   // Paint from cache first (no flicker on the tick that triggered this render).
   for (const panel of panels) {
     const host = panel.dataset.host;
-    if (_svcStatsCache.byHost[host] || (_svcStatsCache.recentByHost[host] || []).length) {
-      const html = renderServiceStatsPanel(_svcStatsCache.byHost[host], _svcStatsCache.recentByHost[host] || []);
-      paintServicePanelIfChanged(panel, html);
+    const recent = recentForPanel(panel, _svcStatsCache.recentByHost[host] || []);
+    if (_svcStatsCache.byHost[host] || recent.length) {
+      paintServicePanelIfChanged(panel, renderServiceStatsPanel(_svcStatsCache.byHost[host], recent, panel));
     }
   }
   // Then fetch fresh in the background and update the cache + panels.
@@ -1562,28 +1599,37 @@ async function fillServiceStatsPanels() {
     ]);
     const byHost = {};
     for (const h of (Array.isArray(hosts) ? hosts : [])) byHost[h.host] = h;
+    // Keep more per host than a single card shows: entries are filtered down
+    // to one service's backends afterwards, so a busy neighbour must not crowd
+    // this service's requests out of the window before filtering happens.
     const recentByHost = {};
     for (const e of (access.entries || [])) {
       if (!recentByHost[e.host]) recentByHost[e.host] = [];
-      if (recentByHost[e.host].length < 12) recentByHost[e.host].push(e);
+      if (recentByHost[e.host].length < 200) recentByHost[e.host].push(e);
     }
     _svcStatsCache = { byHost, recentByHost, fetchedAt: Date.now() };
     // Repaint only the panels that are still in the DOM and expanded AND
     // whose rendered HTML would actually differ from what they show now.
     document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats').forEach(panel => {
       const host = panel.dataset.host;
-      const html = renderServiceStatsPanel(byHost[host], recentByHost[host] || []);
-      paintServicePanelIfChanged(panel, html);
+      const recent = recentForPanel(panel, recentByHost[host] || []);
+      paintServicePanelIfChanged(panel, renderServiceStatsPanel(byHost[host], recent, panel));
     });
   } catch {}
 }
 
-function renderServiceStatsPanel(stats, recent) {
+function renderServiceStatsPanel(stats, recent, panel) {
   if ((!stats || !stats.total) && !recent.length) {
     return '<div class="subhead" style="margin-top:12px">' + I.activity + 'No traffic yet</div>'
          + '<div class="meta">No requests have hit this host since the proxy started. Hit it once and the stats will populate.</div>';
   }
-  let html = '<div class="subhead" style="margin-top:14px">' + I.activity + 'Live traffic</div>';
+  // The counters below come from per-HOST metrics, and a host can front
+  // several services. Say so rather than letting them read as this service's
+  // own numbers — the request table underneath IS service-specific.
+  const host = panel && panel.dataset ? panel.dataset.host : '';
+  let html = '<div class="subhead" style="margin-top:14px">' + I.activity + 'Live traffic'
+    + (host ? ' <span class="hint" style="display:inline;font-weight:400">— all traffic to ' + esc(host) + '</span>' : '')
+    + '</div>';
   if (stats) {
     const p95 = (stats.latency_ms && stats.latency_ms.p95 != null) ? stats.latency_ms.p95.toFixed(1) : '—';
     const tot = stats.total || 0;
@@ -1601,7 +1647,7 @@ function renderServiceStatsPanel(stats, recent) {
     if (Object.keys(by).length) html += statusBarFromCodes(by);
   }
   if (recent.length) {
-    html += '<div class="meta" style="margin:14px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:600">Recent requests</div>';
+    html += '<div class="meta" style="margin:14px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:600">Recent requests <span style="text-transform:none;letter-spacing:0;font-weight:400;opacity:.75">— this service only</span></div>';
     // Fixed-height scroll container so new rows don't push the rest of the
     // card down on every auto-refresh tick.
     html += '<div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm)">';
@@ -3157,6 +3203,12 @@ function wireDialogForms() {
     } catch (e) { toast(e.message, 'err'); }
   };
 
+  // Reflect the cleaned value back into the field on blur, so a pasted
+  // "docker pull ..." visibly becomes the reference that will be sent rather
+  // than being silently rewritten at submit time.
+  const replImage = $('#form-replace-service') && $('#form-replace-service').image;
+  if (replImage) replImage.onblur = () => { replImage.value = normalizeImageRef(replImage.value); };
+
   $('#form-replace-service').onsubmit = async (e) => {
     e.preventDefault();
     const f = e.target;
@@ -3199,7 +3251,7 @@ function wireDialogForms() {
       await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/' + mode, {
         method: 'POST',
         body: JSON.stringify({
-          image: f.image.value,
+          image: normalizeImageRef(f.image.value),
           env: Object.keys(env).length ? env : null,
           env_ack: choices.ack.length ? choices.ack : undefined,
         }),
