@@ -13,6 +13,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
@@ -549,19 +550,46 @@ func bearerToken(r *http.Request) string {
 	return strings.TrimPrefix(v, "Bearer ")
 }
 
+// principalKey carries the authenticated username from the auth wrappers to
+// the handlers.
+//
+// Needed because only ONE of the two mechanisms leaves a trace the handler can
+// read: a session cookie is re-parsed via sessionFrom, but a bearer token is
+// verified inside requireAuth and the username was then discarded. Handlers
+// audit with sessionUser(sessionFrom(req)), so every API-token-authenticated
+// action was recorded with an empty user.
+type principalKey struct{}
+
+func withPrincipal(r *http.Request, user string) *http.Request {
+	if user == "" {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), principalKey{}, user))
+}
+
+// principalFrom is the authenticated username, or "" when the request was not
+// authenticated by a mechanism that recorded one.
+func principalFrom(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	v, _ := r.Context().Value(principalKey{}).(string)
+	return v
+}
+
 func (s *AuthStore) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.IsSetup() {
 			http.Error(w, "auth not set up", http.StatusServiceUnavailable)
 			return
 		}
-		if _, ok := s.sessionFrom(r); ok {
-			next(w, r)
+		if info, ok := s.sessionFrom(r); ok {
+			next(w, withPrincipal(r, info.Username))
 			return
 		}
 		if tok := bearerToken(r); tok != "" {
 			if user := s.VerifyToken(tok); user != "" {
-				next(w, r)
+				next(w, withPrincipal(r, user))
 				return
 			}
 		}
@@ -578,7 +606,7 @@ func (s *AuthStore) requireElevated(next http.HandlerFunc) http.HandlerFunc {
 		// API tokens grant elevation (proof of possession of the token).
 		if tok := bearerToken(r); tok != "" {
 			if user := s.VerifyToken(tok); user != "" {
-				next(w, r)
+				next(w, withPrincipal(r, user))
 				return
 			}
 		}
@@ -591,7 +619,7 @@ func (s *AuthStore) requireElevated(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "2fa required", http.StatusForbidden)
 			return
 		}
-		next(w, r)
+		next(w, withPrincipal(r, info.Username))
 	}
 }
 
