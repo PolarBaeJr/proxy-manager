@@ -1,18 +1,61 @@
 {
   "routes": [
-    { "name": "auth (SSO login)", "host": "auth.polardev.org",
-      "backends": ["http://auth:8096"] },
-    { "name": "auth (SSO login)", "host": "auth.the-aquarium.com",
-      "backends": ["http://auth:8096"] },
-
-    { "name": "badminton (prod) /supabase", "host": "badminton.polardev.org", "path": "/supabase", "strip": true,
-      "backends": ["http://host.docker.internal:54321"] },
-    { "name": "badminton (staging) /supabase", "host": "test.polardev.org", "path": "/supabase", "strip": true,
-      "backends": ["http://host.docker.internal:64321"] },
-
-    { "name": "comp (broken backend)", "host": "comp.polardev.org",
-      "backends": ["http://host.docker.internal:833"] },
-    { "name": "worktracker (broken backend)", "host": "worktracker.polardev.org",
-      "backends": ["http://host.docker.internal:3003"] }
+    {
+      "name": "auth (SSO login)",
+      "host": "auth.polardev.org",
+      "backends": [
+        "http://auth:8096"
+      ]
+    },
+    {
+      "name": "auth (SSO login)",
+      "host": "auth.the-aquarium.com",
+      "backends": [
+        "http://auth:8096"
+      ]
+    },
+    {
+      "name": "badminton (prod) /supabase",
+      "host": "badminton.polardev.org",
+      "path": "/supabase",
+      "strip": true,
+      "backends": [
+        "http://host.docker.internal:54321"
+      ]
+    },
+    {
+      "name": "badminton (staging) /supabase",
+      "host": "test.polardev.org",
+      "path": "/supabase",
+      "strip": true,
+      "backends": [
+        "http://host.docker.internal:64321"
+      ]
+    },
+    {
+      "name": "comp (broken backend)",
+      "host": "comp.polardev.org",
+      "backends": [
+        "http://host.docker.internal:833"
+      ]
+    },
+    {
+      "name": "worktracker (broken backend)",
+      "host": "worktracker.polardev.org",
+      "backends": [
+        "http://host.docker.internal:3003"
+      ]
+    },
+    {
+      "name": "dashboard MCP (tools over MCP; oauth-gated)",
+      "host": "mcp.polardev.org",
+      "path": "/mcp/dashboard",
+      "strip": true,
+      "backends": [
+        "http://dashboard:8097"
+      ],
+      "auth": true,
+      "auth_mode": "oauth"
+    }
   ]
 }

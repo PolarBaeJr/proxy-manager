@@ -1,4 +1,10 @@
-// Minimal MCP server over Streamable HTTP.
+// Minimal MCP server over Streamable HTTP, served by the dashboard itself.
+//
+// Lives in the dashboard binary rather than a separate service so the tools can
+// go through the dashboard's own API handlers. A separate container would have
+// needed a long-lived API token on disk to call back in — a credential that
+// bypasses 2FA and grants everything the dashboard can do. Removing that is the
+// point: there is no token for anyone to manage or leak.
 //
 // Only the subset the spec requires of a tools-only server is implemented:
 // initialize, tools/list, tools/call, ping, and the initialized notification.
@@ -20,6 +26,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -246,11 +253,6 @@ func prop(typ, desc string) map[string]any {
 	return map[string]any{"type": typ, "description": desc}
 }
 
-// actorHeader is set by the proxy and carries a signed assertion naming the
-// authenticated caller. This server neither verifies nor interprets it — it is
-// opaque here and forwarded verbatim to the dashboard, which holds the secret.
-const actorHeader = "X-Pmgr-Actor"
-
 type actorKey struct{}
 
 func withActor(ctx context.Context, assertion string) context.Context {
@@ -263,4 +265,29 @@ func withActor(ctx context.Context, assertion string) context.Context {
 func actorFrom(ctx context.Context) string {
 	v, _ := ctx.Value(actorKey{}).(string)
 	return v
+}
+
+// serveMCP starts the MCP listener. Mounted at "/" because the proxy strips the
+// /mcp/dashboard prefix before forwarding; registering the prefix here too
+// would double it.
+func serveMCP(addr string, s *Server, allowWrites bool) {
+	mux := http.NewServeMux()
+	mux.Handle("/", s)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = srv.ListenAndServe() }()
+
+	mode := "read-only"
+	if allowWrites {
+		mode = "READ-WRITE (MCP_ALLOW_WRITES set)"
+	}
+	log.Printf("mcp on %s — %d tools, %s", addr, len(s.tools), mode)
+}
+
+func isTrue(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }

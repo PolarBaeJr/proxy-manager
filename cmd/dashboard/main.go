@@ -15,6 +15,7 @@ import (
 func main() {
 	addr := flag.String("addr", ":8093", "dashboard listen address")
 	metricsAddr := flag.String("metrics-addr", ":8094", "internal metrics endpoint listen address")
+	mcpAddr := flag.String("mcp-addr", ":8097", "MCP endpoint listen address (proxied at mcp.<domain>/mcp/dashboard)")
 	authFile := flag.String("auth", "/data/auth.json", "auth state file (created on first run)")
 	auditFile := flag.String("audit", "/data/audit.log", "audit log file path")
 	onboardedFile := flag.String("onboarded", "/data/onboarded.json", "onboarded-services state file")
@@ -153,6 +154,21 @@ func main() {
 	}
 
 	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages)
+
+	// MCP on its own port, proxied at mcp.<domain>/mcp/dashboard. Separate from
+	// :8093 because that one is loopback-only and serves the UI at "/", which
+	// the MCP transport also wants. Tools dispatch back through `mux` in-process
+	// so every API handler's guardrails and audit entries still apply.
+	//
+	// Does NO auth of its own: the proxy's oauth mode gates the path and binds
+	// the token to it. Never publish this port.
+	if err := mintInternalToken(); err != nil {
+		log.Fatalf("mcp: cannot mint internal credential: %v", err)
+	}
+	mcpSrv := NewServer("proxy-manager-dashboard", "1")
+	mcpWrites := isTrue(os.Getenv("MCP_ALLOW_WRITES"))
+	registerMCPTools(mcpSrv, &apiCaller{mux: mux}, mcpWrites)
+	serveMCP(*mcpAddr, mcpSrv, mcpWrites)
 
 	log.Printf("dashboard on %s", *addr)
 	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {
