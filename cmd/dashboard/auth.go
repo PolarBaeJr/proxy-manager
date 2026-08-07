@@ -67,6 +67,10 @@ type APIToken struct {
 
 const apiTokenPrefix = "pmt_"
 
+// internalUser is the principal for process-local calls. It only ever appears
+// in an audit record as the "via" half; the actor assertion supplies the human.
+const internalUser = "mcp"
+
 type AuthStore struct {
 	path    string
 	mu      sync.RWMutex
@@ -247,9 +251,37 @@ func (s *AuthStore) CreateToken(username, label string) (rawToken string, t APIT
 
 // VerifyToken hashes the raw token and looks for a matching APIToken across
 // all users. Returns the owning username if found, "" otherwise.
+// internalToken is a credential the process mints for itself at startup so
+// in-process callers (the MCP handler) can go through the real API handlers
+// instead of reimplementing them — keeping guardUnscalable, auto-onboard,
+// canary bookkeeping and the audit log in one place.
+//
+// Held in memory only: never written to disk, never logged, never shown in the
+// UI, and regenerated on every restart. There is nothing for an operator to
+// manage and nothing on disk to steal. The person behind the call is carried
+// separately by the actor assertion, so the audit log still names them.
+var internalToken string
+
+// mintInternalToken generates the process-local credential. Called once at
+// startup; a generation failure leaves it empty, which disables the in-process
+// path rather than falling back to something weaker.
+func mintInternalToken() error {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return err
+	}
+	internalToken = apiTokenPrefix + "internal_" + hex.EncodeToString(b)
+	return nil
+}
+
 func (s *AuthStore) VerifyToken(raw string) string {
 	if !strings.HasPrefix(raw, apiTokenPrefix) {
 		return ""
+	}
+	// Constant-time so a caller cannot probe for the internal credential by
+	// timing, same as the stored-token comparison below.
+	if internalToken != "" && subtle.ConstantTimeCompare([]byte(raw), []byte(internalToken)) == 1 {
+		return internalUser
 	}
 	h := sha256.Sum256([]byte(raw))
 	hashHex := hex.EncodeToString(h[:])

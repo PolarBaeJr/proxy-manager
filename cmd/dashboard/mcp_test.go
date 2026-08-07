@@ -22,21 +22,26 @@ func rpc(t *testing.T, s *Server, body string) (map[string]any, int) {
 	return out, rec.Code
 }
 
-// stubDash stands in for the dashboard API and records what was called, so a
-// tool that silently hits the wrong endpoint is caught.
-func stubDash(t *testing.T, status int, body string) (*dashClient, *[]string) {
+// stubDash stands in for the dashboard's API mux and records what was called,
+// so a tool that silently hits the wrong endpoint is caught. It also asserts
+// the in-process credential is presented — without it the real handlers would
+// 401 and every tool would fail.
+func stubDash(t *testing.T, status int, body string) (*apiCaller, *[]string) {
 	t.Helper()
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
 	var calls []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.Method+" "+r.URL.RequestURI())
-		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
-			t.Errorf("Authorization = %q, want the API token", got)
+		if got := r.Header.Get("Authorization"); got != "Bearer "+internalToken {
+			t.Errorf("Authorization = %q, want the internal credential", got)
 		}
 		w.WriteHeader(status)
 		w.Write([]byte(body))
-	}))
-	t.Cleanup(srv.Close)
-	return newDashClient(srv.URL, "test-token"), &calls
+	})
+	return &apiCaller{mux: h}, &calls
 }
 
 func toolNames(t *testing.T, s *Server) map[string]bool {
@@ -59,7 +64,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	c, _ := stubDash(t, 200, `{}`)
 
 	ro := NewServer("t", "v")
-	registerTools(ro, c, false)
+	registerMCPTools(ro, c, false)
 	names := toolNames(t, ro)
 	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "resolve_canary"} {
 		if names[w] {
@@ -73,7 +78,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	}
 
 	rw := NewServer("t", "v")
-	registerTools(rw, c, true)
+	registerMCPTools(rw, c, true)
 	rwNames := toolNames(t, rw)
 	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "resolve_canary"} {
 		if !rwNames[w] {
@@ -92,7 +97,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 func TestCallingGatedToolFails(t *testing.T) {
 	c, calls := stubDash(t, 200, `{}`)
 	s := NewServer("t", "v")
-	registerTools(s, c, false)
+	registerMCPTools(s, c, false)
 
 	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"set_maintenance","arguments":{"host":"x.example","enabled":true}}}`)
 	e, ok := res["error"].(map[string]any)
@@ -180,7 +185,7 @@ func TestGetIsRejected(t *testing.T) {
 func TestToolFailureIsResultNotProtocolError(t *testing.T) {
 	c, _ := stubDash(t, 404, `service not found`)
 	s := NewServer("t", "v")
-	registerTools(s, c, true)
+	registerMCPTools(s, c, true)
 
 	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_services","arguments":{}}}`)
 	if res["error"] != nil {
@@ -215,7 +220,7 @@ func TestToolsCallCorrectEndpoints(t *testing.T) {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
 			c, calls := stubDash(t, 200, `{"ok":true}`)
 			s := NewServer("t", "v")
-			registerTools(s, c, true)
+			registerMCPTools(s, c, true)
 			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":` + tc.args + `}}`
 			res, _ := rpc(t, s, body)
 			if res["error"] != nil {
@@ -247,7 +252,7 @@ func TestArgumentValidation(t *testing.T) {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
 			c, calls := stubDash(t, 200, `{}`)
 			s := NewServer("t", "v")
-			registerTools(s, c, true)
+			registerMCPTools(s, c, true)
 			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":` + tc.args + `}}`
 			res, _ := rpc(t, s, body)
 			r, ok := res["result"].(map[string]any)
@@ -266,7 +271,7 @@ func TestArgumentValidation(t *testing.T) {
 func TestToolListIsSorted(t *testing.T) {
 	c, _ := stubDash(t, 200, `{}`)
 	s := NewServer("t", "v")
-	registerTools(s, c, true)
+	registerMCPTools(s, c, true)
 	var prev string
 	for _, tool := range s.toolList() {
 		if tool.Name < prev {
@@ -280,7 +285,7 @@ func TestToolListIsSorted(t *testing.T) {
 func TestToolSchemasWellFormed(t *testing.T) {
 	c, _ := stubDash(t, 200, `{}`)
 	s := NewServer("t", "v")
-	registerTools(s, c, true)
+	registerMCPTools(s, c, true)
 	for _, tool := range s.toolList() {
 		if tool.Description == "" {
 			t.Errorf("%s: no description", tool.Name)

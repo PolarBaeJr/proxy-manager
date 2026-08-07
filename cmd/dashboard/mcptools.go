@@ -1,80 +1,72 @@
-// Tool surface over the dashboard's HTTP API.
+// MCP tool surface.
 //
-// Deliberately goes through the dashboard rather than the Docker socket: the
-// API carries guardUnscalable, onboarded-vs-label handling, canary state and —
-// importantly — the audit log, so an LLM-driven change is attributable in the
-// same place a human one is. Talking to Docker directly would fork all of that.
+// Every tool dispatches through the dashboard's OWN API mux rather than
+// touching Docker or the stores directly. That is deliberate: the handlers
+// carry guardUnscalable, the onboarded-vs-label distinction, canary
+// bookkeeping, proxy refresh, and the audit log. Calling the internals would
+// fork all of it and the two paths would drift.
+//
+// Requests are served in-process — no socket, no network hop — authenticated
+// with the process-local credential from auth.go. The caller's actor assertion
+// is copied across so the audit log names the person, not the service.
 //
 // Mutating tools are only REGISTERED when writes are enabled, so a read-only
-// deployment cannot reach one by guessing its name.
+// deployment cannot reach one by guessing a name.
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
-	"time"
 )
 
-// dashClient talks to the dashboard with an API token. That token bypasses 2FA
-// (the dashboard treats possession as proof of elevation), which is exactly why
-// the write half of this server is opt-in.
-type dashClient struct {
-	base  string
-	token string
-	http  *http.Client
+// apiCaller dispatches a request through the dashboard's API handlers.
+type apiCaller struct {
+	mux http.Handler
 }
 
-func newDashClient(base, token string) *dashClient {
-	return &dashClient{
-		base:  strings.TrimSuffix(base, "/"),
-		token: token,
-		http:  &http.Client{Timeout: 60 * time.Second},
-	}
-}
-
-func (c *dashClient) do(ctx context.Context, method, path string, body any) ([]byte, error) {
-	var rdr io.Reader
+// call builds a request, authenticates it as the internal principal, forwards
+// the actor assertion, and returns the handler's body.
+//
+// A non-2xx becomes an error carrying the handler's own message — "no live
+// replicas", "unknown host" — which is what lets the model correct itself.
+func (a *apiCaller) call(ctx context.Context, method, path string, body any) ([]byte, error) {
+	var rdr *strings.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		rdr = bytes.NewReader(b)
+		rdr = strings.NewReader(string(b))
+	} else {
+		rdr = strings.NewReader("")
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rdr)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req := httptest.NewRequest(method, path, rdr).WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
-	// Attribution only. The token above is what authorizes the call; this just
-	// tells the dashboard which person to name in the audit record.
+	if internalToken == "" {
+		return nil, fmt.Errorf("internal credential unavailable")
+	}
+	req.Header.Set("Authorization", "Bearer "+internalToken)
+	// Attribution only — the credential above is what authorizes the call.
 	if a := actorFrom(ctx); a != "" {
 		req.Header.Set(actorHeader, a)
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
+
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+	out := rec.Body.Bytes()
+	if rec.Code/100 != 2 {
+		return nil, fmt.Errorf("%s %s: %d %s", method, path, rec.Code, strings.TrimSpace(string(out)))
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode/100 != 2 {
-		// Surfaced verbatim to the model: the dashboard's own messages
-		// ("unknown host", "no live replicas") are what let it self-correct.
-		return nil, fmt.Errorf("dashboard %s %s: %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(b)))
-	}
-	return b, nil
+	return out, nil
 }
 
-// pretty re-encodes a dashboard response with indentation. Tool output is read
-// by a model, so readable beats compact; unparseable bodies pass through as-is
-// rather than becoming an error.
+// pretty re-indents a JSON response. Tool output is read by a model, so
+// readable beats compact; a non-JSON body passes through untouched.
 func pretty(b []byte) string {
 	var v any
 	if err := json.Unmarshal(b, &v); err != nil {
@@ -87,9 +79,7 @@ func pretty(b []byte) string {
 	return string(out)
 }
 
-// registerTools wires the tool surface. allowWrites gates every tool that can
-// change anything.
-func registerTools(s *Server, c *dashClient, allowWrites bool) {
+func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 	// ---- read-only ----
 
 	s.Register(Tool{
@@ -98,7 +88,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 		Description: "List every service the proxy manages: image, replica count, running count, host, whether an image update is available, and canary state.",
 		InputSchema: schema(map[string]any{}),
 		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
-			b, err := c.do(ctx, "GET", "/api/services", nil)
+			b, err := a.call(ctx, "GET", "/api/services", nil)
 			if err != nil {
 				return "", err
 			}
@@ -109,10 +99,10 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "list_routes",
 		Title:       "List routes",
-		Description: "List the host/path routes the proxy currently serves and their backends. Includes both container-label routes and static ones.",
+		Description: "List the host/path routes the proxy currently serves and their backends, from both container labels and static config.",
 		InputSchema: schema(map[string]any{}),
 		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
-			b, err := c.do(ctx, "GET", "/api/routes", nil)
+			b, err := a.call(ctx, "GET", "/api/routes", nil)
 			if err != nil {
 				return "", err
 			}
@@ -123,10 +113,10 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "get_logs",
 		Title:       "Get container logs",
-		Description: "Fetch recent log lines for one container. Use list_services first to get exact container names.",
+		Description: "Fetch recent log lines for one container. Use list_services first for exact container names.",
 		InputSchema: schema(map[string]any{
 			"container": prop("string", "Exact container name."),
-			"tail":      prop("number", "How many trailing lines to return (default 200, max 2000)."),
+			"tail":      prop("number", "Trailing lines to return (default 200, max 2000)."),
 		}, "container"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "container")
@@ -145,7 +135,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if tail > 2000 {
 				tail = 2000
 			}
-			b, err := c.do(ctx, "GET", "/api/logs/"+url.PathEscape(name)+"?tail="+fmt.Sprint(tail), nil)
+			b, err := a.call(ctx, "GET", "/api/logs/"+url.PathEscape(name)+"?tail="+fmt.Sprint(tail), nil)
 			if err != nil {
 				return "", err
 			}
@@ -156,10 +146,10 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "maintenance_status",
 		Title:       "Maintenance status",
-		Description: "Show which hosts are currently serving the maintenance page, and which have their own custom page.",
+		Description: "Show which hosts currently serve the maintenance page, and which have their own custom page.",
 		InputSchema: schema(map[string]any{}),
 		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
-			b, err := c.do(ctx, "GET", "/api/maintenance", nil)
+			b, err := a.call(ctx, "GET", "/api/maintenance", nil)
 			if err != nil {
 				return "", err
 			}
@@ -170,7 +160,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "list_dns",
 		Title:       "List DNS records",
-		Description: "List Cloudflare DNS records for a zone. Omit zone to use the default zone.",
+		Description: "List Cloudflare DNS records for a zone. Omit zone for the default.",
 		InputSchema: schema(map[string]any{
 			"zone": prop("string", "Zone domain, e.g. polardev.org. Omit for the default."),
 		}),
@@ -182,7 +172,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 					return "", err
 				}
 			}
-			b, err := c.do(ctx, "GET", "/api/cf/records?zone="+url.QueryEscape(zone), nil)
+			b, err := a.call(ctx, "GET", "/api/cf/records?zone="+url.QueryEscape(zone), nil)
 			if err != nil {
 				return "", err
 			}
@@ -199,7 +189,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "set_maintenance",
 		Title:       "Set maintenance mode",
-		Description: "Put a host into maintenance (public visitors get a 503 page) or take it out. Reversible. The host must already be routed by the proxy.",
+		Description: "Put a host into maintenance (public visitors get a 503 page) or take it out. Reversible. The host must already be routed.",
 		Mutating:    true,
 		InputSchema: schema(map[string]any{
 			"host":    prop("string", "Hostname, e.g. sfubadminton.com."),
@@ -218,7 +208,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if on {
 				method = "POST"
 			}
-			b, err := c.do(ctx, method, "/api/maintenance/"+url.PathEscape(host), nil)
+			b, err := a.call(ctx, method, "/api/maintenance/"+url.PathEscape(host), nil)
 			if err != nil {
 				return "", err
 			}
@@ -247,7 +237,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if n < 0 {
 				return "", fmt.Errorf("replicas must not be negative")
 			}
-			b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/scale", map[string]any{"replicas": n})
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/scale", map[string]any{"replicas": n})
 			if err != nil {
 				return "", err
 			}
@@ -258,7 +248,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "lifecycle_service",
 		Title:       "Start or stop a service",
-		Description: "Stop all replicas of a service, or start them again. Stopping keeps the containers and their config, so it is reversible.",
+		Description: "Stop all replicas of a service, or start them again. Stopping keeps containers and their config, so it is reversible.",
 		Mutating:    true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
@@ -276,7 +266,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if action != "start" && action != "stop" {
 				return "", fmt.Errorf("action must be \"start\" or \"stop\", got %q", action)
 			}
-			b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/"+action, nil)
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/"+action, nil)
 			if err != nil {
 				return "", err
 			}
@@ -302,7 +292,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
-			b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/autoupdate", map[string]any{"enabled": on})
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/autoupdate", map[string]any{"enabled": on})
 			if err != nil {
 				return "", err
 			}
@@ -313,7 +303,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "stage_canary",
 		Title:       "Stage a canary",
-		Description: "Deploy a new image alongside the live one so traffic is split across both. Nothing is removed. Follow with promote_canary or discard_canary. Preferred over a direct replace: it is reversible.",
+		Description: "Deploy a new image alongside the live one so traffic splits across both. Nothing is removed. Follow with resolve_canary. Preferred over a direct replace because it is reversible.",
 		Mutating:    true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
@@ -328,7 +318,7 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
-			b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/stage", map[string]any{"image": image})
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/stage", map[string]any{"image": image})
 			if err != nil {
 				return "", err
 			}
@@ -356,13 +346,13 @@ func registerTools(s *Server, c *dashClient, allowWrites bool) {
 			}
 			switch action {
 			case "promote":
-				b, err := c.do(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/promote", nil)
+				b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/promote", nil)
 				if err != nil {
 					return "", err
 				}
 				return pretty(b), nil
 			case "discard":
-				b, err := c.do(ctx, "DELETE", "/api/services/"+url.PathEscape(name)+"/canary", nil)
+				b, err := a.call(ctx, "DELETE", "/api/services/"+url.PathEscape(name)+"/canary", nil)
 				if err != nil {
 					return "", err
 				}

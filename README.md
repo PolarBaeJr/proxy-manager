@@ -143,8 +143,13 @@ Two things make this safe rather than merely tidy:
   challenge. Tokens with no resource (the `"*"` wildcard) are refused on
   path-mounted routes.
 
-`cmd/mcp` is read-only unless `MCP_ALLOW_WRITES=true`. Its dashboard API token
-bypasses 2FA, so the write tools stay opt-in.
+The dashboard serves its own MCP endpoint on `:8097`, routed by a static entry
+in `cmd/proxy/routes.json`. There is **no API token to create**: the tools
+dispatch through the dashboard's own API handlers in-process — so
+`guardUnscalable`, canary bookkeeping and the audit log all still apply — using
+a credential the process mints for itself at startup and never persists.
+
+Read-only unless `MCP_ALLOW_WRITES=true`.
 
 Containers must share the **`edge`** Docker network with the proxy. See `examples/docker-compose-sample.yml`.
 
