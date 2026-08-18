@@ -1,10 +1,14 @@
 // statusbot: a Discord bot, deployed as its own container separate from
 // dashboard/proxy/edge, that polls the dashboard's public /api/health
-// endpoint and posts to a Discord channel on up/degraded/unreachable
-// transitions. Also answers "!status" on demand from the last poll result,
-// and the "/set-alert-channel" slash command (Manage Server permission
-// required) lets a user move the alert destination to whatever channel they
-// invoke it in, persisted to disk so it survives a container restart.
+// endpoint and alerts on up/degraded/unreachable transitions. Alerts are a
+// single persistent "live status" embed message that gets edited in place on
+// each transition rather than a new message every time, falling back to a
+// new message if the edit fails (e.g. the message was deleted). Also answers
+// "!status" on demand from the last poll result, and the
+// "/set-alert-channel" slash command (Manage Server permission required)
+// lets a user move the alert destination to whatever channel they invoke it
+// in, persisted to disk so it survives a container restart. !status and
+// /set-alert-channel both reply with embeds too.
 //
 // Deliberately its own process/container rather than code inside the
 // dashboard: if the dashboard hangs or crashes, a status check running
@@ -46,6 +50,7 @@ func main() {
 	for _, m := range seedMsgs {
 		log.Println(m)
 	}
+	alertMessageID := chStore.GetMessageID()
 
 	sess, err := discordgo.New("Bot " + token)
 	if err != nil {
@@ -66,20 +71,55 @@ func main() {
 		hs, err := fetchHealth(context.Background(), *healthURL, client)
 		mu.Lock()
 		cur := classify(hs, err)
+		// msg is only used as a "did this warrant an alert" gate (its content
+		// is discarded) — reuses transitionMessage's existing prev==""/
+		// prev==cur logic rather than duplicating it; the embed body itself
+		// comes from buildStatusEmbed via statusReply, not from this string.
 		msg := transitionMessage(lastStatus, cur, hs, err)
 		lastStatus, lastHealth, lastErr = cur, hs, err
 		target := alertChannelID
+		msgID := alertMessageID
 		mu.Unlock()
 		log.Printf("health check: status=%s", cur)
 		if msg == "" {
 			return
 		}
 		if target == "" {
-			log.Printf("alert suppressed (no alert channel configured): %s", msg)
+			log.Printf("alert suppressed (no alert channel configured): status now %s", cur)
 			return
 		}
-		if _, sendErr := sess.ChannelMessageSend(target, msg); sendErr != nil {
-			log.Printf("failed to send alert: %v", sendErr)
+		embed := buildStatusEmbed(hs, err)
+		newMsgID := msgID
+		edited := false
+		if msgID != "" {
+			if _, editErr := sess.ChannelMessageEditEmbed(target, msgID, embed); editErr != nil {
+				log.Printf("failed to edit live-status message %s in %s, sending a new one: %v", msgID, target, editErr)
+			} else {
+				edited = true
+			}
+		}
+		if !edited {
+			sent, sendErr := sess.ChannelMessageSendEmbed(target, embed)
+			if sendErr != nil {
+				log.Printf("failed to send alert: %v", sendErr)
+				return
+			}
+			newMsgID = sent.ID
+		}
+		if newMsgID == msgID {
+			return
+		}
+		mu.Lock()
+		stale := alertChannelID != target // channel changed while we were doing I/O — don't clobber the new channel's message id
+		if !stale {
+			alertMessageID = newMsgID
+		}
+		mu.Unlock()
+		if stale {
+			return
+		}
+		if err := chStore.SetMessageID(newMsgID); err != nil {
+			log.Printf("failed to persist live-status message id: %v", err)
 		}
 	}
 
@@ -91,9 +131,9 @@ func main() {
 			return
 		}
 		mu.Lock()
-		reply := statusReply(lastHealth, lastErr)
+		embed := buildStatusEmbed(lastHealth, lastErr)
 		mu.Unlock()
-		if _, err := s.ChannelMessageSend(m.ChannelID, reply); err != nil {
+		if _, err := s.ChannelMessageSendEmbed(m.ChannelID, embed); err != nil {
 			log.Printf("failed to reply to !status: %v", err)
 		}
 	})
@@ -126,23 +166,36 @@ func main() {
 			respond("🚫 you need the Manage Server permission to change the alert channel.")
 			return
 		}
-		// Doubles as a capability probe: InteractionRespond succeeding doesn't
-		// prove the bot can post proactive alerts here later (it goes through
-		// the interaction's own webhook token, not standing channel permissions)
-		// — a real ChannelMessageSend does. Don't persist a channel the bot
-		// can't actually alert into.
-		if _, err := s.ChannelMessageSend(i.ChannelID, "✅ statusbot alerts will now be posted here."); err != nil {
-			log.Printf("set-alert-channel: cannot post in %s: %v", i.ChannelID, err)
+		mu.Lock()
+		probeStatus, probeHealth, probeErr := lastStatus, lastHealth, lastErr
+		mu.Unlock()
+		var embed *discordgo.MessageEmbed
+		if probeStatus == "" {
+			embed = startupEmbed()
+		} else {
+			embed = buildStatusEmbed(probeHealth, probeErr)
+		}
+		// Doubles as a capability probe (same rationale as before) AND seeds the
+		// live-status message in one action — unifies "post the confirmation"
+		// with "create the initial live-status message for this channel" so
+		// there's no second, redundant post.
+		sent, sendErr := s.ChannelMessageSendEmbed(i.ChannelID, embed)
+		if sendErr != nil {
+			log.Printf("set-alert-channel: cannot post in %s: %v", i.ChannelID, sendErr)
 			respond("⚠️ I can't send messages in this channel, so I can't set it as the alert channel.")
 			return
 		}
 		mu.Lock()
 		alertChannelID = i.ChannelID
+		alertMessageID = sent.ID
 		mu.Unlock()
 		ack := "Done."
 		if err := chStore.Set(i.ChannelID); err != nil {
 			log.Printf("failed to persist alert channel: %v", err)
 			ack = "Done — but not saved to disk, so it will reset on the next restart."
+		} else if err := chStore.SetMessageID(sent.ID); err != nil {
+			log.Printf("failed to persist live-status message id: %v", err)
+			ack = "Done — but the live-status message id wasn't saved, so an edit later may post a duplicate."
 		}
 		respond(ack)
 	})

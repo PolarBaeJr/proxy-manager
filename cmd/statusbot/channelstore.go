@@ -13,12 +13,18 @@ const defaultChannelStoreFile = "/data/alert-channel.json"
 
 type channelStoreData struct {
 	ChannelID string `json:"channel_id"`
+	// MessageID belongs to whatever channel ChannelID currently names — the
+	// live-status message being edited in place there. It is cleared
+	// whenever the channel changes (see Set).
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // channelStore persists the alert channel chosen at runtime via
-// /set-alert-channel so it survives a container restart. A nil *channelStore
-// (the /data volume isn't mounted) degrades: Get always returns "", and Set
-// returns a descriptive error instead of pretending the value persisted.
+// /set-alert-channel, and the live-status message ID being edited in place
+// within it, so both survive a container restart. A nil *channelStore (the
+// /data volume isn't mounted) degrades: Get/GetMessageID always return "",
+// and Set/SetMessageID return a descriptive error instead of pretending the
+// value persisted.
 type channelStore struct {
 	path string
 	mu   sync.RWMutex
@@ -65,7 +71,11 @@ func (s *channelStore) Get() string {
 	return s.data.ChannelID
 }
 
-// Set persists channelID as the new alert channel.
+// Set persists channelID as the new alert channel. Always unconditionally
+// clears the persisted MessageID — it belonged to the previous channel, if
+// any, and is meaningless for the new one. The caller re-seeds MessageID via
+// a second SetMessageID call right after, in main.go, once it has posted the
+// new channel's live-status message.
 func (s *channelStore) Set(channelID string) error {
 	if s == nil {
 		return fmt.Errorf("alert-channel persistence not configured (no /data volume mounted for statusbot)")
@@ -73,6 +83,38 @@ func (s *channelStore) Set(channelID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data.ChannelID = channelID
+	s.data.MessageID = ""
+	b, err := json.MarshalIndent(s.data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.path, b, 0o600)
+}
+
+// GetMessageID returns the persisted live-status message ID for the
+// current alert channel, or "" if none is known yet (fresh deploy, just
+// after Set changed the channel, or a pre-existing store file from
+// before this field existed).
+func (s *channelStore) GetMessageID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data.MessageID
+}
+
+// SetMessageID persists the live-status message ID for the
+// already-established alert channel, without touching ChannelID. Does
+// not validate that a channel is actually set — a MessageID recorded
+// without a ChannelID is harmless dead data, never consulted on its own.
+func (s *channelStore) SetMessageID(messageID string) error {
+	if s == nil {
+		return fmt.Errorf("alert-channel persistence not configured (no /data volume mounted for statusbot)")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.MessageID = messageID
 	b, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return err

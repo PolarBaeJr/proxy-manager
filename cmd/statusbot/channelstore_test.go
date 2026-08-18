@@ -183,6 +183,111 @@ func TestInitialAlertChannelBothEmpty(t *testing.T) {
 	}
 }
 
+func TestChannelStoreMessageIDRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alert-channel.json")
+	getenv := func(k string) string {
+		if k == "CHANNEL_STORE_FILE" {
+			return path
+		}
+		return ""
+	}
+	s, _ := newChannelStoreFromEnv(getenv)
+	if s == nil {
+		t.Fatalf("newChannelStoreFromEnv = nil, want a store")
+	}
+	if err := s.Set("123"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := s.SetMessageID("m1"); err != nil {
+		t.Fatalf("SetMessageID: %v", err)
+	}
+
+	fresh, _ := newChannelStoreFromEnv(getenv)
+	if fresh == nil {
+		t.Fatalf("newChannelStoreFromEnv (reload) = nil, want a store")
+	}
+	if got := fresh.Get(); got != "123" {
+		t.Fatalf("Get after reload = %q, want %q", got, "123")
+	}
+	if got := fresh.GetMessageID(); got != "m1" {
+		t.Fatalf("GetMessageID after reload = %q, want %q", got, "m1")
+	}
+}
+
+func TestChannelStoreSetClearsMessageID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alert-channel.json")
+	getenv := func(k string) string {
+		if k == "CHANNEL_STORE_FILE" {
+			return path
+		}
+		return ""
+	}
+	s, _ := newChannelStoreFromEnv(getenv)
+	if s == nil {
+		t.Fatalf("newChannelStoreFromEnv = nil, want a store")
+	}
+	if err := s.Set("123"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := s.SetMessageID("m1"); err != nil {
+		t.Fatalf("SetMessageID: %v", err)
+	}
+	if err := s.Set("456"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if got := s.GetMessageID(); got != "" {
+		t.Fatalf("GetMessageID after channel change = %q, want empty", got)
+	}
+
+	fresh, _ := newChannelStoreFromEnv(getenv)
+	if fresh == nil {
+		t.Fatalf("newChannelStoreFromEnv (reload) = nil, want a store")
+	}
+	if got := fresh.GetMessageID(); got != "" {
+		t.Fatalf("GetMessageID after reload = %q, want empty", got)
+	}
+}
+
+func TestChannelStoreOldFormatFileMessageIDEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alert-channel.json")
+	if err := os.WriteFile(path, []byte(`{"channel_id":"123"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	getenv := func(k string) string {
+		if k == "CHANNEL_STORE_FILE" {
+			return path
+		}
+		return ""
+	}
+	s, msgs := newChannelStoreFromEnv(getenv)
+	if s == nil {
+		t.Fatalf("newChannelStoreFromEnv = nil, msgs=%v; want a store", msgs)
+	}
+	if got := s.Get(); got != "123" {
+		t.Fatalf("Get = %q, want %q", got, "123")
+	}
+	if got := s.GetMessageID(); got != "" {
+		t.Fatalf("GetMessageID = %q, want empty", got)
+	}
+}
+
+func TestChannelStoreNilStoreMessageID(t *testing.T) {
+	var s *channelStore
+	if got := s.GetMessageID(); got != "" {
+		t.Errorf("nil store GetMessageID = %q, want empty", got)
+	}
+	err := s.SetMessageID("x")
+	if err == nil {
+		t.Fatalf("nil store SetMessageID = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "not configured") {
+		t.Errorf("nil store SetMessageID error = %q, want it to name the missing mount", err.Error())
+	}
+}
+
 func TestInitialAlertChannelNilStore(t *testing.T) {
 	envGetenv := func(k string) string {
 		if k == "DISCORD_CHANNEL_ID" {
