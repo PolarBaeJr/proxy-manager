@@ -45,6 +45,7 @@ func main() {
 	// Keying rate limits by real client IP must be spoof-resistant even when the
 	// auth gate is disabled, so parse the trusted-XFF CIDRs unconditionally.
 	router.xffTrusted = parseCIDRList(*authXFFTrustedCIDRs)
+	router.unroutedLimiter = newRateLimiter(defaultRateRPM)
 	if *authDomains != "" {
 		var secret []byte
 		if envHex := strings.TrimSpace(os.Getenv("PMGR_AUTH_SECRET")); envHex != "" {

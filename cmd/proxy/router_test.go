@@ -248,6 +248,71 @@ func TestServeHTTPHostMatch(t *testing.T) {
 	}
 }
 
+// TestServeHTTPUnroutedIsThrottled is the regression test for the finding
+// that unrouted requests (bad Host/path) bypassed rate limiting entirely —
+// exactly the traffic shape a scanner produces. With r.unroutedLimiter set,
+// repeated unmatched requests from the same IP must eventually get a 429
+// instead of an unthrottled stream of 404s.
+func TestServeHTTPUnroutedIsThrottled(t *testing.T) {
+	r := &Router{}
+	r.Set([]*RouteGroup{mkGroup(t, "a.example.org", "", false, "http://127.0.0.1:1")})
+	r.unroutedLimiter = newRateLimiter(3)
+
+	saw404, saw429 := 0, 0
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://unknown.example.org/", nil)
+		req.RemoteAddr = "203.0.113.9:1000"
+		r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+		switch rec.Code {
+		case 404:
+			saw404++
+		case 429:
+			saw429++
+			if ra := rec.Header().Get("Retry-After"); ra == "" {
+				t.Error("429 response missing Retry-After header")
+			}
+		default:
+			t.Fatalf("unexpected code %d", rec.Code)
+		}
+	}
+	if saw404 != 3 || saw429 != 2 {
+		t.Fatalf("got %d×404 + %d×429, want 3×404 then 2×429 (capacity 3)", saw404, saw429)
+	}
+}
+
+// TestServeHTTPRetryAfterMatchesRPM: Retry-After must reflect the group's
+// actual rpm instead of a fixed guess — a fast group should ask for a much
+// shorter wait than a slow one.
+func TestServeHTTPRetryAfterMatchesRPM(t *testing.T) {
+	fast := mkGroup(t, "fast.example.org", "", false, "http://127.0.0.1:1")
+	fast.RateLimit, fast.RateRPM = true, 600 // ceil(60/600) = 1s
+	slow := mkGroup(t, "slow.example.org", "", false, "http://127.0.0.1:1")
+	slow.RateLimit, slow.RateRPM = true, 6 // ceil(60/6) = 10s
+
+	r := &Router{}
+	r.Set([]*RouteGroup{fast, slow})
+
+	// Exhaust the slow group (capacity 6) fully, then check the 7th request.
+	var rec *httptest.ResponseRecorder
+	for i := 0; i < 6; i++ {
+		rec = httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://slow.example.org/", nil)
+		req.RemoteAddr = "203.0.113.9:1000"
+		r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+	}
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://slow.example.org/", nil)
+	req.RemoteAddr = "203.0.113.9:1000"
+	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+	if rec.Code != 429 {
+		t.Fatalf("slow group: code = %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "10" {
+		t.Fatalf("slow group (rpm=6): Retry-After = %q, want 10", got)
+	}
+}
+
 func TestServeHTTPLongestPrefix(t *testing.T) {
 	apiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("api"))

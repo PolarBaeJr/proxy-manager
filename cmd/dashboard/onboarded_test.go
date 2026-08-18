@@ -333,3 +333,40 @@ func TestOnboardedBaseEnvUsesPromotedContainer(t *testing.T) {
 		t.Fatalf("onboardedBaseEnv = %v, want %v (the promoted container's live env)", got, want)
 	}
 }
+
+// TestPromoteToOnboardedCapturesPathAndStrip is the regression test for the
+// sfubadminton.com incident: a label-managed container with proxy.path=/admin
+// gets auto-onboarded (first stop/start), but promoteToOnboarded dropped Path
+// and Strip when building the OnboardedService record. The stored route then
+// keyed as host|"" instead of host|/admin, so router.go's static-vs-label
+// dedup (keyed on host+path) never matched the original's label route and a
+// stray onboarded backend silently took over every non-/admin request to the
+// host.
+func TestPromoteToOnboardedCapturesPathAndStrip(t *testing.T) {
+	dc := newFakeDockerServer(t,
+		&fakeContainer{id: "admin-id", name: "admin", image: "img:v1", env: []string{"FOO=1"}, state: "running"},
+	)
+	store, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := Service{
+		Name: "admin", Host: "sfubadminton.com", Port: 3001, Path: "/admin",
+		Labels: map[string]string{"proxy.path": "/admin", "proxy.strip": "true"},
+		Replicas: 1,
+		Members:  []dockerContainer{{ID: "admin-id", Labels: map[string]string{}}},
+	}
+	if err := promoteToOnboarded(context.Background(), dc, store, svc); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := store.Get("admin")
+	if !ok {
+		t.Fatal("onboarded record not persisted")
+	}
+	if got.Path != "/admin" {
+		t.Errorf("Path = %q, want /admin", got.Path)
+	}
+	if !got.Strip {
+		t.Error("Strip = false, want true")
+	}
+}

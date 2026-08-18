@@ -48,6 +48,8 @@ func promoteToOnboarded(ctx context.Context, dc *dockerClient, onb *OnboardedSto
 		Name:           svc.Name,
 		Host:           svc.Host,
 		Port:           svc.Port,
+		Path:           svc.Path,
+		Strip:          svc.Labels[labelStrip] == "true",
 		Image:          svc.Image,
 		Env:            env,
 		Labels:         svc.Labels,
