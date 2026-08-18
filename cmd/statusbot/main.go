@@ -138,6 +138,34 @@ func main() {
 		}
 	})
 
+	// sess.Open() reads exactly one post-identify message and treats it as
+	// READY without looping if it isn't (e.g. an Op9 Invalid Session forces a
+	// re-identify first) — so State.User can still be nil when Open() returns
+	// successfully. The real READY always arrives later via the session's
+	// read-loop goroutine and is dispatched here (asynchronously — SyncEvents
+	// is left at its default false, see discordgo's Session.handle), which is
+	// why command registration is done here instead of right after Open().
+	// This handler must be registered before sess.Open() is called, same as
+	// the other handlers below, so it can't miss the first Ready dispatch.
+	var registerCmdOnce sync.Once
+	sess.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+		if r.User == nil {
+			log.Printf("ready event missing user info; will retry on next ready (e.g. resume)")
+			return
+		}
+		registerCmdOnce.Do(func() {
+			alertChannelCmdPerms := int64(discordgo.PermissionManageGuild)
+			guildID := os.Getenv("DISCORD_GUILD_ID")
+			if _, err := s.ApplicationCommandCreate(r.User.ID, guildID, &discordgo.ApplicationCommand{
+				Name:                     "set-alert-channel",
+				Description:              "Set this channel as the destination for statusbot's up/degraded/unreachable alerts.",
+				DefaultMemberPermissions: &alertChannelCmdPerms,
+			}); err != nil {
+				log.Printf("failed to register /set-alert-channel command (guild=%q): %v", guildID, err)
+			}
+		})
+	})
+
 	sess.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if i.Type != discordgo.InteractionApplicationCommand ||
 			i.ApplicationCommandData().Name != "set-alert-channel" {
@@ -204,16 +232,6 @@ func main() {
 		log.Fatalf("open discord session: %v", err)
 	}
 	defer sess.Close()
-
-	alertChannelCmdPerms := int64(discordgo.PermissionManageGuild)
-	guildID := os.Getenv("DISCORD_GUILD_ID")
-	if _, err := sess.ApplicationCommandCreate(sess.State.User.ID, guildID, &discordgo.ApplicationCommand{
-		Name:                     "set-alert-channel",
-		Description:              "Set this channel as the destination for statusbot's up/degraded/unreachable alerts.",
-		DefaultMemberPermissions: &alertChannelCmdPerms,
-	}); err != nil {
-		log.Printf("failed to register /set-alert-channel command (guild=%q): %v", guildID, err)
-	}
 
 	mu.Lock()
 	initialTarget := alertChannelID
