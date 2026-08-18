@@ -349,9 +349,10 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 					"keys in env_ack to confirm the overwrite. For a REAL SECRET, never pass the " +
 					"literal value here \u2014 it would land in this tool call and in your transcript. " +
 					"Pass \"ref:NAME\" instead; the dashboard resolves NAME server-side from a " +
-					"secrets file mounted only on the Pi (SECRETS_FILE) and the literal value " +
-					"never reaches this API. Ask the operator to add the KEY=VALUE line to that " +
-					"file directly on the host if the ref doesn't resolve.",
+					"secrets file (SECRETS_DIR/<service>.env, mounted only on the Pi) and the literal value " +
+					"never reaches this API. Ask the operator to add the KEY=VALUE line to " +
+					"this service's own secrets file (SECRETS_DIR/<service>.env) if the ref " +
+					"doesn't resolve.",
 			},
 			"env_ack": map[string]any{
 				"type":  "array",
@@ -412,9 +413,10 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 					"keys in env_ack to confirm the overwrite. For a REAL SECRET, never pass the " +
 					"literal value here \u2014 it would land in this tool call and in your transcript. " +
 					"Pass \"ref:NAME\" instead; the dashboard resolves NAME server-side from a " +
-					"secrets file mounted only on the Pi (SECRETS_FILE) and the literal value " +
-					"never reaches this API. Ask the operator to add the KEY=VALUE line to that " +
-					"file directly on the host if the ref doesn't resolve.",
+					"secrets file (SECRETS_DIR/<service>.env, mounted only on the Pi) and the literal value " +
+					"never reaches this API. Ask the operator to add the KEY=VALUE line to " +
+					"this service's own secrets file (SECRETS_DIR/<service>.env) if the ref " +
+					"doesn't resolve.",
 			},
 			"env_ack": map[string]any{
 				"type":  "array",

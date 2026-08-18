@@ -517,7 +517,7 @@ func (c *dockerClient) stageOnboarded(ctx context.Context, name string, req Repl
 	if svc.CanaryImage != "" {
 		return fmt.Errorf("%q already has a canary — promote or discard first", name)
 	}
-	edits, refs, err := resolveSecretRefs(req.Env, c.secrets)
+	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
 		return err
 	}
@@ -653,7 +653,7 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 	if svc.CanaryImage != "" {
 		return fmt.Errorf("%q has a canary in flight — promote or discard first", name)
 	}
-	edits, refs, err := resolveSecretRefs(req.Env, c.secrets)
+	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
 		return err
 	}

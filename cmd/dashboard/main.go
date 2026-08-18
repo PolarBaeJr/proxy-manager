@@ -52,7 +52,7 @@ func main() {
 		log.Printf("%s", m)
 	}
 	if secrets != nil {
-		log.Printf("secret refs enabled (ref:NAME env values resolve from %s)", secrets.path)
+		log.Printf("secret refs enabled (ref:NAME env values resolve from %s/<service>.env)", secrets.dir)
 	}
 	dc.secrets = secrets
 

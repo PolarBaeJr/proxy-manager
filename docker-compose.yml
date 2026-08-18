@@ -116,15 +116,18 @@ services:
       # override-and-don't-create reasoning as the flag dir above.
       - ${MAINT_PAGE_HOST_DIR:-/var/www/maintenance/hosts}:/var/www/maint-pages
       # Secret-by-reference env values: an env edit of "ref:NAME" (dashboard
-      # UI or MCP replace_service/stage_canary) resolves NAME from this file
-      # instead of taking a literal value — so a real secret never has to be
-      # typed into a tool call or land in an assistant transcript. Mounted
-      # read-only; create this file directly on the Pi (KEY=VALUE per line,
-      # like a .env file), never through chat/MCP. Same override-and-don't-
-      # create reasoning as the maintenance mounts above — if the source
-      # path is absent, newSecretsFromEnv degrades to "disabled" rather than
-      # pretending refs resolve.
-      - ${SECRETS_HOST_FILE:-/etc/proxy-manager/secrets.env}:/etc/secrets.env:ro
+      # UI or MCP replace_service/stage_canary) resolves NAME from
+      # <this dir>/<service>.env instead of taking a literal value — so a
+      # real secret never has to be typed into a tool call or land in an
+      # assistant transcript. ONE FILE PER SERVICE (not a single shared
+      # file): with multiple services on the host, a flat namespace means
+      # two of them picking the same key name silently share a value. Mounted
+      # read-only; create each service's file directly on the Pi (KEY=VALUE
+      # per line, like a .env file), never through chat/MCP. Same override-
+      # and-don't-create reasoning as the maintenance mounts above — if the
+      # source path is absent, newSecretsFromEnv degrades to "disabled"
+      # rather than pretending refs resolve.
+      - ${SECRETS_HOST_DIR:-/etc/proxy-manager/secrets}:/etc/secrets:ro
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CLOUDFLARE_ZONE_ID:   ${CLOUDFLARE_ZONE_ID:-}
@@ -134,7 +137,7 @@ services:
       PROXY_URL:            http://proxy:8094       # for the Access tab (proxy /access)
       MAINT_DIR:            /etc/maint.d            # nginx maintenance flag files
       MAINT_PAGE_DIR:       /var/www/maint-pages    # per-host custom 503 pages
-      SECRETS_FILE:         /etc/secrets.env        # ref:NAME env value source (see mount above)
+      SECRETS_DIR:          /etc/secrets            # ref:NAME env values, one file per service (see mount above)
       # Verifies the proxy's attribution assertion so an action taken through
       # another backend (the MCP server) is audited against the person who
       # asked, not the shared API token. AUDIT ONLY — never authorization.

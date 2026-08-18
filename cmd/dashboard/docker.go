@@ -50,7 +50,7 @@ type dockerClient struct {
 	http *http.Client
 	// secrets resolves "ref:NAME" env edit values. Nil in the zero value
 	// (including every test that builds a dockerClient by hand) — that's
-	// fine, ref: edits just error out asking for SECRETS_FILE.
+	// fine, ref: edits just error out asking for SECRETS_DIR.
 	secrets *secretsStore
 }
 
@@ -634,7 +634,7 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	if err != nil {
 		return fmt.Errorf("inspect template env: %w", err)
 	}
-	edits, refs, err := resolveSecretRefs(req.Env, c.secrets)
+	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
 		return err
 	}
@@ -726,7 +726,7 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 	if err != nil {
 		return fmt.Errorf("inspect template env: %w", err)
 	}
-	edits, refs, err := resolveSecretRefs(req.Env, c.secrets)
+	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
 		return err
 	}
