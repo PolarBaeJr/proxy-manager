@@ -4,6 +4,7 @@ cmd/dashboard/data/
 cmd/edge/data/
 cmd/proxy/data/
 cmd/monitor/data/
+cmd/statusbot/data/
 .DS_Store
 
 # Compiled service binaries (root-level `go build` output)

@@ -17,7 +17,9 @@ name: pi-stack
 #                           or crashes, code running inside it can't report
 #                           that. (Still on the same Pi, so it won't survive
 #                           a full host outage — process isolation only.)
-#                           OPT-IN: requires DISCORD_BOT_TOKEN/_CHANNEL_ID.
+#                           OPT-IN: requires DISCORD_BOT_TOKEN. DISCORD_CHANNEL_ID
+#                           only seeds the initial alert channel (changeable at
+#                           runtime via /set-alert-channel).
 
 networks:
   edge:
@@ -207,6 +209,8 @@ services:
     networks: [edge]
     # No host port — not web-accessible, doesn't need proxy.* labels. Reaches
     # dashboard over the edge network; reaches Discord's gateway outbound.
+    volumes:
+      - ./cmd/statusbot/data:/data      # persisted alert-channel.json (see /set-alert-channel)
     environment:
       # From the Discord Developer Portal: create an application + bot, enable
       # the "Message Content" privileged intent (required for !status to see
@@ -214,7 +218,15 @@ services:
       # into. Set these directly on the Pi (.env or compose override) — never
       # paste the token into chat/MCP, it's a real credential.
       DISCORD_BOT_TOKEN:    ${DISCORD_BOT_TOKEN:-}
+      # Optional now — only seeds the alert channel on first run (or when
+      # /data isn't persisting). Once set, /set-alert-channel (Manage Server
+      # permission required) overrides it at runtime and that choice survives
+      # restarts; this env var is then ignored.
       DISCORD_CHANNEL_ID:   ${DISCORD_CHANNEL_ID:-}
+      # Optional. If set, /set-alert-channel registers guild-scoped and is
+      # available almost instantly. If empty, it registers globally, which
+      # can take Discord up to ~1 hour to propagate to clients.
+      DISCORD_GUILD_ID:     ${DISCORD_GUILD_ID:-}
     command: >
       -health-url=http://dashboard:8093/api/health
       -poll-interval=60s

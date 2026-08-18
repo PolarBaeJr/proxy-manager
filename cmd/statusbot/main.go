@@ -1,7 +1,10 @@
 // statusbot: a Discord bot, deployed as its own container separate from
 // dashboard/proxy/edge, that polls the dashboard's public /api/health
 // endpoint and posts to a Discord channel on up/degraded/unreachable
-// transitions. Also answers "!status" on demand from the last poll result.
+// transitions. Also answers "!status" on demand from the last poll result,
+// and the "/set-alert-channel" slash command (Manage Server permission
+// required) lets a user move the alert destination to whatever channel they
+// invoke it in, persisted to disk so it survives a container restart.
 //
 // Deliberately its own process/container rather than code inside the
 // dashboard: if the dashboard hangs or crashes, a status check running
@@ -31,12 +34,17 @@ func main() {
 	flag.Parse()
 
 	token := os.Getenv("DISCORD_BOT_TOKEN")
-	channelID := os.Getenv("DISCORD_CHANNEL_ID")
 	if token == "" {
 		log.Fatal("DISCORD_BOT_TOKEN is required")
 	}
-	if channelID == "" {
-		log.Fatal("DISCORD_CHANNEL_ID is required")
+
+	chStore, chMsgs := newChannelStoreFromEnv(os.Getenv)
+	for _, m := range chMsgs {
+		log.Println(m)
+	}
+	alertChannelID, seedMsgs := initialAlertChannel(chStore, os.Getenv)
+	for _, m := range seedMsgs {
+		log.Println(m)
 	}
 
 	sess, err := discordgo.New("Bot " + token)
@@ -60,12 +68,18 @@ func main() {
 		cur := classify(hs, err)
 		msg := transitionMessage(lastStatus, cur, hs, err)
 		lastStatus, lastHealth, lastErr = cur, hs, err
+		target := alertChannelID
 		mu.Unlock()
 		log.Printf("health check: status=%s", cur)
-		if msg != "" {
-			if _, sendErr := sess.ChannelMessageSend(channelID, msg); sendErr != nil {
-				log.Printf("failed to send alert: %v", sendErr)
-			}
+		if msg == "" {
+			return
+		}
+		if target == "" {
+			log.Printf("alert suppressed (no alert channel configured): %s", msg)
+			return
+		}
+		if _, sendErr := sess.ChannelMessageSend(target, msg); sendErr != nil {
+			log.Printf("failed to send alert: %v", sendErr)
 		}
 	}
 
@@ -84,11 +98,74 @@ func main() {
 		}
 	})
 
+	sess.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		if i.Type != discordgo.InteractionApplicationCommand ||
+			i.ApplicationCommandData().Name != "set-alert-channel" {
+			return
+		}
+		respond := func(content string) {
+			if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: content,
+					Flags:   discordgo.MessageFlagsEphemeral,
+				},
+			}); err != nil {
+				log.Printf("failed to respond to /set-alert-channel: %v", err)
+			}
+		}
+		if i.Member == nil {
+			respond("this command only works in a server channel, not a DM.")
+			return
+		}
+		// DefaultMemberPermissions below only sets the *initial* Discord UI
+		// restriction — a guild admin can loosen it afterward in
+		// Server Settings > Integrations without this code knowing, so the
+		// permission is re-checked here rather than trusted from registration.
+		if i.Member.Permissions&discordgo.PermissionManageGuild == 0 {
+			respond("🚫 you need the Manage Server permission to change the alert channel.")
+			return
+		}
+		// Doubles as a capability probe: InteractionRespond succeeding doesn't
+		// prove the bot can post proactive alerts here later (it goes through
+		// the interaction's own webhook token, not standing channel permissions)
+		// — a real ChannelMessageSend does. Don't persist a channel the bot
+		// can't actually alert into.
+		if _, err := s.ChannelMessageSend(i.ChannelID, "✅ statusbot alerts will now be posted here."); err != nil {
+			log.Printf("set-alert-channel: cannot post in %s: %v", i.ChannelID, err)
+			respond("⚠️ I can't send messages in this channel, so I can't set it as the alert channel.")
+			return
+		}
+		mu.Lock()
+		alertChannelID = i.ChannelID
+		mu.Unlock()
+		ack := "Done."
+		if err := chStore.Set(i.ChannelID); err != nil {
+			log.Printf("failed to persist alert channel: %v", err)
+			ack = "Done — but not saved to disk, so it will reset on the next restart."
+		}
+		respond(ack)
+	})
+
 	if err := sess.Open(); err != nil {
 		log.Fatalf("open discord session: %v", err)
 	}
 	defer sess.Close()
-	log.Printf("statusbot connected — polling %s every %s, alerts to channel %s", *healthURL, *pollInterval, channelID)
+
+	alertChannelCmdPerms := int64(discordgo.PermissionManageGuild)
+	guildID := os.Getenv("DISCORD_GUILD_ID")
+	if _, err := sess.ApplicationCommandCreate(sess.State.User.ID, guildID, &discordgo.ApplicationCommand{
+		Name:                     "set-alert-channel",
+		Description:              "Set this channel as the destination for statusbot's up/degraded/unreachable alerts.",
+		DefaultMemberPermissions: &alertChannelCmdPerms,
+	}); err != nil {
+		log.Printf("failed to register /set-alert-channel command (guild=%q): %v", guildID, err)
+	}
+
+	mu.Lock()
+	initialTarget := alertChannelID
+	mu.Unlock()
+	log.Printf("statusbot connected — polling %s every %s, alerts to channel %q", *healthURL, *pollInterval, initialTarget)
 
 	poll() // establish a baseline immediately so !status works right away
 	ticker := time.NewTicker(*pollInterval)
