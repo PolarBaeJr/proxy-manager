@@ -503,6 +503,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				for _, o := range onb.List() {
 					if i, ok := labeledIdx[o.Name]; ok {
 						svcs[i].Onboarded = true
+						svcs[i].DualTracked = true
 						// Opt-in from either source (label or dashboard toggle) wins.
 						svcs[i].AutoUpdate = svcs[i].AutoUpdate || o.AutoUpdate
 						if svcs[i].PreviousImage == "" {

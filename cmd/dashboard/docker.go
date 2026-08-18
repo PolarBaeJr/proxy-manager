@@ -307,6 +307,16 @@ type Service struct {
 	CanaryImage     string            `json:"canary_image,omitempty"`     // non-empty when a stage is in progress
 	CanaryReplicas  int               `json:"canary_replicas,omitempty"`
 	Onboarded       bool              `json:"onboarded,omitempty"` // adopted from an unlabelled container
+	// DualTracked is true when this service is BOTH still label-managed (a
+	// running container carries proxy.* labels) AND has an onboarded record
+	// tracking it — the state that let the sfubadminton.com incident happen
+	// (onboarded.go's promoteToOnboarded once silently dropped Path/Strip
+	// when snapshotting a still-labeled container). Not itself an error —
+	// it's how a label-managed service picks up Stage/Promote/Replace/
+	// Rollback — but every field the two representations both track has to
+	// stay reconciled, so it's worth surfacing rather than only discoverable
+	// by diffing routes.json against docker labels by hand.
+	DualTracked     bool              `json:"dual_tracked,omitempty"`
 	Members         []dockerContainer `json:"-"`
 	Labels          map[string]string `json:"labels,omitempty"`
 	MemberSummaries []ServiceMember   `json:"member_summaries"`      // per-replica name/state for UI

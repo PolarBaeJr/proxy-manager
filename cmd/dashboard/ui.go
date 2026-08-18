@@ -1443,6 +1443,11 @@ async function renderServices() {
     if (canary)             badges += ' <span class="pill info"><span class="gl"></span>canary live</span>';
     if (managed)            badges += ' <span class="pill muted" title="Adopted for lifecycle/image tracking only — no traffic routed">' + I.rocket + 'managed · no route</span>';
     else if (s.onboarded)   badges += ' <span class="pill muted" title="Adopted from an unlabelled container — replace/canary disabled">' + I.rocket + 'onboarded</span>';
+    // Tracked BOTH via live proxy.* labels AND the onboarded.json store —
+    // the pattern behind several past incidents (path/env dropped on
+    // promote, stale OCI labels on replace). Not broken by itself, just
+    // worth a human's eye.
+    if (s.dual_tracked) badges += ' <span class="pill warn" title="Both label-managed (docker ps) and onboarded (onboarded.json) under the same name — edits should go through one path consistently">' + I.rocket + 'dual-tracked</span>';
     let facts = '<table class="facts">';
     facts += '<tr><td>Host</td><td>' + (managed ? '<span class="meta">—</span>' : '<span class="ident">' + esc(s.host) + (s.path ? esc(s.path) : '') + '</span>') + '</td></tr>';
     if (canary)              facts += '<tr><td>Canary</td><td><span class="ident" style="color:#5eb4ff">' + esc(s.canary_image) + '</span> <span class="meta">· ' + s.canary_replicas + ' replica' + (s.canary_replicas === 1 ? '' : 's') + '</span></td></tr>';
