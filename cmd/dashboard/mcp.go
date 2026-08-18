@@ -213,6 +213,23 @@ func argString(args map[string]any, key string) (string, error) {
 	return s, nil
 }
 
+// argOptionalString reads an optional string argument that is allowed to be
+// present-but-empty — unlike argString, an empty string is a valid value
+// meaning "use the default" (e.g. zone), not an error. Absent entirely also
+// means the default; both cases return "". Only a non-string value is
+// rejected.
+func argOptionalString(args map[string]any, key string) (string, error) {
+	v, ok := args[key]
+	if !ok {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("argument %q must be a string", key)
+	}
+	return strings.TrimSpace(s), nil
+}
+
 // argInt accepts a JSON number (which decodes to float64) and rejects a
 // fractional value rather than silently truncating a replica count.
 func argInt(args map[string]any, key string) (int, error) {
@@ -257,7 +274,12 @@ func argEnvEdits(args map[string]any, key string) (map[string]string, error) {
 		return nil, fmt.Errorf("argument %q must be an object", key)
 	}
 	out := make(map[string]string, len(m))
-	for k, raw := range m {
+	for rawKey, raw := range m {
+		// Trim like argString does for scalar identifiers — env var names are
+		// conventionally bare identifiers, and an untrimmed key silently fails
+		// to match the real (trimmed) key mergeEnv indexes by, appending a
+		// bogus new var instead of updating the intended one.
+		k := strings.TrimSpace(rawKey)
 		if k == "" {
 			return nil, fmt.Errorf("argument %q: env var name must not be empty", key)
 		}
@@ -267,6 +289,9 @@ func argEnvEdits(args map[string]any, key string) (map[string]string, error) {
 		s, ok := raw.(string)
 		if !ok {
 			return nil, fmt.Errorf("argument %q: value for %q must be a string", key, k)
+		}
+		if _, dup := out[k]; dup {
+			return nil, fmt.Errorf("argument %q: env var name %q given more than once (after trimming whitespace)", key, k)
 		}
 		out[k] = s
 	}

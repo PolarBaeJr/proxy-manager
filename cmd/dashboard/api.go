@@ -649,9 +649,50 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				http.Error(w, "service not found", http.StatusNotFound)
 				return
 			}
+			// A staged canary can live in the labeled-container view
+			// (svc.CanaryImage, set by dc.listServices from the c-prefixed
+			// container's proxy.canary label) or, for onboarded services,
+			// only in the onboarded store — the canary clones onboardedBaseEnv
+			// creates carry no proxy.* labels, so dc.listServices never sees
+			// them. Fall back to the store so an onboarded canary isn't
+			// silently skipped.
+			canaryImage := svc.CanaryImage
+			if canaryImage == "" && onb != nil {
+				if o, ok := onb.Get(name); ok {
+					canaryImage = o.CanaryImage
+				}
+			}
+
 			ic.Check(req.Context(), svc.Image)
 			audit(req, sessionUser(info), "service.check_image", name)
-			httpx.WriteJSON(w, http.StatusOK, ic.Get(svc.Image))
+			live := ic.Get(svc.Image)
+
+			if canaryImage == "" {
+				if live.Err != "" {
+					http.Error(w, live.Err, http.StatusBadGateway)
+					return
+				}
+				httpx.WriteJSON(w, http.StatusOK, live)
+				return
+			}
+
+			ic.Check(req.Context(), canaryImage)
+			canary := ic.Get(canaryImage)
+			if live.Err != "" || canary.Err != "" {
+				msg := ""
+				if live.Err != "" {
+					msg = "live " + svc.Image + ": " + live.Err
+				}
+				if canary.Err != "" {
+					if msg != "" {
+						msg += "; "
+					}
+					msg += "canary " + canaryImage + ": " + canary.Err
+				}
+				http.Error(w, msg, http.StatusBadGateway)
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"live": live, "canary": canary})
 			return
 		}
 		if len(parts) == 2 && parts[1] == "stage" && req.Method == "POST" {
@@ -1007,6 +1048,12 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 				httpx.WriteErr(w, err)
 				return
+			}
+			if body.Name != nil {
+				if err := zc.validateName(*body.Name); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
 			}
 			rec, err := zc.Update(req.Context(), id, body)
 			cf.noteResult(domain, err)

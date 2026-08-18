@@ -165,12 +165,13 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			"zone": prop("string", "Zone domain, e.g. polardev.org. Omit for the default."),
 		}),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
-			zone := ""
-			if _, ok := args["zone"]; ok {
-				var err error
-				if zone, err = argString(args, "zone"); err != nil {
-					return "", err
-				}
+			// argOptionalString, not argString: an explicit zone:"" is a
+			// realistic input from clients that always send every schema key,
+			// and the backend (cfZoneFromReq) already treats "" identically
+			// to an omitted zone (falls back to the default zone).
+			zone, err := argOptionalString(args, "zone")
+			if err != nil {
+				return "", err
 			}
 			b, err := a.call(ctx, "GET", "/api/cf/records?zone="+url.QueryEscape(zone), nil)
 			if err != nil {
@@ -188,7 +189,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "check_for_update",
 		Title:       "Check for an image update",
-		Description: "Force an immediate check of whether a newer image is available in the registry for this service, instead of waiting for the periodic background poll (runs roughly every 10 minutes). Does not change anything about the running service — only refreshes the cached 'update available' status, which then shows up in list_services.",
+		Description: "Force an immediate check of whether a newer image is available in the registry for this service, instead of waiting for the periodic background poll (runs roughly every 10 minutes). Does not change anything about the running service — only refreshes the cached 'update available' status, which then shows up in list_services. If a canary is currently staged, its image is checked too — the response is a single status object when there's no canary, or {\"live\":..., \"canary\":...} when there is.",
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
 		}, "service"),
@@ -483,7 +484,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "restart_replica",
 		Title:       "Start, stop, or restart a replica",
-		Description: "Start, stop, or restart one replica of a service (not the whole service — use lifecycle_service for that). member is a name from list_services' member_summaries. restart is stop immediately followed by start.",
+		Description: "Start, stop, or restart one replica of a service (not the whole service — use lifecycle_service for that). member must be a NON-canary replica name from list_services' member_summaries (one where is_canary is false/absent) — canary replicas can't be managed here, use resolve_canary instead. restart is stop immediately followed by start; on a service's only running (non-canary) replica this causes a brief window with no live backend for that host, so check member_summaries/replicas count first if that matters.",
 		Mutating:    true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
@@ -520,7 +521,11 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 				}
 				b, err := a.call(ctx, "POST", base+"start", nil)
 				if err != nil {
-					return "", err
+					// The stop already succeeded, so this is not a generic
+					// failure — the replica is now down and needs the caller's
+					// attention, not a silent "the start call failed" that
+					// leaves them thinking it's still running.
+					return "", fmt.Errorf("stop succeeded but start failed — replica %q of service %q is now STOPPED (no live backend from it), retry with action=start: %w", member, name, err)
 				}
 				return pretty(b), nil
 			}
@@ -543,12 +548,13 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			"priority": prop("number", "Priority — MX records only."),
 		}, "type", "name", "content"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
-			zone := ""
-			if _, ok := args["zone"]; ok {
-				var err error
-				if zone, err = argString(args, "zone"); err != nil {
-					return "", err
-				}
+			// argOptionalString, not argString: an explicit zone:"" is a
+			// realistic input from clients that always send every schema key,
+			// and the backend (cfZoneFromReq) already treats "" identically
+			// to an omitted zone (falls back to the default zone).
+			zone, err := argOptionalString(args, "zone")
+			if err != nil {
+				return "", err
 			}
 			typ, err := argString(args, "type")
 			if err != nil {
@@ -605,12 +611,13 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			"name":    prop("string", "New record name."),
 		}, "id"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
-			zone := ""
-			if _, ok := args["zone"]; ok {
-				var err error
-				if zone, err = argString(args, "zone"); err != nil {
-					return "", err
-				}
+			// argOptionalString, not argString: an explicit zone:"" is a
+			// realistic input from clients that always send every schema key,
+			// and the backend (cfZoneFromReq) already treats "" identically
+			// to an omitted zone (falls back to the default zone).
+			zone, err := argOptionalString(args, "zone")
+			if err != nil {
+				return "", err
 			}
 			id, err := argString(args, "id")
 			if err != nil {
@@ -659,12 +666,13 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			"id":   prop("string", "Cloudflare record ID, from list_dns."),
 		}, "id"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
-			zone := ""
-			if _, ok := args["zone"]; ok {
-				var err error
-				if zone, err = argString(args, "zone"); err != nil {
-					return "", err
-				}
+			// argOptionalString, not argString: an explicit zone:"" is a
+			// realistic input from clients that always send every schema key,
+			// and the backend (cfZoneFromReq) already treats "" identically
+			// to an omitted zone (falls back to the default zone).
+			zone, err := argOptionalString(args, "zone")
+			if err != nil {
+				return "", err
 			}
 			id, err := argString(args, "id")
 			if err != nil {

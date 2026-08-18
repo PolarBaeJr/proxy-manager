@@ -256,22 +256,23 @@ func TestArgumentValidation(t *testing.T) {
 		{"resolve_canary", `{"service":"app","action":"maybe"}`},    // not promote/discard
 		{"set_maintenance", `{"host":"x.example","enabled":"yes"}`}, // string not bool
 		{"get_logs", `{}`}, // missing container
-		{"stage_canary", `{"service":"app","image":"i:v2","env":"nope"}`},         // env not an object
-		{"stage_canary", `{"service":"app","image":"i:v2","env":{"K":1}}`},        // non-string env value
-		{"stage_canary", `{"service":"app","image":"i:v2","env":{"":"v"}}`},       // empty env key
-		{"stage_canary", `{"service":"app","image":"i:v2","env":{"K=X":"v"}}`},    // env key contains "="
-		{"stage_canary", `{"service":"app","image":"i:v2","env_ack":"nope"}`},     // env_ack not an array
-		{"stage_canary", `{"service":"app","image":"i:v2","env_ack":[1]}`},        // non-string env_ack item
-		{"replace_service", `{"service":"app","image":"i:v2","env":"nope"}`},      // env not an object
-		{"replace_service", `{"service":"app","image":"i:v2","env":{"K":1}}`},     // non-string env value
-		{"replace_service", `{"service":"app","image":"i:v2","env":{"":"v"}}`},    // empty env key
-		{"replace_service", `{"service":"app","image":"i:v2","env":{"K=X":"v"}}`}, // env key contains "="
-		{"replace_service", `{"service":"app","image":"i:v2","env_ack":"nope"}`},  // env_ack not an array
-		{"replace_service", `{"service":"app","image":"i:v2","env_ack":[1]}`},     // non-string env_ack item
-		{"restart_replica", `{"service":"app","member":"m1","action":"nuke"}`},    // not start/stop/restart
-		{"create_dns_record", `{"name":"x.example","content":"1.2.3.4"}`},         // missing type
-		{"update_dns_record", `{"id":"rec1"}`},                                    // no fields to update
-		{"delete_dns_record", `{}`},                                               // missing id
+		{"stage_canary", `{"service":"app","image":"i:v2","env":"nope"}`},              // env not an object
+		{"stage_canary", `{"service":"app","image":"i:v2","env":{"K":1}}`},             // non-string env value
+		{"stage_canary", `{"service":"app","image":"i:v2","env":{"":"v"}}`},            // empty env key
+		{"stage_canary", `{"service":"app","image":"i:v2","env":{"K=X":"v"}}`},         // env key contains "="
+		{"stage_canary", `{"service":"app","image":"i:v2","env":{" K ":"v","K":"w"}}`}, // duplicate key after trim
+		{"stage_canary", `{"service":"app","image":"i:v2","env_ack":"nope"}`},          // env_ack not an array
+		{"stage_canary", `{"service":"app","image":"i:v2","env_ack":[1]}`},             // non-string env_ack item
+		{"replace_service", `{"service":"app","image":"i:v2","env":"nope"}`},           // env not an object
+		{"replace_service", `{"service":"app","image":"i:v2","env":{"K":1}}`},          // non-string env value
+		{"replace_service", `{"service":"app","image":"i:v2","env":{"":"v"}}`},         // empty env key
+		{"replace_service", `{"service":"app","image":"i:v2","env":{"K=X":"v"}}`},      // env key contains "="
+		{"replace_service", `{"service":"app","image":"i:v2","env_ack":"nope"}`},       // env_ack not an array
+		{"replace_service", `{"service":"app","image":"i:v2","env_ack":[1]}`},          // non-string env_ack item
+		{"restart_replica", `{"service":"app","member":"m1","action":"nuke"}`},         // not start/stop/restart
+		{"create_dns_record", `{"name":"x.example","content":"1.2.3.4"}`},              // missing type
+		{"update_dns_record", `{"id":"rec1"}`},                                         // no fields to update
+		{"delete_dns_record", `{}`},                                                    // missing id
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
@@ -525,5 +526,101 @@ func TestUpdateDNSRecordOnlySendsProvidedFields(t *testing.T) {
 	}
 	if got.Name != nil {
 		t.Errorf("Name = %v, want nil (not provided)", *got.Name)
+	}
+}
+
+// An env-var key with surrounding whitespace must be trimmed before it
+// reaches the dashboard — otherwise it silently fails to match the real
+// (trimmed) key mergeEnv indexes by and gets appended as a bogus new var
+// instead of updating the intended one.
+func TestArgEnvEditsTrimsKeys(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	var got ReplaceServiceRequest
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		json.Unmarshal(b, &got)
+		w.WriteHeader(200)
+		w.Write([]byte(`{}`))
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stage_canary","arguments":{"service":"app","image":"i:v2","env":{" PORT ":"3000"}}}}`
+	res, _ := rpc(t, s, body)
+	if r := res["result"].(map[string]any); r["isError"] == true {
+		t.Fatalf("tool errored: %v", r["content"])
+	}
+	if v, ok := got.Env["PORT"]; !ok || v != "3000" {
+		t.Errorf("env = %+v, want a clean %q key", got.Env, "PORT")
+	}
+	if _, ok := got.Env[" PORT "]; ok {
+		t.Errorf("env = %+v, untrimmed key leaked through", got.Env)
+	}
+}
+
+// If a failed start follows a successful stop, the error must say the
+// replica is now STOPPED — not read like a generic call failure that leaves
+// the caller thinking it's still running.
+func TestRestartReplicaStartFailureSaysStopped(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/start") {
+			w.WriteHeader(500)
+			w.Write([]byte(`start failed`))
+			return
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{"status":"stopped"}`))
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"restart_replica","arguments":{"service":"app","member":"m1","action":"restart"}}}`
+	res, _ := rpc(t, s, body)
+	r := res["result"].(map[string]any)
+	if r["isError"] != true {
+		t.Fatalf("expected error, got %v", res)
+	}
+	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "STOPPED") {
+		t.Errorf("error doesn't say the replica is STOPPED: %q", text)
+	}
+}
+
+// zone:"" (present but empty) must be accepted as "use default", the same
+// as an omitted zone — some MCP clients always send every schema key.
+func TestDNSToolsAcceptEmptyZone(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	cases := []struct{ tool, args string }{
+		{"create_dns_record", `{"zone":"","type":"A","name":"x","content":"1.2.3.4"}`},
+		{"update_dns_record", `{"zone":"","id":"rec1","content":"1.2.3.4"}`},
+		{"delete_dns_record", `{"zone":"","id":"rec1"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tool, func(t *testing.T) {
+			c, calls := stubDash(t, 200, `{}`)
+			s := NewServer("t", "v")
+			registerMCPTools(s, c, true)
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":` + tc.args + `}}`
+			res, _ := rpc(t, s, body)
+			r, ok := res["result"].(map[string]any)
+			if !ok || r["isError"] == true {
+				t.Fatalf("zone:\"\" rejected: %v", res)
+			}
+			if len(*calls) != 1 {
+				t.Fatalf("calls = %v, want exactly one", *calls)
+			}
+		})
 	}
 }
