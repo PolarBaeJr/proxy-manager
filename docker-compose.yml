@@ -11,6 +11,13 @@ name: pi-stack
 #   auth      :8096       — SSO login portal + OAuth authorization server
 #                           for proxy.auth=true hosts
 #                           (no public port; reached via proxy at auth.<domain>)
+#   statusbot             — Discord bot; polls dashboard's /api/health and
+#                           alerts on up/degraded/unreachable transitions.
+#                           Its own container on purpose: if dashboard hangs
+#                           or crashes, code running inside it can't report
+#                           that. (Still on the same Pi, so it won't survive
+#                           a full host outage — process isolation only.)
+#                           OPT-IN: requires DISCORD_BOT_TOKEN/_CHANNEL_ID.
 
 networks:
   edge:
@@ -174,3 +181,26 @@ services:
       -dashboard-url=http://dashboard:8093
       -routes-url=http://proxy:8094/routes
       -passkey-rp-domains=${AUTH_PASSKEY_DOMAINS:-}
+
+  statusbot:
+    build:
+      context: .
+      dockerfile: cmd/statusbot/Dockerfile
+    image: ghcr.io/polarbaejr/proxy-manager-statusbot:${STATUSBOT_TAG:-latest}
+    container_name: statusbot
+    restart: unless-stopped
+    profiles: [statusbot]               # opt-in: docker compose --profile statusbot up -d
+    networks: [edge]
+    # No host port — not web-accessible, doesn't need proxy.* labels. Reaches
+    # dashboard over the edge network; reaches Discord's gateway outbound.
+    environment:
+      # From the Discord Developer Portal: create an application + bot, enable
+      # the "Message Content" privileged intent (required for !status to see
+      # command text), invite it to the server, then the channel ID to alert
+      # into. Set these directly on the Pi (.env or compose override) — never
+      # paste the token into chat/MCP, it's a real credential.
+      DISCORD_BOT_TOKEN:    ${DISCORD_BOT_TOKEN:-}
+      DISCORD_CHANNEL_ID:   ${DISCORD_CHANNEL_ID:-}
+    command: >
+      -health-url=http://dashboard:8093/api/health
+      -poll-interval=60s
