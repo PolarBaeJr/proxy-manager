@@ -482,6 +482,58 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 	})
 
 	s.Register(Tool{
+		Name:  "offboard_service",
+		Title: "Remove an onboarded service's tracking record",
+		Description: "Removes the dashboard's onboarded tracking record and its routes.json entry " +
+			"for a service that was adopted via onboarding/stage/promote, tearing down any " +
+			"cloned/canary containers it created (goproxy-onb-<name>-*). The ORIGINAL container " +
+			"is left running untouched — it just stops being routed through this record. Refuses " +
+			"if the service isn't currently onboarded: the backend's DELETE falls through to a " +
+			"hard, irreversible container delete for a plain label-managed service, and this tool " +
+			"deliberately will not trigger that — remove a label-managed service via docker compose " +
+			"instead.",
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services (must have onboarded: true)."),
+		}, "service"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			listBody, err := a.call(ctx, "GET", "/api/services", nil)
+			if err != nil {
+				return "", err
+			}
+			var svcs []struct {
+				Name      string `json:"name"`
+				Onboarded bool   `json:"onboarded"`
+			}
+			if err := json.Unmarshal(listBody, &svcs); err != nil {
+				return "", fmt.Errorf("list_services: %w", err)
+			}
+			found, onboarded := false, false
+			for _, s := range svcs {
+				if s.Name == name {
+					found, onboarded = true, s.Onboarded
+					break
+				}
+			}
+			if !found {
+				return "", fmt.Errorf("service %q not found", name)
+			}
+			if !onboarded {
+				return "", fmt.Errorf("service %q is not onboarded — offboard_service only removes onboarded tracking records, it will not delete a label-managed service's containers", name)
+			}
+			b, err := a.call(ctx, "DELETE", "/api/services/"+url.PathEscape(name), nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
 		Name:        "restart_replica",
 		Title:       "Start, stop, or restart a replica",
 		Description: "Start, stop, or restart one replica of a service (not the whole service — use lifecycle_service for that). member must be a NON-canary replica name from list_services' member_summaries (one where is_canary is false/absent) — canary replicas can't be managed here, use resolve_canary instead. restart is stop immediately followed by start; on a service's only running (non-canary) replica this causes a brief window with no live backend for that host, so check member_summaries/replicas count first if that matters.",

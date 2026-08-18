@@ -29,6 +29,13 @@ type rateLimiter struct {
 
 const idleEvict = 30 * time.Minute
 
+// maxBuckets bounds per-limiter memory under a distinct-key flood (e.g. an
+// attacker rotating through a /64 of IPv6 addresses). Once full, new keys are
+// denied rather than evicting existing buckets, so an active flood can't push
+// out legitimate, already-tracked clients; gc() reclaims space as buckets go
+// idle.
+const maxBuckets = 50_000
+
 func newRateLimiter(rpm int) *rateLimiter {
 	rl := &rateLimiter{
 		buckets:  map[string]*bucket{},
@@ -55,20 +62,27 @@ func (rl *rateLimiter) SetRate(rpm int) {
 	rl.mu.Unlock()
 }
 
-func (rl *rateLimiter) getOrCreate(key string, now time.Time) *bucket {
+func (rl *rateLimiter) getOrCreate(key string, now time.Time) (*bucket, bool) {
 	b, ok := rl.buckets[key]
-	if !ok {
-		b = &bucket{tokens: rl.capacity, lastRefill: now, lastSeen: now}
-		rl.buckets[key] = b
+	if ok {
+		return b, true
 	}
-	return b
+	if len(rl.buckets) >= maxBuckets {
+		return nil, false
+	}
+	b = &bucket{tokens: rl.capacity, lastRefill: now, lastSeen: now}
+	rl.buckets[key] = b
+	return b, true
 }
 
 func (rl *rateLimiter) Allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	now := time.Now()
-	b := rl.getOrCreate(key, now)
+	b, ok := rl.getOrCreate(key, now)
+	if !ok {
+		return false
+	}
 	elapsed := now.Sub(b.lastRefill).Seconds()
 	b.tokens = min(rl.capacity, b.tokens+elapsed*rl.rate)
 	b.lastRefill = now

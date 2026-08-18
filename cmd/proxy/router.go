@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -47,6 +48,12 @@ type RouteGroup struct {
 	limiter   *rateLimiter
 
 	cursor atomic.Uint64
+
+	// static marks a group whose backend list is owned by routes.json /
+	// static config (the onboarded-service flow). Once true, a lingering
+	// docker label for the same host+path must not re-join this group as
+	// a backend — routes.json has exclusive ownership.
+	static bool
 }
 
 func (g *RouteGroup) pickHealthy(skip map[*Backend]bool) *Backend {
@@ -77,6 +84,11 @@ type Router struct {
 	// config edits don't reset per-IP buckets. Guarded by mu.
 	limiters   map[string]*rateLimiter
 	xffTrusted []*net.IPNet
+
+	// unroutedLimiter throttles requests that match no route (bad Host/path),
+	// keyed by client IP, independent of any per-group limiter. Set once at
+	// startup; nil (disabled) in tests that don't wire it up.
+	unroutedLimiter *rateLimiter
 
 	auth     *authGate // nil = auth gating disabled (proxy.auth hosts fail closed)
 	authWarn sync.Once
@@ -154,18 +166,50 @@ func hostOnly(s string) string {
 // rlKey is the per-IP rate-limit bucket key. It reuses realClientIP's
 // XFF-trust logic so a client behind a trusted hop is keyed by its real IP,
 // and an untrusted peer can't mint fresh buckets by rotating X-Forwarded-For.
+// IPv6 addresses are keyed by their /64 (the smallest block an ISP typically
+// hands a single customer) rather than the full /128 — otherwise one client
+// can mint an unbounded number of distinct buckets just by rotating the host
+// portion of its own address.
 func rlKey(req *http.Request, xffTrusted []*net.IPNet) string {
 	if ip := realClientIP(req, xffTrusted); ip != nil {
-		return ip.String()
+		return maskRLKey(ip)
 	}
 	host, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil {
-		return req.RemoteAddr
+		host = req.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return maskRLKey(ip)
 	}
 	return host
 }
 
+func maskRLKey(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String()
+}
+
 const maxRetries = 3
+
+// defaultRateRPM is the fallback capacity for an enabled-but-misconfigured
+// rate limit (proxy.ratelimit=true with a missing/invalid proxy.ratelimit.rpm).
+const defaultRateRPM = 60
+
+// retryAfterSeconds derives a Retry-After value from the group's actual rpm
+// instead of a fixed guess — at rpm=600 a client only needs to wait ~0.1s for
+// its next token; at rpm=6 it needs 10s.
+func retryAfterSeconds(rpm int) int {
+	if rpm <= 0 {
+		rpm = defaultRateRPM
+	}
+	secs := int(math.Ceil(60.0 / float64(rpm)))
+	if secs < 1 {
+		secs = 1
+	}
+	return secs
+}
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Strip any client-supplied attribution header before ANY routing or auth
@@ -204,13 +248,22 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if m, ok := w.(interface{ MarkUnrouted() }); ok {
 			m.MarkUnrouted()
 		}
+		// Unrouted traffic is exactly the shape a scanner produces (random
+		// Host headers/paths) — throttle it too, not just matched routes.
+		// Shares the bounded-bucket-table defense in ratelimit.go, so this
+		// can't be turned into its own memory-exhaustion vector.
+		if r.unroutedLimiter != nil && !r.unroutedLimiter.Allow(rlKey(req, r.xffTrusted)) {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(defaultRateRPM)))
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
 		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.")
 		return
 	}
 	if group.limiter != nil {
 		key := rlKey(req, r.xffTrusted)
 		if !group.limiter.Allow(key) {
-			w.Header().Set("Retry-After", "10")
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(group.RateRPM)))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
@@ -370,6 +423,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 						RateLimit: sr.RateLimit, RateRPM: sr.RateRPM,
 					}
 					groupsByKey[key] = g
+					g.static = true
 				}
 				for _, raw := range sr.Backends {
 					u, err := url.Parse(raw)
@@ -410,6 +464,14 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		path := c.Labels[labelPath]
 		key := host + "|" + path
 		g, ok := groupsByKey[key]
+		if ok && g.static {
+			// routes.json already owns this host+path (onboarded service).
+			// A lingering docker label for the same key — e.g. the original
+			// container of an auto-onboarded service that was never
+			// relabeled — must not sneak back in as a backend or merge its
+			// auth/ratelimit config into the static group.
+			continue
+		}
 		if !ok {
 			display := c.Labels[labelName]
 			if display == "" {
@@ -443,7 +505,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		if rpmStr := c.Labels[labelRateRPM]; rpmStr != "" && g.RateRPM == 0 {
 			rpm, err := strconv.Atoi(rpmStr)
 			if err != nil || rpm <= 0 {
-				log.Printf("skip %s: bad %s=%q", name, labelRateRPM, rpmStr)
+				log.Printf("%s: bad %s=%q, rate limit still enabled at the default %d rpm", name, labelRateRPM, rpmStr, defaultRateRPM)
 			} else {
 				g.RateRPM = rpm
 			}
@@ -480,7 +542,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 	for _, g := range groupsByKey {
 		// Footgun guard: an enabled limiter must never have capacity 0.
 		if g.RateLimit && g.RateRPM <= 0 {
-			g.RateRPM = 60
+			g.RateRPM = defaultRateRPM
 		}
 		sort.SliceStable(g.Backends, func(i, j int) bool { return g.Backends[i].URL < g.Backends[j].URL })
 		out = append(out, g)
