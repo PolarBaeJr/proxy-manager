@@ -639,6 +639,21 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
 			return
 		}
+		if len(parts) == 2 && parts[1] == "check" && req.Method == "POST" {
+			svc, ok, err := findService(req.Context(), dc, name)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if !ok {
+				http.Error(w, "service not found", http.StatusNotFound)
+				return
+			}
+			ic.Check(req.Context(), svc.Image)
+			audit(req, sessionUser(info), "service.check_image", name)
+			httpx.WriteJSON(w, http.StatusOK, ic.Get(svc.Image))
+			return
+		}
 		if len(parts) == 2 && parts[1] == "stage" && req.Method == "POST" {
 			var body ReplaceServiceRequest
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {

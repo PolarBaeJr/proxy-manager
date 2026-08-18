@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -66,12 +67,12 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	ro := NewServer("t", "v")
 	registerMCPTools(ro, c, false)
 	names := toolNames(t, ro)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "resolve_canary"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if names[w] {
 			t.Errorf("mutating tool %q registered in read-only mode", w)
 		}
 	}
-	for _, r := range []string{"list_services", "list_routes", "get_logs", "maintenance_status", "list_dns"} {
+	for _, r := range []string{"list_services", "list_routes", "get_logs", "maintenance_status", "list_dns", "check_for_update"} {
 		if !names[r] {
 			t.Errorf("read tool %q missing", r)
 		}
@@ -80,7 +81,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	rw := NewServer("t", "v")
 	registerMCPTools(rw, c, true)
 	rwNames := toolNames(t, rw)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "resolve_canary"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if !rwNames[w] {
 			t.Errorf("mutating tool %q missing when writes are allowed", w)
 		}
@@ -215,6 +216,14 @@ func TestToolsCallCorrectEndpoints(t *testing.T) {
 		{"lifecycle_service", `{"service":"app","action":"stop"}`, "POST /api/services/app/stop"},
 		{"resolve_canary", `{"service":"app","action":"discard"}`, "DELETE /api/services/app/canary"},
 		{"resolve_canary", `{"service":"app","action":"promote"}`, "POST /api/services/app/promote"},
+		{"stage_canary", `{"service":"app","image":"ghcr.io/org/app:v2"}`, "POST /api/services/app/stage"},
+		{"replace_service", `{"service":"app","image":"ghcr.io/org/app:v2"}`, "POST /api/services/app/replace"},
+		{"restart_replica", `{"service":"app","member":"goproxy-app-1","action":"start"}`, "POST /api/services/app/replicas/goproxy-app-1/start"},
+		{"restart_replica", `{"service":"app","member":"goproxy-app-1","action":"stop"}`, "POST /api/services/app/replicas/goproxy-app-1/stop"},
+		{"check_for_update", `{"service":"app"}`, "POST /api/services/app/check"},
+		{"create_dns_record", `{"type":"A","name":"x.example","content":"1.2.3.4"}`, "POST /api/cf/records?zone="},
+		{"update_dns_record", `{"id":"rec1","content":"1.2.3.4"}`, "PATCH /api/cf/records/rec1?zone="},
+		{"delete_dns_record", `{"id":"rec1"}`, "DELETE /api/cf/records/rec1?zone="},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
@@ -247,6 +256,22 @@ func TestArgumentValidation(t *testing.T) {
 		{"resolve_canary", `{"service":"app","action":"maybe"}`},    // not promote/discard
 		{"set_maintenance", `{"host":"x.example","enabled":"yes"}`}, // string not bool
 		{"get_logs", `{}`}, // missing container
+		{"stage_canary", `{"service":"app","image":"i:v2","env":"nope"}`},         // env not an object
+		{"stage_canary", `{"service":"app","image":"i:v2","env":{"K":1}}`},        // non-string env value
+		{"stage_canary", `{"service":"app","image":"i:v2","env":{"":"v"}}`},       // empty env key
+		{"stage_canary", `{"service":"app","image":"i:v2","env":{"K=X":"v"}}`},    // env key contains "="
+		{"stage_canary", `{"service":"app","image":"i:v2","env_ack":"nope"}`},     // env_ack not an array
+		{"stage_canary", `{"service":"app","image":"i:v2","env_ack":[1]}`},        // non-string env_ack item
+		{"replace_service", `{"service":"app","image":"i:v2","env":"nope"}`},      // env not an object
+		{"replace_service", `{"service":"app","image":"i:v2","env":{"K":1}}`},     // non-string env value
+		{"replace_service", `{"service":"app","image":"i:v2","env":{"":"v"}}`},    // empty env key
+		{"replace_service", `{"service":"app","image":"i:v2","env":{"K=X":"v"}}`}, // env key contains "="
+		{"replace_service", `{"service":"app","image":"i:v2","env_ack":"nope"}`},  // env_ack not an array
+		{"replace_service", `{"service":"app","image":"i:v2","env_ack":[1]}`},     // non-string env_ack item
+		{"restart_replica", `{"service":"app","member":"m1","action":"nuke"}`},    // not start/stop/restart
+		{"create_dns_record", `{"name":"x.example","content":"1.2.3.4"}`},         // missing type
+		{"update_dns_record", `{"id":"rec1"}`},                                    // no fields to update
+		{"delete_dns_record", `{}`},                                               // missing id
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
@@ -306,5 +331,199 @@ func TestToolSchemasWellFormed(t *testing.T) {
 				t.Errorf("%s: %q is required but not defined in properties", tool.Name, r)
 			}
 		}
+	}
+}
+
+// stage_canary and replace_service forward env edits verbatim, and omit the
+// keys entirely from the wire body when the caller doesn't provide any.
+func TestStageAndReplaceForwardEnvEdits(t *testing.T) {
+	cases := []struct{ tool string }{{"stage_canary"}, {"replace_service"}}
+	for _, tc := range cases {
+		t.Run(tc.tool, func(t *testing.T) {
+			prev := internalToken
+			internalToken = "pmt_internal_test"
+			t.Cleanup(func() { internalToken = prev })
+
+			var got ReplaceServiceRequest
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				json.Unmarshal(b, &got)
+				w.WriteHeader(200)
+				w.Write([]byte(`{}`))
+			})
+			c := &apiCaller{mux: h}
+			s := NewServer("t", "v")
+			registerMCPTools(s, c, true)
+
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":{"service":"app","image":"i:v2","env":{"K":"v"},"env_ack":["K"]}}}`
+			res, _ := rpc(t, s, body)
+			if r := res["result"].(map[string]any); r["isError"] == true {
+				t.Fatalf("tool errored: %v", r["content"])
+			}
+			if got.Env["K"] != "v" {
+				t.Errorf("env not forwarded: %+v", got)
+			}
+			if len(got.EnvAck) != 1 || got.EnvAck[0] != "K" {
+				t.Errorf("env_ack not forwarded: %+v", got)
+			}
+
+			var raw map[string]any
+			h2 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				json.Unmarshal(b, &raw)
+				w.WriteHeader(200)
+				w.Write([]byte(`{}`))
+			})
+			c2 := &apiCaller{mux: h2}
+			s2 := NewServer("t", "v")
+			registerMCPTools(s2, c2, true)
+			body2 := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":{"service":"app","image":"i:v2"}}}`
+			res2, _ := rpc(t, s2, body2)
+			if r := res2["result"].(map[string]any); r["isError"] == true {
+				t.Fatalf("tool errored: %v", r["content"])
+			}
+			if _, ok := raw["env"]; ok {
+				t.Errorf("env key present despite not being set: %v", raw)
+			}
+			if _, ok := raw["env_ack"]; ok {
+				t.Errorf("env_ack key present despite not being set: %v", raw)
+			}
+		})
+	}
+}
+
+// A 409 conflict from the dashboard (e.g. an env key whose value differs from
+// what's running) must surface as an MCP tool error naming the conflicting key.
+func TestStageCanaryEnvConflictSurfaces(t *testing.T) {
+	c, _ := stubDash(t, 409, `{"error":"env conflict","keys":["PORT"]}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stage_canary","arguments":{"service":"app","image":"i:v2","env":{"PORT":"3000"}}}}`
+	res, _ := rpc(t, s, body)
+	r, ok := res["result"].(map[string]any)
+	if !ok || r["isError"] != true {
+		t.Fatalf("expected isError, got %v", res)
+	}
+	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "PORT") {
+		t.Errorf("conflicting key not surfaced: %q", text)
+	}
+}
+
+// replace_service surfaces the same conflict shape as stage_canary.
+func TestReplaceServiceEnvConflictSurfaces(t *testing.T) {
+	c, _ := stubDash(t, 409, `{"error":"env conflict","keys":["PORT"]}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"replace_service","arguments":{"service":"app","image":"i:v2","env":{"PORT":"3000"}}}}`
+	res, _ := rpc(t, s, body)
+	r, ok := res["result"].(map[string]any)
+	if !ok || r["isError"] != true {
+		t.Fatalf("expected isError, got %v", res)
+	}
+	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "PORT") {
+		t.Errorf("conflicting key not surfaced: %q", text)
+	}
+}
+
+// restart is stop immediately followed by start, in that order, and the tool
+// returns start's result — the caller cares about the end state.
+func TestRestartReplicaStopsThenStarts(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	var calls []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		w.WriteHeader(200)
+		if strings.HasSuffix(r.URL.Path, "/start") {
+			w.Write([]byte(`{"status":"started"}`))
+		} else {
+			w.Write([]byte(`{"status":"stopped"}`))
+		}
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"restart_replica","arguments":{"service":"app","member":"m1","action":"restart"}}}`
+	res, _ := rpc(t, s, body)
+	r := res["result"].(map[string]any)
+	if r["isError"] == true {
+		t.Fatalf("tool errored: %v", r["content"])
+	}
+	want := []string{"POST /api/services/app/replicas/m1/stop", "POST /api/services/app/replicas/m1/start"}
+	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "started") {
+		t.Errorf("expected start's result, got %q", text)
+	}
+}
+
+// If stop fails, restart must not attempt start.
+func TestRestartReplicaStopFailureSkipsStart(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	var calls []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		w.WriteHeader(500)
+		w.Write([]byte(`stop failed`))
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"restart_replica","arguments":{"service":"app","member":"m1","action":"restart"}}}`
+	res, _ := rpc(t, s, body)
+	r := res["result"].(map[string]any)
+	if r["isError"] != true {
+		t.Fatalf("expected error, got %v", res)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls = %v, want just the stop attempt", calls)
+	}
+}
+
+// update_dns_record must send only the fields the caller actually provided —
+// an explicit false has to reach the wire as false, not get dropped like an
+// absent field would.
+func TestUpdateDNSRecordOnlySendsProvidedFields(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	var got UpdateDNSRequest
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		json.Unmarshal(b, &got)
+		w.WriteHeader(200)
+		w.Write([]byte(`{}`))
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_dns_record","arguments":{"id":"rec1","proxied":false}}}`
+	res, _ := rpc(t, s, body)
+	if r := res["result"].(map[string]any); r["isError"] == true {
+		t.Fatalf("tool errored: %v", r["content"])
+	}
+	if got.Proxied == nil || *got.Proxied != false {
+		t.Errorf("Proxied = %v, want a pointer to false", got.Proxied)
+	}
+	if got.Content != nil {
+		t.Errorf("Content = %v, want nil (not provided)", *got.Content)
+	}
+	if got.Name != nil {
+		t.Errorf("Name = %v, want nil (not provided)", *got.Name)
 	}
 }

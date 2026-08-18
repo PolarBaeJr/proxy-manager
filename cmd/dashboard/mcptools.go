@@ -180,6 +180,31 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 		},
 	})
 
+	// Registered read-only (above the allowWrites gate) even though the
+	// backend route it calls is wrapped in requireElevated: the handler only
+	// forces a registry-digest comparison and caches the result, it never
+	// touches the running service. The internal credential in apiCaller.call
+	// already bypasses the elevated check, same as every other tool here.
+	s.Register(Tool{
+		Name:        "check_for_update",
+		Title:       "Check for an image update",
+		Description: "Force an immediate check of whether a newer image is available in the registry for this service, instead of waiting for the periodic background poll (runs roughly every 10 minutes). Does not change anything about the running service — only refreshes the cached 'update available' status, which then shows up in list_services.",
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+		}, "service"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/check", nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
 	if !allowWrites {
 		return
 	}
@@ -301,13 +326,33 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 	})
 
 	s.Register(Tool{
-		Name:        "stage_canary",
-		Title:       "Stage a canary",
-		Description: "Deploy a new image alongside the live one so traffic splits across both. Nothing is removed. Follow with resolve_canary. Preferred over a direct replace because it is reversible.",
-		Mutating:    true,
+		Name:  "stage_canary",
+		Title: "Stage a canary",
+		Description: "Deploy a new image alongside the live one so traffic splits across both, " +
+			"optionally editing env vars at the same time. Nothing is removed. Follow with " +
+			"resolve_canary. Preferred over a direct replace because it is reversible. " +
+			"Env edits are MERGED onto the service's current env, not a replacement: a key " +
+			"absent from the current env is added, a key with an identical value is a no-op, " +
+			"and a key whose value differs is refused as a conflict (see env_ack). There is " +
+			"no way to remove an env var through this tool.",
+		Mutating: true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
 			"image":   prop("string", "Full image reference including tag."),
+			"env": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description": "Env var edits (name -> new value), merged onto the service's " +
+					"current env. A name whose value differs from what's running is refused as " +
+					"a conflict unless also listed in env_ack; call again with the conflicting " +
+					"keys in env_ack to confirm the overwrite.",
+			},
+			"env_ack": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+				"description": "Env var names from a prior conflict response that should be " +
+					"overwritten. Resubmit the same env plus these names.",
+			},
 		}, "service", "image"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -318,7 +363,80 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/stage", map[string]any{"image": image})
+			env, err := argEnvEdits(args, "env")
+			if err != nil {
+				return "", err
+			}
+			ack, err := argStringSlice(args, "env_ack")
+			if err != nil {
+				return "", err
+			}
+			body := map[string]any{"image": image}
+			if len(env) > 0 {
+				body["env"] = env
+			}
+			if len(ack) > 0 {
+				body["env_ack"] = ack
+			}
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/stage", body)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
+		Name:  "replace_service",
+		Title: "Replace a service's image directly",
+		Description: "Replace a service's running image directly — NOT reversible (old " +
+			"containers are torn down immediately). Optionally edits env vars using the same " +
+			"merge/conflict rules as stage_canary. Prefer stage_canary + resolve_canary when " +
+			"you want a reversible rollout; use this only when a direct swap is intended.",
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+			"image":   prop("string", "Full image reference including tag."),
+			"env": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description": "Env var edits (name -> new value), merged onto the service's " +
+					"current env. A name whose value differs from what's running is refused as " +
+					"a conflict unless also listed in env_ack; call again with the conflicting " +
+					"keys in env_ack to confirm the overwrite.",
+			},
+			"env_ack": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+				"description": "Env var names from a prior conflict response that should be " +
+					"overwritten. Resubmit the same env plus these names.",
+			},
+		}, "service", "image"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			image, err := argString(args, "image")
+			if err != nil {
+				return "", err
+			}
+			env, err := argEnvEdits(args, "env")
+			if err != nil {
+				return "", err
+			}
+			ack, err := argStringSlice(args, "env_ack")
+			if err != nil {
+				return "", err
+			}
+			body := map[string]any{"image": image}
+			if len(env) > 0 {
+				body["env"] = env
+			}
+			if len(ack) > 0 {
+				body["env_ack"] = ack
+			}
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/replace", body)
 			if err != nil {
 				return "", err
 			}
@@ -359,6 +477,204 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 				return pretty(b), nil
 			}
 			return "", fmt.Errorf("action must be \"promote\" or \"discard\", got %q", action)
+		},
+	})
+
+	s.Register(Tool{
+		Name:        "restart_replica",
+		Title:       "Start, stop, or restart a replica",
+		Description: "Start, stop, or restart one replica of a service (not the whole service — use lifecycle_service for that). member is a name from list_services' member_summaries. restart is stop immediately followed by start.",
+		Mutating:    true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+			"member":  prop("string", "Replica name from list_services' member_summaries."),
+			"action":  map[string]any{"type": "string", "enum": []string{"start", "stop", "restart"}, "description": "start, stop, or restart"},
+		}, "service", "member", "action"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			member, err := argString(args, "member")
+			if err != nil {
+				return "", err
+			}
+			action, err := argString(args, "action")
+			if err != nil {
+				return "", err
+			}
+			base := "/api/services/" + url.PathEscape(name) + "/replicas/" + url.PathEscape(member) + "/"
+			switch action {
+			case "start", "stop":
+				b, err := a.call(ctx, "POST", base+action, nil)
+				if err != nil {
+					return "", err
+				}
+				return pretty(b), nil
+			case "restart":
+				// Abort on stop failure rather than attempting start anyway —
+				// a replica already down for another reason shouldn't be
+				// force-started as a side effect of a restart request.
+				if _, err := a.call(ctx, "POST", base+"stop", nil); err != nil {
+					return "", err
+				}
+				b, err := a.call(ctx, "POST", base+"start", nil)
+				if err != nil {
+					return "", err
+				}
+				return pretty(b), nil
+			}
+			return "", fmt.Errorf("action must be \"start\", \"stop\", or \"restart\", got %q", action)
+		},
+	})
+
+	s.Register(Tool{
+		Name:        "create_dns_record",
+		Title:       "Create a DNS record",
+		Description: "Create a Cloudflare DNS record. Omit zone for the default.",
+		Mutating:    true,
+		InputSchema: schema(map[string]any{
+			"zone":     prop("string", "Zone domain, e.g. polardev.org. Omit for the default."),
+			"type":     prop("string", "Record type, e.g. A, CNAME, TXT, MX."),
+			"name":     prop("string", "Record name."),
+			"content":  prop("string", "Record content — the target/value."),
+			"proxied":  prop("boolean", "Whether Cloudflare proxies this record. Defaults to false."),
+			"ttl":      prop("number", "TTL in seconds. Defaults to 1 (automatic) when proxied."),
+			"priority": prop("number", "Priority — MX records only."),
+		}, "type", "name", "content"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			zone := ""
+			if _, ok := args["zone"]; ok {
+				var err error
+				if zone, err = argString(args, "zone"); err != nil {
+					return "", err
+				}
+			}
+			typ, err := argString(args, "type")
+			if err != nil {
+				return "", err
+			}
+			name, err := argString(args, "name")
+			if err != nil {
+				return "", err
+			}
+			content, err := argString(args, "content")
+			if err != nil {
+				return "", err
+			}
+			body := map[string]any{"type": typ, "name": name, "content": content}
+			if _, ok := args["proxied"]; ok {
+				proxied, err := argBool(args, "proxied")
+				if err != nil {
+					return "", err
+				}
+				body["proxied"] = proxied
+			}
+			if _, ok := args["ttl"]; ok {
+				ttl, err := argInt(args, "ttl")
+				if err != nil {
+					return "", err
+				}
+				body["ttl"] = ttl
+			}
+			if _, ok := args["priority"]; ok {
+				priority, err := argInt(args, "priority")
+				if err != nil {
+					return "", err
+				}
+				body["priority"] = priority
+			}
+			b, err := a.call(ctx, "POST", "/api/cf/records?zone="+url.QueryEscape(zone), body)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
+		Name:        "update_dns_record",
+		Title:       "Update a DNS record",
+		Description: "Partially update a Cloudflare DNS record. Only the fields provided are changed; omit a field to leave it untouched. Omit zone for the default.",
+		Mutating:    true,
+		InputSchema: schema(map[string]any{
+			"zone":    prop("string", "Zone domain, e.g. polardev.org. Omit for the default."),
+			"id":      prop("string", "Cloudflare record ID, from list_dns."),
+			"content": prop("string", "New content — the target/value."),
+			"proxied": prop("boolean", "Whether Cloudflare proxies this record."),
+			"name":    prop("string", "New record name."),
+		}, "id"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			zone := ""
+			if _, ok := args["zone"]; ok {
+				var err error
+				if zone, err = argString(args, "zone"); err != nil {
+					return "", err
+				}
+			}
+			id, err := argString(args, "id")
+			if err != nil {
+				return "", err
+			}
+			body := map[string]any{}
+			if _, ok := args["content"]; ok {
+				content, err := argString(args, "content")
+				if err != nil {
+					return "", err
+				}
+				body["content"] = content
+			}
+			if _, ok := args["proxied"]; ok {
+				proxied, err := argBool(args, "proxied")
+				if err != nil {
+					return "", err
+				}
+				body["proxied"] = proxied
+			}
+			if _, ok := args["name"]; ok {
+				name, err := argString(args, "name")
+				if err != nil {
+					return "", err
+				}
+				body["name"] = name
+			}
+			if len(body) == 0 {
+				return "", fmt.Errorf("update_dns_record: provide at least one of content, proxied, name")
+			}
+			b, err := a.call(ctx, "PATCH", "/api/cf/records/"+url.PathEscape(id)+"?zone="+url.QueryEscape(zone), body)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
+		Name:        "delete_dns_record",
+		Title:       "Delete a DNS record",
+		Description: "Delete a Cloudflare DNS record. Omit zone for the default.",
+		Mutating:    true,
+		InputSchema: schema(map[string]any{
+			"zone": prop("string", "Zone domain, e.g. polardev.org. Omit for the default."),
+			"id":   prop("string", "Cloudflare record ID, from list_dns."),
+		}, "id"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			zone := ""
+			if _, ok := args["zone"]; ok {
+				var err error
+				if zone, err = argString(args, "zone"); err != nil {
+					return "", err
+				}
+			}
+			id, err := argString(args, "id")
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "DELETE", "/api/cf/records/"+url.PathEscape(id)+"?zone="+url.QueryEscape(zone), nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
 		},
 	})
 }

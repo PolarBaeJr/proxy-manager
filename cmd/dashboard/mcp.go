@@ -242,6 +242,59 @@ func argBool(args map[string]any, key string) (bool, error) {
 	return b, nil
 }
 
+// argEnvEdits reads the optional "<key>" object argument: a map of env-var
+// edits merged onto the service's current env (see serviceenv.go). Keys must
+// be non-empty and free of "=" — an embedded "=" would corrupt the KEY=VALUE
+// encoding mergeEnv writes and, once re-split, would silently rename the
+// variable and mangle its value.
+func argEnvEdits(args map[string]any, key string) (map[string]string, error) {
+	v, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("argument %q must be an object", key)
+	}
+	out := make(map[string]string, len(m))
+	for k, raw := range m {
+		if k == "" {
+			return nil, fmt.Errorf("argument %q: env var name must not be empty", key)
+		}
+		if strings.Contains(k, "=") {
+			return nil, fmt.Errorf("argument %q: env var name %q must not contain \"=\"", key, k)
+		}
+		s, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("argument %q: value for %q must be a string", key, k)
+		}
+		out[k] = s
+	}
+	return out, nil
+}
+
+// argStringSlice reads an optional array-valued argument whose items must
+// all be strings (e.g. env_ack: the keys a caller has chosen to overwrite).
+func argStringSlice(args map[string]any, key string) ([]string, error) {
+	v, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("argument %q must be an array", key)
+	}
+	out := make([]string, 0, len(arr))
+	for i, raw := range arr {
+		s, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("argument %q[%d] must be a string", key, i)
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
 func schema(props map[string]any, required ...string) map[string]any {
 	if required == nil {
 		required = []string{}
