@@ -36,6 +36,12 @@ const (
 	labelCanary     = "proxy.canary"         // "true" → staged replicas, served alongside live
 	labelAutoUpdate = "proxy.autoupdate"     // "true" → engine replaces on newer registry digest
 	// labelMaintPage lives in maintpage.go, next to the sync that consumes it.
+
+	// ociImageLabelPrefix marks labels that describe the IMAGE (baked in by
+	// the build, e.g. org.opencontainers.image.revision), not the container.
+	// replaceService must not carry these forward onto a replacement running
+	// a different image.
+	ociImageLabelPrefix = "org.opencontainers.image."
 )
 
 // dockerClient is the dashboard's READ-WRITE view of the Docker daemon.
@@ -622,6 +628,14 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	// Stamp the new containers' labels with the previous image for one-click rollback.
 	newLabels := map[string]string{}
 	for k, v := range tpl.Labels {
+		// org.opencontainers.image.* describes the IMAGE, not the container —
+		// carrying the old image's copy forward would override (not merely
+		// shadow) the new image's own labels of the same key at create time,
+		// leaving e.g. image.revision pointing at the image being replaced.
+		// Omit it here so Docker fills it in from req.Image instead.
+		if strings.HasPrefix(k, ociImageLabelPrefix) {
+			continue
+		}
 		newLabels[k] = v
 	}
 	if tpl.Image != "" && tpl.Image != req.Image {

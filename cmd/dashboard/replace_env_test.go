@@ -135,3 +135,69 @@ func asEnvConflict(err error, target **envConflictError) bool {
 	}
 	return ok
 }
+
+// TestReplaceServiceDropsStaleOCIImageLabels is the regression test for the
+// live finding on sfubadminton.com: replaceService copies the template
+// container's labels verbatim onto the replacement, including
+// org.opencontainers.image.* labels baked in by the OLD image. Passed as an
+// explicit Labels map, those override (not just shadow) what Docker would
+// otherwise fill in from the NEW image, leaving e.g. image.revision pointing
+// at the image being replaced. proxy.* labels must still ride forward
+// unchanged — that part is load-bearing for routing continuity.
+func TestReplaceServiceDropsStaleOCIImageLabels(t *testing.T) {
+	var createdLabels map[string]string
+	var sawCreate bool
+
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "tpl1", Names: []string{"/goproxy-app-1"}, State: "running",
+				Image: "ghcr.io/org/app:v1",
+				Labels: map[string]string{
+					labelEnable: "true", labelService: "app", labelHost: "app.example",
+					"org.opencontainers.image.revision": "stale-old-sha",
+					"org.opencontainers.image.source":    "https://github.com/org/app",
+				},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/tpl1/json"):
+			json.NewEncoder(w).Encode(map[string]any{"Config": map[string]any{"Env": []string{}}})
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			sawCreate = true
+			var body struct {
+				Labels map[string]string `json:"Labels"`
+			}
+			b, _ := io.ReadAll(r.Body)
+			json.Unmarshal(b, &body)
+			if createdLabels == nil {
+				createdLabels = body.Labels
+			}
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	if err := dc.replaceService(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}); err != nil {
+		t.Fatalf("replaceService: %v", err)
+	}
+	if !sawCreate {
+		t.Fatal("no container created")
+	}
+	if v, ok := createdLabels["org.opencontainers.image.revision"]; ok {
+		t.Errorf("stale OCI label carried forward: image.revision = %q, want dropped so Docker fills it in from the new image", v)
+	}
+	if v, ok := createdLabels["org.opencontainers.image.source"]; ok {
+		t.Errorf("stale OCI label carried forward: image.source = %q, want dropped", v)
+	}
+	if createdLabels[labelHost] != "app.example" {
+		t.Errorf("proxy.host label lost: %v", createdLabels)
+	}
+	if createdLabels[labelService] != "app" {
+		t.Errorf("proxy.service label lost: %v", createdLabels)
+	}
+}
