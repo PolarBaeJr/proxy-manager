@@ -47,6 +47,15 @@ func main() {
 
 	dc := newDockerClient()
 
+	secrets, secretsMsgs := newSecretsFromEnv(os.Getenv)
+	for _, m := range secretsMsgs {
+		log.Printf("%s", m)
+	}
+	if secrets != nil {
+		log.Printf("secret refs enabled (ref:NAME env values resolve from %s)", secrets.path)
+	}
+	dc.secrets = secrets
+
 	cf, cfMsgs := newCloudflareRegistryFromEnv(os.Getenv)
 	for _, m := range cfMsgs {
 		log.Printf("%s", m)

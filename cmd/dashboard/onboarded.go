@@ -517,9 +517,13 @@ func (c *dockerClient) stageOnboarded(ctx context.Context, name string, req Repl
 	if svc.CanaryImage != "" {
 		return fmt.Errorf("%q already has a canary — promote or discard first", name)
 	}
-	env, err := mergeEnv(c.onboardedBaseEnv(ctx, name, svc), req.Env, req.EnvAck)
+	edits, refs, err := resolveSecretRefs(req.Env, c.secrets)
 	if err != nil {
 		return err
+	}
+	env, err := mergeEnv(c.onboardedBaseEnv(ctx, name, svc), edits, req.EnvAck)
+	if err != nil {
+		return redactRefConflicts(err, refs)
 	}
 	c.pullImage(ctx, req.Image)
 	for i := 1; i <= svc.Replicas; i++ {
@@ -649,9 +653,13 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 	if svc.CanaryImage != "" {
 		return fmt.Errorf("%q has a canary in flight — promote or discard first", name)
 	}
-	env, err := mergeEnv(c.onboardedBaseEnv(ctx, name, svc), req.Env, req.EnvAck)
+	edits, refs, err := resolveSecretRefs(req.Env, c.secrets)
 	if err != nil {
 		return err
+	}
+	env, err := mergeEnv(c.onboardedBaseEnv(ctx, name, svc), edits, req.EnvAck)
+	if err != nil {
+		return redactRefConflicts(err, refs)
 	}
 	c.pullImage(ctx, req.Image)
 	// Spin up replacements named -r2 to avoid colliding with existing -1..N.

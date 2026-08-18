@@ -46,7 +46,13 @@ const (
 
 // dockerClient is the dashboard's READ-WRITE view of the Docker daemon.
 // Required for creating/scaling/deleting services. Mount is rw in compose.
-type dockerClient struct{ http *http.Client }
+type dockerClient struct {
+	http *http.Client
+	// secrets resolves "ref:NAME" env edit values. Nil in the zero value
+	// (including every test that builds a dockerClient by hand) — that's
+	// fine, ref: edits just error out asking for SECRETS_FILE.
+	secrets *secretsStore
+}
 
 func newDockerClient() *dockerClient {
 	return &dockerClient{
@@ -628,9 +634,13 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	if err != nil {
 		return fmt.Errorf("inspect template env: %w", err)
 	}
-	env, err := mergeEnv(base, req.Env, req.EnvAck)
+	edits, refs, err := resolveSecretRefs(req.Env, c.secrets)
 	if err != nil {
 		return err
+	}
+	env, err := mergeEnv(base, edits, req.EnvAck)
+	if err != nil {
+		return redactRefConflicts(err, refs)
 	}
 
 	c.pullImage(ctx, req.Image)
@@ -716,9 +726,13 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 	if err != nil {
 		return fmt.Errorf("inspect template env: %w", err)
 	}
-	env, err := mergeEnv(base, req.Env, req.EnvAck)
+	edits, refs, err := resolveSecretRefs(req.Env, c.secrets)
 	if err != nil {
 		return err
+	}
+	env, err := mergeEnv(base, edits, req.EnvAck)
+	if err != nil {
+		return redactRefConflicts(err, refs)
 	}
 
 	canaryLabels := map[string]string{}

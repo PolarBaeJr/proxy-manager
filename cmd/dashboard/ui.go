@@ -3176,7 +3176,7 @@ function buildDialogs() {
     + '<input type="hidden" name="serviceName">'
     + '<div class="field"><label>Current image</label><input name="currentImage" disabled></div>'
     + '<div class="field" id="field-new-image"><label>New image</label><input name="image" placeholder="ghcr.io/org/app:tag" required></div>'
-    + '<div class="field"><label>Env edits <span class="hint" style="display:inline">(KEY=VALUE per line — merged onto the current env; blank keeps everything as-is)</span></label><textarea name="env"></textarea></div>'
+    + '<div class="field"><label>Env edits <span class="hint" style="display:inline">(KEY=VALUE per line — merged onto the current env; blank keeps everything as-is. For a secret, use KEY=ref:NAME to resolve NAME from the host secrets file instead of typing the value here)</span></label><textarea name="env"></textarea></div>'
     + '<div id="env-conflicts" hidden></div>'
     + '</div><div class="dialog-actions">'
     +   '<button type="button" class="btn" onclick="document.getElementById(\'dlg-replace-service\').close()">Cancel</button>'
