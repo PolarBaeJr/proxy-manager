@@ -573,8 +573,16 @@ func (c *dockerClient) createService(ctx context.Context, req CreateServiceReque
 	if req.Unscalable {
 		labels[labelUnscalable] = "true"
 	}
+	// No merge/conflict here — there's no running container to compare
+	// against yet, just resolution. refs (the conflict-redaction map) is
+	// unused for the same reason: nothing here can produce an
+	// envConflictError.
+	resolvedEnv, _, err := resolveSecretRefs(req.Name, req.Env, c.secrets)
+	if err != nil {
+		return err
+	}
 	var env []string
-	for k, v := range req.Env {
+	for k, v := range resolvedEnv {
 		env = append(env, k+"="+v)
 	}
 	for i := 1; i <= req.Replicas; i++ {

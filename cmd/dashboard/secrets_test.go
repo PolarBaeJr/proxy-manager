@@ -353,3 +353,83 @@ func TestReplaceServiceCrossServiceRefIsolation(t *testing.T) {
 		t.Errorf("app-b API_KEY = %q, want b-value", got)
 	}
 }
+
+// TestCreateServiceResolvesSecretRef is the discriminating case for the
+// "New service" dialog / POST /api/services — a separate code path from
+// replace/stage with no merge step of its own, easy to forget when wiring
+// ref: support. Before this, createService took req.Env completely
+// literally, so a "ref:NAME" typed into a brand-new service would have been
+// baked into the container verbatim instead of resolved — silently wrong,
+// not even an error.
+func TestCreateServiceResolvesSecretRef(t *testing.T) {
+	sec := writeServiceSecrets(t, "newapp", "DATABASE_URL=postgres://real:creds@db/app\n")
+
+	var createdEnv []string
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/create") {
+			var body struct {
+				Env []string `json:"Env"`
+			}
+			b, _ := io.ReadAll(r.Body)
+			json.Unmarshal(b, &body)
+			createdEnv = body.Env
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+			return
+		}
+		w.Write([]byte("{}"))
+	}))
+	dc.secrets = sec
+
+	err := dc.createService(context.Background(), CreateServiceRequest{
+		Name: "newapp", Image: "ghcr.io/org/newapp:v1", Host: "newapp.example", Port: 8080, Replicas: 1,
+		Env: map[string]string{
+			"DATABASE_URL": "ref:DATABASE_URL",
+			"LOG_LEVEL":    "debug",
+		},
+	})
+	if err != nil {
+		t.Fatalf("createService: %v", err)
+	}
+
+	got := map[string]string{}
+	for _, e := range createdEnv {
+		if k, v, ok := splitEnvEntry(e); ok {
+			got[k] = v
+		}
+	}
+	if got["DATABASE_URL"] != "postgres://real:creds@db/app" {
+		t.Errorf("DATABASE_URL = %q, want the resolved secret value", got["DATABASE_URL"])
+	}
+	if got["LOG_LEVEL"] != "debug" {
+		t.Errorf("LOG_LEVEL = %q, want unchanged literal", got["LOG_LEVEL"])
+	}
+}
+
+// TestCreateServiceUnresolvableRefFailsBeforeCreate mirrors the
+// replace/stage guarantee: a bad ref must fail before any container exists,
+// not create one with the literal "ref:NAME" string baked in as its value.
+func TestCreateServiceUnresolvableRefFailsBeforeCreate(t *testing.T) {
+	sec := writeServiceSecrets(t, "newapp", "OTHER=x\n")
+
+	var sawCreate bool
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/create") {
+			sawCreate = true
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+			return
+		}
+		w.Write([]byte("{}"))
+	}))
+	dc.secrets = sec
+
+	err := dc.createService(context.Background(), CreateServiceRequest{
+		Name: "newapp", Image: "ghcr.io/org/newapp:v1", Host: "newapp.example", Port: 8080, Replicas: 1,
+		Env: map[string]string{"DATABASE_URL": "ref:MISSING"},
+	})
+	if err == nil {
+		t.Fatal("expected an error for an unresolvable ref")
+	}
+	if sawCreate {
+		t.Fatal("a container was created with an unresolved ref: string baked in as the literal value")
+	}
+}

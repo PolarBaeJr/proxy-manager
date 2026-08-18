@@ -3161,7 +3161,7 @@ function buildDialogs() {
     +   '<div class="field-row"><div class="field"><label>Replicas</label><input name="replicas" type="number" min="0" value="1"></div>'
     +   '<div class="field check" style="align-items:center;padding-top:24px"><input type="checkbox" name="unscalable" id="nsv-single"><label for="nsv-single">Singleton (db, bot)</label></div></div>'
     +   '<div class="hint" style="margin:-6px 0 12px">Singletons run exactly one replica and cannot be scaled.</div>'
-    +   '<div class="field"><label>Environment (KEY=VALUE per line)</label><textarea name="env" placeholder="DATABASE_URL=postgres://...&#10;PORT=3000"></textarea></div></div>'
+    +   '<div class="field"><label>Environment <span class="hint" style="display:inline">(KEY=VALUE per line. For a secret, use KEY=ref:NAME to resolve NAME from this service’s own secrets file instead of typing the value here)</span></label><textarea name="env" placeholder="DATABASE_URL=postgres://...&#10;PORT=3000"></textarea></div></div>'
     + '</div><div class="dialog-actions">'
     +   '<button type="button" class="btn" onclick="document.getElementById(\'dlg-new-service\').close()">Cancel</button>'
     +   '<button type="submit" class="btn primary">' + I.check + 'Create</button>'
