@@ -1468,6 +1468,9 @@ async function renderServices() {
                   ? '<button class="btn" ' + lockedAttr() + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + lk() + '</button>'
                   : '<button class="btn primary" ' + lockedAttr() + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + lk() + '</button>')
               + '<button class="btn" ' + lockedAttr() + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.swap + 'Replace' + lk() + '</button>'
+              // Force an immediate registry check instead of waiting on the
+              // ~10min background poller — mirrors the MCP check_for_update tool.
+              + '<button class="btn ghost" ' + lockedAttr() + ' onclick="checkForUpdate(\'' + sn + '\', this)">' + I.refresh + 'Check now' + lk() + '</button>'
               + (s.all_stopped
                   ? '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\')">' + I.bolt + 'Start service' + lk() + '</button>'
                   : '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\')">' + I.lock + 'Stop service' + lk() + '</button>')
@@ -1501,7 +1504,8 @@ async function renderServices() {
         const canaryPill = m.is_canary ? ' <span class="pill info">canary</span>' : '';
         const btn = m.is_canary ? ''
           : (live
-              ? '<button class="btn sm ghost" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'stop\')">' + I.lock + 'Stop' + lk() + '</button>'
+              ? '<button class="btn sm ghost" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'restart\')" title="Stop then start this replica">' + I.refresh + 'Restart' + lk() + '</button>'
+              + '<button class="btn sm ghost" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'stop\')">' + I.lock + 'Stop' + lk() + '</button>'
               : '<button class="btn sm" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'start\')">' + I.bolt + 'Start' + lk() + '</button>');
         memberList += '<div class="member-row"><span class="ident dim">' + esc(m.name) + '</span> ' + pill + canaryPill + '<span class="spacer"></span>' + btn + '</div>';
       }
@@ -2010,8 +2014,41 @@ async function toggleMaintenance(host, enable) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+// checkForUpdate forces an immediate registry poll instead of waiting on the
+// ~10min background checker — same endpoint the MCP check_for_update tool
+// calls. Response is either a single status object, or {live, canary} when
+// a canary is staged; either shape may carry update_available.
+async function checkForUpdate(name, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('/api/services/' + encodeURIComponent(name) + '/check', { method:'POST' });
+    const avail = r.update_available || (r.live && r.live.update_available) || (r.canary && r.canary.update_available);
+    toast(avail ? 'update available for ' + name : name + ' is up to date', 'ok');
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { if (btn) btn.disabled = false; }
+}
+
 async function lifecycleReplica(svc, member, act) {
   try {
+    if (act === 'restart') {
+      await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/stop', { method:'POST' });
+      try {
+        await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/start', { method:'POST' });
+        toast('restarted ' + member, 'ok');
+      } catch (e) {
+        // Stop already succeeded — the replica is now down, not still running
+        // pre-restart, so say so rather than a generic "restart failed".
+        toast('stop succeeded but start failed — ' + member + ' is now STOPPED: ' + e.message, 'err');
+        _lastServicesHash = '';
+        renderActive();
+        return;
+      }
+      _lastServicesHash = '';
+      renderActive();
+      return;
+    }
     await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/' + act, { method:'POST' });
     toast(act === 'stop' ? 'stopped ' + member : 'started ' + member, 'ok');
     _lastServicesHash = '';
