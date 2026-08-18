@@ -67,7 +67,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	ro := NewServer("t", "v")
 	registerMCPTools(ro, c, false)
 	names := toolNames(t, ro)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if names[w] {
 			t.Errorf("mutating tool %q registered in read-only mode", w)
 		}
@@ -81,7 +81,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	rw := NewServer("t", "v")
 	registerMCPTools(rw, c, true)
 	rwNames := toolNames(t, rw)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if !rwNames[w] {
 			t.Errorf("mutating tool %q missing when writes are allowed", w)
 		}
@@ -622,5 +622,66 @@ func TestDNSToolsAcceptEmptyZone(t *testing.T) {
 				t.Fatalf("calls = %v, want exactly one", *calls)
 			}
 		})
+	}
+}
+
+// offboard_service must refuse a service that isn't onboarded — the backend's
+// DELETE falls through to a hard container delete for a label-managed
+// service, which this tool must never trigger silently.
+func TestOffboardServiceRefusesNonOnboarded(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	var calls []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		w.WriteHeader(200)
+		w.Write([]byte(`[{"name":"app","onboarded":false}]`))
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offboard_service","arguments":{"service":"app"}}}`
+	res, _ := rpc(t, s, body)
+	r := res["result"].(map[string]any)
+	if r["isError"] != true {
+		t.Fatalf("expected refusal for a non-onboarded service, got %v", res)
+	}
+	if len(calls) != 1 || calls[0] != "GET /api/services" {
+		t.Fatalf("calls = %v, want only the list_services check — DELETE must never fire", calls)
+	}
+}
+
+// offboard_service must proceed to DELETE for a service that IS onboarded.
+func TestOffboardServiceRemovesOnboarded(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	var calls []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		w.WriteHeader(200)
+		if r.Method == "GET" {
+			w.Write([]byte(`[{"name":"app","onboarded":true}]`))
+		} else {
+			w.Write([]byte(`{"status":"offboarded"}`))
+		}
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offboard_service","arguments":{"service":"app"}}}`
+	res, _ := rpc(t, s, body)
+	r := res["result"].(map[string]any)
+	if r["isError"] == true {
+		t.Fatalf("tool errored: %v", r["content"])
+	}
+	want := []string{"GET /api/services", "DELETE /api/services/app"}
+	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+		t.Fatalf("calls = %v, want %v", calls, want)
 	}
 }

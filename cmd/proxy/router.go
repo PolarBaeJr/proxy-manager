@@ -47,6 +47,12 @@ type RouteGroup struct {
 	limiter   *rateLimiter
 
 	cursor atomic.Uint64
+
+	// static marks a group whose backend list is owned by routes.json /
+	// static config (the onboarded-service flow). Once true, a lingering
+	// docker label for the same host+path must not re-join this group as
+	// a backend — routes.json has exclusive ownership.
+	static bool
 }
 
 func (g *RouteGroup) pickHealthy(skip map[*Backend]bool) *Backend {
@@ -370,6 +376,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 						RateLimit: sr.RateLimit, RateRPM: sr.RateRPM,
 					}
 					groupsByKey[key] = g
+					g.static = true
 				}
 				for _, raw := range sr.Backends {
 					u, err := url.Parse(raw)
@@ -410,6 +417,14 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		path := c.Labels[labelPath]
 		key := host + "|" + path
 		g, ok := groupsByKey[key]
+		if ok && g.static {
+			// routes.json already owns this host+path (onboarded service).
+			// A lingering docker label for the same key — e.g. the original
+			// container of an auto-onboarded service that was never
+			// relabeled — must not sneak back in as a backend or merge its
+			// auth/ratelimit config into the static group.
+			continue
+		}
 		if !ok {
 			display := c.Labels[labelName]
 			if display == "" {

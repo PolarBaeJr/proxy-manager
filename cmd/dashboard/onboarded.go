@@ -555,13 +555,35 @@ func (c *dockerClient) promoteOnboarded(ctx context.Context, name string, store 
 	if svc.CanaryImage == "" {
 		return fmt.Errorf("no canary to promote for %q", name)
 	}
-	// Tear down old (non-canary) clones first.
+	// Capture the ACTUAL live env from a promoted canary container FIRST,
+	// before any mutation happens. svc.Env is the template scaleOnboarded
+	// clones from later; if an env edit was staged via stageOnboarded it
+	// only ever reached the canary containers, never svc.Env itself. Failing
+	// here (before tearing down old clones or flipping svc.Image) avoids
+	// half-promoting into an inconsistent state when we can't determine the
+	// promoted env.
 	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
 	if err != nil {
 		return err
 	}
+	cPrefix := fmt.Sprintf("goproxy-onb-%s-c", name)
+	var canaryID string
 	for _, cl := range all {
-		if strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+		if strings.HasPrefix(cl.name(), cPrefix) {
+			canaryID = cl.ID
+			break
+		}
+	}
+	if canaryID == "" {
+		return fmt.Errorf("no canary container found for %q", name)
+	}
+	canaryEnv, err := c.inspectEnv(ctx, canaryID)
+	if err != nil {
+		return fmt.Errorf("inspect canary env: %w", err)
+	}
+	// Tear down old (non-canary) clones first.
+	for _, cl := range all {
+		if strings.HasPrefix(cl.name(), cPrefix) {
 			continue
 		}
 		_ = c.stopContainer(ctx, cl.ID)
@@ -572,6 +594,7 @@ func (c *dockerClient) promoteOnboarded(ctx context.Context, name string, store 
 	svc.OriginalRouted = false
 	svc.PreviousImage = svc.Image
 	svc.Image = svc.CanaryImage
+	svc.Env = canaryEnv
 	svc.CanaryImage = ""
 	svc.CanaryReplicas = 0
 	if err := store.Put(svc); err != nil {
@@ -763,13 +786,20 @@ func proxyRefresh(proxyURL string) {
 // service itself), and only falls back to the stored snapshot when neither can
 // be read — better a stale base than no base, since the caller would otherwise
 // create replicas with an empty environment.
+//
+// A c-prefixed container is only skipped while svc.CanaryImage is set (an
+// actively-staged canary, not yet the live config) — matching the same
+// CanaryImage-gated pattern used by scaleOnboarded and rebuildOnboardedRoute.
+// Once promote has run, CanaryImage clears and the c-prefixed container IS
+// the live one; skipping it unconditionally would fall through to the stale
+// original container's env, silently reverting any promoted env edit.
 func (c *dockerClient) onboardedBaseEnv(ctx context.Context, name string, svc OnboardedService) []string {
 	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
 	if err == nil {
 		cPrefix := fmt.Sprintf("goproxy-onb-%s-c", name)
 		for _, ct := range all {
-			if strings.HasPrefix(ct.name(), cPrefix) {
-				continue // canary replica — not the live config
+			if svc.CanaryImage != "" && strings.HasPrefix(ct.name(), cPrefix) {
+				continue // actively-staged canary replica — not the live config
 			}
 			if env, err := c.inspectEnv(ctx, ct.ID); err == nil && len(env) > 0 {
 				return env
