@@ -164,6 +164,16 @@ func main() {
 				log.Printf("failed to register /set-alert-channel command (guild=%q): %v", guildID, err)
 			}
 		})
+		// Sent here rather than right after sess.Open() returns — Open()
+		// returning without error only means our identify was accepted, not
+		// that Discord's backend has finished standing up the session (same
+		// race as command registration above). A presence update sent before
+		// that finishes is liable to be silently dropped. Re-sent on every
+		// Ready (including resumes), which is harmless and keeps the status
+		// fresh if Discord ever reset it server-side.
+		if err := s.UpdateStatusComplex(discordgo.UpdateStatusData{Status: "online"}); err != nil {
+			log.Printf("failed to set online presence: %v", err)
+		}
 	})
 
 	sess.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -232,14 +242,6 @@ func main() {
 		log.Fatalf("open discord session: %v", err)
 	}
 	defer sess.Close()
-
-	// discordgo's Identify never sets a presence status (it's left as the
-	// zero value, an empty string) unless told to — Discord then shows the
-	// bot as offline/invisible to other members even though the gateway
-	// session itself is fully alive and receiving events.
-	if err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{Status: "online"}); err != nil {
-		log.Printf("failed to set online presence: %v", err)
-	}
 
 	mu.Lock()
 	initialTarget := alertChannelID
