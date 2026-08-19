@@ -98,11 +98,25 @@ func ipInAny(ip net.IP, nets []*net.IPNet) bool {
 	return false
 }
 
-// realClientIP returns the IP auth decisions are based on. Unlike clientIP()
-// in accesslog.go (first XFF hop, spoofable, logging-only), this trusts
-// X-Forwarded-For only when the TCP peer is a known proxy hop, and then takes
-// the RIGHTMOST entry — the one that trusted hop appended; everything left of
-// it is client-controlled.
+// realClientIP returns the IP auth decisions are based on, and is also what
+// proxy.ratelimit buckets by (see labelRateLimit in router.go). Unlike
+// clientIP() in accesslog.go (first XFF hop, spoofable, logging-only), this
+// trusts X-Forwarded-For only when the TCP peer is a known proxy hop, and
+// then takes the RIGHTMOST entry — the one that trusted hop appended;
+// everything left of it is client-controlled.
+//
+// This is only correct if the fronting reverse proxy (nginx, in prod)
+// resolves the real visitor IP into that rightmost XFF entry itself. Without
+// nginx's real_ip module, every Cloudflare-fronted visitor collapses into one
+// shared rate-limit bucket — nginx's own X-Forwarded-For hop-appending uses
+// $remote_addr, which with no real_ip config is the Cloudflare edge IP, not
+// the visitor. Fixed nginx-side only (set_real_ip_from + real_ip_header
+// X-Forwarded-For + real_ip_recursive, in /etc/nginx/conf.d/ on the Pi) —
+// deliberately not here, since this origin is also reachable directly
+// (Tailscale/LAN maintenance bypass), so trusting a client-supplied header
+// like CF-Connecting-IP at this layer, with no raw-connection check, would be
+// spoofable by anyone hitting the origin directly. See proxy-manager memory
+// project_ratelimit_xff_cloudflare_bug.md for the full incident.
 func realClientIP(r *http.Request, xffTrusted []*net.IPNet) net.IP {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
