@@ -49,10 +49,18 @@ type RouteGroup struct {
 
 	cursor atomic.Uint64
 
-	// static marks a group whose backend list is owned by routes.json /
-	// static config (the onboarded-service flow). Once true, a lingering
-	// docker label for the same host+path must not re-join this group as
-	// a backend — routes.json has exclusive ownership.
+	// static marks a group whose backend list is owned by routes.json / a
+	// hand-curated static config entry. Once true, a lingering docker label
+	// for the same host+path must not re-join this group as a direct
+	// backend or merge its auth/ratelimit config in — routes.json has
+	// exclusive ownership of the group's identity. (Onboarding no longer
+	// writes routes.json entries — see cmd/dashboard/onboarded.go — so the
+	// case this protects against today is an incidental host+path
+	// collision between a hand-curated entry and an unrelated label-managed
+	// container, not a not-yet-relabeled onboarded original.) Service-field
+	// backend resolution (Service != "") is the one deliberate exception:
+	// a static group can still pick up backends from label-managed
+	// containers that carry the matching proxy.service label.
 	static bool
 }
 
@@ -387,11 +395,17 @@ func (w *errCatchingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // ---- Assembly: docker labels + static config ----
 
 type staticRoute struct {
-	Host      string   `json:"host"`
-	Path      string   `json:"path,omitempty"`
-	Strip     bool     `json:"strip,omitempty"`
-	Name      string   `json:"name,omitempty"`
-	Backends  []string `json:"backends"`
+	Host     string   `json:"host"`
+	Path     string   `json:"path,omitempty"`
+	Strip    bool     `json:"strip,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Backends []string `json:"backends"`
+	// Service resolves additional backends from label-managed containers
+	// carrying a matching proxy.service label — for the one case that still
+	// needs a hand-curated routes.json entry: per-path rate limits on a
+	// single container serving multiple internal paths. May be set alongside
+	// literal Backends; both are used.
+	Service   string   `json:"service,omitempty"`
 	Health    string   `json:"health,omitempty"`
 	Auth      bool     `json:"auth,omitempty"`
 	AuthUsers []string `json:"auth_users,omitempty"`
@@ -418,7 +432,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 				g, ok := groupsByKey[key]
 				if !ok {
 					g = &RouteGroup{
-						Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name,
+						Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name, Service: sr.Service,
 						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers), AuthMode: sr.AuthMode,
 						RateLimit: sr.RateLimit, RateRPM: sr.RateRPM,
 					}
@@ -439,6 +453,15 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		}
 	}
 
+	// backendsByService collects one *Backend per running, non-canary,
+	// proxy.service-labeled container, keyed by that service name — the pool
+	// a static routes.json entry with a matching Service field backfills
+	// from below. Canary is deliberately excluded here — see the labelCanary
+	// comment in docker.go for why this is an intentional asymmetry with the
+	// dashboard's own serviceBackends (cmd/dashboard/docker.go), which does
+	// include canary.
+	backendsByService := map[string][]*Backend{}
+
 	containers, err := dc.listEnabledContainers(ctx)
 	if err != nil {
 		return nil, err
@@ -456,6 +479,46 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 			log.Printf("skip %s: bad %s=%q", name, labelPort, portStr)
 			continue
 		}
+
+		// Resolve this container's own backend (if running with a reachable
+		// IP) once — used both for backendsByService (below, independent of
+		// static ownership of this host+path) and, further down, for a
+		// label-managed group's own Backends.
+		var backend *Backend
+		if c.State == "running" {
+			// Prefer the managed (edge) network IP for multi-network containers.
+			var ip string
+			if n, ok := c.NetworkSettings.Networks[managedNetwork]; ok && n.IPAddress != "" {
+				ip = n.IPAddress
+			} else {
+				for _, n := range c.NetworkSettings.Networks {
+					if n.IPAddress != "" {
+						ip = n.IPAddress
+						break
+					}
+				}
+			}
+			if ip == "" {
+				log.Printf("skip backend %s: no IP on any network (state=%s)", name, c.State)
+			} else {
+				weight := 1
+				if w, werr := strconv.Atoi(c.Labels[labelWeight]); werr == nil && w > 0 {
+					weight = w
+				}
+				backendURL := fmt.Sprintf("http://%s:%d", ip, port)
+				u, _ := url.Parse(backendURL)
+				backend = makeBackend(backendURL, weight, name, c.Labels[labelHealth], u, host)
+			}
+		}
+
+		// Feed backendsByService BEFORE the static-ownership check below: a
+		// static route resolving this container's proxy.service label and
+		// this container's own default label-managed route are independent
+		// concerns, even when they happen to share a host+path.
+		if svc := c.Labels[labelService]; svc != "" && c.Labels[labelCanary] != "true" && backend != nil {
+			backendsByService[svc] = append(backendsByService[svc], backend)
+		}
+
 		// Always register the route group so a stopped container's host
 		// still maps to *something* — that's what turns the user-visible
 		// page from 404 (no such host) into 503 (host exists, nothing
@@ -465,11 +528,11 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		key := host + "|" + path
 		g, ok := groupsByKey[key]
 		if ok && g.static {
-			// routes.json already owns this host+path (onboarded service).
-			// A lingering docker label for the same key — e.g. the original
-			// container of an auto-onboarded service that was never
-			// relabeled — must not sneak back in as a backend or merge its
-			// auth/ratelimit config into the static group.
+			// routes.json already owns this host+path — a lingering docker
+			// label for the same key must not sneak back in as a direct
+			// backend or merge its auth/ratelimit config into the static
+			// group. (The backendsByService feed above is the one exception,
+			// already handled.)
 			continue
 		}
 		if !ok {
@@ -510,36 +573,24 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 				g.RateRPM = rpm
 			}
 		}
-		if c.State != "running" {
-			continue
+		if backend != nil {
+			g.Backends = append(g.Backends, backend)
 		}
-		// Prefer the managed (edge) network IP for multi-network containers.
-		var ip string
-		if n, ok := c.NetworkSettings.Networks[managedNetwork]; ok && n.IPAddress != "" {
-			ip = n.IPAddress
-		} else {
-			for _, n := range c.NetworkSettings.Networks {
-				if n.IPAddress != "" {
-					ip = n.IPAddress
-					break
-				}
-			}
-		}
-		if ip == "" {
-			log.Printf("skip backend %s: no IP on any network (state=%s)", name, c.State)
-			continue
-		}
-		weight := 1
-		if w, err := strconv.Atoi(c.Labels[labelWeight]); err == nil && w > 0 {
-			weight = w
-		}
-		backendURL := fmt.Sprintf("http://%s:%d", ip, port)
-		u, _ := url.Parse(backendURL)
-		g.Backends = append(g.Backends, makeBackend(backendURL, weight, name, c.Labels[labelHealth], u, host))
 	}
 
 	out := make([]*RouteGroup, 0, len(groupsByKey))
 	for _, g := range groupsByKey {
+		// Backfill a static, service-resolved group's backends from
+		// whatever label-managed containers carry the matching
+		// proxy.service label. A literal Backends list (if any) was already
+		// populated by the static-config loop above — both are used.
+		if g.static && g.Service != "" {
+			if bs, ok := backendsByService[g.Service]; ok {
+				g.Backends = append(g.Backends, bs...)
+			} else {
+				log.Printf("static route %s%s: service %q resolved to zero backends", g.Host, g.PathPrefix, g.Service)
+			}
+		}
 		// Footgun guard: an enabled limiter must never have capacity 0.
 		if g.RateLimit && g.RateRPM <= 0 {
 			g.RateRPM = defaultRateRPM

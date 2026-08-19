@@ -197,6 +197,155 @@ func TestAssembleGroupsStaticOwnsHost(t *testing.T) {
 	}
 }
 
+// writeStaticConfig is a small helper for the Service-field tests below.
+func writeStaticConfig(t *testing.T, routes ...staticRoute) string {
+	t.Helper()
+	cfgPath := t.TempDir() + "/routes.json"
+	data, err := json.Marshal(staticConfig{Routes: routes})
+	if err != nil {
+		t.Fatalf("marshal static config: %v", err)
+	}
+	if err := os.WriteFile(cfgPath, data, 0o644); err != nil {
+		t.Fatalf("write static config: %v", err)
+	}
+	return cfgPath
+}
+
+// TestAssembleGroupsServiceFieldLiteralOnly proves existing literal-backends
+// behavior is unaffected by the Service field's addition — no regression.
+func TestAssembleGroupsServiceFieldLiteralOnly(t *testing.T) {
+	cfgPath := writeStaticConfig(t, staticRoute{Host: "literal.example.com", Backends: []string{"http://10.0.0.9:8080"}})
+	dc := fakeDocker(t, dockerJSON())
+
+	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	g := findGroup(groups, "literal.example.com", "")
+	if g == nil || len(g.Backends) != 1 || g.Backends[0].URL != "http://10.0.0.9:8080" {
+		t.Fatalf("group = %+v, want exactly the literal backend", g)
+	}
+}
+
+// TestAssembleGroupsServiceFieldResolvesBackends proves a routes.json entry
+// with only a Service field (no literal Backends) picks up backends from
+// every running, non-canary, proxy.service-labeled container.
+func TestAssembleGroupsServiceFieldResolvesBackends(t *testing.T) {
+	cfgPath := writeStaticConfig(t, staticRoute{Host: "svc.example.com", Path: "/admin", Service: "auth"})
+	dc := fakeDocker(t, dockerJSON(
+		container("a1", "auth-1", "running",
+			map[string]string{labelHost: "auth.internal.example.com", labelPort: "9000", labelService: "auth"},
+			map[string]string{managedNetwork: "172.20.0.11"}),
+		container("a2", "auth-2", "running",
+			map[string]string{labelHost: "auth.internal.example.com", labelPort: "9000", labelService: "auth"},
+			map[string]string{managedNetwork: "172.20.0.12"}),
+	))
+
+	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	g := findGroup(groups, "svc.example.com", "/admin")
+	if g == nil {
+		t.Fatal("service-resolved group missing")
+	}
+	if len(g.Backends) != 2 {
+		t.Fatalf("Backends = %+v, want both auth-1 and auth-2", g.Backends)
+	}
+
+	// The service-labeled containers must ALSO still appear in their own
+	// default label-managed route — service resolution doesn't steal them.
+	own := findGroup(groups, "auth.internal.example.com", "")
+	if own == nil || len(own.Backends) != 2 {
+		t.Fatalf("own label-managed group = %+v, want both replicas present", own)
+	}
+}
+
+// TestAssembleGroupsServiceFieldCombinedWithLiteral proves a routes.json
+// entry can set BOTH Backends and Service — both contribute to the group.
+func TestAssembleGroupsServiceFieldCombinedWithLiteral(t *testing.T) {
+	cfgPath := writeStaticConfig(t, staticRoute{
+		Host: "combo.example.com", Backends: []string{"http://10.0.0.9:8080"}, Service: "auth",
+	})
+	dc := fakeDocker(t, dockerJSON(
+		container("a1", "auth-1", "running",
+			map[string]string{labelHost: "auth.internal.example.com", labelPort: "9000", labelService: "auth"},
+			map[string]string{managedNetwork: "172.20.0.11"}),
+	))
+
+	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	g := findGroup(groups, "combo.example.com", "")
+	if g == nil || len(g.Backends) != 2 {
+		t.Fatalf("Backends = %+v, want both the literal backend and the service-resolved one", g)
+	}
+	var sawLiteral, sawService bool
+	for _, b := range g.Backends {
+		if b.URL == "http://10.0.0.9:8080" {
+			sawLiteral = true
+		}
+		if b.URL == "http://172.20.0.11:9000" {
+			sawService = true
+		}
+	}
+	if !sawLiteral || !sawService {
+		t.Fatalf("Backends = %+v, missing literal or service-resolved backend", g.Backends)
+	}
+}
+
+// TestAssembleGroupsServiceFieldZeroMatch proves a Service field that
+// matches no container yields an empty (not nil-panicking) group — the
+// existing 503-not-404 behavior already covers a group with zero backends.
+func TestAssembleGroupsServiceFieldZeroMatch(t *testing.T) {
+	cfgPath := writeStaticConfig(t, staticRoute{Host: "nomatch.example.com", Service: "nobody-labels-this"})
+	dc := fakeDocker(t, dockerJSON())
+
+	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	g := findGroup(groups, "nomatch.example.com", "")
+	if g == nil {
+		t.Fatal("group missing — a zero-match Service should still register the group")
+	}
+	if len(g.Backends) != 0 {
+		t.Fatalf("Backends = %+v, want none", g.Backends)
+	}
+}
+
+// TestAssembleGroupsServiceFieldExcludesCanary proves a canary-labeled
+// container is excluded from Service-field resolution (routing sensitive
+// paths to an in-progress canary is worse than the gap), while still
+// appearing in its own default label-managed route (proving the exclusion is
+// scoped to backendsByService, not global).
+func TestAssembleGroupsServiceFieldExcludesCanary(t *testing.T) {
+	cfgPath := writeStaticConfig(t, staticRoute{Host: "svc.example.com", Service: "auth"})
+	dc := fakeDocker(t, dockerJSON(
+		container("live", "auth-1", "running",
+			map[string]string{labelHost: "auth.internal.example.com", labelPort: "9000", labelService: "auth"},
+			map[string]string{managedNetwork: "172.20.0.11"}),
+		container("canary", "auth-canary-1", "running",
+			map[string]string{labelHost: "auth.internal.example.com", labelPort: "9000", labelService: "auth", labelCanary: "true"},
+			map[string]string{managedNetwork: "172.20.0.12"}),
+	))
+
+	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	g := findGroup(groups, "svc.example.com", "")
+	if g == nil || len(g.Backends) != 1 || g.Backends[0].URL != "http://172.20.0.11:9000" {
+		t.Fatalf("service-resolved Backends = %+v, want only the live (non-canary) replica", g)
+	}
+
+	own := findGroup(groups, "auth.internal.example.com", "")
+	if own == nil || len(own.Backends) != 2 {
+		t.Fatalf("own label-managed group = %+v, want both live and canary present (canary exclusion is scoped to backendsByService)", own)
+	}
+}
+
 func TestNormalizeAuthUsers(t *testing.T) {
 	got := normalizeAuthUsers([]string{" Alice ", "", "BOB", "  "})
 	if len(got) != 2 || got[0] != "alice" || got[1] != "bob" {

@@ -1485,13 +1485,13 @@ async function renderServices() {
               + (s.all_stopped
                   ? '<button class="btn" disabled title="Start the service first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
                   : '<button class="btn" ' + lockedAttr() + ' onclick="openAddEnv(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.plus + 'Add env…' + lk() + '</button>')
-              // Auto-update toggle: onboarded services only. Label-sourced
-              // opt-ins (proxy.autoupdate=true) are managed in compose, not here.
-              + (s.onboarded && !(s.labels && s.labels['proxy.autoupdate'] === 'true')
-                  ? (s.auto_update
-                      ? '<button class="btn" ' + lockedAttr() + ' onclick="toggleAutoUpdate(\'' + sn + '\', false)">' + I.arrowup + 'Auto-update: on' + lk() + '</button>'
-                      : '<button class="btn ghost" ' + lockedAttr() + ' onclick="toggleAutoUpdate(\'' + sn + '\', true)">' + I.arrowup + 'Auto-update: off' + lk() + '</button>')
-                  : '')
+              // Auto-update toggle: available for any routed service, label-
+              // managed or onboarded. For a label-managed service this
+              // flips proxy.autoupdate via the same clone-and-recreate as
+              // Add env, above — same image/env/mounts, just the label changes.
+              + (s.auto_update
+                  ? '<button class="btn" ' + lockedAttr() + ' onclick="toggleAutoUpdate(\'' + sn + '\', false)">' + I.arrowup + 'Auto-update: on' + lk() + '</button>'
+                  : '<button class="btn ghost" ' + lockedAttr() + ' onclick="toggleAutoUpdate(\'' + sn + '\', true)">' + I.arrowup + 'Auto-update: off' + lk() + '</button>')
               + (s.previous_image ? '<button class="linkbtn" ' + lockedAttr() + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\')">' + I.rewind + 'Rollback</button>' : '');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
@@ -1819,16 +1819,17 @@ function batchOnboardDialog(ev, btn) {
 // user pastes into their compose file. Hostname defaults to <name>.polardev.org
 // and the user can edit before copy. Port is pre-filled from the lowest
 // exposed internal port (best heuristic for "the app's port").
-// Onboard dialog — one-click adopt: connect container to edge network,
-// write a static route pointing at <container-name>:<port>, register as a
-// service so Replicas can be scaled. Does NOT touch the user's compose file
-// or recreate their container. Reversible from the service's Delete button.
+// Onboard dialog — one-click adopt: relabels and RECREATES the container as
+// N ordinary label-managed replicas (proxy.* labels built from this form),
+// then removes the original. Reversible only in the sense that the new
+// replicas can be deleted like any other service — the original container
+// itself is gone once this completes.
 function onboardDialog(name, port, prefillPath) {
   const dom = (window._discoveryLastDomain || 'polardev.org');
   const d = document.getElementById('dlg-token-reveal');
   d.innerHTML = ''
     + '<div class="dlg"><div class="dlg-head"><div class="di">' + I.rocket + '</div>'
-    + '<div><h3>Onboard ' + esc(name) + '</h3><div class="dsub">Adopts the container without touching its compose file</div></div>'
+    + '<div><h3>Onboard ' + esc(name) + '</h3><div class="dsub">Recreates the container as a labeled service — the original is removed</div></div>'
     + '<button class="x" type="button" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.x + '</button></div>'
     + '<form id="form-onboard"><div class="dlg-body">'
     +   '<div class="field-row">'
@@ -1844,9 +1845,9 @@ function onboardDialog(name, port, prefillPath) {
     +   '</div>'
     +   '<div class="field"><label>Initial replicas</label>'
     +     '<input id="onb-replicas" type="number" min="1" max="20" value="1">'
-    +     '<div class="hint">If &gt; 1, the dashboard clones the container\'s image + env into <code>goproxy-onb-' + esc(name) + '-N</code>. Scale up/down later from the Services tab.</div>'
+    +     '<div class="hint">The dashboard clones the container\'s image + env + mounts into <code>goproxy-' + esc(name) + '-N</code> replicas. Scale up/down later from the Services tab.</div>'
     +   '</div>'
-    +   '<div class="note">' + I.alert + '<div><strong>What this does:</strong> connects the container to the <code>edge</code> Docker network and appends a route to <code>routes.json</code>. The container itself is not recreated.</div></div>'
+    +   '<div class="note">' + I.alert + '<div><strong>What this does:</strong> creates fresh labeled replica(s) with the same image, env, and mounts, then stops and removes the ORIGINAL container. This is destructive to the original container (not just its route) — if it\'s still defined in a docker-compose.yml, remove or comment that service there too, or a future <code>docker compose up -d</code> will recreate an unlabeled duplicate. Refused up front if the container has config (extra port bindings, capabilities, a second Docker network, ...) a recreate can\'t reproduce.</div></div>'
     + '</div><div class="dialog-actions">'
     + '<button type="button" class="btn" onclick="document.getElementById(\'dlg-token-reveal\').close()">Cancel</button>'
     + '<button type="submit" class="btn primary">' + I.check + 'Onboard</button>'

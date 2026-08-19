@@ -160,6 +160,23 @@ type hostConfig struct {
 	RestartPolicy struct {
 		Name string `json:"Name"`
 	} `json:"RestartPolicy"`
+	Mounts []mountSpec `json:"Mounts,omitempty"`
+}
+
+// mountSpec mirrors Docker Engine API's HostConfig.Mounts entry shape —
+// enough to carry a bind mount or named volume forward across a recreate.
+type mountSpec struct {
+	Type     string `json:"Type"`
+	Source   string `json:"Source"`
+	Target   string `json:"Target"`
+	ReadOnly bool   `json:"ReadOnly,omitempty"`
+}
+
+// cloneSpec is the subset of a container's HostConfig that must ride forward
+// when it's recreated (replace/stage/promote/scale/onboard) but isn't part of
+// the labels/env already carried elsewhere.
+type cloneSpec struct {
+	Mounts []mountSpec
 }
 
 // pullImage tries to pull from a registry. Errors are non-fatal: if the image
@@ -294,6 +311,205 @@ func (c *dockerClient) inspectEnv(ctx context.Context, id string) ([]string, err
 		return nil, err
 	}
 	return resp.Config.Env, nil
+}
+
+// inspectCloneSpec returns the HostConfig fields a recreate must carry
+// forward — currently just Mounts (bind mounts / named volumes), which
+// createBody drops today if the caller doesn't thread them through.
+func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSpec, error) {
+	body, err := c.get(ctx, "/containers/"+id+"/json")
+	if err != nil {
+		return cloneSpec{}, err
+	}
+	defer body.Close()
+	var resp struct {
+		HostConfig struct {
+			Mounts []mountSpec `json:"Mounts"`
+		} `json:"HostConfig"`
+	}
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		return cloneSpec{}, err
+	}
+	return cloneSpec{Mounts: resp.HostConfig.Mounts}, nil
+}
+
+// hostConfigRefuseFields is a CLOSED allowlist of HostConfig field names that,
+// if set to a non-zero value, mean the container carries config a recreate
+// (createContainer, Phase 0's Mounts aside) has no way to reproduce — refuse
+// onboarding rather than silently drop it.
+//
+// This is deliberately NOT "every field decoded from a generic
+// map[string]json.RawMessage" — a real `docker inspect` HostConfig always
+// carries plenty of daemon-populated, present-but-zero-in-spirit fields
+// (LogConfig, MaskedPaths, ReadonlyPaths, ShmSize, Runtime, CgroupnsMode,
+// IpcMode, ConsoleSize, ...) that are non-zero JSON values on literally every
+// container, labeled or not. Refusing on any of those would refuse 100% of
+// containers, so only the fields below — the ones a container could only
+// have picked up via an explicit `docker run` flag or compose option that
+// createContainer cannot carry forward — are checked. NetworkMode and
+// RestartPolicy are intentionally excluded: createContainer already
+// hardcodes/manages both. Mounts is intentionally excluded: Phase 0's
+// inspectCloneSpec carries it forward.
+var hostConfigRefuseFields = []string{
+	"PortBindings",
+	"Binds",
+	"Dns", "DnsSearch", "DnsOptions",
+	"ExtraHosts",
+	"CapAdd", "CapDrop",
+	"Privileged",
+	"Devices",
+	"Memory", "MemorySwap", "NanoCpus", "CpuShares", "CpusetCpus", "CpusetMems", "PidsLimit",
+}
+
+// isZeroJSON reports whether a raw JSON value is "not really set": null,
+// false, 0, "", [], or {}. Needed because encoding/json decodes into
+// map[string]json.RawMessage without dropping unknown/zero fields the way a
+// typed struct decode silently would — every field docker inspect returns is
+// present in the map, just often zero-valued, and a naive "key exists in the
+// map" check would refuse every container.
+func isZeroJSON(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true // field absent from the JSON object entirely
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	switch t := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return !t
+	case float64:
+		return t == 0
+	case string:
+		return t == ""
+	case []any:
+		return len(t) == 0
+	case map[string]any:
+		return len(t) == 0
+	}
+	return false
+}
+
+// jsonEqual compares two raw JSON values by structural equality rather than
+// byte-for-byte — needed to compare a container's Config.Cmd/Entrypoint/
+// Healthcheck against its image's, where key order isn't guaranteed to match.
+func jsonEqual(a, b json.RawMessage) bool {
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return false
+	}
+	ab, _ := json.Marshal(av)
+	bb, _ := json.Marshal(bv)
+	return string(ab) == string(bb)
+}
+
+// inspectHostConfigUnknowns fetches a container's inspect output and returns
+// the names of any HostConfig/Config/NetworkSettings fields it carries that a
+// recreate (onboarding, replace, autoupdate) has no way to reproduce — the
+// caller should refuse rather than silently drop them.
+//
+// Decoded into generic maps (json.RawMessage), not a typed struct: a typed
+// decode silently drops fields it doesn't know about, and Docker's inspect
+// response returns every field present-but-often-zero-valued, which would
+// make a naive "is this field present" check refuse everything.
+//
+// Config.Cmd/Entrypoint/Healthcheck need special handling: Docker populates
+// Config.Cmd from the IMAGE's own CMD for virtually every container (e.g.
+// ["nginx","-g","daemon off;"]), so there is no way to tell "image default"
+// from "user override" from the container's inspect alone. This fetches the
+// image's own inspect and only refuses when the container's value actually
+// differs from what the image would produce on its own.
+//
+// TODO(pi-verification): the field lists above were built from the public,
+// documented Docker Engine API HostConfig/Config schema, not a live spot
+// check — re-verify against a real `docker inspect` on the Pi once it's back
+// up, in case a Docker Engine version in use here shapes any field
+// differently.
+func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string) ([]string, error) {
+	body, err := c.get(ctx, "/containers/"+id+"/json")
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	var resp struct {
+		Image      string                     `json:"Image"` // image ID, e.g. "sha256:..."
+		HostConfig map[string]json.RawMessage `json:"HostConfig"`
+		Config     struct {
+			Cmd         json.RawMessage `json:"Cmd"`
+			Entrypoint  json.RawMessage `json:"Entrypoint"`
+			Healthcheck json.RawMessage `json:"Healthcheck"`
+		} `json:"Config"`
+		NetworkSettings struct {
+			Networks map[string]json.RawMessage `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		return nil, err
+	}
+
+	var refused []string
+	for _, f := range hostConfigRefuseFields {
+		raw, ok := resp.HostConfig[f]
+		if !ok || isZeroJSON(raw) {
+			continue
+		}
+		refused = append(refused, f)
+	}
+
+	for netName := range resp.NetworkSettings.Networks {
+		if netName != managedNetwork {
+			refused = append(refused, "NetworkSettings.Networks."+netName)
+		}
+	}
+
+	// Config.Cmd/Entrypoint/Healthcheck: only refuse when they DIFFER from
+	// what the image itself already specifies.
+	if !isZeroJSON(resp.Config.Cmd) || !isZeroJSON(resp.Config.Entrypoint) || !isZeroJSON(resp.Config.Healthcheck) {
+		imgCmd, imgEntrypoint, imgHealthcheck, err := c.inspectImageOverridable(ctx, resp.Image)
+		if err != nil {
+			return nil, fmt.Errorf("inspect image %s: %w", resp.Image, err)
+		}
+		if !isZeroJSON(resp.Config.Cmd) && !jsonEqual(resp.Config.Cmd, imgCmd) {
+			refused = append(refused, "Config.Cmd")
+		}
+		if !isZeroJSON(resp.Config.Entrypoint) && !jsonEqual(resp.Config.Entrypoint, imgEntrypoint) {
+			refused = append(refused, "Config.Entrypoint")
+		}
+		if !isZeroJSON(resp.Config.Healthcheck) && !jsonEqual(resp.Config.Healthcheck, imgHealthcheck) {
+			refused = append(refused, "Config.Healthcheck")
+		}
+	}
+
+	sort.Strings(refused)
+	return refused, nil
+}
+
+// inspectImageOverridable returns an image's own Config.Cmd/Entrypoint/
+// Healthcheck — the baseline inspectHostConfigUnknowns diffs a container's
+// values against, so a container that simply inherited them from its image
+// isn't mistaken for one with an explicit override.
+func (c *dockerClient) inspectImageOverridable(ctx context.Context, imageID string) (cmd, entrypoint, healthcheck json.RawMessage, err error) {
+	body, err := c.get(ctx, "/images/"+url.PathEscape(imageID)+"/json")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer body.Close()
+	var resp struct {
+		Config struct {
+			Cmd         json.RawMessage `json:"Cmd"`
+			Entrypoint  json.RawMessage `json:"Entrypoint"`
+			Healthcheck json.RawMessage `json:"Healthcheck"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		return nil, nil, nil, err
+	}
+	return resp.Config.Cmd, resp.Config.Entrypoint, resp.Config.Healthcheck, nil
 }
 
 // ---- Service-level operations ----
@@ -485,10 +701,14 @@ func (c *dockerClient) scaleService(ctx context.Context, name string, desired in
 		if err != nil {
 			return fmt.Errorf("inspect template %s: %w", tpl.name(), err)
 		}
+		clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+		if err != nil {
+			return fmt.Errorf("inspect template %s: %w", tpl.name(), err)
+		}
 		for i := 0; i < desired-current; i++ {
 			n := nextReplicaIndex(existing, name) + i
 			cname := fmt.Sprintf("goproxy-%s-%d", name, n)
-			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env})
+			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
 			if err != nil {
 				return fmt.Errorf("create %s: %w", cname, err)
 			}
@@ -642,6 +862,10 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	if err != nil {
 		return fmt.Errorf("inspect template env: %w", err)
 	}
+	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template clone spec: %w", err)
+	}
 	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
 		return err
@@ -676,9 +900,10 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	for i := 0; i < len(existing); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:  req.Image,
-			Labels: newLabels,
-			Env:    env,
+			Image:      req.Image,
+			Labels:     newLabels,
+			Env:        env,
+			HostConfig: hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			// Roll back: tear down any new ones we already created.
@@ -710,6 +935,81 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	return nil
 }
 
+// setAutoUpdateLabel flips proxy.autoupdate for a label-managed service via
+// the same clone-and-recreate shape as replaceService, but WITHOUT an image
+// swap: same image, same env, same mounts, only the label value changes.
+// Lets the dashboard/MCP toggle unattended updates for any label-managed
+// service without requiring a compose edit + `docker compose up -d`.
+func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enabled bool) error {
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+	if err != nil {
+		return err
+	}
+	existing := liveOnly(all)
+	if len(existing) == 0 {
+		return fmt.Errorf("service %q not found (no live replicas)", name)
+	}
+	tpl := existing[0]
+
+	env, err := c.inspectEnv(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template env: %w", err)
+	}
+	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template clone spec: %w", err)
+	}
+
+	newLabels := map[string]string{}
+	for k, v := range tpl.Labels {
+		if strings.HasPrefix(k, ociImageLabelPrefix) {
+			continue
+		}
+		newLabels[k] = v
+	}
+	if enabled {
+		newLabels[labelAutoUpdate] = "true"
+	} else {
+		delete(newLabels, labelAutoUpdate)
+	}
+
+	startIdx := nextReplicaIndex(existing, name)
+	var newIDs []string
+	for i := 0; i < len(existing); i++ {
+		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
+		id, err := c.createContainer(ctx, cname, createBody{
+			Image:      tpl.Image,
+			Labels:     newLabels,
+			Env:        env,
+			HostConfig: hostConfig{Mounts: clone.Mounts},
+		})
+		if err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			return fmt.Errorf("create %s: %w", cname, err)
+		}
+		if err := c.startContainer(ctx, id); err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			_ = c.removeContainer(ctx, id)
+			return fmt.Errorf("start %s: %w", cname, err)
+		}
+		newIDs = append(newIDs, id)
+	}
+
+	time.Sleep(replaceSettleDelay)
+
+	for _, ct := range existing {
+		_ = c.stopContainer(ctx, ct.ID)
+		if err := c.removeContainer(ctx, ct.ID); err != nil {
+			log.Printf("autoupdate label flip %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
+		}
+	}
+	return nil
+}
+
 // stageCanary creates additional replicas of a service with a new image. They
 // share the live service's host/port labels, so the proxy round-robins traffic
 // across BOTH live and canary while they coexist. No old containers removed.
@@ -734,6 +1034,10 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 	if err != nil {
 		return fmt.Errorf("inspect template env: %w", err)
 	}
+	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template clone spec: %w", err)
+	}
 	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
 		return err
@@ -755,7 +1059,7 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 	for i := 0; i < len(live); i++ {
 		cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image: req.Image, Labels: canaryLabels, Env: env,
+			Image: req.Image, Labels: canaryLabels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			return fmt.Errorf("create canary %s: %w", cname, err)
@@ -786,6 +1090,10 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 		if err != nil {
 			return fmt.Errorf("inspect canary env: %w", err)
 		}
+		clone, err := c.inspectCloneSpec(ctx, ct.ID)
+		if err != nil {
+			return fmt.Errorf("inspect canary clone spec: %w", err)
+		}
 		labels := map[string]string{}
 		for k, v := range ct.Labels {
 			if k == labelCanary {
@@ -795,7 +1103,7 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 		}
 		startIdx := nextReplicaIndex(all, name)
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx)
-		id, err := c.createContainer(ctx, cname, createBody{Image: ct.Image, Labels: labels, Env: env})
+		id, err := c.createContainer(ctx, cname, createBody{Image: ct.Image, Labels: labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
 		if err != nil {
 			return fmt.Errorf("create promoted %s: %w", cname, err)
 		}
@@ -877,6 +1185,7 @@ type staticRoutesFile struct {
 		Strip    bool     `json:"strip,omitempty"`
 		Name     string   `json:"name,omitempty"`
 		Backends []string `json:"backends"`
+		Service  string   `json:"service,omitempty"`
 	} `json:"routes"`
 }
 
@@ -891,6 +1200,13 @@ func (c *dockerClient) listRoutes(ctx context.Context, configPath string) ([]Rou
 		return g
 	}
 
+	// staticKeys marks which host|path groups had their identity (and
+	// Service field, if any) come from routes.json — used below to scope
+	// Service-field backend backfill so a label-managed group's OWN
+	// proxy.service label (already reflected in its Backends) isn't
+	// mistaken for a resolution request and double-appended.
+	staticKeys := map[string]bool{}
+
 	// 1. Static config file.
 	if configPath != "" {
 		if data, err := os.ReadFile(configPath); err == nil {
@@ -899,8 +1215,10 @@ func (c *dockerClient) listRoutes(ctx context.Context, configPath string) ([]Rou
 				return nil, err
 			}
 			for _, sr := range cfg.Routes {
-				g := add(sr.Host+"|"+sr.Path, func() *RouteView {
-					return &RouteView{Host: sr.Host, Path: sr.Path, Strip: sr.Strip, Name: sr.Name}
+				key := sr.Host + "|" + sr.Path
+				staticKeys[key] = true
+				g := add(key, func() *RouteView {
+					return &RouteView{Host: sr.Host, Path: sr.Path, Strip: sr.Strip, Name: sr.Name, Service: sr.Service}
 				})
 				for _, u := range sr.Backends {
 					g.Backends = append(g.Backends, BackendView{URL: u, Weight: 1, Container: "static"})
@@ -908,6 +1226,12 @@ func (c *dockerClient) listRoutes(ctx context.Context, configPath string) ([]Rou
 			}
 		}
 	}
+
+	// backendsByService mirrors cmd/proxy/router.go's assembleGroups: one
+	// BackendView per running, non-canary, proxy.service-labeled container,
+	// keyed by service name — the pool a static route's Service field
+	// backfills from below.
+	backendsByService := map[string][]BackendView{}
 
 	// 2. Docker labels.
 	containers, err := c.listRunning(ctx, fmt.Sprintf(`{"label":["%s=true"]}`, labelEnable))
@@ -961,11 +1285,31 @@ func (c *dockerClient) listRoutes(ctx context.Context, configPath string) ([]Rou
 		if w, err := strconv.Atoi(ct.Labels[labelWeight]); err == nil && w > 0 {
 			weight = w
 		}
-		g.Backends = append(g.Backends, BackendView{
+		bv := BackendView{
 			URL:       fmt.Sprintf("http://%s:%d", ip, port),
 			Weight:    weight,
 			Container: ct.name(),
-		})
+		}
+		g.Backends = append(g.Backends, bv)
+		// Same canary exclusion as cmd/proxy/router.go: the motivating use
+		// case is per-path rate limits on sensitive paths, where silently
+		// routing to an in-progress canary is worse than the gap of
+		// excluding it.
+		if svc := ct.Labels[labelService]; svc != "" && ct.Labels[labelCanary] != "true" {
+			backendsByService[svc] = append(backendsByService[svc], bv)
+		}
+	}
+
+	for key := range staticKeys {
+		g, ok := groups[key]
+		if !ok || g.Service == "" {
+			continue
+		}
+		if bs, ok := backendsByService[g.Service]; ok {
+			g.Backends = append(g.Backends, bs...)
+		} else {
+			log.Printf("route: static route %s%s: service %q resolved to zero backends", g.Host, g.Path, g.Service)
+		}
 	}
 
 	out := make([]RouteView, 0, len(groups))

@@ -303,7 +303,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 	s.Register(Tool{
 		Name:        "set_autoupdate",
 		Title:       "Toggle auto-update",
-		Description: "Opt a service in or out of unattended updates when a newer image digest appears. Onboarded services only.",
+		Description: "Opt a service in or out of unattended updates when a newer image digest appears. Works for any routed service, onboarded or label-managed.",
 		Mutating:    true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
@@ -494,50 +494,85 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 	})
 
 	s.Register(Tool{
-		Name:  "offboard_service",
-		Title: "Remove an onboarded service's tracking record",
-		Description: "Removes the dashboard's onboarded tracking record and its routes.json entry " +
-			"for a service that was adopted via onboarding/stage/promote, tearing down any " +
-			"cloned/canary containers it created (goproxy-onb-<name>-*). The ORIGINAL container " +
-			"is left running untouched — it just stops being routed through this record. Refuses " +
-			"if the service isn't currently onboarded: the backend's DELETE falls through to a " +
-			"hard, irreversible container delete for a plain label-managed service, and this tool " +
-			"deliberately will not trigger that — remove a label-managed service via docker compose " +
-			"instead.",
+		Name:  "onboard_service",
+		Title: "Onboard an unmanaged container as a label-managed service",
+		Description: "Relabels and DESTRUCTIVELY RECREATES an existing unmanaged container as N " +
+			"ordinary label-managed replicas: captures its image/env/mounts, builds proxy.* labels " +
+			"from the given host/port/path, creates and starts the replacement replicas, then stops " +
+			"and removes the ORIGINAL container. This is not a passive adopt — the original " +
+			"container is gone afterward and the replacements (goproxy-<service>-N) are " +
+			"indistinguishable from any docker-compose-created labeled service. Refuses up front if " +
+			"the container has HostConfig a recreate can't reproduce (extra port bindings, " +
+			"capabilities, a second docker network, ...) rather than silently dropping it. Use " +
+			"list_services or the discovery view to find unmanaged container names first.",
 		Mutating: true,
 		InputSchema: schema(map[string]any{
-			"service": prop("string", "Service name from list_services (must have onboarded: true)."),
+			"service":  prop("string", "Name of the existing unmanaged container to onboard."),
+			"host":     prop("string", "Hostname to route (e.g. app.example.com)."),
+			"port":     prop("number", "Container's internal port to route to."),
+			"path":     prop("string", "Path prefix to route (default: all paths)."),
+			"strip":    prop("boolean", "Strip the path prefix before forwarding (default: false)."),
+			"replicas": prop("number", "Number of replacement replicas to create (default: 1)."),
+		}, "service", "host", "port"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			host, err := argString(args, "host")
+			if err != nil {
+				return "", err
+			}
+			port, err := argInt(args, "port")
+			if err != nil {
+				return "", err
+			}
+			path, err := argOptionalString(args, "path")
+			if err != nil {
+				return "", err
+			}
+			strip := false
+			if _, ok := args["strip"]; ok {
+				if strip, err = argBool(args, "strip"); err != nil {
+					return "", err
+				}
+			}
+			replicas := 1
+			if _, ok := args["replicas"]; ok {
+				if replicas, err = argInt(args, "replicas"); err != nil {
+					return "", err
+				}
+			}
+			b, err := a.call(ctx, "POST", "/api/discovery/"+url.PathEscape(name)+"/onboard", OnboardRequest{
+				Host: host, Port: port, Path: path, Strip: strip, Replicas: replicas,
+			})
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
+		Name:  "offboard_service",
+		Title: "Stop routing a service without destroying its containers",
+		Description: "Stops routing a service without stopping or deleting its container(s). For " +
+			"an ordinary label-managed service this disconnects its container(s) from the edge " +
+			"docker network only — they keep running, just unrouted; reconnect (or `docker compose " +
+			"up -d`) to resume routing. For a service still tracked in the legacy OnboardedStore, " +
+			"this instead removes the onboarded tracking record and routes.json entry and tears " +
+			"down any cloned/canary containers it created (goproxy-onb-<name>-*), leaving the " +
+			"ORIGINAL container running untouched.",
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
 		}, "service"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
 			}
-			listBody, err := a.call(ctx, "GET", "/api/services", nil)
-			if err != nil {
-				return "", err
-			}
-			var svcs []struct {
-				Name      string `json:"name"`
-				Onboarded bool   `json:"onboarded"`
-			}
-			if err := json.Unmarshal(listBody, &svcs); err != nil {
-				return "", fmt.Errorf("list_services: %w", err)
-			}
-			found, onboarded := false, false
-			for _, s := range svcs {
-				if s.Name == name {
-					found, onboarded = true, s.Onboarded
-					break
-				}
-			}
-			if !found {
-				return "", fmt.Errorf("service %q not found", name)
-			}
-			if !onboarded {
-				return "", fmt.Errorf("service %q is not onboarded — offboard_service only removes onboarded tracking records, it will not delete a label-managed service's containers", name)
-			}
-			b, err := a.call(ctx, "DELETE", "/api/services/"+url.PathEscape(name), nil)
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/offboard", nil)
 			if err != nil {
 				return "", err
 			}

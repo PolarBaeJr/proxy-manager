@@ -14,9 +14,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -262,6 +264,29 @@ func (c *dockerClient) disconnectFromEdge(ctx context.Context, containerID strin
 	return nil
 }
 
+// offboardLabelManaged is the general soft-remove for any label-managed
+// service: disconnect every member from the edge network so
+// assembleGroups' next refresh has no IP to route to, WITHOUT stopping or
+// deleting the container(s) — they keep running, keep their proxy.* labels,
+// and keep serving whatever they'd otherwise serve on other networks.
+// Reversible: reconnecting to edge (or a fresh `docker compose up -d`, which
+// reasserts the network) resumes routing.
+func (c *dockerClient) offboardLabelManaged(ctx context.Context, name string) error {
+	existing, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+	if err != nil {
+		return err
+	}
+	if len(existing) == 0 {
+		return fmt.Errorf("service %q not found", name)
+	}
+	for _, ct := range existing {
+		if err := c.disconnectFromEdge(ctx, ct.ID); err != nil {
+			return fmt.Errorf("disconnect %s: %w", ct.name(), err)
+		}
+	}
+	return nil
+}
+
 // ---- Onboarding flow ----
 
 type OnboardRequest struct {
@@ -272,7 +297,20 @@ type OnboardRequest struct {
 	Replicas int    `json:"replicas,omitempty"`
 }
 
-func (c *dockerClient) onboardContainer(ctx context.Context, name string, req OnboardRequest, store *OnboardedStore, routesPath string) error {
+// onboardContainer relabels-and-recreates an existing (typically unlabelled)
+// container as N ordinary label-managed replicas: capture image/env/mounts,
+// build proxy.* labels from req, create + start the replacements, then stop
+// and remove the original. The new containers are indistinguishable from any
+// docker-compose-created labeled service — assembleGroups discovers them on
+// the next refresh like any other. No OnboardedStore record, no routes.json
+// entry: this container is now fully label-managed.
+//
+// Destructive by design: unlike the old track-in-place onboarding, this
+// recreates the container. inspectHostConfigUnknowns runs first specifically
+// so a container with config a recreate can't reproduce (extra port
+// bindings, capabilities, a second docker network, ...) is refused rather
+// than silently downgraded.
+func (c *dockerClient) onboardContainer(ctx context.Context, name string, req OnboardRequest) error {
 	if req.Host == "" || req.Port <= 0 {
 		return fmt.Errorf("host and port are required")
 	}
@@ -306,43 +344,77 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	if ct == nil {
 		return fmt.Errorf("container %q not found", name)
 	}
-	// Capture image + env so we can clone replicas later.
+
+	// Fail closed: refuse rather than silently drop any HostConfig/Config/
+	// network config a recreate has no way to reproduce. Deliberately does
+	// NOT check compose-managed origin — onboarding must work regardless of
+	// a container's origin.
+	unknowns, err := c.inspectHostConfigUnknowns(ctx, ct.ID)
+	if err != nil {
+		return fmt.Errorf("inspect %q: %w", name, err)
+	}
+	if len(unknowns) > 0 {
+		return fmt.Errorf("refusing to onboard %q: would drop %s — resolve manually first", name, strings.Join(unknowns, ", "))
+	}
+
+	// Capture image, env, and mounts so the replacements are equivalent.
 	image := ct.Image
 	env, err := c.inspectEnv(ctx, ct.ID)
 	if err != nil {
 		return fmt.Errorf("inspect env: %w", err)
 	}
-	if err := c.connectToEdge(ctx, ct.ID); err != nil {
-		return fmt.Errorf("connect to edge: %w", err)
+	clone, err := c.inspectCloneSpec(ctx, ct.ID)
+	if err != nil {
+		return fmt.Errorf("inspect clone spec: %w", err)
 	}
-	// Persist onboarded record FIRST so scale/delete can find it even if the
-	// route-write step below fails.
-	svc := OnboardedService{
-		Name:           name,
-		Host:           req.Host,
-		Port:           req.Port,
-		Path:           req.Path,
-		Strip:          req.Strip,
-		Image:          image,
-		Env:            env,
-		Replicas:       1,
-		OriginalRouted: true,
-		CreatedAt:      time.Now().Unix(),
+
+	labels := map[string]string{
+		labelEnable:  "true",
+		labelHost:    req.Host,
+		labelPort:    strconv.Itoa(req.Port),
+		labelService: name,
+		labelName:    name,
 	}
-	if err := store.Put(svc); err != nil {
-		return fmt.Errorf("save onboarded record: %w", err)
+	if req.Path != "" {
+		labels[labelPath] = req.Path
 	}
-	// Write the static route entry using the container's DNS name (resolves
-	// inside the edge network as long as the container is connected).
-	backend := fmt.Sprintf("http://%s:%d", name, req.Port)
-	if err := upsertOnboardedRoute(routesPath, name, req.Host, req.Path, req.Strip, []string{backend}); err != nil {
-		return fmt.Errorf("update routes.json: %w", err)
+	if req.Strip {
+		labels[labelStrip] = "true"
 	}
-	// Scale to requested replicas (will clone if >1).
-	if req.Replicas > 1 {
-		if err := c.scaleOnboarded(ctx, name, req.Replicas, store, routesPath); err != nil {
-			return fmt.Errorf("scale: %w", err)
+
+	var newIDs []string
+	for i := 1; i <= req.Replicas; i++ {
+		cname := fmt.Sprintf("goproxy-%s-%d", name, i)
+		id, err := c.createContainer(ctx, cname, createBody{
+			Image: image, Labels: labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts},
+		})
+		if err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			return fmt.Errorf("create %s: %w", cname, err)
 		}
+		if err := c.startContainer(ctx, id); err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			_ = c.removeContainer(ctx, id)
+			return fmt.Errorf("start %s: %w", cname, err)
+		}
+		newIDs = append(newIDs, id)
+	}
+
+	// Give the new containers a few seconds to bind their ports / accept
+	// connections before we tear down the original.
+	time.Sleep(replaceSettleDelay)
+
+	if project := ct.Labels["com.docker.compose.project"]; project != "" {
+		composeFile := ct.Labels["com.docker.compose.project.config_files"]
+		log.Printf("onboarded %q away from compose — %s still defines this service; remove or comment that block or a future 'docker compose up -d' will recreate an unlabeled duplicate", name, composeFile)
+	}
+	_ = c.stopContainer(ctx, ct.ID)
+	if err := c.removeContainer(ctx, ct.ID); err != nil {
+		return fmt.Errorf("onboard %q: new replicas are running but failed to remove the original %s: %w", name, ct.name(), err)
 	}
 	return nil
 }

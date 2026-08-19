@@ -33,6 +33,22 @@ const (
 	labelAuthMode  = "proxy.auth.mode"
 	labelRateLimit = "proxy.ratelimit"
 	labelRateRPM   = "proxy.ratelimit.rpm"
+	// labelCanary does not otherwise exist in the proxy package — canary is
+	// managed by the dashboard (cmd/dashboard/docker.go's labelCanary) and
+	// the proxy has never needed to know about it, since a canary container
+	// still just carries the SAME proxy.* labels as its live siblings and
+	// joins their default label-managed group like any other replica. It's
+	// added here only to exclude canary containers from
+	// assembleGroups' backendsByService (routes.json Service-field
+	// resolution) — a DELIBERATE asymmetry with the dashboard's own
+	// serviceBackends (cmd/dashboard/docker.go), which DOES include canary.
+	// The motivating use case for Service-field routes.json entries is
+	// per-path rate limits on sensitive paths (e.g. auth/login) on a single
+	// container serving multiple internal paths — silently routing some of
+	// that sensitive traffic to an in-progress canary is worse than the gap
+	// of excluding it; the canary still serves everything reachable through
+	// its own default label-managed route exactly as before.
+	labelCanary = "proxy.canary"
 )
 
 // dockerClient is the proxy's READ-ONLY view of the Docker daemon.
@@ -98,7 +114,6 @@ func (c *dockerClient) listEnabledContainers(ctx context.Context) ([]dockerConta
 	var out []dockerContainer
 	return out, json.NewDecoder(body).Decode(&out)
 }
-
 
 type dockerEvent struct {
 	Type   string `json:"Type"`
