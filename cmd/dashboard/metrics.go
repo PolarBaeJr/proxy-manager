@@ -28,9 +28,30 @@ type Metrics struct {
 
 	latencyMs   []float64
 	latencyHead int
+
+	// windowBuckets is a ring of per-minute request/byte/error totals, used to
+	// derive last_5m/last_1h/last_24h aggregates without persisting anything.
+	windowBuckets [numBuckets]winBucket
+	now           func() time.Time
 }
 
 const latencyWindow = 1000
+
+// bucketDuration/numBuckets size the windowed-metrics ring: one bucket per
+// minute, spanning a full day.
+const (
+	bucketDuration = time.Minute
+	numBuckets     = 24 * 60
+)
+
+// winBucket holds one minute's worth of windowed totals. minute == 0 is a safe
+// "unset" sentinel since Unix-minute timestamps are never 0 in practice.
+type winBucket struct {
+	minute int64
+	count  uint64
+	bytes  uint64
+	errors uint64
+}
 
 func NewMetrics() *Metrics {
 	return &Metrics{
@@ -40,6 +61,7 @@ func NewMetrics() *Metrics {
 		byMethod:     map[string]uint64{},
 		byHostStatus: map[string]map[int]uint64{},
 		latencyMs:    make([]float64, 0, latencyWindow),
+		now:          time.Now,
 	}
 }
 
@@ -63,7 +85,35 @@ func (m *Metrics) Record(host, method string, status int, bytes int64, dur time.
 		m.latencyMs[m.latencyHead] = ms
 		m.latencyHead = (m.latencyHead + 1) % latencyWindow
 	}
+	minute := m.now().Unix() / 60
+	idx := int(minute % int64(numBuckets))
+	b := &m.windowBuckets[idx]
+	if b.minute != minute {
+		*b = winBucket{minute: minute}
+	}
+	b.count++
+	if bytes > 0 {
+		b.bytes += uint64(bytes)
+	}
+	if status >= 400 && status <= 599 {
+		b.errors++
+	}
 	m.mu.Unlock()
+}
+
+// windowSummary sums windowed buckets covering the trailing `minutes` minutes
+// up to and including nowMinute. Must be called with m.mu already held.
+func (m *Metrics) windowSummary(nowMinute int64, minutes int64) map[string]any {
+	var reqs, bytesOut, errs uint64
+	for i := range m.windowBuckets {
+		b := &m.windowBuckets[i]
+		if b.minute > 0 && b.minute > nowMinute-minutes && b.minute <= nowMinute {
+			reqs += b.count
+			bytesOut += b.bytes
+			errs += b.errors
+		}
+	}
+	return map[string]any{"requests": reqs, "bytes_out": bytesOut, "errors": errs}
 }
 
 func (m *Metrics) Snapshot() map[string]any {
@@ -104,6 +154,7 @@ func (m *Metrics) Snapshot() map[string]any {
 	if len(lat) > 0 {
 		maxV = lat[len(lat)-1]
 	}
+	nowMinute := m.now().Unix() / 60
 	return map[string]any{
 		"started_at":     m.StartedAt.UTC().Format(time.RFC3339),
 		"uptime_seconds": int64(time.Since(m.StartedAt).Seconds()),
@@ -118,6 +169,11 @@ func (m *Metrics) Snapshot() map[string]any {
 			"p50": pct(0.50), "p90": pct(0.90), "p95": pct(0.95), "p99": pct(0.99), "max": maxV,
 		},
 		"sample_size": len(lat),
+		"windowed": map[string]any{
+			"last_5m":  m.windowSummary(nowMinute, 5),
+			"last_1h":  m.windowSummary(nowMinute, 60),
+			"last_24h": m.windowSummary(nowMinute, numBuckets),
+		},
 	}
 }
 

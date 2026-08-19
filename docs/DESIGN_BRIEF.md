@@ -329,7 +329,7 @@ the backend is already wired. Auth is automatic via session cookie.
 |---|---|---|
 | `GET /api/health` | `{status, targets:[{name,health}], checked_at}` — no auth, sanitized | Status badge in header; external monitors |
 | `GET /api/stats` | host CPU/MEM/DISK numbers | sysstat widget (already in header) |
-| `GET /api/monitor/overview` | aggregate health + all targets w/ basic metrics | "Stack health" hero card on Stats tab |
+| `GET /api/monitor/overview` | aggregate health + all targets w/ basic metrics, incl. `windowed_requests_1h`/`windowed_requests_24h` | "Stack health" hero card on Stats tab |
 | `GET /api/monitor/snapshot` | raw `{name → TargetState}` map incl. full last sample | debug / power-user view |
 
 ### Per-target detail (NEW — wire these into per-target pages)
