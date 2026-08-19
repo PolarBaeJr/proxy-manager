@@ -233,6 +233,14 @@ func main() {
 	}
 	defer sess.Close()
 
+	// discordgo's Identify never sets a presence status (it's left as the
+	// zero value, an empty string) unless told to — Discord then shows the
+	// bot as offline/invisible to other members even though the gateway
+	// session itself is fully alive and receiving events.
+	if err := sess.UpdateStatusComplex(discordgo.UpdateStatusData{Status: "online"}); err != nil {
+		log.Printf("failed to set online presence: %v", err)
+	}
+
 	mu.Lock()
 	initialTarget := alertChannelID
 	mu.Unlock()
