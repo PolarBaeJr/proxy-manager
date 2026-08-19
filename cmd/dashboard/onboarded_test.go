@@ -342,31 +342,8 @@ func TestOnboardedBaseEnvUsesPromotedContainer(t *testing.T) {
 // dedup (keyed on host+path) never matched the original's label route and a
 // stray onboarded backend silently took over every non-/admin request to the
 // host.
-func TestPromoteToOnboardedCapturesPathAndStrip(t *testing.T) {
-	dc := newFakeDockerServer(t,
-		&fakeContainer{id: "admin-id", name: "admin", image: "img:v1", env: []string{"FOO=1"}, state: "running"},
-	)
-	store, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc := Service{
-		Name: "admin", Host: "sfubadminton.com", Port: 3001, Path: "/admin",
-		Labels: map[string]string{"proxy.path": "/admin", "proxy.strip": "true"},
-		Replicas: 1,
-		Members:  []dockerContainer{{ID: "admin-id", Labels: map[string]string{}}},
-	}
-	if err := promoteToOnboarded(context.Background(), dc, store, svc); err != nil {
-		t.Fatal(err)
-	}
-	got, ok := store.Get("admin")
-	if !ok {
-		t.Fatal("onboarded record not persisted")
-	}
-	if got.Path != "/admin" {
-		t.Errorf("Path = %q, want /admin", got.Path)
-	}
-	if !got.Strip {
-		t.Error("Strip = false, want true")
-	}
-}
+//
+// promoteToOnboarded itself was removed as part of the onboarding rework
+// (Stop/Start no longer auto-snapshots a label-managed service into the
+// legacy OnboardedStore — see lifecycle.go) — this regression test is
+// obsolete along with it.

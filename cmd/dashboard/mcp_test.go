@@ -67,7 +67,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	ro := NewServer("t", "v")
 	registerMCPTools(ro, c, false)
 	names := toolNames(t, ro)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if names[w] {
 			t.Errorf("mutating tool %q registered in read-only mode", w)
 		}
@@ -81,7 +81,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	rw := NewServer("t", "v")
 	registerMCPTools(rw, c, true)
 	rwNames := toolNames(t, rw)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if !rwNames[w] {
 			t.Errorf("mutating tool %q missing when writes are allowed", w)
 		}
@@ -625,10 +625,11 @@ func TestDNSToolsAcceptEmptyZone(t *testing.T) {
 	}
 }
 
-// offboard_service must refuse a service that isn't onboarded — the backend's
-// DELETE falls through to a hard container delete for a label-managed
-// service, which this tool must never trigger silently.
-func TestOffboardServiceRefusesNonOnboarded(t *testing.T) {
+// offboard_service now hits the single /offboard endpoint directly — the
+// backend itself picks the legacy onboarded-teardown path or the label-
+// managed network-disconnect path, so the tool no longer needs its own
+// list_services lookup.
+func TestOffboardServiceCallsOffboardEndpoint(t *testing.T) {
 	prev := internalToken
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
@@ -637,38 +638,7 @@ func TestOffboardServiceRefusesNonOnboarded(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.Method+" "+r.URL.RequestURI())
 		w.WriteHeader(200)
-		w.Write([]byte(`[{"name":"app","onboarded":false}]`))
-	})
-	c := &apiCaller{mux: h}
-	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
-
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offboard_service","arguments":{"service":"app"}}}`
-	res, _ := rpc(t, s, body)
-	r := res["result"].(map[string]any)
-	if r["isError"] != true {
-		t.Fatalf("expected refusal for a non-onboarded service, got %v", res)
-	}
-	if len(calls) != 1 || calls[0] != "GET /api/services" {
-		t.Fatalf("calls = %v, want only the list_services check — DELETE must never fire", calls)
-	}
-}
-
-// offboard_service must proceed to DELETE for a service that IS onboarded.
-func TestOffboardServiceRemovesOnboarded(t *testing.T) {
-	prev := internalToken
-	internalToken = "pmt_internal_test"
-	t.Cleanup(func() { internalToken = prev })
-
-	var calls []string
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls = append(calls, r.Method+" "+r.URL.RequestURI())
-		w.WriteHeader(200)
-		if r.Method == "GET" {
-			w.Write([]byte(`[{"name":"app","onboarded":true}]`))
-		} else {
-			w.Write([]byte(`{"status":"offboarded"}`))
-		}
+		w.Write([]byte(`{"status":"offboarded"}`))
 	})
 	c := &apiCaller{mux: h}
 	s := NewServer("t", "v")
@@ -680,8 +650,61 @@ func TestOffboardServiceRemovesOnboarded(t *testing.T) {
 	if r["isError"] == true {
 		t.Fatalf("tool errored: %v", r["content"])
 	}
-	want := []string{"GET /api/services", "DELETE /api/services/app"}
-	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+	want := []string{"POST /api/services/app/offboard"}
+	if len(calls) != 1 || calls[0] != want[0] {
 		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
+
+// A failure from the backend (e.g. no label-managed containers found for the
+// service) must surface as an error result, not be swallowed.
+func TestOffboardServiceSurfacesBackendError(t *testing.T) {
+	c, calls := stubDash(t, 400, `service "app" not found`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offboard_service","arguments":{"service":"app"}}}`
+	res, _ := rpc(t, s, body)
+	r := res["result"].(map[string]any)
+	if r["isError"] != true {
+		t.Fatalf("expected an error result, got %v", res)
+	}
+	if len(*calls) != 1 || (*calls)[0] != "POST /api/services/app/offboard" {
+		t.Fatalf("calls = %v", *calls)
+	}
+}
+
+// onboard_service must forward host/port/path/strip/replicas to the
+// discovery onboard endpoint, defaulting strip/replicas when omitted.
+func TestOnboardServiceCallsOnboardEndpoint(t *testing.T) {
+	c, calls := stubDash(t, 200, `{"status":"onboarded","name":"app"}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"onboard_service","arguments":{"service":"app","host":"app.example.com","port":8080}}}`
+	res, _ := rpc(t, s, body)
+	r := res["result"].(map[string]any)
+	if r["isError"] == true {
+		t.Fatalf("tool errored: %v", r["content"])
+	}
+	if len(*calls) != 1 || (*calls)[0] != "POST /api/discovery/app/onboard" {
+		t.Fatalf("calls = %v, want a single POST to the onboard endpoint", *calls)
+	}
+}
+
+// onboard_service must require host and port.
+func TestOnboardServiceRequiresHostAndPort(t *testing.T) {
+	c, calls := stubDash(t, 200, `{}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"onboard_service","arguments":{"service":"app"}}}`
+	res, _ := rpc(t, s, body)
+	r := res["result"].(map[string]any)
+	if r["isError"] != true {
+		t.Fatalf("expected refusal without host/port, got %v", res)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("calls = %v, want the dashboard never contacted", *calls)
 	}
 }

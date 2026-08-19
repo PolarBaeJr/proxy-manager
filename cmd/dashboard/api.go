@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -623,18 +622,24 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				httpx.WriteErr(w, err)
 				return
 			}
-			o, ok := onb.Get(name)
-			if !ok {
-				http.Error(w, "not an onboarded service — set the proxy.autoupdate label in compose for label-managed services", http.StatusNotFound)
-				return
-			}
-			if o.Host == "" {
-				http.Error(w, "managed-only service (no route) — auto-update needs a routed onboarded service", http.StatusBadRequest)
-				return
-			}
-			if err := onb.SetAutoUpdate(name, body.Enabled); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
+			if o, ok := onb.Get(name); ok {
+				if o.Host == "" {
+					http.Error(w, "managed-only service (no route) — auto-update needs a routed onboarded service", http.StatusBadRequest)
+					return
+				}
+				if err := onb.SetAutoUpdate(name, body.Enabled); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+			} else {
+				// Label-managed service: flip proxy.autoupdate via a
+				// lightweight clone-and-recreate (same image/env/mounts,
+				// only the label value changes) rather than requiring a
+				// compose edit.
+				if err := dc.setAutoUpdateLabel(req.Context(), name, body.Enabled); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
 			}
 			audit(req, sessionUser(info), "service.autoupdate_set", name+" => "+strconv.FormatBool(body.Enabled))
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
@@ -748,11 +753,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		}
 		// ---- Stop / Start (per-service or per-replica) ----
 		// Stopping retains all container config — `docker start` brings it
-		// back instantly. First stop of a labeled-but-not-onboarded service
-		// also snapshots it into the onboarded store so the full lifecycle
-		// (stage/promote/replace/rollback) becomes available. Auto-onboard
-		// is best-effort: a snapshot failure is logged but doesn't block
-		// the user's stop/start action.
+		// back instantly.
 		if len(parts) == 2 && (parts[1] == "stop" || parts[1] == "start") && req.Method == "POST" {
 			svc, ok, err := findService(req.Context(), dc, name)
 			if err != nil {
@@ -762,13 +763,6 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			if !ok {
 				http.Error(w, "service not found", http.StatusNotFound)
 				return
-			}
-			if !svc.Onboarded {
-				if err := promoteToOnboarded(req.Context(), dc, onb, svc); err != nil {
-					log.Printf("auto-onboard %s failed (continuing): %v", name, err)
-				} else {
-					audit(req, sessionUser(info), "service.auto_onboard", name)
-				}
 			}
 			act := parts[1]
 			var acted int
@@ -807,13 +801,6 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				http.Error(w, "service not found", http.StatusNotFound)
 				return
 			}
-			if !svc.Onboarded {
-				if err := promoteToOnboarded(req.Context(), dc, onb, svc); err != nil {
-					log.Printf("auto-onboard %s failed (continuing): %v", name, err)
-				} else {
-					audit(req, sessionUser(info), "service.auto_onboard", name)
-				}
-			}
 			var targetID string
 			var targetIsCanary bool
 			for _, m := range svc.MemberSummaries {
@@ -843,6 +830,29 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			proxyRefresh(proxyURLFromEnv())
 			audit(req, sessionUser(info), "service.replica_"+act, name+"/"+member)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": act + "ped", "member": member})
+			return
+		}
+		// ---- Offboard: stop routing a service without destroying its
+		// container(s) ----
+		// Primary/documented path for ANY label-managed service: disconnect
+		// its container(s) from the edge network, leaving them running with
+		// their proxy.* labels intact — reconnect (or `docker compose up
+		// -d`) to resume routing. A service still tracked in the legacy
+		// OnboardedStore keeps its old teardown-the-clones-and-drop-the-
+		// route behavior instead, so existing onboarded entries don't break.
+		if len(parts) == 2 && parts[1] == "offboard" && req.Method == "POST" {
+			if _, ok := onb.Get(name); ok {
+				if err := dc.offboardContainer(req.Context(), name, onb, routesConfigPath); err != nil {
+					httpx.WriteErr(w, err)
+					return
+				}
+			} else if err := dc.offboardLabelManaged(req.Context(), name); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			proxyRefresh(proxyURLFromEnv())
+			audit(req, sessionUser(info), "service.offboard", name)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "offboarded"})
 			return
 		}
 		if req.Method == "DELETE" {
@@ -943,7 +953,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteErr(w, err)
 			return
 		}
-		if err := dc.onboardContainer(req.Context(), name, body, onb, routesConfigPath); err != nil {
+		if err := dc.onboardContainer(req.Context(), name, body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
