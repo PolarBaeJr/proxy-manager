@@ -1,0 +1,88 @@
+name: uptime-check
+
+# Runs OFF the Pi on purpose: a bot/monitor running on the Pi can't report
+# the Pi being down. This pings a public health endpoint on a schedule and
+# posts to Discord only when the reachability state actually changes (down
+# or recovered), not on every tick.
+#
+# Setup (one-time, in this repo's Settings -> Secrets and variables -> Actions):
+#   Variables -> New repository variable
+#     HEALTHCHECK_URL = https://<a public host you want monitored>/healthz
+#   Secrets -> New repository secret
+#     DISCORD_WEBHOOK_URL = <a Discord channel webhook URL>
+# Until both are set, the job no-ops (skips the check) rather than alerting.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip if not configured
+        id: cfg
+        run: |
+          if [ -z "${{ vars.HEALTHCHECK_URL }}" ] || [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            echo "HEALTHCHECK_URL and/or DISCORD_WEBHOOK_URL not set — skipping (see workflow header for setup)."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore last known status
+        if: steps.cfg.outputs.configured == 'true'
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: status.txt
+          key: uptime-status-${{ github.run_id }}
+          restore-keys: uptime-status-
+
+      - name: Check health endpoint
+        if: steps.cfg.outputs.configured == 'true'
+        id: check
+        run: |
+          if curl -fsS --max-time 10 "${{ vars.HEALTHCHECK_URL }}" > /dev/null; then
+            echo "status=up" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=down" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine previous status
+        if: steps.cfg.outputs.configured == 'true'
+        id: prev
+        run: |
+          if [ -f status.txt ]; then
+            echo "status=$(cat status.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Discord on state change
+        if: steps.cfg.outputs.configured == 'true' && steps.check.outputs.status != steps.prev.outputs.status
+        run: |
+          if [ "${{ steps.check.outputs.status }}" = "down" ]; then
+            msg="🔴 **${{ vars.HEALTHCHECK_URL }}** is unreachable (checked $(date -u -Iseconds))."
+          else
+            msg="🟢 **${{ vars.HEALTHCHECK_URL }}** is back up (checked $(date -u -Iseconds))."
+          fi
+          curl -fsS -H "Content-Type: application/json" \
+            -d "$(jq -n --arg c "$msg" '{content: $c}')" \
+            "${{ secrets.DISCORD_WEBHOOK_URL }}"
+
+      - name: Save current status
+        if: steps.cfg.outputs.configured == 'true'
+        run: echo -n "${{ steps.check.outputs.status }}" > status.txt
+
+      - name: Persist status for next run
+        if: steps.cfg.outputs.configured == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: status.txt
+          key: uptime-status-${{ github.run_id }}
