@@ -2886,6 +2886,8 @@ async function renderStats() {
   }, 0);
   const totalReqs = overview.total_requests || live.reduce((a,t) => a + (t.total || 0), 0);
   const errPct = totalReqs > 0 ? (totErrors / totalReqs) * 100 : 0;
+  const win1hReqs = overview.windowed_requests_1h;
+  const anyWindowed = live.some(t => t.windowed);
 
   const stackPill = overview.health === 'up'
     ? '<span class="pill ok"><span class="gl"></span>all healthy</span>'
@@ -2897,7 +2899,9 @@ async function renderStats() {
           ? '<span class="up">' + I.check + 'all systems normal</span>'
           : '<span class="down">' + I.alert + degraded + ' degraded</span>',
         true)
-    + kpi(I.activity, 'Total requests', '<span class="num">' + fmt(totalReqs) + '</span>', '<span>' + I.clock + 'lifetime</span>')
+    + (anyWindowed
+        ? kpi(I.activity, 'Requests (1h)', '<span class="num">' + fmt(win1hReqs) + '</span>', '<span>' + I.clock + fmt(totalReqs) + ' lifetime</span>')
+        : kpi(I.activity, 'Total requests', '<span class="num">' + fmt(totalReqs) + '</span>', '<span>' + I.clock + 'lifetime</span>'))
     + kpi(I.bolt,     'In flight',      '<span class="num">' + inFlight + '</span>',       '<span>across all targets</span>')
     + kpi(I.clock,    'Avg p95 latency','<span class="num">' + avgP95 + '</span><small>ms</small>',
         '<span class="' + (errPct > 1 ? 'down' : 'up') + '">' + pct(errPct) + ' error rate</span>')
@@ -2916,8 +2920,9 @@ async function renderStats() {
     const total = t.total || 0;
     const tErr  = (() => { const by = t.by_status || {}; let n = 0; for (const [c, v] of Object.entries(by)) { const f = String(c)[0]; if (f === '4' || f === '5') n += v; } return n; })();
     const tErrPct = total > 0 ? (tErr / total * 100) : 0;
+    const tWin1h = (t.windowed && t.windowed.last_1h) ? (+t.windowed.last_1h.requests || 0) : null;
     const nums = isAbsent ? '' : '<div class="grid k4" style="margin:10px 0 6px">'
-        + kpiSm('Requests', fmt(total))
+        + (tWin1h != null ? kpiSm('Requests (1h)', fmt(tWin1h)) : kpiSm('Requests', fmt(total)))
         + kpiSm('In flight', String(t.in_flight || 0))
         + kpiSm('p95',     p95 + ' <small>ms</small>')
         + kpiSm('Errors',  pct(tErrPct))
@@ -3004,6 +3009,7 @@ async function renderStatsDetail(name) {
   // raw truth; the UI just lets the operator choose which slice to see.
   const stoppedHosts = new Set((svcs || []).filter(s => s.all_stopped).map(s => s.host));
   const m       = t.metrics || {};
+  const win1h   = (m.windowed && m.windowed.last_1h) ? (+m.windowed.last_1h.requests || 0) : null;
   const rate1   = +(t.rate_per_sec_1m || 0);
   const rate5   = +(t.rate_per_sec_5m || 0);
   const p95     = (m.latency_ms && m.latency_ms.p95 != null) ? m.latency_ms.p95 : 0;
@@ -3020,7 +3026,9 @@ async function renderStatsDetail(name) {
     + healthPill(t.health) + '<div class="spacer"></div>'
     + '<div class="meta">rate ' + rate1.toFixed(1) + ' req/s (1m) · ' + rate5.toFixed(1) + ' req/s (5m)</div></div>'
     + '<div class="grid k4">'
-    + kpi(I.activity, 'Total requests', '<span class="num">' + fmt(total) + '</span>', '<span>' + I.clock + 'lifetime</span>')
+    + (win1h != null
+        ? kpi(I.activity, 'Requests (1h)', '<span class="num">' + fmt(win1h) + '</span>', '<span>' + I.clock + fmt(total) + ' lifetime</span>')
+        : kpi(I.activity, 'Total requests', '<span class="num">' + fmt(total) + '</span>', '<span>' + I.clock + 'lifetime</span>'))
     + kpi(I.bolt,     'In flight',      '<span class="num">' + inFlight + '</span>',     '<span>concurrent</span>')
     + kpi(I.clock,    'p95 latency',    '<span class="num">' + (p95 ? p95.toFixed(0) : '—') + '</span><small>ms</small>', '<span>tail response time</span>')
     + kpi(I.shield,   'Error rate',     '<span class="num">' + pct(errPct) + '</span>',

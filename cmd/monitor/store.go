@@ -398,6 +398,10 @@ func (s *Store) Overview() map[string]any {
 	defer s.mu.RUnlock()
 
 	totalReqs := uint64(0)
+	// winReq1h/winReq24h are a best-effort sum: targets that haven't reported
+	// a "windowed" field yet (rolling deploy skew) contribute 0, so these
+	// under-report until the whole fleet is on a build with windowed metrics.
+	winReq1h, winReq24h := uint64(0), uint64(0)
 	allUp := true
 	targets := []map[string]any{}
 	for name, st := range s.state {
@@ -417,8 +421,21 @@ func (s *Store) Overview() map[string]any {
 			entry["by_method"] = d["by_method"]
 			entry["by_host"] = d["by_host"]
 			entry["latency_ms"] = d["latency_ms"]
+			entry["windowed"] = d["windowed"]
 			if t, ok := d["total"].(float64); ok {
 				totalReqs += uint64(t)
+			}
+			if w, ok := d["windowed"].(map[string]any); ok {
+				if h1, ok := w["last_1h"].(map[string]any); ok {
+					if r, ok := h1["requests"].(float64); ok {
+						winReq1h += uint64(r)
+					}
+				}
+				if h24, ok := w["last_24h"].(map[string]any); ok {
+					if r, ok := h24["requests"].(float64); ok {
+						winReq24h += uint64(r)
+					}
+				}
 			}
 		}
 		targets = append(targets, entry)
@@ -434,9 +451,11 @@ func (s *Store) Overview() map[string]any {
 		healthy = "degraded"
 	}
 	return map[string]any{
-		"health":       healthy,
-		"total_requests": totalReqs,
-		"targets":      targets,
-		"scraped_at":   time.Now().UTC().Format(time.RFC3339),
+		"health":                healthy,
+		"total_requests":        totalReqs,
+		"windowed_requests_1h":  winReq1h,
+		"windowed_requests_24h": winReq24h,
+		"targets":               targets,
+		"scraped_at":            time.Now().UTC().Format(time.RFC3339),
 	}
 }

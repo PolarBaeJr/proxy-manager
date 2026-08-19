@@ -107,6 +107,42 @@ func TestRate(t *testing.T) {
 	}
 }
 
+func TestOverviewWindowedPassthrough(t *testing.T) {
+	s := NewStore(time.Hour, 5*time.Second)
+	s.state["reporting"] = &TargetState{Name: "reporting", Health: "up", EverReached: true, Latest: &Sample{OK: true, Data: map[string]any{
+		"total": 10.0,
+		"windowed": map[string]any{
+			"last_1h":  map[string]any{"requests": 7.0, "bytes_out": 100.0, "errors": 1.0},
+			"last_24h": map[string]any{"requests": 9.0, "bytes_out": 200.0, "errors": 2.0},
+		},
+	}}}
+	s.state["stale"] = &TargetState{Name: "stale", Health: "up", EverReached: true, Latest: &Sample{OK: true, Data: map[string]any{
+		"total": 5.0,
+	}}}
+
+	ov := s.Overview()
+	if ov["windowed_requests_1h"].(uint64) != 7 {
+		t.Fatalf("windowed_requests_1h = %v, want 7", ov["windowed_requests_1h"])
+	}
+	if ov["windowed_requests_24h"].(uint64) != 9 {
+		t.Fatalf("windowed_requests_24h = %v, want 9", ov["windowed_requests_24h"])
+	}
+
+	targets := ov["targets"].([]map[string]any)
+	for _, entry := range targets {
+		if entry["name"] == "reporting" {
+			if entry["windowed"] == nil {
+				t.Fatal("reporting target should have windowed passthrough")
+			}
+		}
+		if entry["name"] == "stale" {
+			if entry["windowed"] != nil {
+				t.Fatalf("stale target windowed = %v, want nil", entry["windowed"])
+			}
+		}
+	}
+}
+
 func TestErrorPctRecent(t *testing.T) {
 	s := NewStore(time.Hour, 5*time.Second)
 	s.state["t"] = &TargetState{Name: "t", Latest: &Sample{OK: true, Data: map[string]any{
