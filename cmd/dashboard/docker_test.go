@@ -95,6 +95,65 @@ func TestListServicesGrouping(t *testing.T) {
 	}
 }
 
+func TestListServicesGroupLabel(t *testing.T) {
+	rogue := ct("rogue-group", "x:1", "running", map[string]string{labelService: "roguegroup", labelGroup: "<script>"})
+	dc := fakeDocker(t, ctJSON(
+		ct("goproxy-web-1", "web:1", "running", map[string]string{labelService: "web", labelHost: "web.example.org", labelPort: "80", labelGroup: "myapp"}),
+		ct("goproxy-db-1", "db:1", "running", map[string]string{labelService: "db"}),
+		rogue,
+	))
+	svcs, err := dc.listServices(context.Background())
+	if err != nil {
+		t.Fatalf("listServices: %v", err)
+	}
+	web := pickService(svcs, "web")
+	if web == nil || web.Group != "myapp" {
+		t.Fatalf("web.Group = %+v, want %q", web, "myapp")
+	}
+	// No proxy.group label → defaults to the service's own name.
+	db := pickService(svcs, "db")
+	if db == nil || db.Group != "db" {
+		t.Fatalf("db.Group = %+v, want defaulted to %q", db, "db")
+	}
+	// Invalid proxy.group label → the whole container is dropped, same as an
+	// invalid proxy.host/proxy.path label.
+	if pickService(svcs, "roguegroup") != nil {
+		t.Fatal("container with invalid proxy.group label should have been skipped")
+	}
+}
+
+func TestListServicesMemberHealth(t *testing.T) {
+	c := ct("goproxy-web-1", "web:1", "running", map[string]string{labelService: "web", labelHost: "web.example.org", labelPort: "80"})
+	c["Status"] = "Up 2 minutes (healthy)"
+	dc := fakeDocker(t, ctJSON(c))
+	svcs, err := dc.listServices(context.Background())
+	if err != nil {
+		t.Fatalf("listServices: %v", err)
+	}
+	web := pickService(svcs, "web")
+	if web == nil || len(web.MemberSummaries) != 1 {
+		t.Fatalf("web = %+v", web)
+	}
+	if web.MemberSummaries[0].Health != "healthy" {
+		t.Fatalf("Health = %q, want %q", web.MemberSummaries[0].Health, "healthy")
+	}
+}
+
+func TestParseHealth(t *testing.T) {
+	cases := []struct{ status, want string }{
+		{"Up 2 minutes (healthy)", "healthy"},
+		{"Up 2 minutes (unhealthy)", "unhealthy"},
+		{"Up 2 seconds (health: starting)", "starting"},
+		{"Up 2 minutes", ""},
+		{"Exited (0) 3 minutes ago", ""},
+	}
+	for _, c := range cases {
+		if got := parseHealth(c.status); got != c.want {
+			t.Errorf("parseHealth(%q) = %q, want %q", c.status, got, c.want)
+		}
+	}
+}
+
 func TestNextReplicaIndex(t *testing.T) {
 	existing := []dockerContainer{
 		{Names: []string{"/goproxy-foo-1"}},

@@ -31,6 +31,7 @@ const (
 	labelName       = "proxy.name"
 	labelWeight     = "proxy.weight"
 	labelService    = "proxy.service"
+	labelGroup      = "proxy.group"          // product-level grouping for the Status view; defaults to the service name
 	labelUnscalable = "proxy.unscalable"     // when "true", dashboard greys out +/- buttons
 	labelPrevImage  = "proxy.previous_image" // set on Replace; enables one-click Rollback
 	labelCanary     = "proxy.canary"         // "true" → staged replicas, served alongside live
@@ -101,6 +102,7 @@ type dockerContainer struct {
 	Image           string            `json:"Image"`
 	ImageID         string            `json:"ImageID"`
 	State           string            `json:"State"`
+	Status          string            `json:"Status"` // raw docker status, e.g. "Up 2 minutes (healthy)"
 	Labels          map[string]string `json:"Labels"`
 	NetworkSettings struct {
 		Networks map[string]struct {
@@ -114,6 +116,23 @@ func (c *dockerContainer) name() string {
 		return strings.TrimPrefix(c.Names[0], "/")
 	}
 	return c.ID[:12]
+}
+
+// parseHealth pulls a healthcheck state out of the raw Status string that
+// /containers/json already returns (e.g. "Up 2 minutes (healthy)") — no
+// extra /inspect call needed. Empty string means "no healthcheck defined",
+// which callers should treat as healthy (most containers have none).
+func parseHealth(status string) string {
+	switch {
+	case strings.Contains(status, "(healthy)"):
+		return "healthy"
+	case strings.Contains(status, "(unhealthy)"):
+		return "unhealthy"
+	case strings.Contains(status, "(health: starting)"):
+		return "starting"
+	default:
+		return ""
+	}
 }
 
 func (c *dockerClient) listAll(ctx context.Context, filter string) ([]dockerContainer, error) {
@@ -515,20 +534,24 @@ func (c *dockerClient) inspectImageOverridable(ctx context.Context, imageID stri
 // ---- Service-level operations ----
 
 type Service struct {
-	Name            string            `json:"name"`
-	Image           string            `json:"image"`
-	ImageID         string            `json:"image_id,omitempty"`
-	Host            string            `json:"host"`
-	Port            int               `json:"port"`
-	Path            string            `json:"path,omitempty"`
-	Replicas        int               `json:"replicas"`
-	Unscalable      bool              `json:"unscalable,omitempty"`
-	PreviousImage   string            `json:"previous_image,omitempty"`   // for one-click rollback
-	UpdateAvailable bool              `json:"update_available,omitempty"` // set by image checker
-	AutoUpdate      bool              `json:"auto_update,omitempty"`      // opted in to unattended updates
-	CanaryImage     string            `json:"canary_image,omitempty"`     // non-empty when a stage is in progress
-	CanaryReplicas  int               `json:"canary_replicas,omitempty"`
-	Onboarded       bool              `json:"onboarded,omitempty"` // adopted from an unlabelled container
+	Name string `json:"name"`
+	// Group is the product-level grouping (proxy.group label) the Status
+	// view/statusbot bucket services by — defaults to Name when the label is
+	// absent, so an ungrouped service is its own group of one.
+	Group           string `json:"group"`
+	Image           string `json:"image"`
+	ImageID         string `json:"image_id,omitempty"`
+	Host            string `json:"host"`
+	Port            int    `json:"port"`
+	Path            string `json:"path,omitempty"`
+	Replicas        int    `json:"replicas"`
+	Unscalable      bool   `json:"unscalable,omitempty"`
+	PreviousImage   string `json:"previous_image,omitempty"`   // for one-click rollback
+	UpdateAvailable bool   `json:"update_available,omitempty"` // set by image checker
+	AutoUpdate      bool   `json:"auto_update,omitempty"`      // opted in to unattended updates
+	CanaryImage     string `json:"canary_image,omitempty"`     // non-empty when a stage is in progress
+	CanaryReplicas  int    `json:"canary_replicas,omitempty"`
+	Onboarded       bool   `json:"onboarded,omitempty"` // adopted from an unlabelled container
 	// DualTracked is true when this service is BOTH still label-managed (a
 	// running container carries proxy.* labels) AND has an onboarded record
 	// tracking it — the state that let the sfubadminton.com incident happen
@@ -558,6 +581,10 @@ type ServiceMember struct {
 	ID       string `json:"id"`
 	State    string `json:"state"`
 	IsCanary bool   `json:"is_canary,omitempty"`
+	// Health is parsed from the container's raw Status string: "healthy",
+	// "unhealthy", "starting", or "" when no healthcheck is defined (most
+	// containers) — treat "" as healthy, not unknown.
+	Health string `json:"health,omitempty"`
 }
 
 func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
@@ -583,11 +610,21 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 			log.Printf("skip container %s: invalid proxy.path label %q", ct.name(), p)
 			continue
 		}
+		group := ct.Labels[labelGroup]
+		if group != "" && !validServiceName(group) {
+			// Rendered into an HTML heading client-side on the Status tab —
+			// same XSS boundary as proxy.service/proxy.host above.
+			log.Printf("skip container %s: invalid proxy.group label %q", ct.name(), group)
+			continue
+		}
 		isCanary := ct.Labels[labelCanary] == "true"
 		s, ok := byName[name]
 		if !ok {
 			s = &Service{Name: name, Labels: ct.Labels}
 			byName[name] = s
+		}
+		if s.Group == "" {
+			s.Group = group
 		}
 		s.Members = append(s.Members, ct)
 		if isCanary {
@@ -608,13 +645,16 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 	}
 	out := make([]Service, 0, len(byName))
 	for _, s := range byName {
+		if s.Group == "" {
+			s.Group = s.Name
+		}
 		// Build per-member summaries (sorted by name for stable UI order)
 		// and determine the AllStopped flag from non-canary members.
 		allStopped := len(s.Members) > 0
 		for _, m := range s.Members {
 			isCanary := m.Labels[labelCanary] == "true"
 			s.MemberSummaries = append(s.MemberSummaries, ServiceMember{
-				Name: m.name(), ID: m.ID, State: m.State, IsCanary: isCanary,
+				Name: m.name(), ID: m.ID, State: m.State, IsCanary: isCanary, Health: parseHealth(m.Status),
 			})
 			if !isCanary && m.State == "running" {
 				allStopped = false

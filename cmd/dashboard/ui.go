@@ -551,12 +551,14 @@ footer.app code{color:var(--muted)}
       <section id="tab-observability" class="tabpane" hidden>
         <nav class="subnav" id="obs-subnav">
           <button class="active" data-sub="stats">Stats</button>
+          <button data-sub="status">Status</button>
           <button data-sub="logs">Container logs</button>
           <button data-sub="access">Access log</button>
           <button data-sub="releases">Releases</button>
           <button data-sub="images">Images</button>
         </nav>
         <div id="tab-stats"></div>
+        <div id="tab-status" hidden></div>
         <div id="tab-logs" hidden></div>
         <div id="tab-access" hidden></div>
         <div id="tab-releases" hidden></div>
@@ -1045,7 +1047,7 @@ function switchObsSub(s) {
   if (s !== 'access') accessState.mounted = false;
   if (s !== 'stats') statsDetail = null;
   $$('#obs-subnav button').forEach(b => b.classList.toggle('active', b.dataset.sub === s));
-  ['stats','logs','access','releases','images'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
+  ['stats','status','logs','access','releases','images'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
   renderActive();
 }
 
@@ -1068,6 +1070,7 @@ async function renderActive() {
       await renderDNS();
     } else if (activeTab === 'observability') {
       if (obsSubTab === 'stats') await renderStats();
+      else if (obsSubTab === 'status') await renderStatus();
       else if (obsSubTab === 'logs') await renderLogs();
       else if (obsSubTab === 'access') await renderAccess();
       else if (obsSubTab === 'releases') await renderReleases();
@@ -1428,9 +1431,11 @@ async function renderServices() {
   for (const s of svcs) {
     const sn = esc(s.name);
     const canary = !!s.canary_image;
-    // Managed-only: adopted for lifecycle/image tracking with no route. No
-    // traffic is routed, so canary/replace/stop/stats make no sense.
-    const managed = s.onboarded && !s.host;
+    // Managed-only: no route (either adopted for lifecycle/image tracking
+    // only, or a label-managed container that only carries proxy.service —
+    // e.g. a grouped-only DB). No traffic is routed, so canary/replace/
+    // stop/stats make no sense.
+    const managed = !s.host;
     let badges = '';
     if (s.update_available) badges += ' <span class="pill warn">' + I.arrowup + 'update available</span>';
     if (s.auto_update) {
@@ -1441,7 +1446,7 @@ async function renderServices() {
       badges += ' <span class="pill ok" title="' + auTitle + '">' + I.arrowup + 'auto-update</span>';
     }
     if (canary)             badges += ' <span class="pill info"><span class="gl"></span>canary live</span>';
-    if (managed)            badges += ' <span class="pill muted" title="Adopted for lifecycle/image tracking only — no traffic routed">' + I.rocket + 'managed · no route</span>';
+    if (managed)            badges += ' <span class="pill muted" title="No proxy.host/port configured — no traffic routed (lifecycle/image tracking only)">' + I.rocket + 'managed · no route</span>';
     else if (s.onboarded)   badges += ' <span class="pill muted" title="Adopted from an unlabelled container — replace/canary disabled">' + I.rocket + 'onboarded</span>';
     // Tracked BOTH via live proxy.* labels AND the onboarded.json store —
     // the pattern behind several past incidents (path/env dropped on
@@ -1543,7 +1548,7 @@ async function renderServices() {
          +    facts
          +    memberList
          +    '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
-         +    (managed ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-backends="' + esc((s.backends || []).join(' ')) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
+         +    (managed ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-service="' + sn + '" data-backends="' + esc((s.backends || []).join(' ')) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
          +  '</div>'
          +  '</div>';
   }
@@ -1555,7 +1560,7 @@ async function renderServices() {
 // Cache last per-host stats so re-render uses prior data instantly — kills
 // the height-jump on every 5s auto-refresh tick where the panel would
 // otherwise flash "Loading…" → full content.
-let _svcStatsCache = { byHost: {}, recentByHost: {}, fetchedAt: 0 };
+let _svcStatsCache = { byHost: {}, recentByHost: {}, byService: {}, fetchedAt: 0 };
 // Per-panel hash of last-painted content, so we only touch innerHTML when
 // the rendered HTML would actually differ. Without this, the table inside
 // each panel was being re-parsed every 5s — that's what was "moving around".
@@ -1589,6 +1594,17 @@ function recentForPanel(panel, hostEntries) {
   return out;
 }
 
+// flattenStatusByService turns /api/service-status's grouped shape into a
+// flat name → entry lookup, for matching against a .svc-stats panel's
+// data-service attribute.
+function flattenStatusByService(status) {
+  const out = {};
+  for (const g of ((status && status.groups) || [])) {
+    for (const s of (g.services || [])) out[s.name] = s;
+  }
+  return out;
+}
+
 async function fillServiceStatsPanels() {
   const panels = document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats');
   if (!panels.length) return;
@@ -1596,15 +1612,17 @@ async function fillServiceStatsPanels() {
   for (const panel of panels) {
     const host = panel.dataset.host;
     const recent = recentForPanel(panel, _svcStatsCache.recentByHost[host] || []);
-    if (_svcStatsCache.byHost[host] || recent.length) {
-      paintServicePanelIfChanged(panel, renderServiceStatsPanel(_svcStatsCache.byHost[host], recent, panel));
+    const svcStatus = _svcStatsCache.byService[panel.dataset.service];
+    if (_svcStatsCache.byHost[host] || recent.length || svcStatus) {
+      paintServicePanelIfChanged(panel, renderServiceStatsPanel(_svcStatsCache.byHost[host], recent, panel, svcStatus));
     }
   }
   // Then fetch fresh in the background and update the cache + panels.
   try {
-    const [hosts, access] = await Promise.all([
+    const [hosts, access, status] = await Promise.all([
       api('/api/monitor/target/proxy/hosts').catch(() => []),
       api('/api/access?limit=400').catch(() => ({ entries: [] })),
+      api('/api/service-status').catch(() => null),
     ]);
     const byHost = {};
     for (const h of (Array.isArray(hosts) ? hosts : [])) byHost[h.host] = h;
@@ -1616,43 +1634,56 @@ async function fillServiceStatsPanels() {
       if (!recentByHost[e.host]) recentByHost[e.host] = [];
       if (recentByHost[e.host].length < 200) recentByHost[e.host].push(e);
     }
-    _svcStatsCache = { byHost, recentByHost, fetchedAt: Date.now() };
+    const byService = flattenStatusByService(status);
+    _svcStatsCache = { byHost, recentByHost, byService, fetchedAt: Date.now() };
     // Repaint only the panels that are still in the DOM and expanded AND
     // whose rendered HTML would actually differ from what they show now.
     document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats').forEach(panel => {
       const host = panel.dataset.host;
       const recent = recentForPanel(panel, recentByHost[host] || []);
-      paintServicePanelIfChanged(panel, renderServiceStatsPanel(byHost[host], recent, panel));
+      paintServicePanelIfChanged(panel, renderServiceStatsPanel(byHost[host], recent, panel, byService[panel.dataset.service]));
     });
   } catch {}
 }
 
-function renderServiceStatsPanel(stats, recent, panel) {
-  if ((!stats || !stats.total) && !recent.length) {
+function renderServiceStatsPanel(stats, recent, panel, svcStatus) {
+  // Requests now comes from /api/service-status (per-service, bucketed by
+  // backend) instead of the host-wide monitor stats — a host can front
+  // several services (badminton.polardev.org routes to four), and the old
+  // source mingled every neighbour's traffic into this number.
+  const svcReqs = svcStatus && svcStatus.requests_5m != null ? svcStatus.requests_5m : null;
+  const tot = svcReqs != null ? svcReqs : (stats ? stats.total || 0 : 0);
+  if (!tot && !recent.length) {
     return '<div class="subhead" style="margin-top:12px">' + I.activity + 'No traffic yet</div>'
-         + '<div class="meta">No requests have hit this host since the proxy started. Hit it once and the stats will populate.</div>';
+         + '<div class="meta">No requests have hit this service in the last 5 minutes. Hit it once and the stats will populate.</div>';
   }
-  // The counters below come from per-HOST metrics, and a host can front
-  // several services. Say so rather than letting them read as this service's
-  // own numbers — the request table underneath IS service-specific.
   const host = panel && panel.dataset ? panel.dataset.host : '';
-  let html = '<div class="subhead" style="margin-top:14px">' + I.activity + 'Live traffic'
-    + (host ? ' <span class="hint" style="display:inline;font-weight:400">— all traffic to ' + esc(host) + '</span>' : '')
-    + '</div>';
-  if (stats) {
-    const p95 = (stats.latency_ms && stats.latency_ms.p95 != null) ? stats.latency_ms.p95.toFixed(1) : '—';
-    const tot = stats.total || 0;
-    const inflight = stats.in_flight || 0;
-    const by = stats.by_status || {};
+  let html = '<div class="subhead" style="margin-top:14px">' + I.activity + 'Live traffic</div>';
+  if (stats || svcReqs != null) {
+    const p95 = (stats && stats.latency_ms && stats.latency_ms.p95 != null) ? stats.latency_ms.p95.toFixed(1) : '—';
+    const inflight = stats ? (stats.in_flight || 0) : 0;
+    const by = stats ? (stats.by_status || {}) : {};
     let errs = 0;
     for (const [c, v] of Object.entries(by)) { const f = String(c)[0]; if (f === '4' || f === '5') errs += v; }
-    const errPct = tot > 0 ? (errs / tot * 100) : 0;
-    html += '<div class="grid k4" style="margin-bottom:10px">'
-          + kpiSm('Requests', fmt(tot))
+    const statsTotal = stats ? (stats.total || 0) : 0;
+    const errPct = statsTotal > 0 ? (errs / statsTotal * 100) : 0;
+    const reqsVal = fmt(tot) + (svcStatus && svcStatus.rate_truncated
+      ? ' <small title="Access log wrapped inside the 5-minute window — may be undercounted">≈</small>' : '');
+    // Label the window explicitly once svcReqs is populated — it's a 5m
+    // count, not the lifetime total the tile used to show, and sitting next
+    // to In flight/p95/Errors (still lifetime) makes the distinction easy
+    // to miss otherwise.
+    const reqsLabel = svcReqs != null ? 'Requests (5m)' : 'Requests';
+    html += '<div class="grid k4" style="margin-bottom:4px">'
+          + kpiSm(reqsLabel, reqsVal)
           + kpiSm('In flight', String(inflight))
           + kpiSm('p95', p95 + ' <small>ms</small>')
           + kpiSm('Errors', pct(errPct))
           + '</div>';
+    // In flight / p95 / errors still come from per-HOST metrics — a host can
+    // front several services, so only THOSE three numbers are host-wide.
+    // Requests above is now this service's own count.
+    if (host) html += '<div class="meta" style="margin:0 0 10px;font-size:11px">In flight / p95 / errors are host-wide (all services on ' + esc(host) + ').</div>';
     if (Object.keys(by).length) html += statusBarFromCodes(by);
   }
   if (recent.length) {
@@ -2967,6 +2998,67 @@ async function renderStats() {
 
   el.innerHTML = html;
 }
+
+/* ---------- Status (per-group health/usage; read-only) ---------- */
+let _lastStatusHash = '';
+async function renderStatus() {
+  const el = $('#tab-status');
+  let data;
+  try {
+    data = await api('/api/service-status');
+  } catch (e) {
+    el.innerHTML = emptyState(I.activity, 'Status unavailable', e.message || 'Could not load service status.');
+    return;
+  }
+  // Hash only groups, not the whole payload — sampled_at/stats_sampled_at
+  // are timestamps that churn every request/poll and would defeat this
+  // guard entirely, repainting (and re-parsing) the table every 5s tick.
+  const hash = JSON.stringify(data.groups || []);
+  if (hash === _lastStatusHash && el.children.length) return;
+  _lastStatusHash = hash;
+  const groups = data.groups || [];
+  if (!groups.length) {
+    el.innerHTML = emptyState(I.services, 'No services', 'No proxy.service-labeled containers found.');
+    return;
+  }
+  let html = '';
+  for (const g of groups) {
+    html += '<div class="subhead">' + I.services + esc(g.group) + '</div>';
+    html += '<div class="card"><table><thead><tr><th>Service</th><th>Health</th><th>Requests (5m)</th><th>CPU</th><th>Mem</th></tr></thead><tbody>';
+    for (const s of (g.services || [])) {
+      const repl = s.healthy_replicas + '/' + s.total_replicas;
+      // !s.routed alone can't win the muted/neutral branch — an unrouted
+      // service (e.g. a DB) that's fully down is still down, not merely
+      // "not applicable", and must render as the red/bad pill like a
+      // routed one would.
+      const health = (!s.routed && s.state !== 'down')
+        ? '<span class="pill muted">' + repl + '</span>'
+        : s.state === 'up'
+        ? '<span class="pill ok"><span class="gl"></span>' + repl + '</span>'
+        : s.state === 'degraded'
+        ? '<span class="pill warn">' + I.alert + repl + '</span>'
+        : '<span class="pill bad">' + I.x + repl + '</span>';
+      const reqs = (!s.routed || s.requests_5m == null)
+        ? '<span class="meta">—</span>'
+        : fmt(s.requests_5m) + (s.rate_truncated
+            ? ' <span class="pill warn" title="Access log wrapped inside the 5-minute window — this count may be low">' + I.alert + 'truncated</span>'
+            : '');
+      const cpu = (s.cpu_pct != null) ? pct(s.cpu_pct) : '<span class="meta">—</span>';
+      const mem = s.mem_used_bytes
+        ? fmtBytes(s.mem_used_bytes) + (s.mem_limit_bytes ? ' <span class="meta">/ ' + fmtBytes(s.mem_limit_bytes) + '</span>' : '')
+        : '<span class="meta">—</span>';
+      html += '<tr><td><span class="ident">' + esc(s.name) + '</span>'
+        + (s.host ? ' <span class="meta">' + esc(s.host) + '</span>' : '') + '</td>'
+        + '<td>' + health + '</td>'
+        + '<td>' + reqs + '</td>'
+        + '<td>' + cpu + '</td>'
+        + '<td>' + mem + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+  el.innerHTML = html;
+}
+
 function openTarget(n) { statsDetail = n; renderActive(); }
 function closeTarget() { statsDetail = null; renderActive(); }
 function toggleTopHostsFilter(id) {

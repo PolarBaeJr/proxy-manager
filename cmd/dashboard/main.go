@@ -152,6 +152,10 @@ func main() {
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
+	// Background: sample per-container CPU/mem for the Status sub-tab (and
+	// later, statusbot) — served from cache, never blocks a live request.
+	go dockerStatsLoop(ctx, dc)
+
 	// Background: keep the DNS zone list matching the Cloudflare account, so a
 	// newly added domain needs no env edit or restart.
 	go cf.SyncLoop(ctx)

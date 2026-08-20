@@ -10,6 +10,13 @@
 // in, persisted to disk so it survives a container restart. !status and
 // /set-alert-channel both reply with embeds too.
 //
+// Separately, it also polls the dashboard's authenticated
+// GET /api/service-status endpoint (see servicestatus.go/statusembed.go) on
+// its own faster ticker and keeps a SECOND persistent embed — one field per
+// service group — edited in place the same way, using its own message ID
+// (channelstore.go's StatusMessageID) so it never collides with the
+// transition-alert message above.
+//
 // Deliberately its own process/container rather than code inside the
 // dashboard: if the dashboard hangs or crashes, a status check running
 // inside it can't report that. It still runs on the same Pi, so it won't
@@ -35,11 +42,17 @@ import (
 func main() {
 	healthURL := flag.String("health-url", "http://dashboard:8093/api/health", "dashboard /api/health URL to poll")
 	pollInterval := flag.Duration("poll-interval", 60*time.Second, "how often to poll health")
+	statusURL := flag.String("status-url", "http://dashboard:8093/api/service-status", "dashboard /api/service-status URL to poll")
+	statusInterval := flag.Duration("status-interval", 15*time.Second, "how often to poll per-service status")
 	flag.Parse()
 
 	token := os.Getenv("DISCORD_BOT_TOKEN")
 	if token == "" {
 		log.Fatal("DISCORD_BOT_TOKEN is required")
+	}
+	dashboardToken := os.Getenv("DASHBOARD_API_TOKEN")
+	if dashboardToken == "" {
+		log.Println("⚠ DASHBOARD_API_TOKEN not set — the service-status embed will show as unavailable")
 	}
 
 	chStore, chMsgs := newChannelStoreFromEnv(os.Getenv)
@@ -51,6 +64,7 @@ func main() {
 		log.Println(m)
 	}
 	alertMessageID := chStore.GetMessageID()
+	statusMessageID := chStore.GetStatusMessageID()
 
 	sess, err := discordgo.New("Bot " + token)
 	if err != nil {
@@ -66,6 +80,7 @@ func main() {
 	var lastStatus string
 	var lastHealth healthStatus
 	var lastErr error
+	var lastStatusErr string // last service-status fetch error's message, "" = last poll succeeded; only used to dedupe repeated log lines below
 
 	poll := func() {
 		hs, err := fetchHealth(context.Background(), *healthURL, client)
@@ -120,6 +135,64 @@ func main() {
 		}
 		if err := chStore.SetMessageID(newMsgID); err != nil {
 			log.Printf("failed to persist live-status message id: %v", err)
+		}
+	}
+
+	pollStatus := func() {
+		resp, fetchErr := fetchServiceStatus(context.Background(), *statusURL, dashboardToken, client)
+		errMsg := ""
+		if fetchErr != nil {
+			errMsg = fetchErr.Error()
+		}
+		mu.Lock()
+		shouldLog := errMsg != lastStatusErr // dedupe: only log when the error (or its absence) changes, not every tick
+		lastStatusErr = errMsg
+		target := alertChannelID
+		msgID := statusMessageID
+		mu.Unlock()
+		if fetchErr != nil && shouldLog {
+			log.Printf("service-status poll failed: %v", fetchErr)
+		}
+		if target == "" {
+			return
+		}
+		var embed *discordgo.MessageEmbed
+		if fetchErr != nil {
+			embed = statusUnavailableEmbed(fetchErr)
+		} else {
+			embed = buildServiceStatusEmbed(resp)
+		}
+		newMsgID := msgID
+		edited := false
+		if msgID != "" {
+			if _, editErr := sess.ChannelMessageEditEmbed(target, msgID, embed); editErr != nil {
+				log.Printf("failed to edit service-status message %s in %s, sending a new one: %v", msgID, target, editErr)
+			} else {
+				edited = true
+			}
+		}
+		if !edited {
+			sent, sendErr := sess.ChannelMessageSendEmbed(target, embed)
+			if sendErr != nil {
+				log.Printf("failed to send service-status message: %v", sendErr)
+				return
+			}
+			newMsgID = sent.ID
+		}
+		if newMsgID == msgID {
+			return
+		}
+		mu.Lock()
+		stale := alertChannelID != target // channel changed while we were doing I/O — don't clobber the new channel's message id
+		if !stale {
+			statusMessageID = newMsgID
+		}
+		mu.Unlock()
+		if stale {
+			return
+		}
+		if err := chStore.SetStatusMessageID(newMsgID); err != nil {
+			log.Printf("failed to persist service-status message id: %v", err)
 		}
 	}
 
@@ -226,6 +299,7 @@ func main() {
 		mu.Lock()
 		alertChannelID = i.ChannelID
 		alertMessageID = sent.ID
+		statusMessageID = "" // belonged to the previous channel, if any — chStore.Set below clears the persisted copy the same way
 		mu.Unlock()
 		ack := "Done."
 		if err := chStore.Set(i.ChannelID); err != nil {
@@ -246,11 +320,15 @@ func main() {
 	mu.Lock()
 	initialTarget := alertChannelID
 	mu.Unlock()
-	log.Printf("statusbot connected — polling %s every %s, alerts to channel %q", *healthURL, *pollInterval, initialTarget)
+	log.Printf("statusbot connected — polling %s every %s, and %s every %s, alerts to channel %q",
+		*healthURL, *pollInterval, *statusURL, *statusInterval, initialTarget)
 
-	poll() // establish a baseline immediately so !status works right away
+	poll()       // establish a baseline immediately so !status works right away
+	pollStatus() // ditto, for the service-status embed
 	ticker := time.NewTicker(*pollInterval)
 	defer ticker.Stop()
+	statusTicker := time.NewTicker(*statusInterval)
+	defer statusTicker.Stop()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -261,6 +339,8 @@ func main() {
 			return
 		case <-ticker.C:
 			poll()
+		case <-statusTicker.C:
+			pollStatus()
 		}
 	}
 }

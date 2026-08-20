@@ -17,14 +17,21 @@ type channelStoreData struct {
 	// live-status message being edited in place there. It is cleared
 	// whenever the channel changes (see Set).
 	MessageID string `json:"message_id,omitempty"`
+	// StatusMessageID is the separate, independently-edited per-service
+	// status embed message (see servicestatus.go/statusembed.go) — kept
+	// apart from MessageID so the ~15s status tick and the up/down
+	// transition alerts don't fight over the same message. Cleared on a
+	// channel change alongside MessageID, for the same reason.
+	StatusMessageID string `json:"status_message_id,omitempty"`
 }
 
 // channelStore persists the alert channel chosen at runtime via
-// /set-alert-channel, and the live-status message ID being edited in place
-// within it, so both survive a container restart. A nil *channelStore (the
-// /data volume isn't mounted) degrades: Get/GetMessageID always return "",
-// and Set/SetMessageID return a descriptive error instead of pretending the
-// value persisted.
+// /set-alert-channel, and the live-status/service-status message IDs being
+// edited in place within it, so both survive a container restart. A nil
+// *channelStore (the /data volume isn't mounted) degrades:
+// Get/GetMessageID/GetStatusMessageID always return "", and
+// Set/SetMessageID/SetStatusMessageID return a descriptive error instead of
+// pretending the value persisted.
 type channelStore struct {
 	path string
 	mu   sync.RWMutex
@@ -84,6 +91,7 @@ func (s *channelStore) Set(channelID string) error {
 	defer s.mu.Unlock()
 	s.data.ChannelID = channelID
 	s.data.MessageID = ""
+	s.data.StatusMessageID = ""
 	b, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return err
@@ -115,6 +123,36 @@ func (s *channelStore) SetMessageID(messageID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data.MessageID = messageID
+	b, err := json.MarshalIndent(s.data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.path, b, 0o600)
+}
+
+// GetStatusMessageID returns the persisted service-status embed message ID
+// for the current alert channel, or "" if none is known yet — mirrors
+// GetMessageID but for the independent per-service status tick.
+func (s *channelStore) GetStatusMessageID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data.StatusMessageID
+}
+
+// SetStatusMessageID persists the service-status embed message ID for the
+// already-established alert channel, without touching ChannelID or
+// MessageID — mirrors SetMessageID but for the independent per-service
+// status tick.
+func (s *channelStore) SetStatusMessageID(messageID string) error {
+	if s == nil {
+		return fmt.Errorf("alert-channel persistence not configured (no /data volume mounted for statusbot)")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.StatusMessageID = messageID
 	b, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return err
