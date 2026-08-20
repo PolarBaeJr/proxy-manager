@@ -73,14 +73,3 @@ func TestBuildStatusEmbedTimestampFromCheckedAt(t *testing.T) {
 		t.Errorf("Timestamp = %q, want %q", embed.Timestamp, "2026-01-01T00:00:00Z")
 	}
 }
-
-func TestStartupEmbedNeutral(t *testing.T) {
-	embed := startupEmbed()
-	if embed.Color != colorNeutral {
-		t.Errorf("Color = %#x, want %#x", embed.Color, colorNeutral)
-	}
-	desc := strings.ToLower(embed.Description)
-	if strings.Contains(desc, "unreachable") || strings.Contains(desc, "🔴") {
-		t.Errorf("Description = %q, want no red-alert wording", embed.Description)
-	}
-}

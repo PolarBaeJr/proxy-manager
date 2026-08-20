@@ -62,29 +62,6 @@ func classify(hs healthStatus, err error) string {
 	return hs.Status
 }
 
-// transitionMessage returns the Discord alert text for a prev->cur status
-// change, or "" if no alert is warranted. prev == "" (no baseline yet, e.g.
-// the very first poll after startup) never alerts — only real transitions do.
-func transitionMessage(prev, cur string, hs healthStatus, err error) string {
-	if prev == "" || prev == cur {
-		return ""
-	}
-	switch cur {
-	case "up":
-		return "✅ back to healthy — all targets up."
-	case "unreachable":
-		msg := "🔴 dashboard health endpoint is unreachable"
-		if err != nil {
-			msg += ": " + err.Error()
-		}
-		return msg
-	case "degraded":
-		return "⚠️ degraded — " + degradedSummary(hs)
-	default:
-		return fmt.Sprintf("status changed: %s → %s", prev, cur)
-	}
-}
-
 // statusReply renders the on-demand !status reply from the most recent poll
 // result — no live poll, so it answers instantly even if the target is down.
 func statusReply(hs healthStatus, err error) string {

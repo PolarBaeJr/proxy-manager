@@ -74,33 +74,6 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-func TestTransitionMessage(t *testing.T) {
-	// No baseline yet (startup) — must never alert, even though "" != "up".
-	if msg := transitionMessage("", "up", healthStatus{}, nil); msg != "" {
-		t.Errorf("first poll should not alert, got %q", msg)
-	}
-	// No change — no alert.
-	if msg := transitionMessage("up", "up", healthStatus{}, nil); msg != "" {
-		t.Errorf("unchanged status should not alert, got %q", msg)
-	}
-	// up -> unreachable must mention the error.
-	msg := transitionMessage("up", "unreachable", healthStatus{}, context.DeadlineExceeded)
-	if !strings.Contains(msg, "unreachable") || !strings.Contains(msg, context.DeadlineExceeded.Error()) {
-		t.Errorf("unreachable transition = %q, want it to mention the error", msg)
-	}
-	// unreachable -> up is the recovery message.
-	msg = transitionMessage("unreachable", "up", healthStatus{}, nil)
-	if !strings.Contains(strings.ToLower(msg), "healthy") {
-		t.Errorf("recovery transition = %q, want a healthy/back-up message", msg)
-	}
-	// up -> degraded must name the down target.
-	hs := healthStatus{Status: "degraded", Targets: []healthTarget{{Name: "proxy", Health: "down"}, {Name: "edge", Health: "up"}}}
-	msg = transitionMessage("up", "degraded", hs, nil)
-	if !strings.Contains(msg, "proxy") || strings.Contains(msg, "edge (up)") {
-		t.Errorf("degraded transition = %q, want it to name the down target only", msg)
-	}
-}
-
 func TestStatusReply(t *testing.T) {
 	if r := statusReply(healthStatus{Status: "up", CheckedAt: "t"}, nil); !strings.Contains(r, "up") {
 		t.Errorf("up reply = %q", r)
