@@ -174,3 +174,67 @@ func TestValidUsername(t *testing.T) {
 		}
 	}
 }
+
+func TestRemintServiceToken(t *testing.T) {
+	s, _ := newConfirmedStore(t, "alice", "correct horse")
+	raw, err := s.RemintServiceToken("statusbot")
+	if err != nil {
+		t.Fatalf("RemintServiceToken: %v", err)
+	}
+	if got := s.VerifyToken(raw); got != "statusbot" {
+		t.Fatalf("VerifyToken(raw) = %q, want %q", got, "statusbot")
+	}
+	s.mu.RLock()
+	lastUsed := s.data.ServiceTokens[0].LastUsedAt
+	s.mu.RUnlock()
+	if lastUsed == 0 {
+		t.Fatal("LastUsedAt was not set after VerifyToken")
+	}
+}
+
+func TestRemintServiceTokenReplacesOld(t *testing.T) {
+	s, _ := newConfirmedStore(t, "alice", "correct horse")
+	oldRaw, err := s.RemintServiceToken("statusbot")
+	if err != nil {
+		t.Fatalf("RemintServiceToken (first): %v", err)
+	}
+	newRaw, err := s.RemintServiceToken("statusbot")
+	if err != nil {
+		t.Fatalf("RemintServiceToken (second): %v", err)
+	}
+	s.mu.RLock()
+	n := len(s.data.ServiceTokens)
+	s.mu.RUnlock()
+	if n != 1 {
+		t.Fatalf("len(ServiceTokens) = %d, want 1", n)
+	}
+	if s.VerifyToken(oldRaw) != "" {
+		t.Fatal("old service token still verifies after remint")
+	}
+	if got := s.VerifyToken(newRaw); got != "statusbot" {
+		t.Fatalf("VerifyToken(newRaw) = %q, want %q", got, "statusbot")
+	}
+}
+
+func TestServiceTokenDoesNotElevate(t *testing.T) {
+	s, _ := newConfirmedStore(t, "alice", "correct horse")
+	raw, err := s.RemintServiceToken("statusbot")
+	if err != nil {
+		t.Fatalf("RemintServiceToken: %v", err)
+	}
+	if got := s.VerifyToken(raw); got != "statusbot" {
+		t.Fatalf("VerifyToken(raw) = %q, want %q — service tokens must still pass the broad check", got, "statusbot")
+	}
+	if got := s.VerifyElevatedToken(raw); got != "" {
+		t.Fatalf("VerifyElevatedToken(raw) = %q, want \"\" — service tokens must never grant elevated access", got)
+	}
+
+	// Contrast: a human-minted token still elevates.
+	userRaw, _, err := s.CreateToken("alice", "cli")
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	if got := s.VerifyElevatedToken(userRaw); got != "alice" {
+		t.Fatalf("VerifyElevatedToken(userRaw) = %q, want %q", got, "alice")
+	}
+}

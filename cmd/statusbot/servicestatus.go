@@ -43,7 +43,7 @@ type serviceStatusResp struct {
 // error so main.go's poll loop can dedupe its "not configured" log line the
 // same way it dedupes any other repeated fetch error, instead of spamming it
 // every tick.
-var errNoDashboardToken = fmt.Errorf("DASHBOARD_API_TOKEN not set")
+var errNoDashboardToken = fmt.Errorf("no dashboard API token available (set DASHBOARD_API_TOKEN, or wait for dashboard auto-provisioning)")
 
 // fetchServiceStatus calls the dashboard's authenticated GET
 // /api/service-status endpoint — see cmd/dashboard/api.go and

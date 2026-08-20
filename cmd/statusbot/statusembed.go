@@ -168,8 +168,8 @@ func humanBytes(n uint64) string {
 
 // statusUnavailableEmbed renders a clear "no data" embed instead of leaving
 // a stale service-status message in place — used when the fetch failed
-// (including a missing DASHBOARD_API_TOKEN) or the response decoded to zero
-// groups.
+// (including no dashboard API token being available) or the response
+// decoded to zero groups.
 func statusUnavailableEmbed(err error) *discordgo.MessageEmbed {
 	desc := "⚠️ service status unavailable"
 	if err != nil {

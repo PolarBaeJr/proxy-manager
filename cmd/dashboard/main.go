@@ -23,6 +23,7 @@ func main() {
 	imageHistoryFile := flag.String("image-history", "/data/image-history.json", "per-service image version history state file")
 	prefsFile := flag.String("prefs", "/data/prefs.json", "per-user UI preferences state file")
 	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (rw: dashboard appends onboarded routes here)")
+	serviceTokenDir := flag.String("service-token-dir", "/tokens", "directory to write auto-provisioned service credentials (e.g. statusbot's token) — a sibling container mounts this read-only")
 	flag.Parse()
 
 	metrics := NewMetrics()
@@ -35,6 +36,10 @@ func main() {
 	}
 	if !auth.IsSetup() {
 		log.Printf("⚠ auth not yet set up — visit the dashboard to create the first user")
+	}
+
+	if err := provisionServiceToken(auth, *serviceTokenDir, "statusbot"); err != nil {
+		log.Printf("⚠ statusbot token provisioning: %v", err)
 	}
 
 	if err := openAuditLog(*auditFile); err != nil {
