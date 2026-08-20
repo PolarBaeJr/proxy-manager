@@ -5,7 +5,9 @@ nothing here is deployed by `docker compose up`. These files are tracked so the
 host config has a reviewable source of truth; installing them is manual.
 
 ```
-snippets/maintenance.conf   ->  /etc/nginx/snippets/maintenance.conf
+snippets/maintenance.conf     ->  /etc/nginx/snippets/maintenance.conf
+conf.d/cloudflare-realip.conf ->  /etc/nginx/conf.d/cloudflare-realip.conf
+conf.d/maintenance-bypass.conf -> /etc/nginx/conf.d/maintenance-bypass.conf
 ```
 
 ## Installing
@@ -15,10 +17,43 @@ sudo cp /etc/nginx/snippets/maintenance.conf \
         /etc/nginx/snippets/maintenance.conf.bak-$(date +%Y%m%d-%H%M%S)
 sudo cp deploy/nginx/snippets/maintenance.conf /etc/nginx/snippets/maintenance.conf
 sudo mkdir -p /var/www/maintenance/hosts
+
+sudo cp /etc/nginx/conf.d/cloudflare-realip.conf \
+        /etc/nginx/conf.d/cloudflare-realip.conf.bak-$(date +%Y%m%d-%H%M%S)
+sudo cp deploy/nginx/conf.d/cloudflare-realip.conf /etc/nginx/conf.d/cloudflare-realip.conf
+
+sudo cp /etc/nginx/conf.d/maintenance-bypass.conf \
+        /etc/nginx/conf.d/maintenance-bypass.conf.bak-$(date +%Y%m%d-%H%M%S)
+sudo cp deploy/nginx/conf.d/maintenance-bypass.conf /etc/nginx/conf.d/maintenance-bypass.conf
+
 sudo nginx -t && sudo nginx -s reload
 ```
 
 Rollback is `cp` the `.bak-*` file back and reload.
+
+## Why `cloudflare-realip.conf` and `maintenance-bypass.conf` matter
+
+Both are load-bearing and both fail silently if lost (e.g. a from-scratch nginx
+rebuild that only pulls what's tracked here):
+
+- **`cloudflare-realip.conf`** makes `$remote_addr` the real visitor IP instead
+  of the Cloudflare edge IP for every nginx-fronted host. Without it,
+  `proxy.ratelimit` buckets every Cloudflare visitor together as one client.
+  The Cloudflare IP ranges inside are pinned as of 2026-08-19 — re-fetch from
+  `https://www.cloudflare.com/ips-v4` and `/ips-v6` periodically, since a new
+  range appearing means those visitors silently stop being trusted and fall
+  back to edge-IP bucketing with no error.
+- **`maintenance-bypass.conf`** is what `snippets/maintenance.conf` (above)
+  reads `$maint_bypass` from — it's what lets Tailscale/LAN traffic through a
+  host in maintenance mode while Cloudflare-fronted traffic still gets the
+  maintenance page. It depends on `cloudflare-realip.conf` already being
+  loaded (keys off `$realip_remote_addr`, which only exists once the realip
+  module is configured). Without it, the maintenance bypass silently starts
+  admitting or rejecting the wrong traffic instead of erroring.
+
+See `project_ratelimit_xff_cloudflare_bug.md` and
+`reference_nginx_wildcard_server_name_gotchas.md` in proxy-manager memory for
+the incidents that led to each file.
 
 ## Per-app maintenance pages
 
