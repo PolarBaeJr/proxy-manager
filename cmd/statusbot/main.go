@@ -1,21 +1,19 @@
 // statusbot: a Discord bot, deployed as its own container separate from
-// dashboard/proxy/edge, that polls the dashboard's public /api/health
-// endpoint and alerts on up/degraded/unreachable transitions. Alerts are a
-// single persistent "live status" embed message that gets edited in place on
-// each transition rather than a new message every time, falling back to a
-// new message if the edit fails (e.g. the message was deleted). Also answers
-// "!status" on demand from the last poll result, and the
-// "/set-alert-channel" slash command (Manage Server permission required)
-// lets a user move the alert destination to whatever channel they invoke it
-// in, persisted to disk so it survives a container restart. !status and
-// /set-alert-channel both reply with embeds too.
-//
-// Separately, it also polls the dashboard's authenticated
+// dashboard/proxy/edge, that polls the dashboard's authenticated
 // GET /api/service-status endpoint (see servicestatus.go/statusembed.go) on
-// its own faster ticker and keeps a SECOND persistent embed — one field per
-// service group — edited in place the same way, using its own message ID
-// (channelstore.go's StatusMessageID) so it never collides with the
-// transition-alert message above.
+// a fixed ticker and keeps a single persistent "service status" embed — one
+// field per service group, with an aggregate up/degraded/down count in its
+// header — edited in place on every tick rather than a new message every
+// time, falling back to a new message if the edit fails (e.g. the message
+// was deleted). The "/set-alert-channel" slash command (Manage Server
+// permission required) lets a user move that message to whatever channel
+// they invoke it in, persisted to disk so it survives a container restart —
+// doubling as a capability probe (confirms the bot can post there) and the
+// seed for the new channel's status message.
+//
+// Separately, it also polls the dashboard's public GET /api/health endpoint
+// on its own slower ticker purely to keep the on-demand "!status" reply
+// fresh — that poll no longer posts or edits any message on its own.
 //
 // Deliberately its own process/container rather than code inside the
 // dashboard: if the dashboard hangs or crashes, a status check running
@@ -61,7 +59,6 @@ func main() {
 	for _, m := range seedMsgs {
 		log.Println(m)
 	}
-	alertMessageID := chStore.GetMessageID()
 	statusMessageID := chStore.GetStatusMessageID()
 
 	sess, err := discordgo.New("Bot " + token)
@@ -75,65 +72,17 @@ func main() {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	var mu sync.Mutex
-	var lastStatus string
 	var lastHealth healthStatus
 	var lastErr error
 	var lastStatusErr string // last service-status fetch error's message, "" = last poll succeeded; only used to dedupe repeated log lines below
 
 	poll := func() {
 		hs, err := fetchHealth(context.Background(), *healthURL, client)
-		mu.Lock()
 		cur := classify(hs, err)
-		// msg is only used as a "did this warrant an alert" gate (its content
-		// is discarded) — reuses transitionMessage's existing prev==""/
-		// prev==cur logic rather than duplicating it; the embed body itself
-		// comes from buildStatusEmbed via statusReply, not from this string.
-		msg := transitionMessage(lastStatus, cur, hs, err)
-		lastStatus, lastHealth, lastErr = cur, hs, err
-		target := alertChannelID
-		msgID := alertMessageID
+		mu.Lock()
+		lastHealth, lastErr = hs, err
 		mu.Unlock()
 		log.Printf("health check: status=%s", cur)
-		if msg == "" {
-			return
-		}
-		if target == "" {
-			log.Printf("alert suppressed (no alert channel configured): status now %s", cur)
-			return
-		}
-		embed := buildStatusEmbed(hs, err)
-		newMsgID := msgID
-		edited := false
-		if msgID != "" {
-			if _, editErr := sess.ChannelMessageEditEmbed(target, msgID, embed); editErr != nil {
-				log.Printf("failed to edit live-status message %s in %s, sending a new one: %v", msgID, target, editErr)
-			} else {
-				edited = true
-			}
-		}
-		if !edited {
-			sent, sendErr := sess.ChannelMessageSendEmbed(target, embed)
-			if sendErr != nil {
-				log.Printf("failed to send alert: %v", sendErr)
-				return
-			}
-			newMsgID = sent.ID
-		}
-		if newMsgID == msgID {
-			return
-		}
-		mu.Lock()
-		stale := alertChannelID != target // channel changed while we were doing I/O — don't clobber the new channel's message id
-		if !stale {
-			alertMessageID = newMsgID
-		}
-		mu.Unlock()
-		if stale {
-			return
-		}
-		if err := chStore.SetMessageID(newMsgID); err != nil {
-			log.Printf("failed to persist live-status message id: %v", err)
-		}
 	}
 
 	pollStatus := func() {
@@ -229,7 +178,7 @@ func main() {
 			guildID := os.Getenv("DISCORD_GUILD_ID")
 			if _, err := s.ApplicationCommandCreate(r.User.ID, guildID, &discordgo.ApplicationCommand{
 				Name:                     "set-alert-channel",
-				Description:              "Set this channel as the destination for statusbot's up/degraded/unreachable alerts.",
+				Description:              "Set this channel as the destination for statusbot's persistent service-status message.",
 				DefaultMemberPermissions: &alertChannelCmdPerms,
 			}); err != nil {
 				log.Printf("failed to register /set-alert-channel command (guild=%q): %v", guildID, err)
@@ -275,19 +224,23 @@ func main() {
 			respond("🚫 you need the Manage Server permission to change the alert channel.")
 			return
 		}
-		mu.Lock()
-		probeStatus, probeHealth, probeErr := lastStatus, lastHealth, lastErr
-		mu.Unlock()
+		// Discord requires an interaction response within 3s; a background
+		// poll can afford the client's full 5s timeout but a synchronous
+		// probe here can't, so this uses a tighter deadline and treats a
+		// timeout the same as any other fetch failure (statusUnavailableEmbed).
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		resp, fetchErr := fetchServiceStatus(probeCtx, *statusURL, resolveDashboardToken(*tokenFile), client)
+		probeCancel()
 		var embed *discordgo.MessageEmbed
-		if probeStatus == "" {
-			embed = startupEmbed()
+		if fetchErr != nil {
+			embed = statusUnavailableEmbed(fetchErr)
 		} else {
-			embed = buildStatusEmbed(probeHealth, probeErr)
+			embed = buildServiceStatusEmbed(resp)
 		}
-		// Doubles as a capability probe (same rationale as before) AND seeds the
-		// live-status message in one action — unifies "post the confirmation"
-		// with "create the initial live-status message for this channel" so
-		// there's no second, redundant post.
+		// Doubles as a capability probe (confirms the bot can post here) AND
+		// seeds the status message in one action — unifies "post the
+		// confirmation" with "create the initial status message for this
+		// channel" so there's no second, redundant post.
 		sent, sendErr := s.ChannelMessageSendEmbed(i.ChannelID, embed)
 		if sendErr != nil {
 			log.Printf("set-alert-channel: cannot post in %s: %v", i.ChannelID, sendErr)
@@ -296,16 +249,15 @@ func main() {
 		}
 		mu.Lock()
 		alertChannelID = i.ChannelID
-		alertMessageID = sent.ID
-		statusMessageID = "" // belonged to the previous channel, if any — chStore.Set below clears the persisted copy the same way
+		statusMessageID = sent.ID
 		mu.Unlock()
 		ack := "Done."
 		if err := chStore.Set(i.ChannelID); err != nil {
 			log.Printf("failed to persist alert channel: %v", err)
 			ack = "Done — but not saved to disk, so it will reset on the next restart."
-		} else if err := chStore.SetMessageID(sent.ID); err != nil {
-			log.Printf("failed to persist live-status message id: %v", err)
-			ack = "Done — but the live-status message id wasn't saved, so an edit later may post a duplicate."
+		} else if err := chStore.SetStatusMessageID(sent.ID); err != nil {
+			log.Printf("failed to persist service-status message id: %v", err)
+			ack = "Done — but the service-status message id wasn't saved, so an edit later may post a duplicate."
 		}
 		respond(ack)
 	})
@@ -315,10 +267,23 @@ func main() {
 	}
 	defer sess.Close()
 
+	// One-time cleanup: delete the old simple health-alert embed left over
+	// from before the two persistent messages were consolidated into just
+	// the detailed one, so it doesn't sit in the channel forever showing a
+	// stale status. Best-effort — a delete failure (already gone, missing
+	// permission) is logged and ignored, not fatal.
+	if legacyID := chStore.LegacyMessageID(); legacyID != "" && alertChannelID != "" {
+		if err := sess.ChannelMessageDelete(alertChannelID, legacyID); err != nil {
+			log.Printf("failed to delete legacy status message %s in %s (safe to ignore if it's already gone): %v", legacyID, alertChannelID, err)
+		} else {
+			log.Printf("deleted legacy status message %s in %s", legacyID, alertChannelID)
+		}
+	}
+
 	mu.Lock()
 	initialTarget := alertChannelID
 	mu.Unlock()
-	log.Printf("statusbot connected — polling %s every %s, and %s every %s, alerts to channel %q",
+	log.Printf("statusbot connected — polling %s every %s, and %s every %s, posting status to channel %q",
 		*healthURL, *pollInterval, *statusURL, *statusInterval, initialTarget)
 
 	poll()       // establish a baseline immediately so !status works right away
