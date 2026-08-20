@@ -44,16 +44,14 @@ func main() {
 	pollInterval := flag.Duration("poll-interval", 60*time.Second, "how often to poll health")
 	statusURL := flag.String("status-url", "http://dashboard:8093/api/service-status", "dashboard /api/service-status URL to poll")
 	statusInterval := flag.Duration("status-interval", 15*time.Second, "how often to poll per-service status")
+	tokenFile := flag.String("token-file", "/tokens/statusbot.token", "path to an auto-provisioned dashboard API token; used when DASHBOARD_API_TOKEN is unset")
 	flag.Parse()
 
 	token := os.Getenv("DISCORD_BOT_TOKEN")
 	if token == "" {
 		log.Fatal("DISCORD_BOT_TOKEN is required")
 	}
-	dashboardToken := os.Getenv("DASHBOARD_API_TOKEN")
-	if dashboardToken == "" {
-		log.Println("⚠ DASHBOARD_API_TOKEN not set — the service-status embed will show as unavailable")
-	}
+	log.Printf("dashboard API token: DASHBOARD_API_TOKEN env overrides; otherwise read from %s each poll (written automatically by the dashboard on first boot)", *tokenFile)
 
 	chStore, chMsgs := newChannelStoreFromEnv(os.Getenv)
 	for _, m := range chMsgs {
@@ -139,7 +137,7 @@ func main() {
 	}
 
 	pollStatus := func() {
-		resp, fetchErr := fetchServiceStatus(context.Background(), *statusURL, dashboardToken, client)
+		resp, fetchErr := fetchServiceStatus(context.Background(), *statusURL, resolveDashboardToken(*tokenFile), client)
 		errMsg := ""
 		if fetchErr != nil {
 			errMsg = fetchErr.Error()
@@ -343,4 +341,24 @@ func main() {
 			pollStatus()
 		}
 	}
+}
+
+// resolveDashboardToken prefers an explicit env override; otherwise it reads
+// the token the dashboard auto-provisions on first boot. Re-read on every
+// call (not cached) so a token minted by the dashboard after statusbot has
+// already started is picked up on the next poll tick without a restart, and
+// so deleting the file to force a manual rotation takes effect on the very
+// next tick.
+func resolveDashboardToken(tokenFile string) string {
+	if t := os.Getenv("DASHBOARD_API_TOKEN"); t != "" {
+		return t
+	}
+	if tokenFile == "" {
+		return ""
+	}
+	b, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }

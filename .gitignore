@@ -1,6 +1,7 @@
 .env
 cmd/auth/data/
 cmd/dashboard/data/
+cmd/dashboard/tokens/
 cmd/edge/data/
 cmd/proxy/data/
 cmd/monitor/data/

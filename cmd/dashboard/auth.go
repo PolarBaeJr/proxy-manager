@@ -89,8 +89,9 @@ type pendingUser struct {
 const pendingTTL = 10 * time.Minute
 
 type authData struct {
-	CookieSecret string `json:"cookie_secret"`
-	Users        []User `json:"users"`
+	CookieSecret  string     `json:"cookie_secret"`
+	Users         []User     `json:"users"`
+	ServiceTokens []APIToken `json:"service_tokens,omitempty"`
 
 	// Legacy single-user fields (migrated to Users on first load if found).
 	LegacySalt         string `json:"salt,omitempty"`
@@ -250,8 +251,43 @@ func (s *AuthStore) CreateToken(username, label string) (rawToken string, t APIT
 	return raw, t, nil
 }
 
-// VerifyToken hashes the raw token and looks for a matching APIToken across
-// all users. Returns the owning username if found, "" otherwise.
+// RemintServiceToken mints a fresh, persisted credential for a
+// process-identity `name` (e.g. "statusbot") — NOT tied to a human User
+// like CreateToken is. Any existing entry for `name` is replaced first: a
+// token's raw value can never be recovered once minted (only its hash is
+// stored), so if the caller's token file went missing there is no way to
+// rewrite the same secret — minting fresh and orphaning the old hash is the
+// only option.
+func (s *AuthStore) RemintServiceToken(name string) (rawToken string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kept := s.data.ServiceTokens[:0]
+	for _, t := range s.data.ServiceTokens {
+		if t.Label != name {
+			kept = append(kept, t)
+		}
+	}
+	s.data.ServiceTokens = kept
+
+	rb := make([]byte, 32)
+	if _, err := rand.Read(rb); err != nil {
+		return "", err
+	}
+	raw := apiTokenPrefix + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(rb)
+	h := sha256.Sum256([]byte(raw))
+	hashHex := hex.EncodeToString(h[:])
+	s.data.ServiceTokens = append(s.data.ServiceTokens, APIToken{
+		ID:        hashHex[:12],
+		Label:     name,
+		Hash:      hashHex,
+		CreatedAt: time.Now().Unix(),
+	})
+	if err := s.save(); err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
 // internalToken is a credential the process mints for itself at startup so
 // in-process callers (the MCP handler) can go through the real API handlers
 // instead of reimplementing them — keeping guardUnscalable, auto-onboard,
@@ -275,29 +311,61 @@ func mintInternalToken() error {
 	return nil
 }
 
+// VerifyToken hashes the raw token and looks for a matching credential
+// across the internal token, service tokens, and every user's tokens.
+// Returns the owning identity if found, "" otherwise. This is the BROAD
+// check (requireAuth): it accepts service tokens, which are deliberately
+// non-elevating — see VerifyElevatedToken for the narrower one requireAuth's
+// write-gated sibling uses.
 func (s *AuthStore) VerifyToken(raw string) string {
-	if !strings.HasPrefix(raw, apiTokenPrefix) {
+	id, _ := s.verifyTokenKind(raw)
+	return id
+}
+
+// VerifyElevatedToken is VerifyToken restricted to credentials authorized for
+// elevated (write) actions. Auto-provisioned service tokens (see
+// RemintServiceToken) verify fine under VerifyToken — a sibling container
+// like statusbot needs to read status data — but must NOT pass here: nothing
+// should auto-distribute a credential that can stage/replace/scale services
+// or touch DNS just because a container mount exists.
+func (s *AuthStore) VerifyElevatedToken(raw string) string {
+	id, elevated := s.verifyTokenKind(raw)
+	if !elevated {
 		return ""
 	}
+	return id
+}
+
+func (s *AuthStore) verifyTokenKind(raw string) (id string, elevated bool) {
+	if !strings.HasPrefix(raw, apiTokenPrefix) {
+		return "", false
+	}
 	// Constant-time so a caller cannot probe for the internal credential by
-	// timing, same as the stored-token comparison below.
+	// timing, same as the stored-token comparisons below.
 	if internalToken != "" && subtle.ConstantTimeCompare([]byte(raw), []byte(internalToken)) == 1 {
-		return internalUser
+		return internalUser, true
 	}
 	h := sha256.Sum256([]byte(raw))
 	hashHex := hex.EncodeToString(h[:])
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for i := range s.data.ServiceTokens {
+		if subtle.ConstantTimeCompare([]byte(s.data.ServiceTokens[i].Hash), []byte(hashHex)) == 1 {
+			s.data.ServiceTokens[i].LastUsedAt = time.Now().Unix()
+			_ = s.save()
+			return s.data.ServiceTokens[i].Label, false
+		}
+	}
 	for i := range s.data.Users {
 		for j := range s.data.Users[i].Tokens {
 			if subtle.ConstantTimeCompare([]byte(s.data.Users[i].Tokens[j].Hash), []byte(hashHex)) == 1 {
 				s.data.Users[i].Tokens[j].LastUsedAt = time.Now().Unix()
 				_ = s.save()
-				return s.data.Users[i].Username
+				return s.data.Users[i].Username, true
 			}
 		}
 	}
-	return ""
+	return "", false
 }
 
 func (s *AuthStore) ListTokens(username string) []APIToken {
@@ -603,9 +671,11 @@ func (s *AuthStore) requireElevated(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "auth not set up", http.StatusServiceUnavailable)
 			return
 		}
-		// API tokens grant elevation (proof of possession of the token).
+		// API tokens grant elevation (proof of possession of the token) —
+		// except auto-provisioned service tokens, which VerifyElevatedToken
+		// deliberately rejects (see RemintServiceToken).
 		if tok := bearerToken(r); tok != "" {
-			if user := s.VerifyToken(tok); user != "" {
+			if user := s.VerifyElevatedToken(tok); user != "" {
 				next(w, withPrincipal(r, user))
 				return
 			}

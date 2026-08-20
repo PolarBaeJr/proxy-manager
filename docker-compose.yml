@@ -130,6 +130,12 @@ services:
       # source path is absent, newSecretsFromEnv degrades to "disabled"
       # rather than pretending refs resolve.
       - ${SECRETS_HOST_DIR:-/etc/proxy-manager/secrets}:/etc/secrets:ro
+      # Auto-provisioned credential handoff: on first boot the dashboard
+      # mints a "statusbot" API token here if one doesn't already exist, so
+      # statusbot never needs a human to manually mint+paste one. Dedicated
+      # and narrow on purpose — NOT the /data mount above, which also holds
+      # auth.json/audit.log/etc that statusbot has no business seeing.
+      - ./cmd/dashboard/tokens:/tokens
     environment:
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
       CLOUDFLARE_ZONE_ID:   ${CLOUDFLARE_ZONE_ID:-}
@@ -211,6 +217,7 @@ services:
     # dashboard over the edge network; reaches Discord's gateway outbound.
     volumes:
       - ./cmd/statusbot/data:/data      # persisted alert-channel.json (see /set-alert-channel)
+      - ./cmd/dashboard/tokens:/tokens:ro   # auto-provisioned dashboard API token (see dashboard's /tokens mount)
     environment:
       # From the Discord Developer Portal: create an application + bot, enable
       # the "Message Content" privileged intent (required for !status to see
@@ -227,13 +234,14 @@ services:
       # available almost instantly. If empty, it registers globally, which
       # can take Discord up to ~1 hour to propagate to clients.
       DISCORD_GUILD_ID:     ${DISCORD_GUILD_ID:-}
-      # Bearer token for the dashboard's GET /api/service-status (feeds the
-      # per-service-group status embed) — mint one in the dashboard UI under
-      # Users > My API tokens > Generate token, and set it here. Left empty,
-      # that embed posts as "unavailable" instead of failing silently.
+      # Optional override. Left unset, statusbot reads an auto-provisioned
+      # token the dashboard mints on first boot into the shared /tokens
+      # mount above — no manual minting step needed. Set this only to point
+      # at a token from elsewhere (e.g. a different dashboard instance).
       DASHBOARD_API_TOKEN:  ${DASHBOARD_API_TOKEN:-}
     command: >
       -health-url=http://dashboard:8093/api/health
       -poll-interval=60s
       -status-url=http://dashboard:8093/api/service-status
       -status-interval=15s
+      -token-file=/tokens/statusbot.token
