@@ -227,6 +227,13 @@ services:
       # available almost instantly. If empty, it registers globally, which
       # can take Discord up to ~1 hour to propagate to clients.
       DISCORD_GUILD_ID:     ${DISCORD_GUILD_ID:-}
+      # Bearer token for the dashboard's GET /api/service-status (feeds the
+      # per-service-group status embed) — mint one in the dashboard UI under
+      # Users > My API tokens > Generate token, and set it here. Left empty,
+      # that embed posts as "unavailable" instead of failing silently.
+      DASHBOARD_API_TOKEN:  ${DASHBOARD_API_TOKEN:-}
     command: >
       -health-url=http://dashboard:8093/api/health
       -poll-interval=60s
+      -status-url=http://dashboard:8093/api/service-status
+      -status-interval=15s

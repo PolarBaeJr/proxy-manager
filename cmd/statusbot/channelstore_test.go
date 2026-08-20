@@ -274,6 +274,96 @@ func TestChannelStoreOldFormatFileMessageIDEmpty(t *testing.T) {
 	}
 }
 
+func TestChannelStoreStatusMessageIDRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alert-channel.json")
+	getenv := func(k string) string {
+		if k == "CHANNEL_STORE_FILE" {
+			return path
+		}
+		return ""
+	}
+	s, _ := newChannelStoreFromEnv(getenv)
+	if s == nil {
+		t.Fatalf("newChannelStoreFromEnv = nil, want a store")
+	}
+	if err := s.Set("123"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := s.SetMessageID("m1"); err != nil {
+		t.Fatalf("SetMessageID: %v", err)
+	}
+	if err := s.SetStatusMessageID("s1"); err != nil {
+		t.Fatalf("SetStatusMessageID: %v", err)
+	}
+
+	fresh, _ := newChannelStoreFromEnv(getenv)
+	if fresh == nil {
+		t.Fatalf("newChannelStoreFromEnv (reload) = nil, want a store")
+	}
+	if got := fresh.GetMessageID(); got != "m1" {
+		t.Fatalf("GetMessageID after reload = %q, want %q", got, "m1")
+	}
+	if got := fresh.GetStatusMessageID(); got != "s1" {
+		t.Fatalf("GetStatusMessageID after reload = %q, want %q", got, "s1")
+	}
+}
+
+func TestChannelStoreSetClearsStatusMessageIDToo(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "alert-channel.json")
+	getenv := func(k string) string {
+		if k == "CHANNEL_STORE_FILE" {
+			return path
+		}
+		return ""
+	}
+	s, _ := newChannelStoreFromEnv(getenv)
+	if s == nil {
+		t.Fatalf("newChannelStoreFromEnv = nil, want a store")
+	}
+	if err := s.Set("123"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := s.SetMessageID("m1"); err != nil {
+		t.Fatalf("SetMessageID: %v", err)
+	}
+	if err := s.SetStatusMessageID("s1"); err != nil {
+		t.Fatalf("SetStatusMessageID: %v", err)
+	}
+	if err := s.Set("456"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if got := s.GetMessageID(); got != "" {
+		t.Fatalf("GetMessageID after channel change = %q, want empty", got)
+	}
+	if got := s.GetStatusMessageID(); got != "" {
+		t.Fatalf("GetStatusMessageID after channel change = %q, want empty", got)
+	}
+
+	fresh, _ := newChannelStoreFromEnv(getenv)
+	if fresh == nil {
+		t.Fatalf("newChannelStoreFromEnv (reload) = nil, want a store")
+	}
+	if got := fresh.GetStatusMessageID(); got != "" {
+		t.Fatalf("GetStatusMessageID after reload = %q, want empty", got)
+	}
+}
+
+func TestChannelStoreNilStoreStatusMessageID(t *testing.T) {
+	var s *channelStore
+	if got := s.GetStatusMessageID(); got != "" {
+		t.Errorf("nil store GetStatusMessageID = %q, want empty", got)
+	}
+	err := s.SetStatusMessageID("x")
+	if err == nil {
+		t.Fatalf("nil store SetStatusMessageID = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "not configured") {
+		t.Errorf("nil store SetStatusMessageID error = %q, want it to name the missing mount", err.Error())
+	}
+}
+
 func TestChannelStoreNilStoreMessageID(t *testing.T) {
 	var s *channelStore
 	if got := s.GetMessageID(); got != "" {
