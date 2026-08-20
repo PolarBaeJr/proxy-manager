@@ -288,8 +288,6 @@ func (s *AuthStore) RemintServiceToken(name string) (rawToken string, err error)
 	return raw, nil
 }
 
-// VerifyToken hashes the raw token and looks for a matching APIToken across
-// all users. Returns the owning username if found, "" otherwise.
 // internalToken is a credential the process mints for itself at startup so
 // in-process callers (the MCP handler) can go through the real API handlers
 // instead of reimplementing them — keeping guardUnscalable, auto-onboard,
