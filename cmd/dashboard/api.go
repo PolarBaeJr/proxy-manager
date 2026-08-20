@@ -86,6 +86,18 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		httpx.WriteJSON(w, http.StatusOK, GetStats())
 	}))
 
+	// Per-service-group health/usage for the Status sub-tab (and later,
+	// statusbot's Discord embed). Combines listServices, the proxy's access
+	// log, and the docker-stats cache — see servicestatus.go.
+	mux.HandleFunc("/api/service-status", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		status, err := buildServiceStatus(req.Context(), dc, proxyURLFromEnv())
+		if err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, status)
+	}))
+
 	// ---- Per-user UI preferences (pmgr-* localStorage mirror) ----
 	// Deliberately requireAuth (not requireElevated) for writes: prefs are
 	// cosmetic per-user state written fire-and-forget on every chip click;
