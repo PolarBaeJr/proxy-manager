@@ -16,6 +16,10 @@ bin/update-cloudflare-ips.sh  ->  Mac mini peer node ONLY, see below — the
 org.cloudflare-realip.plist   ->  /Library/LaunchDaemons/org.cloudflare-realip.plist
 ```
 
+See also `deploy/nginx-stream-pi/` — the Pi's own separate stream-only nginx
+instance (dashboard-peer transport), the Linux/systemd counterpart to the Mac
+mini's `nginx-stream/` below.
+
 ## Installing
 
 ```sh
@@ -76,6 +80,58 @@ Verified running concurrently with the main nginx with no port conflict
 one-nginx-per-box rule from above, which is specifically about `:443`
 contention. Confirmed end-to-end (2026-08-24): the Pi's proxy reaches Redis
 through this path with `PING` → `PONG`, auth included.
+
+## `deploy/nginx-stream-pi/` — Pi side of the dashboard peer transport, SEPARATE nginx instance
+
+The Linux/systemd counterpart to `nginx-stream/` above, same reasoning:
+`listen <tailscale-ip>` is fatal at boot if Tailscale isn't up yet, and
+`tailscaled.service` has no ordering guarantee ahead of `nginx.service`, so
+this runs as its own instance rather than a `stream{}` block in the main
+config. `Restart=on-failure` (systemd) does the same job as the Mac's
+LaunchDaemon `KeepAlive`.
+
+One real difference from the Mac: this Debian nginx build has the stream
+module as a **dynamic** module (`--with-stream=dynamic`, confirmed via
+`nginx -V`), not compiled in — `deploy/nginx-stream-pi/nginx.conf` loads it
+explicitly (`load_module .../ngx_stream_module.so;`). The package
+(`libnginx-mod-stream`) must be installed first:
+
+```sh
+sudo apt-get install -y libnginx-mod-stream
+```
+
+Installing it also auto-enables the module for the MAIN nginx too, via
+`/etc/nginx/modules-enabled/50-mod-stream.conf` (a symlink the package
+creates on its own) — harmless since the main config has no `stream{}`
+block to activate, but worth knowing before assuming the module is scoped to
+just this second instance. On this Pi, installing the module also pulled in
+an `nginx`/`nginx-common` point-release upgrade as a dependency, whose
+postinst triggered an automatic reload of the live production nginx —
+verified safe afterward (config test passed, public sites returned 200,
+`cloudflare-realip.conf`'s `real_ip` entries were intact), but not something
+this command warns you about up front.
+
+```
+deploy/nginx-stream-pi/nginx.conf          ->  /etc/nginx-stream/nginx.conf
+deploy/nginx-stream-pi/nginx-stream.service -> /etc/systemd/system/nginx-stream.service
+```
+
+```sh
+sudo apt-get install -y libnginx-mod-stream
+sudo mkdir -p /etc/nginx-stream /var/log/nginx-stream
+sudo cp deploy/nginx-stream-pi/nginx.conf /etc/nginx-stream/nginx.conf
+sudo cp deploy/nginx-stream-pi/nginx-stream.service /etc/systemd/system/nginx-stream.service
+sudo nginx -t -c /etc/nginx-stream/nginx.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now nginx-stream.service
+```
+
+Verified running concurrently with the main nginx with no port conflict
+(bound to `100.123.79.47:8093` only, confirmed via `ss -tlnp` — not
+`0.0.0.0`) — same "different address, different port" reasoning as the Mac
+side, not a reopening of the one-nginx-per-box rule. Confirmed end-to-end
+(2026-08-24): the Mac mini reaches the Pi's dashboard through this path,
+`HTTP 200` in ~26ms.
 
 ## `bin/update-cloudflare-ips.sh` — Mac mini peer node only, keeps `cloudflare-realip.conf` fresh
 
