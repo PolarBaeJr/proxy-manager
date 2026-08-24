@@ -185,6 +185,10 @@ func main() {
 		switch action {
 		case "start", "die", "destroy", "kill", "stop":
 			refresh()
+			return
+		}
+		if strings.HasPrefix(action, "health_status") {
+			refresh()
 		}
 	})
 	go runHealthChecks(ctx, router)

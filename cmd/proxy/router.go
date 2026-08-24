@@ -27,6 +27,13 @@ type Backend struct {
 	proxy       *httputil.ReverseProxy
 	healthyFlag atomic.Bool
 
+	// DockerUnhealthy floors healthy() to false whenever Docker's own
+	// HEALTHCHECK reports this container unhealthy, independent of the
+	// proxy's own TCP/HTTP probe result. Written once at construction (see
+	// assembleGroups) before the Backend is published via Router.Set() —
+	// plain bool, no atomic needed, same pattern as URL/Weight/Container.
+	DockerUnhealthy bool
+
 	// Learned marks a backend synthesized from a peer's pushed route (see
 	// peermerge.go) rather than discovered locally via docker labels or
 	// routes.json. PeerID is the identity of the peer that advertised it.
@@ -35,7 +42,7 @@ type Backend struct {
 }
 
 func (b *Backend) markHealthy(ok bool) { b.healthyFlag.Store(ok) }
-func (b *Backend) healthy() bool       { return b.healthyFlag.Load() }
+func (b *Backend) healthy() bool       { return !b.DockerUnhealthy && b.healthyFlag.Load() }
 
 type RouteGroup struct {
 	Host        string
@@ -195,7 +202,7 @@ func (r *Router) Set(groups []*RouteGroup) {
 	prevHealth := map[string]bool{}
 	for _, g := range prev {
 		for _, b := range g.Backends {
-			prevHealth[b.URL] = b.healthy()
+			prevHealth[b.URL] = b.healthyFlag.Load()
 		}
 	}
 	for _, g := range groups {
@@ -494,6 +501,17 @@ func (w *errCatchingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("proxy: underlying ResponseWriter does not support hijacking")
 }
 
+// healthLabelWarned tracks which label-managed containers we've already
+// warned about missing proxy.health, keyed by container name, for the
+// process lifetime. Needed because refresh() now also fires on Docker
+// health_status events (see main.go), far more often than the original
+// start/die/destroy/kill/stop set — without dedup, a flapping container
+// would spam this warning on every transition.
+var (
+	healthLabelWarnMu   sync.Mutex
+	healthLabelWarnSeen = map[string]bool{}
+)
+
 // ---- Assembly: docker labels + static config ----
 
 type staticRoute struct {
@@ -610,6 +628,18 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 				backendURL := fmt.Sprintf("http://%s:%d", ip, port)
 				u, _ := url.Parse(backendURL)
 				backend = makeBackend(backendURL, weight, name, c.Labels[labelHealth], u, host)
+				backend.DockerUnhealthy = dockerUnhealthy(c.Status)
+				if backend.DockerUnhealthy {
+					log.Printf("backend %s (%s): Docker reports unhealthy — excluded from routing for %s%s", name, backend.URL, host, c.Labels[labelPath])
+				}
+				if c.Labels[labelHealth] == "" {
+					healthLabelWarnMu.Lock()
+					if !healthLabelWarnSeen[name] {
+						healthLabelWarnSeen[name] = true
+						log.Printf("%s (%s%s): no %s label — falling back to TCP-only health checks; if you add one, the endpoint must respond within %s", name, host, c.Labels[labelPath], labelHealth, healthTimeout)
+					}
+					healthLabelWarnMu.Unlock()
+				}
 			}
 		}
 

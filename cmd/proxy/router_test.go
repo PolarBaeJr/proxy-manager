@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -53,6 +55,15 @@ func container(id, name, state string, labels, networks map[string]string) map[s
 		"Labels":          labels,
 		"NetworkSettings": map[string]any{"Networks": nets},
 	}
+}
+
+// containerWithStatus is a sibling to container() that also sets the raw
+// docker Status string (e.g. "Up 2 minutes (unhealthy)"), for exercising the
+// Docker health-status floor without touching container()'s signature/callers.
+func containerWithStatus(id, name, state, status string, labels, networks map[string]string) map[string]any {
+	c := container(id, name, state, labels, networks)
+	c["Status"] = status
+	return c
 }
 
 func findGroup(groups []*RouteGroup, host, path string) *RouteGroup {
@@ -812,5 +823,118 @@ func TestPeerMeshLoopPreventionTwoInstances(t *testing.T) {
 	}
 	if got := hitsB.Load(); got != 1 {
 		t.Fatalf("B was hit %d time(s), want exactly 1 (no forwarding loop)", got)
+	}
+}
+
+// TestDockerHealthFloorIndependentOfProbe proves the Docker health-status
+// floor (step A) works even when the TCP/HTTP probe hasn't run yet: a fresh
+// Router.Set() defaults healthyFlag to true, but a container whose Status
+// reports "(unhealthy)" must still be excluded from routing.
+func TestDockerHealthFloorIndependentOfProbe(t *testing.T) {
+	dc := fakeDocker(t, dockerJSON(
+		containerWithStatus("u", "app-u", "running", "Up 2 minutes (unhealthy)",
+			map[string]string{labelHost: "u.example.org", labelPort: "8080"},
+			map[string]string{managedNetwork: "172.20.0.9"}),
+	))
+
+	groups, err := assembleGroups(context.Background(), dc, "")
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	g := findGroup(groups, "u.example.org", "")
+	if g == nil || len(g.Backends) != 1 {
+		t.Fatalf("u group = %+v", g)
+	}
+	b := g.Backends[0]
+	if !b.DockerUnhealthy {
+		t.Fatal("DockerUnhealthy should be true for a container reporting (unhealthy)")
+	}
+
+	r := &Router{}
+	r.Set(groups)
+	if !b.healthyFlag.Load() {
+		t.Fatal("healthyFlag should default true on a fresh Set()")
+	}
+	if b.healthy() {
+		t.Fatal("healthy() should be false — DockerUnhealthy floor must apply even though healthyFlag is true")
+	}
+}
+
+// TestDockerHealthFloorRecoversAcrossRefresh is the regression test for step
+// 6: prevHealth carry-forward must read the raw healthyFlag, not healthy(),
+// or a floored backend's false gets laundered forward and the backend stays
+// stuck unhealthy on the next refresh even after Docker reports it healthy
+// again.
+func TestDockerHealthFloorRecoversAcrossRefresh(t *testing.T) {
+	dcUnhealthy := fakeDocker(t, dockerJSON(
+		containerWithStatus("f", "app-f", "running", "Up 2 minutes (unhealthy)",
+			map[string]string{labelHost: "f.example.org", labelPort: "8080"},
+			map[string]string{managedNetwork: "172.20.0.9"}),
+	))
+	groups1, err := assembleGroups(context.Background(), dcUnhealthy, "")
+	if err != nil {
+		t.Fatalf("assembleGroups (unhealthy): %v", err)
+	}
+	r := &Router{}
+	r.Set(groups1)
+	g1 := findGroup(groups1, "f.example.org", "")
+	if g1 == nil || len(g1.Backends) != 1 || g1.Backends[0].healthy() {
+		t.Fatalf("first pass: backend should be unhealthy, got %+v", g1)
+	}
+
+	dcHealthy := fakeDocker(t, dockerJSON(
+		containerWithStatus("f", "app-f", "running", "Up 5 minutes (healthy)",
+			map[string]string{labelHost: "f.example.org", labelPort: "8080"},
+			map[string]string{managedNetwork: "172.20.0.9"}),
+	))
+	groups2, err := assembleGroups(context.Background(), dcHealthy, "")
+	if err != nil {
+		t.Fatalf("assembleGroups (healthy): %v", err)
+	}
+	r.Set(groups2)
+	g2 := findGroup(groups2, "f.example.org", "")
+	if g2 == nil || len(g2.Backends) != 1 {
+		t.Fatalf("second pass: group = %+v", g2)
+	}
+	if !g2.Backends[0].healthy() {
+		t.Fatal("backend should be healthy immediately after Docker reports recovery, not stuck unhealthy from carry-forward")
+	}
+}
+
+// TestMissingHealthLabelWarningDedup proves the missing-proxy.health warning
+// (steps 8-9) only LOGS once per container name for the process lifetime,
+// even across repeated assembleGroups() calls (which now happen far more
+// often thanks to health_status event refreshes) — not just that the dedup
+// map gets set (which would pass even if the log call were unconditional).
+// healthLabelWarnSeen is package-level and persists across tests in this
+// binary, so this test uses a container name no other test in the package
+// reuses, and resets its own entry rather than the whole map. No test in
+// this package logs from a goroutine or runs t.Parallel(), so redirecting
+// the shared log.Writer() for the duration of this test is safe.
+func TestMissingHealthLabelWarningDedup(t *testing.T) {
+	const name = "app-warn-dedup-test-only"
+	healthLabelWarnMu.Lock()
+	delete(healthLabelWarnSeen, name)
+	healthLabelWarnMu.Unlock()
+
+	dc := fakeDocker(t, dockerJSON(
+		container("w", name, "running",
+			map[string]string{labelHost: "w.example.org", labelPort: "8080"},
+			map[string]string{managedNetwork: "172.20.0.9"}),
+	))
+
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	if _, err := assembleGroups(context.Background(), dc, ""); err != nil {
+		t.Fatalf("assembleGroups (1st): %v", err)
+	}
+	if _, err := assembleGroups(context.Background(), dc, ""); err != nil {
+		t.Fatalf("assembleGroups (2nd): %v", err)
+	}
+	if got := strings.Count(buf.String(), name); got != 1 {
+		t.Fatalf("warning logged %d time(s) across two assembleGroups() calls, want exactly 1 (dedup)", got)
 	}
 }

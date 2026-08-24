@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,11 +39,16 @@ func checkBackend(b *Backend) {
 		req, _ := http.NewRequestWithContext(ctx, "GET", b.URL+b.HealthPath, nil)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
+			log.Printf("health check %s%s: %v (timeout budget %s) — marking unhealthy", b.URL, b.HealthPath, err, healthTimeout)
 			b.markHealthy(false)
 			return
 		}
 		resp.Body.Close()
-		b.markHealthy(resp.StatusCode/100 == 2)
+		ok := resp.StatusCode/100 == 2
+		if !ok {
+			log.Printf("health check %s%s: status %d — marking unhealthy", b.URL, b.HealthPath, resp.StatusCode)
+		}
+		b.markHealthy(ok)
 		return
 	}
 	// A learned (peer) backend has no HealthPath — deliberately: this bare TCP
