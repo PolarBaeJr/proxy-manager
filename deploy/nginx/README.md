@@ -51,14 +51,28 @@ LaunchDaemon with `KeepAlive` so a boot-time bind failure just retries until
 Tailscale is up:
 
 ```
-deploy/nginx-stream/nginx.conf          ->  /Users/matthew/deploy/nginx-stream/nginx.conf
-(plist tracked separately, see below)   ->  /Library/LaunchDaemons/org.nginx-stream.plist
+deploy/nginx-stream/nginx.conf            ->  /Users/matthew/deploy/nginx-stream/nginx.conf
+deploy/nginx-stream/org.nginx-stream.plist -> /Library/LaunchDaemons/org.nginx-stream.plist
+```
+
+Both tracked files are a **live copy of the Mac mini's actual running
+config**, not a portable template — nginx has no env-var interpolation, so
+the Tailscale IP (`100.83.62.68`) and `/Users/matthew` path are literal to
+this one machine. Copying either file onto a second peer node requires
+editing both by hand first.
+
+```sh
+sudo mkdir -p /Users/matthew/deploy/nginx-stream/logs
+sudo cp deploy/nginx-stream/nginx.conf /Users/matthew/deploy/nginx-stream/nginx.conf
+sudo cp deploy/nginx-stream/org.nginx-stream.plist /Library/LaunchDaemons/org.nginx-stream.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/org.nginx-stream.plist
 ```
 
 Verified running concurrently with the main nginx with no port conflict
 (different address, different port, own pid file) — this does not reopen the
 one-nginx-per-box rule from above, which is specifically about `:443`
-contention.
+contention. Confirmed end-to-end (2026-08-24): the Pi's proxy reaches Redis
+through this path with `PING` → `PONG`, auth included.
 
 ## Why `cloudflare-realip.conf` and `maintenance-bypass.conf` matter
 
