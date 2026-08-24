@@ -17,10 +17,10 @@ import (
 type Metrics struct {
 	mu sync.Mutex
 
-	StartedAt    time.Time
-	Total        atomic.Uint64
-	BytesOut     atomic.Uint64
-	InFlight     atomic.Int64
+	StartedAt time.Time
+	Total     atomic.Uint64
+	BytesOut  atomic.Uint64
+	InFlight  atomic.Int64
 
 	byHost       map[string]uint64
 	byStatus     map[int]uint64
@@ -28,8 +28,8 @@ type Metrics struct {
 	byHostStatus map[string]map[int]uint64 // host → status → count
 
 	// Latency reservoir — last 1000 observations. Cheap percentile estimation.
-	latencyMs    []float64
-	latencyHead  int
+	latencyMs   []float64
+	latencyHead int
 
 	// windowBuckets is a ring of per-minute request/byte/error totals, used to
 	// derive last_5m/last_1h/last_24h aggregates without persisting anything.
@@ -269,10 +269,11 @@ func maxOr0(s []float64) float64 {
 
 // metricsServer starts an HTTP server on addr exposing /metrics (JSON),
 // /access (per-request log ring), /refresh (rebuild the router from
-// labels + routes.json on demand), and /routes (currently routed hosts —
-// the auth binary uses it to validate login redirects). Bind to internal
-// addresses only.
-func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup) {
+// labels + routes.json on demand), /routes (currently routed hosts —
+// the auth binary uses it to validate login redirects), and /ratelimit
+// (current rate-limit bucket state per route — the dashboard's rate-limit
+// view reads this). Bind to internal addresses only.
+func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -296,6 +297,12 @@ func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapsh
 	}
 	if a != nil {
 		mux.HandleFunc("/access", accessHandler(a))
+	}
+	if rlSnapshot != nil {
+		mux.HandleFunc("/ratelimit", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"routes": rlSnapshot()})
+		})
 	}
 	if refresh != nil {
 		mux.HandleFunc("/refresh", func(w http.ResponseWriter, _ *http.Request) {

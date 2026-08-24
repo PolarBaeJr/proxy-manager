@@ -1,5 +1,13 @@
 # Federated peers — design plan
 
+> **Superseded for the proxy-level mesh scope.** The chosen design for
+> peer-as-backend request forwarding, gossip sync, and shared rate limiting
+> lives in [`PEER_MESH_PLAN.md`](PEER_MESH_PLAN.md) — read that first. This
+> document's dashboard-aggregation ideas (Cluster tab, fan-out `/api/cluster/*`,
+> peer tokens) are still relevant groundwork for a later phase and are kept
+> here, but do not implement Phase 1 below as written without reconciling it
+> against `PEER_MESH_PLAN.md`'s request-path design.
+
 Status: **draft, not implemented.** Captures the shape of the work for the
 "active scheduler / placement" tier of distributed support the user picked.
 Lives here so future sessions can pick it up without re-deriving the design.

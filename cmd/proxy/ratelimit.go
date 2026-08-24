@@ -8,10 +8,37 @@ import (
 // Per-IP token bucket for proxy.ratelimit hosts. In-memory; restart wipes state.
 // Capacity = burst, refill = `rate` tokens per second.
 //
-// The proxy is single-instance in prod, so there's no cross-instance gossip
-// (unlike cmd/edge, which ships per-IP usage to peers). The rate limit is
-// therefore per-instance by design. Note the auth gate's -auth-trusted-cidrs
-// LAN bypass intentionally does NOT apply here — LAN clients are still throttled.
+// When -redis-addr is unset (the default), the proxy is single-instance in
+// prod and this in-memory limiter is the whole story: no cross-instance
+// gossip, per-instance by design. When -redis-addr IS set, RouteGroup.limiter
+// is instead a hybridLimiter (see redisrl.go) backed by a shared Redis
+// instance, so the same per-IP cap applies across every proxy in the mesh —
+// with automatic fail-open-to-this-type on a Redis outage. Note the auth
+// gate's -auth-trusted-cidrs LAN bypass intentionally does NOT apply here —
+// LAN clients are still throttled.
+
+// limiter is the interface RouteGroup.limiter and Router.limiters hold, so
+// the in-memory rateLimiter and the Redis-backed hybridLimiter (redisrl.go)
+// are interchangeable at every call site.
+type limiter interface {
+	Allow(key string) bool
+	SetRate(rpm int)
+	Stop()
+	// Snapshot returns a read-only view of currently tracked buckets, for the
+	// dashboard's rate-limit view. Never mutates state (does not consume a
+	// token or apply a refill write) — RECOMPUTED refill is fine to report,
+	// STORED tokens must not change as a side effect of viewing them.
+	Snapshot() []bucketSnapshot
+}
+
+// bucketSnapshot is one client's current rate-limit bucket state, as reported
+// by Snapshot(). Tokens is refill-adjusted to "now" for display, without
+// writing that adjustment back.
+type bucketSnapshot struct {
+	Key      string  `json:"key"`
+	Tokens   float64 `json:"tokens"`
+	Capacity float64 `json:"capacity"`
+}
 
 type bucket struct {
 	tokens     float64
@@ -93,6 +120,24 @@ func (rl *rateLimiter) Allow(key string) bool {
 	b.tokens--
 	return true
 }
+
+// Snapshot reports each tracked bucket's current key and refill-adjusted
+// token count without mutating rl.buckets — a read for the dashboard's
+// rate-limit view, not a consuming Allow call.
+func (rl *rateLimiter) Snapshot() []bucketSnapshot {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	out := make([]bucketSnapshot, 0, len(rl.buckets))
+	for key, b := range rl.buckets {
+		elapsed := now.Sub(b.lastRefill).Seconds()
+		tokens := min(rl.capacity, b.tokens+elapsed*rl.rate)
+		out = append(out, bucketSnapshot{Key: key, Tokens: tokens, Capacity: rl.capacity})
+	}
+	return out
+}
+
+var _ limiter = (*rateLimiter)(nil)
 
 func (rl *rateLimiter) gc() {
 	t := time.NewTicker(5 * time.Minute)

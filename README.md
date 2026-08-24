@@ -1,6 +1,6 @@
 # proxy-manager
 
-> Self-hosted reverse proxy, load balancer, and management dashboard for a single host. Five small Go binaries with a tight dependency footprint (`webauthn` for passkeys, `x/crypto/acme` for TLS autocert, `rsc.io/qr` for TOTP QR codes — that's it).
+> Self-hosted reverse proxy, load balancer, and management dashboard for a single host. Five small Go binaries with a tight dependency footprint (`webauthn` for passkeys, `x/crypto/acme` for TLS autocert, `rsc.io/qr` for TOTP QR codes, `discordgo` for the optional status bot — that's it). Redis (`go-redis`) is an additional *optional* runtime dependency, only pulled in when `REDIS_ADDR` is set for shared cross-peer rate limiting; unset, the proxy has no Redis dependency at all.
 
 Built for a Raspberry Pi running 10+ production services. Replaces the usual nginx + Traefik + Portainer + Homepage + assorted bash with ~10k lines of Go you can read in a weekend. Container labels are the source of truth — drop two labels on a service and it's routed.
 
@@ -107,7 +107,7 @@ Drop these on any container you want routed:
 | `proxy.auth=true` |   | require SSO login (default: public, no auth) — see [Access control](#access-control-opt-in-sso) |
 | `proxy.auth.users=alice,bob` |   | optional allowlist; empty = any authenticated user |
 | `proxy.auth.mode=oauth` |   | bearer-only OAuth mode for MCP servers (default is cookie SSO) |
-| `proxy.ratelimit=true` |   | per-client-IP rate limit (default: off) — spoof-resistant client IP, `429` when exceeded |
+| `proxy.ratelimit=true` |   | per-client-IP rate limit (default: off) — spoof-resistant client IP, `429` when exceeded. In-memory per-instance by default; shared across every proxy in the mesh when `REDIS_ADDR` is set (see `.env.example`) |
 | `proxy.ratelimit.rpm=60` |   | requests per minute per IP (default 60 if enabled without a value) |
 
 ### MCP servers
@@ -208,8 +208,9 @@ examples/
 scripts/
   cname         Cloudflare DNS CLI (alternative to the DNS tab)
 docs/
-  DESIGN_BRIEF.md   archived design handoff (Vercel/Geist dashboard rebuild)
-  PEERS_PLAN.md     draft design for federated multi-host support
+  DESIGN_BRIEF.md    archived design handoff (Vercel/Geist dashboard rebuild)
+  PEERS_PLAN.md      draft design for dashboard-only federated aggregation (superseded for proxy-level mesh)
+  PEER_MESH_PLAN.md  chosen design for proxy-level peer mesh (peer-as-backend, gossip sync, shared rate limiting)
 go.mod          single module: github.com/PolarBaeJr/proxy-manager
 docker-compose.yml
 .env.example
