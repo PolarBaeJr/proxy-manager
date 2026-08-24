@@ -101,6 +101,17 @@ services:
     container_name: dashboard
     restart: unless-stopped
     networks: [edge]
+    labels:
+      # Private-only hostname: no public DNS record. Routed by the internal
+      # proxy same as any other labeled service; reachability is gated by
+      # nginx binding this host's vhost to the Tailscale IP only, not by
+      # anything here. DASHBOARD_HOST lets the Pi and Mac mini peer each
+      # advertise their own hostname from this one shared compose file.
+      proxy.enable:     "true"
+      proxy.host:       "${DASHBOARD_HOST:-dashboard.polardev.org}"
+      proxy.port:       "8093"
+      proxy.service:    "dashboard"
+      proxy.unscalable: "true"
     ports:
       # Loopback-only publish: dashboard is reached through the proxy on the
       # docker network (Host: dashboard.polardev.org). Direct :8093 access
@@ -164,6 +175,15 @@ services:
       # static route. Empty => read-only tools; true => also maintenance,
       # scale, start/stop, autoupdate and canary.
       MCP_ALLOW_WRITES:     ${MCP_ALLOW_WRITES:-}
+      # WebAuthn RP identity — see cmd/dashboard/passkey.go's doc comment.
+      # Set PASSKEY_RP_ID to the shared parent domain (e.g. "polardev.org")
+      # and list every instance's full origin in PASSKEY_RP_ORIGINS so a
+      # passkey registered on one dashboard validates on the other. Empty =>
+      # today's default (rp_id=localhost), unchanged.
+      PASSKEY_RP_ID:        ${PASSKEY_RP_ID:-}
+      PASSKEY_RP_ORIGINS:   ${PASSKEY_RP_ORIGINS:-}
+    command: >
+      -redis-addr=${REDIS_ADDR:-}
 
   monitor:
     build:
