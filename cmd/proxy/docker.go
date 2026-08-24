@@ -86,12 +86,24 @@ type dockerContainer struct {
 	ID              string            `json:"Id"`
 	Names           []string          `json:"Names"`
 	State           string            `json:"State"`
+	Status          string            `json:"Status"` // raw docker status, e.g. "Up 2 minutes (healthy)"
 	Labels          map[string]string `json:"Labels"`
 	NetworkSettings struct {
 		Networks map[string]struct {
 			IPAddress string `json:"IPAddress"`
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
+}
+
+// dockerUnhealthy reports whether the container's raw Status string (from
+// the /containers/json list endpoint) indicates a failing Docker
+// HEALTHCHECK. Mirrors cmd/dashboard/docker.go's parseHealth string-match —
+// the list endpoint has no structured State.Health.Status field, only this
+// human-readable string, and calling /inspect per container per refresh is
+// the cost this avoids. No HEALTHCHECK, or "(health: starting)", returns
+// false — this is a floor, not a full signal.
+func dockerUnhealthy(status string) bool {
+	return strings.Contains(status, "(unhealthy)")
 }
 
 func (c *dockerContainer) name() string {

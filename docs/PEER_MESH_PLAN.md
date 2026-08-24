@@ -58,6 +58,31 @@ being load-balanced across peers. The Redis-backed `hybridLimiter` (see
 rather than alongside it: it removes that ordering hazard for whoever builds
 this next.
 
+## Known limitation: self-referential health checks defeat failover
+
+A backend's health-check endpoint is only a trustworthy signal if it's
+actually independent of the proxy/edge layer that's consuming it. If a
+backend's health endpoint reaches its own dependencies (e.g. a database) by a
+path that also hairpins back out through the same proxy/edge infrastructure —
+rather than staying fully internal to the Docker network — then that
+backend's health signal is partly self-referential: a degradation in the
+proxy or edge layer itself can make every backend behind it report unhealthy
+at the same time, even though each backend's own application and database are
+both fine.
+
+Critically, peer-mesh failover does **not** rescue this case. A peer's own
+probe of its own backend for the same route hairpins through the same shared
+edge infrastructure, so the correlated failure isn't something failover can
+route around by construction — every peer sees the same false-unhealthy
+signal for the same structural reason. (For example, hypothetically: if a
+backend's health endpoint round-trips through a public URL rather than an
+internal Docker network route, an edge outage would look identical to that
+backend actually being down, to every prober in the mesh at once.)
+
+The fix is architectural (keep health-check dependency paths internal to the
+Docker network, not routed back through the proxy/edge), not something this
+plan's failover mechanism can paper over.
+
 ## Relationship to `PEERS_PLAN.md`
 
 That document's dashboard-aggregation ideas (Cluster tab, `peers.json`,
