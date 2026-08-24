@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.cloudflare-realip</string>
+
+    <!-- Replaces the Pi's root crontab line `17 4 * * 1
+         /usr/local/sbin/update-cloudflare-ips.sh`. If this job is missing, the
+         Cloudflare IP ranges in conf.d/cloudflare-realip.conf go stale as
+         Cloudflare adds prefixes; real_ip then stops rewriting $remote_addr for
+         those ranges and EVERY visitor from them collapses into one rate-limit
+         bucket. It degrades silently - the site keeps returning 200. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/matthew/deploy/bin/update-cloudflare-ips.sh</string>
+    </array>
+
+    <!-- Mondays 04:17, same slot the Pi used. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>4</integer>
+        <key>Minute</key><integer>17</integer>
+    </dict>
+
+    <!-- Deliberately NOT RunAtLoad: it reloads nginx, and there is no reason to
+         do that on every boot. launchd runs a missed StartCalendarInterval once
+         after wake/boot, which is the behaviour we want. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/matthew/deploy/nginx/logs/cloudflare-realip.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/matthew/deploy/nginx/logs/cloudflare-realip.err.log</string>
+</dict>
+</plist>

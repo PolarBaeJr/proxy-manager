@@ -11,6 +11,9 @@ conf.d/maintenance-bypass.conf -> /etc/nginx/conf.d/maintenance-bypass.conf
 stream.d/redis-peer.conf      ->  Mac mini peer node ONLY, see below — NOT
                                    the same nginx instance/install path as
                                    the three files above.
+bin/update-cloudflare-ips.sh  ->  Mac mini peer node ONLY, see below — the
+                                   job that keeps cloudflare-realip.conf fresh.
+org.cloudflare-realip.plist   ->  /Library/LaunchDaemons/org.cloudflare-realip.plist
 ```
 
 ## Installing
@@ -73,6 +76,56 @@ Verified running concurrently with the main nginx with no port conflict
 one-nginx-per-box rule from above, which is specifically about `:443`
 contention. Confirmed end-to-end (2026-08-24): the Pi's proxy reaches Redis
 through this path with `PING` → `PONG`, auth included.
+
+## `bin/update-cloudflare-ips.sh` — Mac mini peer node only, keeps `cloudflare-realip.conf` fresh
+
+On the Pi, `conf.d/cloudflare-realip.conf` (see below for why it matters) is
+regenerated weekly by a root crontab line:
+
+```
+17 4 * * 1 /usr/local/sbin/update-cloudflare-ips.sh
+```
+
+When the Pi's nginx tree was copied to the Mac mini, only the *output* of that
+script came along — not the script or its schedule. Left unported, the ranges
+in `cloudflare-realip.conf` go stale as Cloudflare adds prefixes: `real_ip`
+silently stops rewriting `$remote_addr` for the missing ranges, and every
+visitor from them collapses into one `proxy.ratelimit` bucket. Nothing errors —
+the site keeps returning 200.
+
+`bin/update-cloudflare-ips.sh` is a macOS port of the Pi script, and
+`org.cloudflare-realip.plist` is its LaunchDaemon (Mondays 04:17, same slot the
+Pi used). Both are a **live copy of the Mac mini's actual job**, not a
+portable template — paths (`/Users/matthew/...`) are literal to this one
+machine, same caveat as `nginx-stream/` below. Differences from the Pi
+original, all commented in the script itself:
+
+1. Config/log paths live under `/Users/matthew/deploy`, not `/etc/nginx` and
+   `/var/log`.
+2. BSD `date` has no `-Is` — GNU's ISO-timestamp shorthand exits nonzero on
+   macOS, which would kill the script under `set -euo pipefail`. Replaced with
+   an explicit `+%Y-%m-%dT%H:%M:%S%z` format string.
+3. Every nginx invocation carries `-p`/`-c` — otherwise it tests/reloads
+   `/opt/homebrew/etc/nginx` (Homebrew's default prefix) instead of the config
+   actually being served, and `nginx -t` would pass against the wrong tree.
+4. There is no `systemctl`; reload is `nginx -s reload` against the same
+   prefix. The nginx master runs as root, so this must run as a root
+   LaunchDaemon, not in a user's interactive shell.
+
+```sh
+sudo mkdir -p /Users/matthew/deploy/bin
+sudo cp deploy/nginx/bin/update-cloudflare-ips.sh /Users/matthew/deploy/bin/update-cloudflare-ips.sh
+sudo chmod +x /Users/matthew/deploy/bin/update-cloudflare-ips.sh
+sudo cp deploy/nginx/org.cloudflare-realip.plist /Library/LaunchDaemons/org.cloudflare-realip.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/org.cloudflare-realip.plist
+```
+
+Verified end-to-end (2026-08-24): forcing a change path (deleting one range
+from the live config) was detected, the full set was restored, `nginx -t`
+passed, a dated backup was written, and nginx reloaded gracefully (master pid
+unchanged, workers cycled). Also verified running under `launchctl kickstart`
+directly, to confirm it survives launchd's minimal `PATH` rather than only
+working in an interactive shell.
 
 ## Why `cloudflare-realip.conf` and `maintenance-bypass.conf` matter
 
