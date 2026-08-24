@@ -8,6 +8,9 @@ host config has a reviewable source of truth; installing them is manual.
 snippets/maintenance.conf     ->  /etc/nginx/snippets/maintenance.conf
 conf.d/cloudflare-realip.conf ->  /etc/nginx/conf.d/cloudflare-realip.conf
 conf.d/maintenance-bypass.conf -> /etc/nginx/conf.d/maintenance-bypass.conf
+stream.d/redis-peer.conf      ->  Mac mini peer node ONLY, see below — NOT
+                                   the same nginx instance/install path as
+                                   the three files above.
 ```
 
 ## Installing
@@ -30,6 +33,32 @@ sudo nginx -t && sudo nginx -s reload
 ```
 
 Rollback is `cp` the `.bak-*` file back and reload.
+
+## `stream.d/redis-peer.conf` — Mac mini peer node only, SEPARATE nginx instance
+
+Do not install this into the main nginx (the one serving `conf.d/`/`snippets/`
+above). `stream{}` is a top-level block and cannot be reached from
+`conf.d/`'s `http{}` scope — and more importantly, `listen <tailscale-ip>` is
+FATAL to nginx at boot if that Tailscale interface doesn't exist yet
+(`nginx -t` fails outright, process doesn't start). Tailscale comes up as an
+independent boot service with no ordering guarantee ahead of nginx, so
+putting this in the main instance risks taking down `:80`/`:443` for every
+site on the box over a Redis side-channel on an unlucky boot.
+
+Instead it runs as a second, minimal nginx (`events{}` + a `stream{}` block
+including this file, nothing else — no `http{}`), under its own
+LaunchDaemon with `KeepAlive` so a boot-time bind failure just retries until
+Tailscale is up:
+
+```
+deploy/nginx-stream/nginx.conf          ->  /Users/matthew/deploy/nginx-stream/nginx.conf
+(plist tracked separately, see below)   ->  /Library/LaunchDaemons/org.nginx-stream.plist
+```
+
+Verified running concurrently with the main nginx with no port conflict
+(different address, different port, own pid file) — this does not reopen the
+one-nginx-per-box rule from above, which is specifically about `:443`
+contention.
 
 ## Why `cloudflare-realip.conf` and `maintenance-bypass.conf` matter
 
