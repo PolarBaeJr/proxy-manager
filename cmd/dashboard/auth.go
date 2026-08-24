@@ -23,7 +23,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -77,7 +79,37 @@ type AuthStore struct {
 	mu      sync.RWMutex
 	data    authData
 	pending map[string]*pendingUser // keyed by lowercased username
+
+	// txRunner is nil unless -redis-addr is set, in which case s.data.Users
+	// is shared cross-instance via Redis instead of being purely file-local.
+	// nil preserves today's exact file-only behavior — see mutateUsers.
+	txRunner txRunner
 }
+
+// txRunner is the narrow seam this store needs from Redis: one
+// optimistic-locking read-modify-write attempt against a single key. Kept
+// minimal (one method) so a test fake stays simple — see redisrl.go for
+// this repo's established pattern of a narrow interface + hand-rolled fake
+// over a real/fake Redis server.
+type txRunner interface {
+	// RunTx does ONE attempt: reads current bytes for key (nil slice if
+	// absent — not an error), calls fn, writes fn's result back only if the
+	// key hasn't changed since the read. Returns errTxConflict (not retried
+	// internally — mutateUsers owns retrying) if it lost the race. A
+	// business-logic error returned BY fn must propagate through RunTx
+	// verbatim (not wrapped as errTxConflict) and must abort before any
+	// write happens.
+	RunTx(ctx context.Context, key string, fn func(current []byte) (newVal []byte, err error)) error
+	// Get is a plain, non-transactional read — used for the refresh loop
+	// and the "adopt existing Redis state" branch of startup sync, neither
+	// of which needs Watch/EXEC semantics. Returns nil, nil if the key is
+	// absent (not an error).
+	Get(ctx context.Context, key string) ([]byte, error)
+}
+
+var errTxConflict = errors.New("authredis: concurrent modification, retry")
+
+const authRedisKey = "pmgr:auth:users"
 
 // pendingUser holds a not-yet-confirmed user. They must verify a TOTP code
 // matching their freshly-generated secret before they're saved to disk.
@@ -155,6 +187,80 @@ func (s *AuthStore) findUser(username string) *User {
 	return nil
 }
 
+// userIndex finds username in users, returning -1 if not found. Needed by
+// mutateUsers callers because findUser reads s.data.Users directly rather
+// than taking a slice param.
+func userIndex(users []User, username string) int {
+	for i := range users {
+		if strings.EqualFold(users[i].Username, username) {
+			return i
+		}
+	}
+	return -1
+}
+
+const (
+	redisAuthCallTimeout = 2 * time.Second
+	maxMutateRetries     = 10
+)
+
+// mutateUsers is the single write path for s.data.Users. With no Redis
+// configured (txRunner == nil) it behaves exactly like the pre-Redis code:
+// lock, mutate in place, save to disk. With Redis configured, fn runs
+// against Redis's current state under optimistic locking (retrying on
+// conflict), and the in-memory cache + local file are updated to match only
+// after the Redis write actually lands — so mutating call sites all pass fn
+// a plain function of ([]User) ([]User, error) that never needs to know how
+// its result is shared.
+func (s *AuthStore) mutateUsers(fn func(users []User) ([]User, error)) error {
+	if s.txRunner == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		newUsers, err := fn(s.data.Users)
+		if err != nil {
+			return err
+		}
+		s.data.Users = newUsers
+		return s.save()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), redisAuthCallTimeout)
+	defer cancel()
+	var result []User
+	for attempt := 0; attempt < maxMutateRetries; attempt++ {
+		err := s.txRunner.RunTx(ctx, authRedisKey, func(cur []byte) ([]byte, error) {
+			var users []User
+			if len(cur) > 0 {
+				if uerr := json.Unmarshal(cur, &users); uerr != nil {
+					return nil, uerr
+				}
+			}
+			newUsers, ferr := fn(users)
+			if ferr != nil {
+				return nil, ferr
+			}
+			result = newUsers
+			if newUsers == nil {
+				newUsers = []User{}
+			}
+			return json.Marshal(newUsers)
+		})
+		if err == nil {
+			s.mu.Lock()
+			s.data.Users = result
+			serr := s.save()
+			s.mu.Unlock()
+			if serr != nil {
+				log.Printf("dashboard auth: redis write succeeded but local mirror save failed: %v", serr)
+			}
+			return nil
+		}
+		if !errors.Is(err, errTxConflict) {
+			return err
+		}
+	}
+	return fmt.Errorf("mutateUsers: exceeded %d retries on conflict", maxMutateRetries)
+}
+
 // ---- Two-phase user creation: generate → confirm with TOTP ----
 
 // BeginSetup queues the first user. The user is NOT saved until ConfirmPending
@@ -201,22 +307,27 @@ func (s *AuthStore) BeginCreateUser(username, password string) (secret, otpauthU
 // on success, persists the user.
 func (s *AuthStore) ConfirmPending(username, code string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	key := strings.ToLower(username)
 	p, ok := s.pending[key]
 	if !ok {
+		s.mu.Unlock()
 		return fmt.Errorf("no pending confirmation for %q (already confirmed, or expired)", username)
 	}
 	if time.Now().After(p.expiresAt) {
 		delete(s.pending, key)
+		s.mu.Unlock()
 		return fmt.Errorf("confirmation expired — start over")
 	}
 	if !verifyTOTPSecret(p.user.TOTPSecret, code) {
+		s.mu.Unlock()
 		return fmt.Errorf("invalid code")
 	}
-	s.data.Users = append(s.data.Users, p.user)
+	newUser := p.user
 	delete(s.pending, key)
-	return s.save()
+	s.mu.Unlock()
+	return s.mutateUsers(func(users []User) ([]User, error) {
+		return append(users, newUser), nil
+	})
 }
 
 // ---- API tokens (programmatic credentials) ----
@@ -224,12 +335,6 @@ func (s *AuthStore) ConfirmPending(username, code string) error {
 // CreateToken generates a new API token for `username`. Returns the RAW token
 // (only time it's ever shown) and the stored APIToken metadata.
 func (s *AuthStore) CreateToken(username, label string) (rawToken string, t APIToken, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.findUser(username)
-	if u == nil {
-		return "", APIToken{}, fmt.Errorf("user %q not found", username)
-	}
 	if label == "" {
 		label = "untitled"
 	}
@@ -238,17 +343,24 @@ func (s *AuthStore) CreateToken(username, label string) (rawToken string, t APIT
 	raw := apiTokenPrefix + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(rb)
 	h := sha256.Sum256([]byte(raw))
 	hashHex := hex.EncodeToString(h[:])
-	t = APIToken{
+	newToken := APIToken{
 		ID:        hashHex[:12],
 		Label:     label,
 		Hash:      hashHex,
 		CreatedAt: time.Now().Unix(),
 	}
-	u.Tokens = append(u.Tokens, t)
-	if err := s.save(); err != nil {
+	err = s.mutateUsers(func(users []User) ([]User, error) {
+		i := userIndex(users, username)
+		if i == -1 {
+			return nil, fmt.Errorf("user %q not found", username)
+		}
+		users[i].Tokens = append(users[i].Tokens, newToken)
+		return users, nil
+	})
+	if err != nil {
 		return "", APIToken{}, err
 	}
-	return raw, t, nil
+	return raw, newToken, nil
 }
 
 // RemintServiceToken mints a fresh, persisted credential for a
@@ -360,7 +472,15 @@ func (s *AuthStore) verifyTokenKind(raw string) (id string, elevated bool) {
 		for j := range s.data.Users[i].Tokens {
 			if subtle.ConstantTimeCompare([]byte(s.data.Users[i].Tokens[j].Hash), []byte(hashHex)) == 1 {
 				s.data.Users[i].Tokens[j].LastUsedAt = time.Now().Unix()
-				_ = s.save()
+				// With Redis configured, this is a purely informational/display
+				// timestamp — being stale or occasionally lost has no security
+				// impact, and pushing every bearer-token verification through
+				// the Redis mutation path would put routine auth checks in lock
+				// contention with real writes. Update the in-memory cache only
+				// and skip the disk save; without Redis, behavior is unchanged.
+				if s.txRunner == nil {
+					_ = s.save()
+				}
 				return s.data.Users[i].Username, true
 			}
 		}
@@ -384,19 +504,19 @@ func (s *AuthStore) ListTokens(username string) []APIToken {
 }
 
 func (s *AuthStore) DeleteToken(username, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.findUser(username)
-	if u == nil {
-		return fmt.Errorf("user %q not found", username)
-	}
-	for i, t := range u.Tokens {
-		if t.ID == id {
-			u.Tokens = append(u.Tokens[:i], u.Tokens[i+1:]...)
-			return s.save()
+	return s.mutateUsers(func(users []User) ([]User, error) {
+		i := userIndex(users, username)
+		if i == -1 {
+			return nil, fmt.Errorf("user %q not found", username)
 		}
-	}
-	return fmt.Errorf("token %q not found", id)
+		for j, t := range users[i].Tokens {
+			if t.ID == id {
+				users[i].Tokens = append(users[i].Tokens[:j], users[i].Tokens[j+1:]...)
+				return users, nil
+			}
+		}
+		return nil, fmt.Errorf("token %q not found", id)
+	})
 }
 
 // CancelPending throws away any pending user with the given username. Safe to call.
@@ -415,18 +535,17 @@ func (s *AuthStore) HasPending(username string) bool {
 }
 
 func (s *AuthStore) DeleteUser(username string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.data.Users) <= 1 {
-		return fmt.Errorf("cannot delete the last user")
-	}
-	for i, u := range s.data.Users {
-		if strings.EqualFold(u.Username, username) {
-			s.data.Users = append(s.data.Users[:i], s.data.Users[i+1:]...)
-			return s.save()
+	return s.mutateUsers(func(users []User) ([]User, error) {
+		if len(users) <= 1 {
+			return nil, fmt.Errorf("cannot delete the last user")
 		}
-	}
-	return fmt.Errorf("user %q not found", username)
+		for i, u := range users {
+			if strings.EqualFold(u.Username, username) {
+				return append(users[:i], users[i+1:]...), nil
+			}
+		}
+		return nil, fmt.Errorf("user %q not found", username)
+	})
 }
 
 func (s *AuthStore) ListUsers() []User {

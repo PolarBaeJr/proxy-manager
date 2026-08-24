@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -24,6 +26,7 @@ func main() {
 	prefsFile := flag.String("prefs", "/data/prefs.json", "per-user UI preferences state file")
 	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (rw: dashboard appends onboarded routes here)")
 	serviceTokenDir := flag.String("service-token-dir", "/tokens", "directory to write auto-provisioned service credentials (e.g. statusbot's token) — a sibling container mounts this read-only")
+	redisAddr := flag.String("redis-addr", "", "shared Redis address for cross-peer user identity (passkeys/tokens/passwords), e.g. host:6379 (empty = local-file-only auth, today's behavior)")
 	flag.Parse()
 
 	metrics := NewMetrics()
@@ -34,6 +37,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("auth store: %v", err)
 	}
+	if *redisAddr != "" {
+		redisClient := redis.NewClient(&redis.Options{Addr: *redisAddr, Password: os.Getenv("REDIS_PASSWORD")})
+		auth.txRunner = &redisTxRunner{client: redisClient}
+		if err := auth.syncFromRedisOrImport(context.Background()); err != nil {
+			log.Printf("dashboard auth: redis sync failed at startup, continuing with local users until reachable: %v", err)
+		}
+		log.Printf("shared user identity enabled via redis at %s", *redisAddr)
+	}
+
 	if !auth.IsSetup() {
 		log.Printf("⚠ auth not yet set up — visit the dashboard to create the first user")
 	}
@@ -164,6 +176,13 @@ func main() {
 	// Background: keep the DNS zone list matching the Cloudflare account, so a
 	// newly added domain needs no env edit or restart.
 	go cf.SyncLoop(ctx)
+
+	// Background: poll Redis for user identity changes made by a peer
+	// instance, so reads (findUser et al) stay in sync without every read
+	// going through Redis.
+	if auth.txRunner != nil {
+		go auth.refreshLoop(ctx)
+	}
 
 	// Background: copy each proxy.maintenance app's own 503 page onto disk
 	// ahead of time — it has to already be there when the app goes down.
