@@ -1,0 +1,30 @@
+# Dashboard peer transport (Pi side) — separate nginx instance from the
+# main HTTP edge (nginx.service). See /etc/nginx-stream/nginx.conf for why.
+[Unit]
+Description=nginx stream proxy (Tailscale dashboard-peer transport, separate from main HTTP edge)
+Documentation=man:nginx(8)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+ConditionFileIsExecutable=/usr/sbin/nginx
+
+[Service]
+Type=forking
+PIDFile=/run/nginx-stream.pid
+ExecStartPre=/usr/sbin/nginx -t -q -c /etc/nginx-stream/nginx.conf -g 'daemon on; master_process on;'
+ExecStart=/usr/sbin/nginx -c /etc/nginx-stream/nginx.conf -g 'daemon on; master_process on;'
+ExecReload=/usr/sbin/nginx -c /etc/nginx-stream/nginx.conf -g 'daemon on; master_process on;' -s reload
+ExecStop=-/sbin/start-stop-daemon --quiet --stop --retry QUIT/5 --pidfile /run/nginx-stream.pid
+TimeoutStopSec=5
+KillMode=mixed
+
+# Unlike the main nginx.service, this one MUST retry on failure: a boot-time
+# bind failure (Tailscale not up yet) is expected and should self-heal
+# rather than leave the peer transport permanently down until someone
+# notices. StartLimitIntervalSec=0 disables systemd's restart-rate giveup —
+# equivalent to the Mac LaunchDaemon's KeepAlive semantics.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
