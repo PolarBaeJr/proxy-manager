@@ -174,18 +174,18 @@ func (m *passkeyManager) popCeremony(tok string) (*pendingCeremony, bool) {
 // ---- AuthStore helpers for credentials ----
 
 func (s *AuthStore) AddCredential(username string, c StoredCredential) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.findUser(username)
-	if u == nil {
-		return fmt.Errorf("user %q not found", username)
-	}
 	if c.Label == "" {
 		c.Label = "Passkey"
 	}
 	c.CreatedAt = time.Now().Unix()
-	u.Credentials = append(u.Credentials, c)
-	return s.save()
+	return s.mutateUsers(func(users []User) ([]User, error) {
+		i := userIndex(users, username)
+		if i == -1 {
+			return nil, fmt.Errorf("user %q not found", username)
+		}
+		users[i].Credentials = append(users[i].Credentials, c)
+		return users, nil
+	})
 }
 
 // PublicCredential is the JSON shape returned to the dashboard UI. It hides
@@ -218,19 +218,19 @@ func (s *AuthStore) ListCredentials(username string) []PublicCredential {
 }
 
 func (s *AuthStore) DeleteCredential(username, idKey string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.findUser(username)
-	if u == nil {
-		return fmt.Errorf("user %q not found", username)
-	}
-	for i, c := range u.Credentials {
-		if credIDKey(c.ID) == idKey {
-			u.Credentials = append(u.Credentials[:i], u.Credentials[i+1:]...)
-			return s.save()
+	return s.mutateUsers(func(users []User) ([]User, error) {
+		i := userIndex(users, username)
+		if i == -1 {
+			return nil, fmt.Errorf("user %q not found", username)
 		}
-	}
-	return fmt.Errorf("credential not found")
+		for j, c := range users[i].Credentials {
+			if credIDKey(c.ID) == idKey {
+				users[i].Credentials = append(users[i].Credentials[:j], users[i].Credentials[j+1:]...)
+				return users, nil
+			}
+		}
+		return nil, fmt.Errorf("credential not found")
+	})
 }
 
 // snapshotUsers returns a copy of all users — used by the discoverable-login
@@ -249,25 +249,25 @@ func (s *AuthStore) snapshotUsers() []User {
 // is unknown. Flag persistence is what stops "BackupEligible inconsistency"
 // errors when iCloud Keychain syncs the passkey after registration.
 func (s *AuthStore) updateCredential(username string, credID []byte, signCount uint32, flags webauthn.CredentialFlags) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	u := s.findUser(username)
-	if u == nil {
-		return false
-	}
-	for i := range u.Credentials {
-		if string(u.Credentials[i].ID) == string(credID) {
-			u.Credentials[i].SignCount = signCount
-			u.Credentials[i].UserPresent = flags.UserPresent
-			u.Credentials[i].UserVerified = flags.UserVerified
-			u.Credentials[i].BackupEligible = flags.BackupEligible
-			u.Credentials[i].BackupState = flags.BackupState
-			u.Credentials[i].LastUsedAt = time.Now().Unix()
-			_ = s.save()
-			return true
+	err := s.mutateUsers(func(users []User) ([]User, error) {
+		i := userIndex(users, username)
+		if i == -1 {
+			return nil, fmt.Errorf("user %q not found", username)
 		}
-	}
-	return false
+		for j := range users[i].Credentials {
+			if string(users[i].Credentials[j].ID) == string(credID) {
+				users[i].Credentials[j].SignCount = signCount
+				users[i].Credentials[j].UserPresent = flags.UserPresent
+				users[i].Credentials[j].UserVerified = flags.UserVerified
+				users[i].Credentials[j].BackupEligible = flags.BackupEligible
+				users[i].Credentials[j].BackupState = flags.BackupState
+				users[i].Credentials[j].LastUsedAt = time.Now().Unix()
+				return users, nil
+			}
+		}
+		return nil, fmt.Errorf("credential not found")
+	})
+	return err == nil
 }
 
 // credIDKey is the stable string key we use to identify a credential in the
