@@ -1,0 +1,45 @@
+# Override for running proxy-manager on a Mac mini peer node (Colima).
+# Use alongside the base file, never alone:
+#   docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d
+#
+# Differences from the Pi's docker-compose.yml:
+#   - project name changed so this stack never collides with "pi-stack" if
+#     the two are ever visible to the same Docker context
+#   - dashboard's host-stat bind mounts (/proc, /mnt/ssd) are dropped: under
+#     Colima's Linux VM, /proc would report the VM's stats rather than the
+#     real Mac's, and /mnt/ssd (the Pi's SSD) doesn't exist here at all. The
+#     Stats tab shows no host metrics for this node until that's designed
+#     properly instead of silently mounting the wrong thing.
+#   - adds redis: the peer mesh's shared rate-limit store (see cmd/proxy's
+#     Redis-backed limiter). Bound to this host's Tailscale IP only, never
+#     0.0.0.0 — reachable by peer proxies over Tailscale, never on the LAN
+#     or public internet. REDIS_PASSWORD is required (no insecure default);
+#     set it in .env before bringing this override up.
+
+name: mac-stack
+
+services:
+  dashboard:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./cmd/proxy/routes.json:/etc/proxy/routes.json
+      - ./cmd/dashboard/data:/data
+      - ${MAINT_HOST_DIR:-/etc/nginx/maint.d}:/etc/maint.d
+      - ${MAINT_PAGE_HOST_DIR:-/var/www/maintenance/hosts}:/var/www/maint-pages
+      - ${SECRETS_HOST_DIR:-/etc/proxy-manager/secrets}:/etc/secrets:ro
+      - ./cmd/dashboard/tokens:/tokens
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks: [edge]
+    ports:
+      - "${REDIS_BIND_IP:-100.83.62.68}:6379:6379"
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env — see docker-compose.mac.yml}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
