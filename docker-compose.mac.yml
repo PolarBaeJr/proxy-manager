@@ -11,16 +11,41 @@
 #     Stats tab shows no host metrics for this node until that's designed
 #     properly instead of silently mounting the wrong thing.
 #   - adds redis: the peer mesh's shared rate-limit store (see cmd/proxy's
-#     Redis-backed limiter). Bound to this host's Tailscale IP only, never
-#     0.0.0.0 — reachable by peer proxies over Tailscale, never on the LAN
-#     or public internet. REDIS_PASSWORD is required (no insecure default);
-#     set it in .env before bringing this override up.
+#     Redis-backed limiter). REDIS_PASSWORD is required (no insecure
+#     default); set it in .env before bringing this override up.
+#
+# Colima-on-macOS quirks that shaped this file, both learned the hard way:
+#
+#   1. Only /Users/matthew is shared into the Colima VM via virtiofs. Any
+#      host path a bind mount points at must live under it. The three
+#      overridable defaults below (MAINT_HOST_DIR etc.) inherit the base
+#      file's Linux paths (/etc/nginx/maint.d and friends), which don't
+#      exist on macOS — and Docker's bind mount silently CREATES a missing
+#      source as an empty directory *inside the VM* instead of failing. The
+#      result isn't an error, it's a feature that quietly does nothing:
+#      dashboard boots clean with an empty secrets dir and maintenance flags
+#      nginx can never see. Point every one of these three at a path under
+#      /Users/matthew in your .env, and don't trust a clean startup log as
+#      confirmation that the mount actually reached real data.
+#
+#   2. Docker port-publishing runs inside the VM's own network namespace,
+#      which never sees the macOS host's Tailscale interface — so a
+#      container CANNOT bind a Tailscale IP directly (`cannot assign
+#      requested address`). redis therefore publishes to 127.0.0.1 only;
+#      making it reachable over Tailscale (and only Tailscale, never the
+#      LAN) is native nginx's job via a stream{} block — see
+#      deploy/nginx/stream.d/redis-peer.conf.
 
 name: mac-stack
 
 services:
   dashboard:
-    volumes:
+    # !override replaces the base list instead of merging into it. Compose
+    # merges override volumes/environment by default — drop this tag and
+    # /proc + /mnt/ssd silently come back, which is exactly what happened
+    # the first time this file was written without it (docker inspect
+    # showed both still mounted despite the comment above claiming otherwise).
+    volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
       - ./cmd/proxy/routes.json:/etc/proxy/routes.json
       - ./cmd/dashboard/data:/data
@@ -35,7 +60,9 @@ services:
     restart: unless-stopped
     networks: [edge]
     ports:
-      - "${REDIS_BIND_IP:-100.83.62.68}:6379:6379"
+      # Loopback only — see quirk (2) above. native nginx's stream{} block
+      # is what actually exposes this over Tailscale.
+      - "127.0.0.1:6379:6379"
     command: >
       redis-server
       --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env — see docker-compose.mac.yml}
