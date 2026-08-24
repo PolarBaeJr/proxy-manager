@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -24,6 +26,7 @@ func main() {
 	authTrustedCIDRs := flag.String("auth-trusted-cidrs", "", "comma-separated CIDRs that bypass auth entirely (e.g. LAN ranges)")
 	authXFFTrustedCIDRs := flag.String("auth-xff-trusted-cidrs", "127.0.0.0/8,172.16.0.0/12", "comma-separated CIDRs of peers whose X-Forwarded-For is trusted")
 	authVerifyTokenURL := flag.String("auth-verify-token-url", "http://dashboard:8093/api/auth/verify-token", "dashboard endpoint used to verify bearer API tokens")
+	redisAddr := flag.String("redis-addr", "", "shared Redis address for cross-peer rate limiting, e.g. 100.83.62.68:6379 (empty = in-memory-only rate limiting, today's behavior)")
 	flag.Parse()
 
 	metrics := NewMetrics()
@@ -46,6 +49,16 @@ func main() {
 	// auth gate is disabled, so parse the trusted-XFF CIDRs unconditionally.
 	router.xffTrusted = parseCIDRList(*authXFFTrustedCIDRs)
 	router.unroutedLimiter = newRateLimiter(defaultRateRPM)
+	if *redisAddr != "" {
+		redisClient := redis.NewClient(&redis.Options{
+			Addr:     *redisAddr,
+			Password: os.Getenv("REDIS_PASSWORD"),
+		})
+		router.newLimiter = func(routeKey string, rpm int) limiter {
+			return newHybridLimiter(redisClient, routeKey, rpm, idleEvict)
+		}
+		log.Printf("shared rate limiting enabled via Redis at %s", *redisAddr)
+	}
 	if *authDomains != "" {
 		var secret []byte
 		if envHex := strings.TrimSpace(os.Getenv("PMGR_AUTH_SECRET")); envHex != "" {
@@ -89,7 +102,7 @@ func main() {
 
 	// Pass refresh into the metrics server so /refresh can be hit by the
 	// dashboard after it edits routes.json — saves a docker restart.
-	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot)
+	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot)
 	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
 	go dc.streamEvents(ctx, func(action string) {

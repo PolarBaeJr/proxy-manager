@@ -993,6 +993,21 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.Copy(w, resp.Body)
 		}))
+
+		// Rate-limit bucket state (read-only; auth-gated). Empty {"routes":[]}
+		// whenever no route has proxy.ratelimit=true, whether the proxy's own
+		// rate limiting is in-memory-only or Redis-backed — the dashboard
+		// doesn't need to know which.
+		mux.HandleFunc("/api/ratelimit", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
+			resp, err := http.Get(px + "/ratelimit")
+			if err != nil {
+				http.Error(w, "proxy unreachable", http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.Copy(w, resp.Body)
+		}))
 	}
 
 	mux.HandleFunc("/api/cf/records", func(w http.ResponseWriter, req *http.Request) {

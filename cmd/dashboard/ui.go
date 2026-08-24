@@ -554,6 +554,7 @@ footer.app code{color:var(--muted)}
           <button data-sub="status">Status</button>
           <button data-sub="logs">Container logs</button>
           <button data-sub="access">Access log</button>
+          <button data-sub="ratelimit">Rate limits</button>
           <button data-sub="releases">Releases</button>
           <button data-sub="images">Images</button>
         </nav>
@@ -561,6 +562,7 @@ footer.app code{color:var(--muted)}
         <div id="tab-status" hidden></div>
         <div id="tab-logs" hidden></div>
         <div id="tab-access" hidden></div>
+        <div id="tab-ratelimit" hidden></div>
         <div id="tab-releases" hidden></div>
         <div id="tab-images" hidden></div>
       </section>
@@ -1047,7 +1049,7 @@ function switchObsSub(s) {
   if (s !== 'access') accessState.mounted = false;
   if (s !== 'stats') statsDetail = null;
   $$('#obs-subnav button').forEach(b => b.classList.toggle('active', b.dataset.sub === s));
-  ['stats','status','logs','access','releases','images'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
+  ['stats','status','logs','access','ratelimit','releases','images'].forEach(x => { const el = $('#tab-' + x); if (el) el.hidden = x !== s; });
   renderActive();
 }
 
@@ -1073,6 +1075,7 @@ async function renderActive() {
       else if (obsSubTab === 'status') await renderStatus();
       else if (obsSubTab === 'logs') await renderLogs();
       else if (obsSubTab === 'access') await renderAccess();
+      else if (obsSubTab === 'ratelimit') await renderRateLimit();
       else if (obsSubTab === 'releases') await renderReleases();
       else if (obsSubTab === 'images') await renderImages();
     } else if (activeTab === 'users') {
@@ -2686,6 +2689,53 @@ function paintAccess() {
   view.innerHTML = '<table class="acc-table"><thead><tr>'
     + '<th>Time</th><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>ms</th><th>Bytes</th><th>Client IP</th><th>Backend</th><th>UA</th>'
     + '</tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+/* ---------- Rate limits (proxy token-bucket state; Redis-shared or in-memory) ---------- */
+let _lastRateLimitHash = '';
+async function renderRateLimit() {
+  const el = $('#tab-ratelimit');
+  let data;
+  try {
+    data = await api('/api/ratelimit');
+  } catch (e) {
+    el.innerHTML = '<div class="card">' + esc(e.message) + '</div>';
+    return;
+  }
+  const routes = data.routes || [];
+  const hash = JSON.stringify(routes);
+  if (hash === _lastRateLimitHash && el.children.length) return;
+  _lastRateLimitHash = hash;
+
+  const blurb = '<div class="subhead">' + I.activity + 'Rate limits'
+    + ' <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— current per-client-IP bucket state for proxy.ratelimit routes</span>'
+    + '</div>';
+
+  if (!routes.length) {
+    el.innerHTML = blurb + '<div class="card">No routes have <code>proxy.ratelimit=true</code>.</div>';
+    return;
+  }
+
+  const cards = routes.map(rt => {
+    const head = '<div class="card-head"><div class="ttl">' + I.layers + '<span>' + esc(rt.host) + esc(rt.path || '') + '</span>'
+      + ' <span class="pill">' + rt.rpm + ' rpm</span>'
+      + ' <span class="pill">' + (rt.buckets || []).length + ' client(s)</span></div></div>';
+    const buckets = (rt.buckets || []).slice().sort((a, b) => a.tokens - b.tokens);
+    const rows = buckets.map(b => {
+      const pct = b.capacity > 0 ? Math.round((b.tokens / b.capacity) * 100) : 0;
+      const cls = pct <= 10 ? 's5' : pct <= 40 ? 's4' : 's2';
+      return '<tr>'
+        + '<td class="meta">' + esc(b.key) + '</td>'
+        + '<td><span class="sc ' + cls + '">' + b.tokens.toFixed(1) + ' / ' + b.capacity + '</span></td>'
+        + '</tr>';
+    }).join('');
+    const body = '<table class="acc-table"><thead><tr>'
+      + '<th>Client</th><th>Tokens remaining</th>'
+      + '</tr></thead><tbody>' + (rows || '<tr><td colspan="2" style="color:var(--muted)">No active clients right now.</td></tr>') + '</tbody></table>';
+    return '<div class="card">' + head + body + '</div>';
+  }).join('');
+
+  el.innerHTML = blurb + cards;
 }
 
 /* ---------- Releases (mark stable + revert command for infra services) ---------- */

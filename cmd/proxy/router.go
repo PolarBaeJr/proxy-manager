@@ -45,7 +45,7 @@ type RouteGroup struct {
 
 	RateLimit bool
 	RateRPM   int
-	limiter   *rateLimiter
+	limiter   limiter
 
 	cursor atomic.Uint64
 
@@ -90,8 +90,16 @@ type Router struct {
 
 	// limiters persist across refreshes, keyed by group key host+"|"+path, so
 	// config edits don't reset per-IP buckets. Guarded by mu.
-	limiters   map[string]*rateLimiter
+	limiters   map[string]limiter
 	xffTrusted []*net.IPNet
+
+	// newLimiter constructs a fresh limiter for a route group, given its
+	// host+"|"+path route key (for the Redis key scheme) and rpm; nil
+	// defaults to the plain in-memory rateLimiter (today's behavior). main.go
+	// sets this to build a Redis-backed hybridLimiter when -redis-addr is
+	// configured. Kept as a constructor func (rather than a *redis.Client
+	// field here) so router.go stays free of the redis import.
+	newLimiter func(routeKey string, rpm int) limiter
 
 	// unroutedLimiter throttles requests that match no route (bad Host/path),
 	// keyed by client IP, independent of any per-group limiter. Set once at
@@ -112,7 +120,7 @@ func (r *Router) Set(groups []*RouteGroup) {
 	// Done under the same lock, with g.limiter assigned before r.groups is
 	// published, so ServeHTTP never reads a group whose limiter isn't wired up.
 	if r.limiters == nil {
-		r.limiters = map[string]*rateLimiter{}
+		r.limiters = map[string]limiter{}
 	}
 	live := map[string]bool{}
 	for _, g := range groups {
@@ -125,7 +133,12 @@ func (r *Router) Set(groups []*RouteGroup) {
 			rl.SetRate(g.RateRPM)
 			g.limiter = rl
 		} else {
-			rl := newRateLimiter(g.RateRPM)
+			var rl limiter
+			if r.newLimiter != nil {
+				rl = r.newLimiter(key, g.RateRPM)
+			} else {
+				rl = newRateLimiter(g.RateRPM)
+			}
 			r.limiters[key] = rl
 			g.limiter = rl
 		}
@@ -161,6 +174,33 @@ func (r *Router) Snapshot() []*RouteGroup {
 	defer r.mu.RUnlock()
 	out := make([]*RouteGroup, len(r.groups))
 	copy(out, r.groups)
+	return out
+}
+
+// RouteRateLimitSnapshot is one rate-limited route group's current bucket
+// state, for the dashboard's read-only rate-limit view.
+type RouteRateLimitSnapshot struct {
+	Host    string           `json:"host"`
+	Path    string           `json:"path"`
+	RPM     int              `json:"rpm"`
+	Buckets []bucketSnapshot `json:"buckets"`
+}
+
+// RateLimitSnapshot reports current bucket state for every rate-limited
+// route group. Read-only — delegates to each group's limiter.Snapshot().
+func (r *Router) RateLimitSnapshot() []RouteRateLimitSnapshot {
+	r.mu.RLock()
+	groups := r.groups
+	r.mu.RUnlock()
+	out := make([]RouteRateLimitSnapshot, 0)
+	for _, g := range groups {
+		if !g.RateLimit || g.limiter == nil {
+			continue
+		}
+		out = append(out, RouteRateLimitSnapshot{
+			Host: g.Host, Path: g.PathPrefix, RPM: g.RateRPM, Buckets: g.limiter.Snapshot(),
+		})
+	}
 	return out
 }
 
