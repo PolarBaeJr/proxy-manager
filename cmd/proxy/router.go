@@ -308,15 +308,22 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	req.Header.Del(ActorHeader)
 
 	// A hopped request is one a peer proxy already forwarded to us. It skips
-	// forwarding to another learned backend (loop prevention, below) and
-	// skips the rate-limit charge the originating peer already made.
+	// forwarding to another learned backend (loop prevention, below) — that's
+	// its only effect. It does NOT skip the rate-limit charge: a hop only
+	// happens when the receiving side has no healthy local backend for the
+	// route (see pickHealthy's local-first tiering), so a hopped request is
+	// charged again here on top of whatever the originating peer charged.
+	// That's a mildly conservative double-charge during failover, not a
+	// correctness bug, and it's the price of not trusting this header for
+	// anything security-relevant.
 	//
 	// Unlike ActorHeader above, this arrives unauthenticated: a peer forwards
 	// to our proxy port, not the bearer-gated metrics port, so there's no
-	// signature to check it against. For loop prevention that's fail-safe —
-	// a client forging it only denies itself peer failover. The limiter skip
-	// is NOT self-limiting the same way, so it relies on the edge (nginx)
-	// stripping any client-supplied X-Pmgr-Peer-Hop before it reaches here.
+	// signature to check it against. Using it for loop prevention only is
+	// fail-safe against forgery — a client forging it only denies itself
+	// peer failover. It must never gate a rate-limit decision: any client
+	// can set this header on a direct request, and skipping the limiter
+	// whenever it's present would be a self-inflicted bypass.
 	hopped := req.Header.Get(PeerHopHeader) != ""
 	req.Header.Del(PeerHopHeader)
 
@@ -361,12 +368,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.")
 		return
 	}
-	// Skip the check entirely for a request that already hopped from a peer:
-	// the originating peer already charged this request against the shared
-	// (Redis-backed) limiter before forwarding it here, so charging it again
-	// on the receiving side would double-decrement the same bucket for one
-	// logical request.
-	if group.limiter != nil && !hopped {
+	// Always charged, hopped or not — see the hopped comment above for why
+	// PeerHopHeader must never gate this decision.
+	if group.limiter != nil {
 		key := rlKey(req, r.xffTrusted)
 		if !group.limiter.Allow(key) {
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(group.RateRPM)))

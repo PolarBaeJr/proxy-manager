@@ -681,12 +681,13 @@ func TestPeerBackendRestoresStrippedPrefix(t *testing.T) {
 	}
 }
 
-// TestServeHTTPHoppedRequestBypassesLimiter proves the hopped-request
-// limiter skip: a request that already hopped from a peer must skip the
-// rate-limit check (the originating peer already charged the shared
-// bucket), while a non-hopped request against the same exhausted bucket
-// still gets 429.
-func TestServeHTTPHoppedRequestBypassesLimiter(t *testing.T) {
+// TestServeHTTPHoppedRequestStillRateLimited proves PeerHopHeader never
+// gates the rate-limit decision: it's an unauthenticated, client-settable
+// header, so trusting its presence to skip the limiter would let any client
+// bypass its own rate limit by setting the header on a direct request. A
+// hopped request against an exhausted bucket must still get 429, same as a
+// non-hopped one.
+func TestServeHTTPHoppedRequestStillRateLimited(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	}))
@@ -716,14 +717,14 @@ func TestServeHTTPHoppedRequestBypassesLimiter(t *testing.T) {
 		t.Fatalf("non-hopped request code = %d, want 429 (limiter exhausted)", rec.Code)
 	}
 
-	// A hopped request against the same exhausted bucket must bypass the check.
+	// A hopped request against the same exhausted bucket must still be throttled.
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest("GET", "http://rl.example.org/", nil)
 	req.RemoteAddr = "203.0.113.9:1000"
 	req.Header.Set(PeerHopHeader, "1")
 	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
-	if rec.Code != 200 {
-		t.Fatalf("hopped request code = %d, want 200 (limiter check bypassed)", rec.Code)
+	if rec.Code != 429 {
+		t.Fatalf("hopped request code = %d, want 429 (PeerHopHeader must not bypass the limiter)", rec.Code)
 	}
 }
 

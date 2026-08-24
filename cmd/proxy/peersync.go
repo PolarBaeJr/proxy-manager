@@ -29,10 +29,9 @@ import (
 // RateLimit/RateRPM are carried across too — NOT part of the plan as
 // written, added because omitting them opens a rate-limit bypass: a
 // synthesized learned-only group on the receiving side would otherwise
-// default to RateLimit=false, so it never charges the shared limiter, while
-// ServeHTTP's hopped-request limiter skip assumes the ORIGINATING side
-// already did. Without this field neither side ever charges the bucket for a
-// route reached purely through a peer hop.
+// default to RateLimit=false, so a request routed directly into it (this
+// host has no local backend for the route at all) would never be charged
+// against the shared limiter.
 type peerRouteInfo struct {
 	Host        string `json:"host"`
 	PathPrefix  string `json:"path,omitempty"`

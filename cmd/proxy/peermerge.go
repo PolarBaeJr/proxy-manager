@@ -139,11 +139,10 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup) []*RouteGroup {
 				// brand-new (learned-only) group with no local knowledge of
 				// its own — an existing local group's own RateLimit config
 				// always wins (unchanged, same as every other label/static
-				// merge rule in this codebase). This is also what makes the
-				// hopped-request limiter skip in ServeHTTP sound: without it,
-				// a learned-only group here would default to RateLimit=false
-				// and never charge the shared limiter at all, while the
-				// peer that forwarded to us assumes we already did.
+				// merge rule in this codebase). Without this, a learned-only
+				// group here would default to RateLimit=false and never
+				// charge the shared limiter for a request routed directly
+				// into it.
 				g = &RouteGroup{
 					Host: host, PathPrefix: path, StripPrefix: lr.stripPrefix, Name: lr.name,
 					RateLimit: lr.rateLimit, RateRPM: lr.rateRPM,
