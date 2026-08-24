@@ -5,10 +5,11 @@
     <key>Label</key>
     <string>org.nginx-stream</string>
 
-    <!-- Redis-over-Tailscale TCP proxy. Separate from org.nginx ON PURPOSE:
-         it binds a Tailscale address, and nginx treats an unassignable bind
-         as fatal. Isolated here, a Tailscale-not-up-yet boot costs only this
-         proxy; the HTTP edge on :80/:443 is unaffected. -->
+    <!-- Tailscale-only TCP proxy for this box's peer side-channels (Redis,
+         dashboard). Separate from org.nginx ON PURPOSE: it binds a Tailscale
+         address, and nginx treats an unassignable bind as fatal. Isolated
+         here, a Tailscale-not-up-yet boot costs only this proxy; the HTTP
+         edge on :80/:443 is unaffected. -->
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/nginx</string>

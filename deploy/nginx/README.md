@@ -41,16 +41,23 @@ sudo nginx -t && sudo nginx -s reload
 
 Rollback is `cp` the `.bak-*` file back and reload.
 
-## `stream.d/redis-peer.conf` — Mac mini peer node only, SEPARATE nginx instance
+## `nginx-stream/` — Mac mini peer node only, SEPARATE nginx instance
 
-Do not install this into the main nginx (the one serving `conf.d/`/`snippets/`
-above). `stream{}` is a top-level block and cannot be reached from
-`conf.d/`'s `http{}` scope — and more importantly, `listen <tailscale-ip>` is
-FATAL to nginx at boot if that Tailscale interface doesn't exist yet
-(`nginx -t` fails outright, process doesn't start). Tailscale comes up as an
-independent boot service with no ordering guarantee ahead of nginx, so
-putting this in the main instance risks taking down `:80`/`:443` for every
-site on the box over a Redis side-channel on an unlucky boot.
+Started as Redis-only (`stream.d/redis-peer.conf` below is that original,
+now-superseded single-block form); the live instance has since grown a
+second `server{}` block for the dashboard's main port (`:8093`), and will
+grow a third for the dashboard peer-handshake port. All three share this one
+instance rather than each getting their own, for the same reason below.
+
+Do not install any of this into the main nginx (the one serving
+`conf.d/`/`snippets/` above). `stream{}` is a top-level block and cannot be
+reached from `conf.d/`'s `http{}` scope — and more importantly,
+`listen <tailscale-ip>` is FATAL to nginx at boot if that Tailscale interface
+doesn't exist yet (`nginx -t` fails outright, process doesn't start).
+Tailscale comes up as an independent boot service with no ordering guarantee
+ahead of nginx, so putting any of this in the main instance risks taking down
+`:80`/`:443` for every site on the box over a side-channel proxy on an
+unlucky boot.
 
 Instead it runs as a second, minimal nginx (`events{}` + a `stream{}` block
 including this file, nothing else — no `http{}`), under its own
@@ -79,7 +86,8 @@ Verified running concurrently with the main nginx with no port conflict
 (different address, different port, own pid file) — this does not reopen the
 one-nginx-per-box rule from above, which is specifically about `:443`
 contention. Confirmed end-to-end (2026-08-24): the Pi's proxy reaches Redis
-through this path with `PING` → `PONG`, auth included.
+through this path with `PING` → `PONG`, auth included, and both directions of
+Pi<->Mac dashboard reachability work through the `:8093` block.
 
 ## `deploy/nginx-stream-pi/` — Pi side of the dashboard peer transport, SEPARATE nginx instance
 
