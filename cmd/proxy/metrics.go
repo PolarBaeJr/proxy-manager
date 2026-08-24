@@ -270,10 +270,11 @@ func maxOr0(s []float64) float64 {
 // metricsServer starts an HTTP server on addr exposing /metrics (JSON),
 // /access (per-request log ring), /refresh (rebuild the router from
 // labels + routes.json on demand), /routes (currently routed hosts —
-// the auth binary uses it to validate login redirects), and /ratelimit
+// the auth binary uses it to validate login redirects), /ratelimit
 // (current rate-limit bucket state per route — the dashboard's rate-limit
-// view reads this). Bind to internal addresses only.
-func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot) {
+// view reads this), and /peer/handshake (bearer-gated peer-mesh handshake —
+// see peers.go). Bind to internal addresses only.
+func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot, peerHandler http.Handler) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -310,6 +311,9 @@ func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapsh
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"refreshed"}`))
 		})
+	}
+	if peerHandler != nil {
+		mux.Handle("/peer/handshake", peerHandler)
 	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}

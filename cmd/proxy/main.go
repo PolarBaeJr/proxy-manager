@@ -27,7 +27,10 @@ func main() {
 	authXFFTrustedCIDRs := flag.String("auth-xff-trusted-cidrs", "127.0.0.0/8,172.16.0.0/12", "comma-separated CIDRs of peers whose X-Forwarded-For is trusted")
 	authVerifyTokenURL := flag.String("auth-verify-token-url", "http://dashboard:8093/api/auth/verify-token", "dashboard endpoint used to verify bearer API tokens")
 	redisAddr := flag.String("redis-addr", "", "shared Redis address for cross-peer rate limiting, e.g. 100.83.62.68:6379 (empty = in-memory-only rate limiting, today's behavior)")
+	peers := flag.String("peers", "", "comma-separated peer proxy base URLs for the discovery handshake, e.g. http://100.83.62.68:8094 (empty = disabled)")
+	peerSyncInterval := flag.Duration("peer-sync-interval", 5*time.Second, "how often to handshake with peers (matches the proxy's health-check cadence)")
 	flag.Parse()
+	peerSecret := strings.TrimSpace(os.Getenv("PMGR_PEER_SECRET"))
 
 	metrics := NewMetrics()
 	if st, ok := loadMetricsState(*statePath); ok {
@@ -100,9 +103,31 @@ func main() {
 	}
 	refresh()
 
+	// Peer mesh discovery handshake (Phase 2 of docs/PEER_MESH_PLAN.md): only
+	// enabled when a shared secret is present. No route data crosses the wire
+	// yet, just connectivity + auth proof.
+	identity, err := os.Hostname()
+	if err != nil || identity == "" {
+		identity = "proxy"
+	}
+	peerList := splitAndTrim(*peers)
+	var peerHandler http.Handler
+	if peerSecret != "" {
+		peerHandler = peerHandshakeHandler(peerSecret, identity)
+		if len(peerList) > 0 {
+			registry := newPeerRegistry(peerList, peerSecret, identity, *peerSyncInterval)
+			go registry.Run(ctx)
+			log.Printf("proxy peers: handshaking with %d peer(s) every %s", len(peerList), *peerSyncInterval)
+		} else {
+			log.Printf("proxy peers: /peer/handshake enabled (receive-only, no outbound peers configured)")
+		}
+	} else if len(peerList) > 0 {
+		log.Printf("proxy peers: peers configured but PMGR_PEER_SECRET empty — handshake disabled")
+	}
+
 	// Pass refresh into the metrics server so /refresh can be hit by the
 	// dashboard after it edits routes.json — saves a docker restart.
-	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot)
+	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot, peerHandler)
 	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
 	go dc.streamEvents(ctx, func(action string) {
