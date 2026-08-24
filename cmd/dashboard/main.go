@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -27,6 +28,9 @@ func main() {
 	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (rw: dashboard appends onboarded routes here)")
 	serviceTokenDir := flag.String("service-token-dir", "/tokens", "directory to write auto-provisioned service credentials (e.g. statusbot's token) — a sibling container mounts this read-only")
 	redisAddr := flag.String("redis-addr", "", "shared Redis address for cross-peer user identity (passkeys/tokens/passwords), e.g. host:6379 (empty = local-file-only auth, today's behavior)")
+	peers := flag.String("peers", "", "comma-separated peer dashboard peer-handshake base URLs, e.g. http://100.83.62.68:8098 (empty = outbound handshake disabled)")
+	peerSyncInterval := flag.Duration("peer-sync-interval", 5*time.Second, "how often to handshake with peer dashboards")
+	peerAddr := flag.String("peer-addr", ":8098", "internal peer-handshake listen address (only started if DASHBOARD_PEER_SECRET is set)")
 	flag.Parse()
 
 	metrics := NewMetrics()
@@ -206,6 +210,40 @@ func main() {
 	mcpWrites := isTrue(os.Getenv("MCP_ALLOW_WRITES"))
 	registerMCPTools(mcpSrv, &apiCaller{mux: mux}, mcpWrites)
 	serveMCP(*mcpAddr, mcpSrv, mcpWrites)
+
+	// Cross-host dashboard peer handshake (Stage 2 of the cross-host control
+	// feature). Identity must be distinguishable across instances — unlike
+	// cmd/proxy, both dashboard containers share container_name "dashboard",
+	// so os.Hostname() alone can't tell them apart. Prefer DASHBOARD_HOST
+	// (already set per-instance for WebAuthn), then hostname, then a literal
+	// fallback.
+	identity := strings.TrimSpace(os.Getenv("DASHBOARD_HOST"))
+	if identity == "" {
+		if h, err := os.Hostname(); err == nil {
+			identity = h
+		}
+	}
+	if identity == "" {
+		identity = "dashboard"
+		log.Printf("⚠ DASHBOARD_HOST and hostname both unset — peer identity %q is indistinguishable from other dashboard instances", identity)
+	}
+	// Separate trust boundary from PMGR_PEER_SECRET (proxy mesh) and
+	// PMGR_ACTOR_SECRET (audit attribution) — never read, share, or fall back
+	// between them.
+	peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+	peerList := splitAndTrim(*peers)
+	switch {
+	case peerSecret != "" && len(peerList) > 0:
+		peerServer(*peerAddr, peerHandshakeHandler(peerSecret, identity))
+		registry := newPeerRegistry(peerList, peerSecret, identity, *peerSyncInterval)
+		go registry.Run(ctx)
+		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake on %s", len(peerList), *peerSyncInterval, *peerAddr)
+	case peerSecret != "":
+		peerServer(*peerAddr, peerHandshakeHandler(peerSecret, identity))
+		log.Printf("dashboard peers: /peer/handshake enabled on %s (receive-only, no outbound peers configured)", *peerAddr)
+	case len(peerList) > 0:
+		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
+	}
 
 	log.Printf("dashboard on %s", *addr)
 	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {

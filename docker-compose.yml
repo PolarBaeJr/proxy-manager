@@ -117,6 +117,10 @@ services:
       # docker network (Host: dashboard.polardev.org). Direct :8093 access
       # would leak the plaintext login page + session cookie to any LAN peer.
       - "127.0.0.1:8093:8093"
+      # Cross-host peer-handshake port (see DASHBOARD_PEER_SECRET below).
+      # Loopback-only here too — reachability across hosts is via the
+      # Tailscale-bound nginx stream proxy applied outside this repo.
+      - "127.0.0.1:8098:8098"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock        # read-write (service mgmt)
       - ./cmd/proxy/routes.json:/etc/proxy/routes.json    # rw: dashboard appends onboarded routes here
@@ -182,8 +186,21 @@ services:
       # today's default (rp_id=localhost), unchanged.
       PASSKEY_RP_ID:        ${PASSKEY_RP_ID:-}
       PASSKEY_RP_ORIGINS:   ${PASSKEY_RP_ORIGINS:-}
+      # This instance's own hostname — labels: above only interpolates it into
+      # proxy.host at compose-parse time, it isn't otherwise passed into the
+      # container. Also used as the peer-handshake identity below so Pi and
+      # Mac mini are distinguishable (container_name is "dashboard" on both).
+      DASHBOARD_HOST:       ${DASHBOARD_HOST:-}
+      # Dashboard-level peer mesh discovery handshake (see DASHBOARD_PEERS in
+      # .env.example). Empty = /peer/handshake disabled, unchanged behavior.
+      # Separate trust boundary from PMGR_PEER_SECRET/PMGR_ACTOR_SECRET above.
+      DASHBOARD_PEER_SECRET: ${DASHBOARD_PEER_SECRET:-}
+    # = form so empty env expansions don't swallow the next flag.
     command: >
       -redis-addr=${REDIS_ADDR:-}
+      -peers=${DASHBOARD_PEERS:-}
+      -peer-sync-interval=${DASHBOARD_PEER_SYNC_INTERVAL:-5s}
+      -peer-addr=:8098
 
   monitor:
     build:
