@@ -1,10 +1,12 @@
 # Peer mesh — chosen design (orientation, not a spec)
 
-Status: **not implemented.** This is the actual direction picked for
-proxy-level (request-path) federation, as opposed to `PEERS_PLAN.md`'s
-narrower dashboard-only aggregation. Written so a future session doesn't
-re-derive the design or accidentally build the older, narrower plan instead.
-Keep this short — a few hundred words, not a phase-by-phase spec.
+Status: **Phase 2 (peer discovery + handshake) implemented.** Route sync
+(peer-as-backend forwarding, `peersync.go`/`peermerge.go`) is not yet built —
+see the note below. This is the actual direction picked for proxy-level
+(request-path) federation, as opposed to `PEERS_PLAN.md`'s narrower
+dashboard-only aggregation. Written so a future session doesn't re-derive the
+design or accidentally build the older, narrower plan instead. Keep this
+short — a few hundred words, not a phase-by-phase spec.
 
 ## The core idea: peer-as-backend
 
@@ -28,9 +30,15 @@ consensus, no leader — eventual consistency, same tolerance model as edge's
 existing gossip. `cmd/proxy/peersync.go` (push loop) and `cmd/proxy/peermerge.go`
 (apply-received-routes-as-synthetic-backends) are the natural split, named
 so a reviewer maps them onto `cmd/edge/peers.go`'s `PeerSync`/`gossipHandler`
-by inspection. `cmd/proxy/peers.go` would hold the peer list/config plumbing.
-**None of these three files exist yet** — this document is the only trace of
-the design until someone picks up the phase.
+by inspection.
+
+**Implemented so far (Phase 2):** `cmd/proxy/peers.go` holds the peer
+list/config plumbing — a `PeerRegistry` that periodically POSTs an
+authenticated, placeholder handshake to every configured peer's
+`/peer/handshake` endpoint (also in `peers.go`) and records success/failure +
+last-contact time per peer. This proves connectivity and auth work end to
+end; no route/backend data crosses the wire yet. **`peersync.go` and
+`peermerge.go` do not exist yet** — that's the next phase to pick up.
 
 ## Trust: one shared bearer secret for v1
 

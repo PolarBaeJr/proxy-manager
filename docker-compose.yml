@@ -80,6 +80,9 @@ services:
       # .env.example. Empty = today's in-memory-only rate limiting, unchanged.
       REDIS_ADDR: ${REDIS_ADDR:-}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # Proxy-level peer mesh discovery handshake (see PMGR_PEERS in
+      # .env.example). Empty = /peer/handshake disabled, unchanged behavior.
+      PMGR_PEER_SECRET: ${PMGR_PEER_SECRET:-}
     # = form so empty env expansions don't swallow the next flag. Auth gating
     # stays OFF until AUTH_DOMAINS is set (e.g. polardev.org,the-aquarium.com);
     # all other proxy flags keep their built-in defaults.
@@ -87,6 +90,8 @@ services:
       -auth-domains=${AUTH_DOMAINS:-}
       -auth-trusted-cidrs=${AUTH_TRUSTED_CIDRS:-}
       -redis-addr=${REDIS_ADDR:-}
+      -peers=${PMGR_PEERS:-}
+      -peer-sync-interval=${PMGR_PEER_SYNC_INTERVAL:-5s}
 
   dashboard:
     build:
