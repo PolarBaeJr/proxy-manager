@@ -267,14 +267,23 @@ func maxOr0(s []float64) float64 {
 	return s[len(s)-1]
 }
 
+// peerHandlers groups the peer-mesh HTTP handlers registered by
+// metricsServer. Either field may be nil, in which case its route isn't
+// registered at all (same shape as the other optional metricsServer params).
+type peerHandlers struct {
+	Handshake http.Handler // POST /peer/handshake — see peers.go
+	Routes    http.Handler // POST /peer/routes — see peermerge.go
+}
+
 // metricsServer starts an HTTP server on addr exposing /metrics (JSON),
 // /access (per-request log ring), /refresh (rebuild the router from
 // labels + routes.json on demand), /routes (currently routed hosts —
 // the auth binary uses it to validate login redirects), /ratelimit
 // (current rate-limit bucket state per route — the dashboard's rate-limit
-// view reads this), and /peer/handshake (bearer-gated peer-mesh handshake —
-// see peers.go). Bind to internal addresses only.
-func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot, peerHandler http.Handler) {
+// view reads this), /peer/handshake (bearer-gated peer-mesh handshake — see
+// peers.go), and /peer/routes (bearer-gated peer route push — see
+// peermerge.go). Bind to internal addresses only.
+func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot, peers peerHandlers) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -312,8 +321,11 @@ func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapsh
 			_, _ = w.Write([]byte(`{"status":"refreshed"}`))
 		})
 	}
-	if peerHandler != nil {
-		mux.Handle("/peer/handshake", peerHandler)
+	if peers.Handshake != nil {
+		mux.Handle("/peer/handshake", peers.Handshake)
+	}
+	if peers.Routes != nil {
+		mux.Handle("/peer/routes", peers.Routes)
 	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}

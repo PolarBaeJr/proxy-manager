@@ -26,6 +26,12 @@ type Backend struct {
 	HealthPath  string
 	proxy       *httputil.ReverseProxy
 	healthyFlag atomic.Bool
+
+	// Learned marks a backend synthesized from a peer's pushed route (see
+	// peermerge.go) rather than discovered locally via docker labels or
+	// routes.json. PeerID is the identity of the peer that advertised it.
+	Learned bool
+	PeerID  string
 }
 
 func (b *Backend) markHealthy(ok bool) { b.healthyFlag.Store(ok) }
@@ -64,10 +70,44 @@ type RouteGroup struct {
 	static bool
 }
 
-func (g *RouteGroup) pickHealthy(skip map[*Backend]bool) *Backend {
+// PeerHopHeader marks a request that has already been forwarded once by a
+// peer proxy in the mesh. Its presence lets the receiving side (a) skip
+// re-charging the shared rate limiter for a request already charged by the
+// originating peer (see ServeHTTP) and (b) refuse to forward the request to
+// yet another learned (peer) backend, which is what actually prevents a
+// forwarding loop between two proxies that both only know about each other
+// for a given route.
+const PeerHopHeader = "X-Pmgr-Peer-Hop"
+
+// pickHealthy is a two-tier preference: a healthy local (non-learned) backend
+// is always chosen over a healthy learned (peer) one when both exist for the
+// route, so a peer is only ever used as a failover — per
+// docs/PEER_MESH_PLAN.md — not load-balanced alongside a working local
+// backend. Only when the local tier has nothing eligible does it fall
+// through to the learned tier (gated on allowPeer, same as before). Each
+// tier does its own weighted round-robin via the shared cursor; the cursor
+// is only advanced by a tier that actually has a candidate, so an empty
+// local tier never perturbs the round-robin sequence within the learned
+// tier (and vice versa) — this keeps existing local-only routing behavior
+// (and its round-robin sequence) untouched when there are no learned
+// backends at all.
+func (g *RouteGroup) pickHealthy(skip map[*Backend]bool, allowPeer bool) *Backend {
+	if b := g.pickHealthyTier(skip, false); b != nil {
+		return b
+	}
+	if allowPeer {
+		return g.pickHealthyTier(skip, true)
+	}
+	return nil
+}
+
+// pickHealthyTier restricts selection to backends whose Learned flag matches
+// wantLearned, applying the same skip-set + weighted round-robin logic
+// pickHealthy always used.
+func (g *RouteGroup) pickHealthyTier(skip map[*Backend]bool, wantLearned bool) *Backend {
 	var pool []*Backend
 	for _, b := range g.Backends {
-		if !b.healthy() || skip[b] {
+		if !b.healthy() || skip[b] || b.Learned != wantLearned {
 			continue
 		}
 		w := b.Weight
@@ -267,6 +307,19 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Only the proxy may set it, and only after it knows who is calling.
 	req.Header.Del(ActorHeader)
 
+	// A hopped request is one a peer proxy already forwarded to us. It skips
+	// forwarding to another learned backend (loop prevention, below) and
+	// skips the rate-limit charge the originating peer already made.
+	//
+	// Unlike ActorHeader above, this arrives unauthenticated: a peer forwards
+	// to our proxy port, not the bearer-gated metrics port, so there's no
+	// signature to check it against. For loop prevention that's fail-safe —
+	// a client forging it only denies itself peer failover. The limiter skip
+	// is NOT self-limiting the same way, so it relies on the edge (nginx)
+	// stripping any client-supplied X-Pmgr-Peer-Hop before it reaches here.
+	hopped := req.Header.Get(PeerHopHeader) != ""
+	req.Header.Del(PeerHopHeader)
+
 	r.mu.RLock()
 	groups := r.groups
 	r.mu.RUnlock()
@@ -308,7 +361,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		serveUnavailable(w, http.StatusNotFound, reqHost, "Service unavailable at this time, try again later.")
 		return
 	}
-	if group.limiter != nil {
+	// Skip the check entirely for a request that already hopped from a peer:
+	// the originating peer already charged this request against the shared
+	// (Redis-backed) limiter before forwarding it here, so charging it again
+	// on the receiving side would double-decrement the same bucket for one
+	// logical request.
+	if group.limiter != nil && !hopped {
 		key := rlKey(req, r.xffTrusted)
 		if !group.limiter.Allow(key) {
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(group.RateRPM)))
@@ -339,7 +397,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	tried := map[*Backend]bool{}
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		b := group.pickHealthy(tried)
+		b := group.pickHealthy(tried, !hopped)
 		if b == nil {
 			break
 		}
@@ -663,5 +721,35 @@ func makeBackend(rawURL string, weight int, container, healthPath string, u *url
 	}
 	return &Backend{
 		URL: rawURL, Weight: weight, Container: container, HealthPath: healthPath, proxy: p,
+	}
+}
+
+// makePeerBackend builds a synthetic *Backend that forwards to another proxy
+// instance in the mesh instead of a local container. routeHost/pathPrefix
+// are the route's own identity (not the peer's) — pathPrefix and stripPrefix
+// mirror the owning RouteGroup so the Director can restore the prefix that
+// ServeHTTP already stripped from req.URL.Path before it ever reaches here
+// (see the StripPrefix block above); without that restoration the peer's own
+// ServeHTTP wouldn't be able to match/strip it itself. Returns nil if
+// peerBaseURL doesn't parse.
+func makePeerBackend(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool, peerID string) *Backend {
+	u, err := url.Parse(peerBaseURL)
+	if err != nil {
+		log.Printf("peer backend: bad URL %q: %v", peerBaseURL, err)
+		return nil
+	}
+	p := httputil.NewSingleHostReverseProxy(u)
+	orig := p.Director
+	p.Director = func(req *http.Request) {
+		orig(req)
+		req.Host = routeHost
+		if stripPrefix && pathPrefix != "" {
+			req.URL.Path = pathPrefix + req.URL.Path
+		}
+		req.Header.Set(PeerHopHeader, "1")
+	}
+	return &Backend{
+		URL: peerBaseURL, Weight: 1, Container: "peer:" + peerID, proxy: p,
+		Learned: true, PeerID: peerID,
 	}
 }

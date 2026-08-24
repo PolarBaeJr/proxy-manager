@@ -28,7 +28,8 @@ func main() {
 	authVerifyTokenURL := flag.String("auth-verify-token-url", "http://dashboard:8093/api/auth/verify-token", "dashboard endpoint used to verify bearer API tokens")
 	redisAddr := flag.String("redis-addr", "", "shared Redis address for cross-peer rate limiting, e.g. 100.83.62.68:6379 (empty = in-memory-only rate limiting, today's behavior)")
 	peers := flag.String("peers", "", "comma-separated peer proxy base URLs for the discovery handshake, e.g. http://100.83.62.68:8094 (empty = disabled)")
-	peerSyncInterval := flag.Duration("peer-sync-interval", 5*time.Second, "how often to handshake with peers (matches the proxy's health-check cadence)")
+	peerSyncInterval := flag.Duration("peer-sync-interval", 5*time.Second, "how often to handshake with peers and push/resync learned routes (matches the proxy's health-check cadence)")
+	peerAdvertiseURL := flag.String("peer-advertise-url", "", "this proxy's own base URL as reachable by peers, e.g. http://100.83.62.68:8092 — empty disables route push")
 	flag.Parse()
 	peerSecret := strings.TrimSpace(os.Getenv("PMGR_PEER_SECRET"))
 
@@ -88,12 +89,19 @@ func main() {
 		router.auth = newAuthGate(secret, actorSecret, *authDomains, *authTrustedCIDRs, *authXFFTrustedCIDRs, *authVerifyTokenURL)
 		log.Printf("auth gate enabled for domain(s) %s", *authDomains)
 	}
+	// routeStore holds routes pushed by peers (Phase 3 of
+	// docs/PEER_MESH_PLAN.md), overlaid onto freshly-assembled groups on every
+	// refresh() below. ttl is a multiple of the sync interval so a route
+	// survives a couple of missed pushes before it's dropped.
+	routeStore := newPeerRouteStore(3 * *peerSyncInterval)
+
 	refresh := func() {
 		groups, err := assembleGroups(ctx, dc, *staticConfig)
 		if err != nil {
 			log.Printf("refresh: %v", err)
 			return
 		}
+		groups = routeStore.overlay(groups)
 		router.Set(groups)
 		total := 0
 		for _, g := range groups {
@@ -103,23 +111,66 @@ func main() {
 	}
 	refresh()
 
-	// Peer mesh discovery handshake (Phase 2 of docs/PEER_MESH_PLAN.md): only
-	// enabled when a shared secret is present. No route data crosses the wire
-	// yet, just connectivity + auth proof.
+	// Peer mesh discovery handshake (Phase 2 of docs/PEER_MESH_PLAN.md) and
+	// route sync (Phase 3): both only enabled when a shared secret is
+	// present.
 	identity, err := os.Hostname()
 	if err != nil || identity == "" {
 		identity = "proxy"
 	}
 	peerList := splitAndTrim(*peers)
-	var peerHandler http.Handler
+	var ph peerHandlers
 	if peerSecret != "" {
-		peerHandler = peerHandshakeHandler(peerSecret, identity)
+		ph.Handshake = peerHandshakeHandler(peerSecret, identity)
+		ph.Routes = peerRoutesHandler(peerSecret, routeStore, refresh)
+
+		// Periodic TTL-eviction check: refresh() is otherwise only driven by
+		// Docker events (see streamEvents below) and a successful peer route
+		// push (see peerRoutesHandler, which skips refresh() on a
+		// steady-state push that doesn't add a new route/peer). Without
+		// this, a PeerRouteStore entry that ages past its TTL would never
+		// actually get evicted from the live router. Deliberately gated on
+		// peerSecret alone, NOT on len(peerList) > 0: a receive-only host
+		// (secret set, no outbound -peers) still accepts pushes into
+		// routeStore via /peer/routes and needs this same eviction —
+		// gating it behind outbound peers being configured would leave TTL
+		// permanently decorative for exactly that host.
+		//
+		// Each tick only does a cheap in-memory scan (routeStore.hasExpired,
+		// no Docker call) and calls the actual (Docker-listing) refresh()
+		// only when that scan finds something past its TTL — refresh() is
+		// deliberately event-driven and must not be polled unconditionally
+		// against the Docker API just to notice an idle store has nothing to
+		// evict.
+		go func() {
+			t := time.NewTicker(*peerSyncInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					if routeStore.hasExpired() {
+						refresh()
+					}
+				}
+			}
+		}()
+
 		if len(peerList) > 0 {
 			registry := newPeerRegistry(peerList, peerSecret, identity, *peerSyncInterval)
 			go registry.Run(ctx)
 			log.Printf("proxy peers: handshaking with %d peer(s) every %s", len(peerList), *peerSyncInterval)
+
+			if *peerAdvertiseURL != "" {
+				routePush := newPeerSync(router, peerList, peerSecret, identity, *peerAdvertiseURL, *peerSyncInterval)
+				go routePush.Run(ctx)
+				log.Printf("proxy peers: pushing routes to %d peer(s) every %s, advertising %s", len(peerList), *peerSyncInterval, *peerAdvertiseURL)
+			} else {
+				log.Printf("proxy peers: -peer-advertise-url unset — route push disabled (receive-only)")
+			}
 		} else {
-			log.Printf("proxy peers: /peer/handshake enabled (receive-only, no outbound peers configured)")
+			log.Printf("proxy peers: /peer/handshake and /peer/routes enabled (receive-only, no outbound peers configured)")
 		}
 	} else if len(peerList) > 0 {
 		log.Printf("proxy peers: peers configured but PMGR_PEER_SECRET empty — handshake disabled")
@@ -127,7 +178,7 @@ func main() {
 
 	// Pass refresh into the metrics server so /refresh can be hit by the
 	// dashboard after it edits routes.json — saves a docker restart.
-	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot, peerHandler)
+	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot, ph)
 	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
 	go dc.streamEvents(ctx, func(action string) {

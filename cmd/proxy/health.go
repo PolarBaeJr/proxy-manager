@@ -45,6 +45,11 @@ func checkBackend(b *Backend) {
 		b.markHealthy(resp.StatusCode/100 == 2)
 		return
 	}
+	// A learned (peer) backend has no HealthPath — deliberately: this bare TCP
+	// dial only proves the peer proxy process is reachable at all, not that it
+	// still serves this specific route. Route-level staleness is handled by
+	// TTL expiry in PeerRouteStore.overlay, not health checks — don't invent a
+	// route-specific health path here.
 	u, _ := url.Parse(b.URL)
 	d := net.Dialer{Timeout: healthTimeout}
 	conn, err := d.DialContext(ctx, "tcp", u.Host)

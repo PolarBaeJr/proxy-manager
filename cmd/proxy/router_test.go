@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -586,5 +587,229 @@ func TestServeHTTPStripPrefix(t *testing.T) {
 	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, httptest.NewRequest("GET", "http://a.example.org/api/foo", nil))
 	if seen != "/foo" {
 		t.Fatalf("backend saw path %q, want /foo (prefix stripped)", seen)
+	}
+}
+
+// TestPickHealthySkipsLearnedUnlessAllowed proves the allowPeer gate on
+// pickHealthy: with allowPeer=false a learned backend must never be chosen
+// (this is what stops a request that already hopped from a peer being
+// forwarded to yet another peer), even when it's the only eligible backend
+// in the group (i.e. the local tier is empty).
+func TestPickHealthySkipsLearnedUnlessAllowed(t *testing.T) {
+	learned := makePeerBackend("http://127.0.0.1:2", "h.example.org", "", false, "peer-b")
+	learned.markHealthy(true)
+	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{learned}}
+
+	for i := 0; i < 50; i++ {
+		if b := g.pickHealthy(nil, false); b != nil {
+			t.Fatal("pickHealthy(nil, false) returned a backend when the only eligible one is learned")
+		}
+	}
+	if b := g.pickHealthy(nil, true); b == nil || !b.Learned {
+		t.Fatal("pickHealthy(nil, true) should fall through to the learned tier when no local backend exists")
+	}
+}
+
+// TestPickHealthyPrefersLocalOverLearned is the fix for the load-balance bug:
+// docs/PEER_MESH_PLAN.md specifies a peer is used only "when its own
+// backends for a route are unhealthy or absent" (failover), not load-balanced
+// alongside a working local backend. With one healthy local and one healthy
+// learned backend for the same route, pickHealthy(nil, true) must never
+// return the learned one while the local stays healthy; once the local is
+// marked unhealthy, it must fail over to the learned backend.
+func TestPickHealthyPrefersLocalOverLearned(t *testing.T) {
+	u, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	local := makeBackend("http://127.0.0.1:1", 1, "c", "", u, "h.example.org")
+	local.markHealthy(true)
+	learned := makePeerBackend("http://127.0.0.1:2", "h.example.org", "", false, "peer-b")
+	learned.markHealthy(true)
+	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{local, learned}}
+
+	for i := 0; i < 200; i++ {
+		if b := g.pickHealthy(nil, true); b == nil || b.Learned {
+			t.Fatal("pickHealthy(nil, true) returned the learned backend while a healthy local backend exists")
+		}
+	}
+
+	local.markHealthy(false)
+	for i := 0; i < 50; i++ {
+		if b := g.pickHealthy(nil, true); b == nil || !b.Learned {
+			t.Fatal("pickHealthy(nil, true) should fail over to the learned backend once the local one is unhealthy")
+		}
+	}
+}
+
+// TestPeerBackendRestoresStrippedPrefix proves the prefix-restoration fix:
+// ServeHTTP strips group.PathPrefix from req.URL.Path before pickHealthy
+// ever runs, so makePeerBackend's Director must restore it before forwarding
+// to the peer — otherwise the receiving peer's own host+path match fails or
+// hits the wrong group.
+func TestPeerBackendRestoresStrippedPrefix(t *testing.T) {
+	var seenPath, seenHost, seenHop string
+	peerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenHost = r.Host
+		seenHop = r.Header.Get(PeerHopHeader)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer peerBackend.Close()
+
+	b := makePeerBackend(peerBackend.URL, "mcp.example.org", "/mcp/foo", true, "peer-b")
+	g := &RouteGroup{Host: "mcp.example.org", PathPrefix: "/mcp/foo", StripPrefix: true, Backends: []*Backend{b}}
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://mcp.example.org/mcp/foo/bar", nil)
+	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if seenPath != "/mcp/foo/bar" {
+		t.Fatalf("peer backend saw path %q, want /mcp/foo/bar (stripped prefix must be restored before the peer hop)", seenPath)
+	}
+	if seenHost != "mcp.example.org" {
+		t.Fatalf("peer backend saw Host %q, want mcp.example.org", seenHost)
+	}
+	if seenHop != "1" {
+		t.Fatal("peer backend never saw PeerHopHeader set on the outbound hop")
+	}
+}
+
+// TestServeHTTPHoppedRequestBypassesLimiter proves the hopped-request
+// limiter skip: a request that already hopped from a peer must skip the
+// rate-limit check (the originating peer already charged the shared
+// bucket), while a non-hopped request against the same exhausted bucket
+// still gets 429.
+func TestServeHTTPHoppedRequestBypassesLimiter(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	g := mkGroup(t, "rl.example.org", "", false, backend.URL)
+	g.RateLimit, g.RateRPM = true, 1
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	// First request consumes the sole token (capacity 1).
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://rl.example.org/", nil)
+	req.RemoteAddr = "203.0.113.9:1000"
+	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+	if rec.Code != 200 {
+		t.Fatalf("first request code = %d, want 200", rec.Code)
+	}
+
+	// A second, non-hopped request against the same exhausted bucket is throttled.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "http://rl.example.org/", nil)
+	req.RemoteAddr = "203.0.113.9:1000"
+	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+	if rec.Code != 429 {
+		t.Fatalf("non-hopped request code = %d, want 429 (limiter exhausted)", rec.Code)
+	}
+
+	// A hopped request against the same exhausted bucket must bypass the check.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "http://rl.example.org/", nil)
+	req.RemoteAddr = "203.0.113.9:1000"
+	req.Header.Set(PeerHopHeader, "1")
+	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+	if rec.Code != 200 {
+		t.Fatalf("hopped request code = %d, want 200 (limiter check bypassed)", rec.Code)
+	}
+}
+
+// TestPeerRouteStoreOverlayRateLimitReachesRouterSet proves the full
+// overlay -> router.Set() pipeline: a synthesized learned-only group that
+// carries RateLimit/RateRPM from a peer push actually gets a working
+// limiter wired up by Set()'s existing reconciliation, exactly like a
+// locally-discovered rate-limited group would. Without this, a route
+// reached purely through a peer hop would never have its shared bucket
+// charged by either side (see peersync.go's peerRouteInfo doc comment).
+func TestPeerRouteStoreOverlayRateLimitReachesRouterSet(t *testing.T) {
+	store := newPeerRouteStore(time.Minute)
+	store.merge(peerRoutePayload{
+		Peer: "b", Advertise: "http://127.0.0.1:1",
+		Routes: []peerRouteInfo{{Host: "rl.example.org", Backends: 1, RateLimit: true, RateRPM: 1}},
+	})
+
+	r := &Router{}
+	r.Set(store.overlay(nil))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://rl.example.org/", nil)
+	req.RemoteAddr = "203.0.113.9:1000"
+	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+	// First request against the learned backend fails (nothing listening at
+	// 127.0.0.1:1, connection refused immediately — no DNS involved) but must
+	// still have consumed the sole token.
+	if rec.Code == 429 {
+		t.Fatalf("first request unexpectedly rate-limited already: code = %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "http://rl.example.org/", nil)
+	req.RemoteAddr = "203.0.113.9:1000"
+	r.ServeHTTP(&accessWriter{ResponseWriter: rec}, req)
+	if rec.Code != 429 {
+		t.Fatalf("second request code = %d, want 429 (limiter must be wired up on the overlay-synthesized group)", rec.Code)
+	}
+}
+
+// TestPeerMeshLoopPreventionTwoInstances is the single most important test
+// in the peer mesh: two independent Routers, each with, for the same host,
+// ONLY a learned backend pointing at the other (mutual, no local backend on
+// either side). A request to A must forward to B exactly once — B sees
+// PeerHopHeader set, pickHealthy(_, false) finds no eligible backend since
+// B's only backend for that route is also learned, and B returns 503 —
+// rather than A and B bouncing the request back and forth forever.
+func TestPeerMeshLoopPreventionTwoInstances(t *testing.T) {
+	const host = "shared.example.org"
+
+	rA := &Router{}
+	rB := &Router{}
+
+	var hitsB atomic.Int32
+	var srvA, srvB *httptest.Server
+	srvA = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rA.ServeHTTP(w, r)
+	}))
+	defer srvA.Close()
+	srvB = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitsB.Add(1)
+		rB.ServeHTTP(w, r)
+	}))
+	defer srvB.Close()
+
+	bA := makePeerBackend(srvB.URL, host, "", false, "b")
+	rA.Set([]*RouteGroup{{Host: host, Backends: []*Backend{bA}}})
+
+	bB := makePeerBackend(srvA.URL, host, "", false, "a")
+	rB.Set([]*RouteGroup{{Host: host, Backends: []*Backend{bB}}})
+
+	req, err := http.NewRequest("GET", srvA.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request to A: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (B has no eligible backend for an already-hopped request)", resp.StatusCode)
+	}
+	if got := hitsB.Load(); got != 1 {
+		t.Fatalf("B was hit %d time(s), want exactly 1 (no forwarding loop)", got)
 	}
 }
