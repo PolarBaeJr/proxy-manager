@@ -2615,13 +2615,51 @@ function paintLogs() {
 }
 
 /* ---------- Access log (proxy ring buffer) ---------- */
-let accessState = { limit:200, hostFilter:'', statusFilter:'', textFilter:'', follow:true, mounted:false, entries:[] };
+// accessState.host: '' = this host; a peer identity string otherwise —
+// same on-demand host-picker shape as Images' _imagesHost, but kept inside
+// accessState (not persisted via loadPref/savePref) since the Access tab
+// remounts fresh on every tab-visit anyway.
+let accessState = { limit:200, hostFilter:'', statusFilter:'', textFilter:'', follow:true, mounted:false, entries:[], host:'' };
+
+async function loadAccessPeerOptions() {
+  try {
+    const d = await (await fetch('/api/peers')).json();
+    return d.peers || [];
+  } catch (e) { return []; }
+}
+
+// updateAccessHostBadge paints the "viewing peer X" pill without a full
+// remount — called both at mount time and from the picker's onchange, so
+// the two call sites can't drift.
+function updateAccessHostBadge() {
+  const b = $('#acc-host-badge');
+  if (!b) return;
+  b.innerHTML = accessState.host
+    ? ' <span class="pill muted" title="Viewing access log on ' + esc(machineLabel(accessState.host)) + '">' + I.layers + esc(machineLabel(accessState.host)) + '</span>'
+    : '';
+}
 
 async function renderAccess() {
   const el = $('#tab-access');
   if (!accessState.mounted) {
+    if (_selfIdentity === null) await loadSelfIdentity();
+    const peers = (await loadAccessPeerOptions()).filter(p => p.identity);
+    if (accessState.host && !peers.some(p => p.identity === accessState.host)) {
+      accessState.host = '';
+      accessState.entries = [];
+    }
+    const pickerOptions = ['<option value="">This host' + (_selfIdentity ? ' (' + esc(machineLabel(_selfIdentity)) + ')' : '') + '</option>']
+      .concat(peers.map(p => {
+        const label = machineLabel(p.identity) + (!p.ok ? ' (unreachable)' : '');
+        const selected = p.identity === accessState.host ? ' selected' : '';
+        return '<option value="' + esc(p.identity) + '"' + selected + '>' + esc(label) + '</option>';
+      }));
     el.innerHTML =
-      '<div class="subhead">' + I.activity + 'Proxy access log <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— last ' + accessState.limit + ' requests</span></div>'
+      '<div class="card"><div class="card-head"><div class="ttl">' + I.globe + '<span>Viewing</span></div>'
+      +   '<div class="spacer"></div>'
+      +   '<select id="acc-host-select">' + pickerOptions.join('') + '</select>'
+      + '</div></div>'
+      + '<div class="subhead">' + I.activity + 'Proxy access log<span id="acc-host-badge"></span> <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— last ' + accessState.limit + ' requests</span></div>'
       + '<div class="card">'
       +   '<div class="logs-toolbar">'
       +     '<div class="field"><label>Host</label>'
@@ -2639,12 +2677,19 @@ async function renderAccess() {
       +   '<div id="acc-view"><div class="acc-empty">Loading…</div></div>'
       +   '<div id="acc-meta" class="log-status idle"><span class="dot"></span><span id="acc-meta-text">idle</span></div>'
       + '</div>';
+    $('#acc-host-select').onchange = e => {
+      accessState.host = e.target.value;
+      accessState.entries = [];
+      updateAccessHostBadge();
+      fetchAccess();
+    };
     $('#acc-host').oninput   = e => { accessState.hostFilter = e.target.value; paintAccess(); };
     $('#acc-status').oninput = e => { accessState.statusFilter = e.target.value; paintAccess(); };
     $('#acc-text').oninput   = e => { accessState.textFilter = e.target.value; paintAccess(); };
     $('#acc-limit').onchange = e => { accessState.limit = Math.max(50, Math.min(2000, parseInt(e.target.value)||200)); fetchAccess(); };
     $('#acc-follow').onchange = e => { accessState.follow = e.target.checked; };
     $('#acc-refresh-btn').onclick = () => fetchAccess();
+    updateAccessHostBadge();
     accessState.mounted = true;
   }
   if (accessState.follow || !accessState.entries.length) {
@@ -2660,7 +2705,8 @@ async function fetchAccess() {
   if (meta) meta.className = 'log-status';
   if (txt) txt.textContent = 'fetching…';
   try {
-    const r = await api('/api/access?limit=' + accessState.limit);
+    const q = '/api/access?limit=' + accessState.limit + (accessState.host ? '&host=' + encodeURIComponent(accessState.host) : '');
+    const r = await api(q);
     accessState.entries = r.entries || [];
     paintAccess();
     if (txt) txt.textContent = (accessState.entries.length) + ' shown · ' + fmt(r.total || 0) + ' total · refreshed ' + fmtTime();
