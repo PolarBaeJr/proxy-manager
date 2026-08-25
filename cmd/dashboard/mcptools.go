@@ -79,7 +79,43 @@ func pretty(b []byte) string {
 	return string(out)
 }
 
-func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
+// hostArg reads the optional peer-targeting argument named by key, gated
+// separately from allowWrites: a model acting on a hallucinated or wrong
+// host could mutate a service it never meant to touch, so reaching another
+// host by name requires its own explicit opt-in (MCP_ALLOW_PEER_WRITES)
+// even when local writes are already enabled.
+//
+// key is not always "host" — onboard_service already uses that name for the
+// hostname to ROUTE (an unrelated, required argument), so it reads this one
+// under "peer_host" instead; every other tool here reads it under "host".
+func hostArg(args map[string]any, key string, allowPeerWrites bool) (string, error) {
+	host, err := argOptionalString(args, key)
+	if err != nil {
+		return "", err
+	}
+	if host == "" {
+		return "", nil
+	}
+	if !allowPeerWrites {
+		return "", fmt.Errorf("%s %q given but cross-host MCP writes are disabled (set MCP_ALLOW_PEER_WRITES=true to enable)", key, host)
+	}
+	return host, nil
+}
+
+// withHost appends ?host=<host> (or &host=<host> if path already has a
+// query string) to path, or returns path unchanged if host is empty.
+func withHost(path, host string) string {
+	if host == "" {
+		return path
+	}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + "host=" + url.QueryEscape(host)
+}
+
+func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool) {
 	// ---- read-only ----
 
 	s.Register(Tool{
@@ -192,13 +228,19 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 		Description: "Force an immediate check of whether a newer image is available in the registry for this service, instead of waiting for the periodic background poll (runs roughly every 10 minutes). Does not change anything about the running service — only refreshes the cached 'update available' status, which then shows up in list_services. If a canary is currently staged, its image is checked too — the response is a single status object when there's no canary, or {\"live\":..., \"canary\":...} when there is.",
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
+			"host":    prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/check", nil)
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			path := "/api/services/" + url.PathEscape(name) + "/check"
+			b, err := a.call(ctx, "POST", withHost(path, host), nil)
 			if err != nil {
 				return "", err
 			}
@@ -250,6 +292,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 		InputSchema: schema(map[string]any{
 			"service":  prop("string", "Service name from list_services."),
 			"replicas": prop("number", "Desired replica count (>= 0)."),
+			"host":     prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "replicas"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -263,7 +306,12 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if n < 0 {
 				return "", fmt.Errorf("replicas must not be negative")
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/scale", map[string]any{"replicas": n})
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			path := "/api/services/" + url.PathEscape(name) + "/scale"
+			b, err := a.call(ctx, "POST", withHost(path, host), map[string]any{"replicas": n})
 			if err != nil {
 				return "", err
 			}
@@ -279,6 +327,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
 			"action":  map[string]any{"type": "string", "enum": []string{"start", "stop"}, "description": "start or stop"},
+			"host":    prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "action"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -292,7 +341,12 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if action != "start" && action != "stop" {
 				return "", fmt.Errorf("action must be \"start\" or \"stop\", got %q", action)
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/"+action, nil)
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			path := "/api/services/" + url.PathEscape(name) + "/" + action
+			b, err := a.call(ctx, "POST", withHost(path, host), nil)
 			if err != nil {
 				return "", err
 			}
@@ -308,6 +362,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
 			"enabled": prop("boolean", "true to enable unattended updates."),
+			"host":    prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "enabled"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -318,7 +373,12 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/autoupdate", map[string]any{"enabled": on})
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			path := "/api/services/" + url.PathEscape(name) + "/autoupdate"
+			b, err := a.call(ctx, "POST", withHost(path, host), map[string]any{"enabled": on})
 			if err != nil {
 				return "", err
 			}
@@ -360,6 +420,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 				"description": "Env var names from a prior conflict response that should be " +
 					"overwritten. Resubmit the same env plus these names.",
 			},
+			"host": prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "image"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -378,6 +439,10 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
 			body := map[string]any{"image": image}
 			if len(env) > 0 {
 				body["env"] = env
@@ -385,7 +450,8 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if len(ack) > 0 {
 				body["env_ack"] = ack
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/stage", body)
+			path := "/api/services/" + url.PathEscape(name) + "/stage"
+			b, err := a.call(ctx, "POST", withHost(path, host), body)
 			if err != nil {
 				return "", err
 			}
@@ -424,6 +490,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 				"description": "Env var names from a prior conflict response that should be " +
 					"overwritten. Resubmit the same env plus these names.",
 			},
+			"host": prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "image"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -442,6 +509,10 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
 			body := map[string]any{"image": image}
 			if len(env) > 0 {
 				body["env"] = env
@@ -449,7 +520,8 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if len(ack) > 0 {
 				body["env_ack"] = ack
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/replace", body)
+			path := "/api/services/" + url.PathEscape(name) + "/replace"
+			b, err := a.call(ctx, "POST", withHost(path, host), body)
 			if err != nil {
 				return "", err
 			}
@@ -465,6 +537,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
 			"action":  map[string]any{"type": "string", "enum": []string{"promote", "discard"}, "description": "promote or discard"},
+			"host":    prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "action"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -475,15 +548,21 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
 			switch action {
 			case "promote":
-				b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/promote", nil)
+				path := "/api/services/" + url.PathEscape(name) + "/promote"
+				b, err := a.call(ctx, "POST", withHost(path, host), nil)
 				if err != nil {
 					return "", err
 				}
 				return pretty(b), nil
 			case "discard":
-				b, err := a.call(ctx, "DELETE", "/api/services/"+url.PathEscape(name)+"/canary", nil)
+				path := "/api/services/" + url.PathEscape(name) + "/canary"
+				b, err := a.call(ctx, "DELETE", withHost(path, host), nil)
 				if err != nil {
 					return "", err
 				}
@@ -513,6 +592,9 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			"path":     prop("string", "Path prefix to route (default: all paths)."),
 			"strip":    prop("boolean", "Strip the path prefix before forwarding (default: false)."),
 			"replicas": prop("number", "Number of replacement replicas to create (default: 1)."),
+			"peer_host": prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by "+
+				"list_services) to onboard a container on a DIFFERENT dashboard host instead of this one. Not "+
+				"to be confused with \"host\" above, which is the hostname to ROUTE. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "host", "port"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -543,7 +625,12 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 					return "", err
 				}
 			}
-			b, err := a.call(ctx, "POST", "/api/discovery/"+url.PathEscape(name)+"/onboard", OnboardRequest{
+			peerHost, err := hostArg(args, "peer_host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			path2 := "/api/discovery/" + url.PathEscape(name) + "/onboard"
+			b, err := a.call(ctx, "POST", withHost(path2, peerHost), OnboardRequest{
 				Host: host, Port: port, Path: path, Strip: strip, Replicas: replicas,
 			})
 			if err != nil {
@@ -566,13 +653,19 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 		Mutating: true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
+			"host":    prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/offboard", nil)
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			path := "/api/services/" + url.PathEscape(name) + "/offboard"
+			b, err := a.call(ctx, "POST", withHost(path, host), nil)
 			if err != nil {
 				return "", err
 			}
@@ -589,6 +682,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			"service": prop("string", "Service name from list_services."),
 			"member":  prop("string", "Replica name from list_services' member_summaries."),
 			"action":  map[string]any{"type": "string", "enum": []string{"start", "stop", "restart"}, "description": "start, stop, or restart"},
+			"host":    prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "member", "action"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
@@ -603,10 +697,14 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 			if err != nil {
 				return "", err
 			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
 			base := "/api/services/" + url.PathEscape(name) + "/replicas/" + url.PathEscape(member) + "/"
 			switch action {
 			case "start", "stop":
-				b, err := a.call(ctx, "POST", base+action, nil)
+				b, err := a.call(ctx, "POST", withHost(base+action, host), nil)
 				if err != nil {
 					return "", err
 				}
@@ -615,10 +713,10 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites bool) {
 				// Abort on stop failure rather than attempting start anyway —
 				// a replica already down for another reason shouldn't be
 				// force-started as a side effect of a restart request.
-				if _, err := a.call(ctx, "POST", base+"stop", nil); err != nil {
+				if _, err := a.call(ctx, "POST", withHost(base+"stop", host), nil); err != nil {
 					return "", err
 				}
-				b, err := a.call(ctx, "POST", base+"start", nil)
+				b, err := a.call(ctx, "POST", withHost(base+"start", host), nil)
 				if err != nil {
 					// The stop already succeeded, so this is not a generic
 					// failure — the replica is now down and needs the caller's

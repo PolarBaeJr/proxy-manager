@@ -348,7 +348,7 @@ func actorFrom(ctx context.Context) string {
 // serveMCP starts the MCP listener. Mounted at "/" because the proxy strips the
 // /mcp/dashboard prefix before forwarding; registering the prefix here too
 // would double it.
-func serveMCP(addr string, s *Server, allowWrites bool) {
+func serveMCP(addr string, s *Server, allowWrites, allowPeerWrites bool) {
 	mux := http.NewServeMux()
 	mux.Handle("/", s)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
@@ -358,6 +358,9 @@ func serveMCP(addr string, s *Server, allowWrites bool) {
 	mode := "read-only"
 	if allowWrites {
 		mode = "READ-WRITE (MCP_ALLOW_WRITES set)"
+	}
+	if allowPeerWrites {
+		mode += ", peer writes ENABLED (MCP_ALLOW_PEER_WRITES set)"
 	}
 	log.Printf("mcp on %s — %d tools, %s", addr, len(s.tools), mode)
 }

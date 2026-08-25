@@ -276,8 +276,9 @@ func main() {
 	}
 	mcpSrv := NewServer("proxy-manager-dashboard", "1")
 	mcpWrites := isTrue(os.Getenv("MCP_ALLOW_WRITES"))
-	registerMCPTools(mcpSrv, &apiCaller{mux: mux}, mcpWrites)
-	serveMCP(*mcpAddr, mcpSrv, mcpWrites)
+	mcpPeerWrites := isTrue(os.Getenv("MCP_ALLOW_PEER_WRITES"))
+	registerMCPTools(mcpSrv, &apiCaller{mux: mux}, mcpWrites, mcpPeerWrites)
+	serveMCP(*mcpAddr, mcpSrv, mcpWrites, mcpPeerWrites)
 
 	if redisClient != nil {
 		go registry.ratchetOwnVersion(ctx)

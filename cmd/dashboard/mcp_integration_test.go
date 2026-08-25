@@ -27,7 +27,7 @@ func TestMCPToolReachesRealHandler(t *testing.T) {
 	mux := newDashboardMux(nil, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, nil)
 
 	srv := NewServer("t", "v")
-	registerMCPTools(srv, &apiCaller{mux: mux}, false)
+	registerMCPTools(srv, &apiCaller{mux: mux}, false, false)
 
 	res, _ := rpc(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"maintenance_status","arguments":{}}}`)
 	if res["error"] != nil {
@@ -57,7 +57,7 @@ func TestMCPToolRefusedWithoutInternalCredential(t *testing.T) {
 
 	mux := newDashboardMux(nil, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, nil)
 	srv := NewServer("t", "v")
-	registerMCPTools(srv, &apiCaller{mux: mux}, false)
+	registerMCPTools(srv, &apiCaller{mux: mux}, false, false)
 
 	res, _ := rpc(t, srv, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"maintenance_status","arguments":{}}}`)
 	r := res["result"].(map[string]any)
