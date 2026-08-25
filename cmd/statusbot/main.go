@@ -1,15 +1,18 @@
 // statusbot: a Discord bot, deployed as its own container separate from
 // dashboard/proxy/edge, that polls the dashboard's authenticated
-// GET /api/service-status endpoint (see servicestatus.go/statusembed.go) on
-// a fixed ticker and keeps a single persistent "service status" embed — one
-// field per service group, with an aggregate up/degraded/down count in its
-// header — edited in place on every tick rather than a new message every
-// time, falling back to a new message if the edit fails (e.g. the message
-// was deleted). The "/set-alert-channel" slash command (Manage Server
-// permission required) lets a user move that message to whatever channel
-// they invoke it in, persisted to disk so it survives a container restart —
-// doubling as a capability probe (confirms the bot can post there) and the
-// seed for the new channel's status message.
+// GET /api/service-status endpoint (see servicestatus.go/statuspager.go) on
+// a fixed ticker and keeps a single persistent "service status" message —
+// an overview page plus one page per service group, paged through with
+// Back/Next buttons (see statuspager.go) — edited in place on every tick
+// rather than a new message every time, falling back to a new message if
+// the edit fails (e.g. the message was deleted). Whichever page a user last
+// navigated to stays selected across ticks; a button click updates that
+// page instantly from the last successful poll rather than fetching fresh.
+// The "/set-alert-channel" slash command (Manage Server permission
+// required) lets a user move that message to whatever channel they invoke
+// it in, persisted to disk so it survives a container restart — doubling as
+// a capability probe (confirms the bot can post there) and the seed for the
+// new channel's status message.
 //
 // Separately, it also polls the dashboard's public GET /api/health endpoint
 // on its own slower ticker purely to keep the on-demand "!status" reply
@@ -74,7 +77,9 @@ func main() {
 	var mu sync.Mutex
 	var lastHealth healthStatus
 	var lastErr error
-	var lastStatusErr string // last service-status fetch error's message, "" = last poll succeeded; only used to dedupe repeated log lines below
+	var lastStatusErr string             // last service-status fetch error's message, "" = last poll succeeded; only used to dedupe repeated log lines below
+	var lastStatusResp serviceStatusResp // last successful service-status fetch, kept so a Back/Next click can rebuild any page without waiting for the next poll
+	var statusPage int                   // 0-indexed page currently shown in the persistent status message; survives across poll ticks, reset to 0 whenever the message is (re)created
 
 	poll := func() {
 		hs, err := fetchHealth(context.Background(), *healthURL, client)
@@ -94,6 +99,9 @@ func main() {
 		mu.Lock()
 		shouldLog := errMsg != lastStatusErr // dedupe: only log when the error (or its absence) changes, not every tick
 		lastStatusErr = errMsg
+		if fetchErr == nil {
+			lastStatusResp = resp
+		}
 		target := alertChannelID
 		msgID := statusMessageID
 		mu.Unlock()
@@ -103,23 +111,41 @@ func main() {
 		if target == "" {
 			return
 		}
-		var embed *discordgo.MessageEmbed
+		var pages []*discordgo.MessageEmbed
 		if fetchErr != nil {
-			embed = statusUnavailableEmbed(fetchErr)
+			pages = []*discordgo.MessageEmbed{statusUnavailableEmbed(fetchErr)}
 		} else {
-			embed = buildServiceStatusEmbed(resp)
+			pages = buildStatusPages(resp)
 		}
+		mu.Lock()
+		if statusPage >= len(pages) {
+			statusPage = 0 // e.g. the fleet shrank, or this tick fell back to the single unavailable page
+		}
+		page := statusPage
+		mu.Unlock()
+		embed := pages[page]
+		components := statusPageComponents(page, len(pages))
+
 		newMsgID := msgID
 		edited := false
 		if msgID != "" {
-			if _, editErr := sess.ChannelMessageEditEmbed(target, msgID, embed); editErr != nil {
+			edit := &discordgo.MessageEdit{
+				Channel:    target,
+				ID:         msgID,
+				Embeds:     &[]*discordgo.MessageEmbed{embed},
+				Components: &components,
+			}
+			if _, editErr := sess.ChannelMessageEditComplex(edit); editErr != nil {
 				log.Printf("failed to edit service-status message %s in %s, sending a new one: %v", msgID, target, editErr)
 			} else {
 				edited = true
 			}
 		}
 		if !edited {
-			sent, sendErr := sess.ChannelMessageSendEmbed(target, embed)
+			sent, sendErr := sess.ChannelMessageSendComplex(target, &discordgo.MessageSend{
+				Embeds:     []*discordgo.MessageEmbed{embed},
+				Components: components,
+			})
 			if sendErr != nil {
 				log.Printf("failed to send service-status message: %v", sendErr)
 				return
@@ -231,17 +257,23 @@ func main() {
 		probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		resp, fetchErr := fetchServiceStatus(probeCtx, *statusURL, resolveDashboardToken(*tokenFile), client)
 		probeCancel()
-		var embed *discordgo.MessageEmbed
+		var pages []*discordgo.MessageEmbed
 		if fetchErr != nil {
-			embed = statusUnavailableEmbed(fetchErr)
+			pages = []*discordgo.MessageEmbed{statusUnavailableEmbed(fetchErr)}
 		} else {
-			embed = buildServiceStatusEmbed(resp)
+			mu.Lock()
+			lastStatusResp = resp
+			mu.Unlock()
+			pages = buildStatusPages(resp)
 		}
 		// Doubles as a capability probe (confirms the bot can post here) AND
 		// seeds the status message in one action — unifies "post the
 		// confirmation" with "create the initial status message for this
 		// channel" so there's no second, redundant post.
-		sent, sendErr := s.ChannelMessageSendEmbed(i.ChannelID, embed)
+		sent, sendErr := s.ChannelMessageSendComplex(i.ChannelID, &discordgo.MessageSend{
+			Embeds:     []*discordgo.MessageEmbed{pages[0]},
+			Components: statusPageComponents(0, len(pages)),
+		})
 		if sendErr != nil {
 			log.Printf("set-alert-channel: cannot post in %s: %v", i.ChannelID, sendErr)
 			respond("⚠️ I can't send messages in this channel, so I can't set it as the alert channel.")
@@ -250,6 +282,7 @@ func main() {
 		mu.Lock()
 		alertChannelID = i.ChannelID
 		statusMessageID = sent.ID
+		statusPage = 0
 		mu.Unlock()
 		ack := "Done."
 		if err := chStore.Set(i.ChannelID); err != nil {
@@ -260,6 +293,52 @@ func main() {
 			ack = "Done — but the service-status message id wasn't saved, so an edit later may post a duplicate."
 		}
 		respond(ack)
+	})
+
+	// Back/Next on the persistent status message. Uses lastStatusResp (kept
+	// current by pollStatus, above) rather than fetching — a click should
+	// feel instant, and the data is at most one -status-interval stale
+	// either way. Responds via InteractionResponseUpdateMessage, which edits
+	// the clicked message and acknowledges the interaction in one round
+	// trip instead of a separate ChannelMessageEditComplex call.
+	sess.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		if i.Type != discordgo.InteractionMessageComponent {
+			return
+		}
+		customID := i.MessageComponentData().CustomID
+		if customID != statusPageCustomIDBack && customID != statusPageCustomIDNext {
+			return
+		}
+		mu.Lock()
+		resp := lastStatusResp
+		pages := buildStatusPages(resp)
+		switch customID {
+		case statusPageCustomIDBack:
+			if statusPage > 0 {
+				statusPage--
+			}
+		case statusPageCustomIDNext:
+			if statusPage < len(pages)-1 {
+				statusPage++
+			}
+		}
+		if statusPage >= len(pages) {
+			statusPage = len(pages) - 1
+		}
+		page := statusPage
+		mu.Unlock()
+
+		embed := pages[page]
+		components := statusPageComponents(page, len(pages))
+		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Embeds:     []*discordgo.MessageEmbed{embed},
+				Components: components,
+			},
+		}); err != nil {
+			log.Printf("failed to respond to status page navigation (%s): %v", customID, err)
+		}
 	})
 
 	if err := sess.Open(); err != nil {

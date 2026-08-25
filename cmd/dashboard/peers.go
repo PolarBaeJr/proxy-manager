@@ -92,6 +92,10 @@ func newPeerRegistry(peers []string, secret, identity, version string, interval 
 // Identity returns this host's own peer identity.
 func (p *PeerRegistry) Identity() string { return p.identity }
 
+// Peers returns a copy of the configured peer-handshake base URLs — used by
+// fetchPeerServiceStatus to know which peers' /peer/service-status to poll.
+func (p *PeerRegistry) Peers() []string { return append([]string(nil), p.peers...) }
+
 func (p *PeerRegistry) Run(ctx context.Context) {
 	t := time.NewTicker(p.interval)
 	defer t.Stop()
@@ -289,6 +293,114 @@ func peerHandshakeHandler(secret, identity, version string) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"peer": identity, "ok": true, "version": version})
 	})
+}
+
+// peerServiceStatusResp is the wire shape for GET /peer/service-status —
+// this peer's own local service-status (never further merged, so a mesh
+// can't loop) plus its identity, since the fetcher needs both to label the
+// groups it merges in.
+type peerServiceStatusResp struct {
+	Identity string            `json:"identity"`
+	Status   ServiceStatusResp `json:"status"`
+}
+
+// peerServiceStatusHandler returns the HTTP handler for GET
+// /peer/service-status on the dedicated peer-handshake port — same
+// bearer-auth shape as peerHandshakeHandler. Always returns THIS host's own
+// local status only (never re-merges groups already tagged with another
+// peer's Machine) — the caller (api.go's /api/service-status) is the one
+// that fans out to every configured peer, so a peer answering this request
+// never needs to know about the mesh beyond itself.
+func peerServiceStatusHandler(secret, identity string, dc *dockerClient, proxyURL string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		status, err := buildServiceStatus(r.Context(), dc, proxyURL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(peerServiceStatusResp{Identity: identity, Status: status})
+	})
+}
+
+// fetchPeerServiceStatus polls every configured peer's /peer/service-status
+// in parallel (bounded by a short per-peer timeout, so one unreachable peer
+// can't stall /api/service-status past a fraction of a second) and returns
+// their groups, each tagged with that peer's own identity as Machine. A
+// peer that's down, slow, or misconfigured is logged and simply omitted —
+// this is advisory display only, same as the rest of the peer mesh, never
+// something the caller should fail on.
+func fetchPeerServiceStatus(ctx context.Context, registry *PeerRegistry, secret string) []ServiceStatusGroup {
+	peers := registry.Peers()
+	if len(peers) == 0 || secret == "" {
+		return nil
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	results := make(chan []ServiceStatusGroup, len(peers))
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+			url := strings.TrimRight(peer, "/") + "/peer/service-status"
+			reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+			if err != nil {
+				results <- nil
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+secret)
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("dashboard peer service-status: %s unreachable: %v", url, err)
+				results <- nil
+				return
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("dashboard peer service-status: %s → %s", url, resp.Status)
+				results <- nil
+				return
+			}
+			var body peerServiceStatusResp
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				log.Printf("dashboard peer service-status: %s bad response: %v", url, err)
+				results <- nil
+				return
+			}
+			machine := body.Identity
+			if machine == "" {
+				machine = peer // fallback label so a peer that forgot to set DASHBOARD_HOST still shows up as *something*
+			}
+			groups := body.Status.Groups
+			for i := range groups {
+				groups[i].Machine = machine
+			}
+			results <- groups
+		}(peer)
+	}
+	wg.Wait()
+	close(results)
+	var out []ServiceStatusGroup
+	for g := range results {
+		out = append(out, g...)
+	}
+	return out
 }
 
 type peerView struct {

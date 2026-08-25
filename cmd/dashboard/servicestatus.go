@@ -126,6 +126,13 @@ type ServiceStatusEntry struct {
 type ServiceStatusGroup struct {
 	Group    string               `json:"group"`
 	Services []ServiceStatusEntry `json:"services"`
+	// Machine is the peer identity (DASHBOARD_HOST, see peers.go) whose
+	// dashboard instance this group's data came from — "" for this host's
+	// own groups (the common case, and the only case before any peers are
+	// configured), set only on groups merged in from a peer's
+	// /peer/service-status. Lets a multi-host caller (statusbot) label which
+	// host each group belongs to without a second lookup.
+	Machine string `json:"machine,omitempty"`
 }
 
 type ServiceStatusResp struct {

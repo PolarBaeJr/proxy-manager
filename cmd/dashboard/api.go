@@ -99,6 +99,19 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteErr(w, err)
 			return
 		}
+		// Merge in every configured peer's own service-status (see
+		// peers.go's fetchPeerServiceStatus) so one dashboard's /api/
+		// service-status — the endpoint statusbot polls — reports the whole
+		// mesh, not just this host. Local groups get this host's own
+		// identity as Machine too, so every group in the response is
+		// consistently labeled, not just the merged-in ones.
+		if registry != nil {
+			for i := range status.Groups {
+				status.Groups[i].Machine = registry.Identity()
+			}
+			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+			status.Groups = append(status.Groups, fetchPeerServiceStatus(req.Context(), registry, peerSecret)...)
+		}
 		httpx.WriteJSON(w, http.StatusOK, status)
 	}))
 
