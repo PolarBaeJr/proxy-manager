@@ -517,6 +517,22 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 					httpx.WriteErr(w, err)
 					return
 				}
+				// Drop the dashboard's own service — it must never appear as
+				// something you can stop/replace/scale from within its own
+				// UI. Deliberately asymmetric with /api/service-status
+				// (servicestatus.go), which does NOT filter itself out, so
+				// statusbot/Observability still reports the dashboard's own
+				// health.
+				svcs = excludeSelf(svcs)
+				// NOTE: excludeSelf runs before the onboarded-merge dedupe
+				// below, which matches by name against svcs. In practice
+				// this never collides — the discovery/onboarding UI only
+				// offers containers WITHOUT proxy labels, and the
+				// dashboard's own container always carries them — but if a
+				// "dashboard" entry were ever forced into the onboarded
+				// store anyway, it would no longer find a name match here
+				// and would get appended as a second (onboarded-only) card.
+				// Mutations would still be blocked by the guard below.
 				// Merge in onboarded services. If a labeled service already
 				// has the same name (auto-promoted via the lifecycle Stop
 				// path), DON'T append a second entry — just mark the
@@ -592,6 +608,18 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		name := parts[0]
 		if name == "" {
 			http.NotFound(w, req)
+			return
+		}
+		// Centralized guard, before any subpath dispatch (scale/replace/
+		// stop/start/canary/etc.) — refuses ANY mutating action targeting
+		// the dashboard's own service. Lives here rather than per-branch so
+		// nothing new added below can accidentally skip it. This also
+		// covers MCP write tools for free, since they dispatch through this
+		// same mux/handler in-process (see main.go's registerMCPTools).
+		// On a Docker error (err != nil) this falls through without
+		// blocking — err is deliberately not treated as "assume self".
+		if self, err := dc.serviceContainsSelfByName(req.Context(), name); err == nil && self {
+			http.Error(w, "refusing to manage the dashboard's own service from within itself — use docker compose on the host", http.StatusForbidden)
 			return
 		}
 		info, _ := auth.sessionFrom(req)

@@ -69,6 +69,33 @@ func main() {
 
 	dc := newDockerClient()
 
+	// One-shot visibility check: confirm self-identification (isSelfContainer,
+	// selfidentity.go) actually matches this process's own container among
+	// what's running right now. If a future compose change adds a
+	// hostname: override to the dashboard service, os.Hostname() stops
+	// returning the container ID and this silently regresses — log it here
+	// instead of only discovering it the hard way in the UI.
+	if h, err := selfHostname(); err == nil {
+		containers, listErr := dc.listAll(context.Background(), "")
+		switch {
+		case listErr != nil:
+			log.Printf("dashboard self-identification: hostname=%q — could not list containers to verify: %v", h, listErr)
+		default:
+			matched := false
+			for _, ct := range containers {
+				if isSelfContainer(ct) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				log.Printf("dashboard self-identification: hostname=%q matched container=true", h)
+			} else {
+				log.Printf("⚠ dashboard self-identification: hostname=%q matched no running container — self-exclusion in /api/services will not work (compose hostname: override?)", h)
+			}
+		}
+	}
+
 	secrets, secretsMsgs := newSecretsFromEnv(os.Getenv)
 	for _, m := range secretsMsgs {
 		log.Printf("%s", m)
