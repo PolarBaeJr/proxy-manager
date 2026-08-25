@@ -65,7 +65,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	c, _ := stubDash(t, 200, `{}`)
 
 	ro := NewServer("t", "v")
-	registerMCPTools(ro, c, false)
+	registerMCPTools(ro, c, false, false)
 	names := toolNames(t, ro)
 	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if names[w] {
@@ -79,7 +79,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	}
 
 	rw := NewServer("t", "v")
-	registerMCPTools(rw, c, true)
+	registerMCPTools(rw, c, true, false)
 	rwNames := toolNames(t, rw)
 	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if !rwNames[w] {
@@ -98,7 +98,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 func TestCallingGatedToolFails(t *testing.T) {
 	c, calls := stubDash(t, 200, `{}`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, false)
+	registerMCPTools(s, c, false, false)
 
 	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"set_maintenance","arguments":{"host":"x.example","enabled":true}}}`)
 	e, ok := res["error"].(map[string]any)
@@ -186,7 +186,7 @@ func TestGetIsRejected(t *testing.T) {
 func TestToolFailureIsResultNotProtocolError(t *testing.T) {
 	c, _ := stubDash(t, 404, `service not found`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_services","arguments":{}}}`)
 	if res["error"] != nil {
@@ -229,7 +229,7 @@ func TestToolsCallCorrectEndpoints(t *testing.T) {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
 			c, calls := stubDash(t, 200, `{"ok":true}`)
 			s := NewServer("t", "v")
-			registerMCPTools(s, c, true)
+			registerMCPTools(s, c, true, false)
 			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":` + tc.args + `}}`
 			res, _ := rpc(t, s, body)
 			if res["error"] != nil {
@@ -278,7 +278,7 @@ func TestArgumentValidation(t *testing.T) {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
 			c, calls := stubDash(t, 200, `{}`)
 			s := NewServer("t", "v")
-			registerMCPTools(s, c, true)
+			registerMCPTools(s, c, true, false)
 			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":` + tc.args + `}}`
 			res, _ := rpc(t, s, body)
 			r, ok := res["result"].(map[string]any)
@@ -297,7 +297,7 @@ func TestArgumentValidation(t *testing.T) {
 func TestToolListIsSorted(t *testing.T) {
 	c, _ := stubDash(t, 200, `{}`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 	var prev string
 	for _, tool := range s.toolList() {
 		if tool.Name < prev {
@@ -311,7 +311,7 @@ func TestToolListIsSorted(t *testing.T) {
 func TestToolSchemasWellFormed(t *testing.T) {
 	c, _ := stubDash(t, 200, `{}`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 	for _, tool := range s.toolList() {
 		if tool.Description == "" {
 			t.Errorf("%s: no description", tool.Name)
@@ -354,7 +354,7 @@ func TestStageAndReplaceForwardEnvEdits(t *testing.T) {
 			})
 			c := &apiCaller{mux: h}
 			s := NewServer("t", "v")
-			registerMCPTools(s, c, true)
+			registerMCPTools(s, c, true, false)
 
 			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":{"service":"app","image":"i:v2","env":{"K":"v"},"env_ack":["K"]}}}`
 			res, _ := rpc(t, s, body)
@@ -377,7 +377,7 @@ func TestStageAndReplaceForwardEnvEdits(t *testing.T) {
 			})
 			c2 := &apiCaller{mux: h2}
 			s2 := NewServer("t", "v")
-			registerMCPTools(s2, c2, true)
+			registerMCPTools(s2, c2, true, false)
 			body2 := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":{"service":"app","image":"i:v2"}}}`
 			res2, _ := rpc(t, s2, body2)
 			if r := res2["result"].(map[string]any); r["isError"] == true {
@@ -398,7 +398,7 @@ func TestStageAndReplaceForwardEnvEdits(t *testing.T) {
 func TestStageCanaryEnvConflictSurfaces(t *testing.T) {
 	c, _ := stubDash(t, 409, `{"error":"env conflict","keys":["PORT"]}`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stage_canary","arguments":{"service":"app","image":"i:v2","env":{"PORT":"3000"}}}}`
 	res, _ := rpc(t, s, body)
@@ -416,7 +416,7 @@ func TestStageCanaryEnvConflictSurfaces(t *testing.T) {
 func TestReplaceServiceEnvConflictSurfaces(t *testing.T) {
 	c, _ := stubDash(t, 409, `{"error":"env conflict","keys":["PORT"]}`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"replace_service","arguments":{"service":"app","image":"i:v2","env":{"PORT":"3000"}}}}`
 	res, _ := rpc(t, s, body)
@@ -449,7 +449,7 @@ func TestRestartReplicaStopsThenStarts(t *testing.T) {
 	})
 	c := &apiCaller{mux: h}
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"restart_replica","arguments":{"service":"app","member":"m1","action":"restart"}}}`
 	res, _ := rpc(t, s, body)
@@ -481,7 +481,7 @@ func TestRestartReplicaStopFailureSkipsStart(t *testing.T) {
 	})
 	c := &apiCaller{mux: h}
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"restart_replica","arguments":{"service":"app","member":"m1","action":"restart"}}}`
 	res, _ := rpc(t, s, body)
@@ -511,7 +511,7 @@ func TestUpdateDNSRecordOnlySendsProvidedFields(t *testing.T) {
 	})
 	c := &apiCaller{mux: h}
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_dns_record","arguments":{"id":"rec1","proxied":false}}}`
 	res, _ := rpc(t, s, body)
@@ -547,7 +547,7 @@ func TestArgEnvEditsTrimsKeys(t *testing.T) {
 	})
 	c := &apiCaller{mux: h}
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stage_canary","arguments":{"service":"app","image":"i:v2","env":{" PORT ":"3000"}}}}`
 	res, _ := rpc(t, s, body)
@@ -581,7 +581,7 @@ func TestRestartReplicaStartFailureSaysStopped(t *testing.T) {
 	})
 	c := &apiCaller{mux: h}
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"restart_replica","arguments":{"service":"app","member":"m1","action":"restart"}}}`
 	res, _ := rpc(t, s, body)
@@ -611,7 +611,7 @@ func TestDNSToolsAcceptEmptyZone(t *testing.T) {
 		t.Run(tc.tool, func(t *testing.T) {
 			c, calls := stubDash(t, 200, `{}`)
 			s := NewServer("t", "v")
-			registerMCPTools(s, c, true)
+			registerMCPTools(s, c, true, false)
 			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":` + tc.args + `}}`
 			res, _ := rpc(t, s, body)
 			r, ok := res["result"].(map[string]any)
@@ -642,7 +642,7 @@ func TestOffboardServiceCallsOffboardEndpoint(t *testing.T) {
 	})
 	c := &apiCaller{mux: h}
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offboard_service","arguments":{"service":"app"}}}`
 	res, _ := rpc(t, s, body)
@@ -661,7 +661,7 @@ func TestOffboardServiceCallsOffboardEndpoint(t *testing.T) {
 func TestOffboardServiceSurfacesBackendError(t *testing.T) {
 	c, calls := stubDash(t, 400, `service "app" not found`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"offboard_service","arguments":{"service":"app"}}}`
 	res, _ := rpc(t, s, body)
@@ -679,7 +679,7 @@ func TestOffboardServiceSurfacesBackendError(t *testing.T) {
 func TestOnboardServiceCallsOnboardEndpoint(t *testing.T) {
 	c, calls := stubDash(t, 200, `{"status":"onboarded","name":"app"}`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"onboard_service","arguments":{"service":"app","host":"app.example.com","port":8080}}}`
 	res, _ := rpc(t, s, body)
@@ -696,7 +696,7 @@ func TestOnboardServiceCallsOnboardEndpoint(t *testing.T) {
 func TestOnboardServiceRequiresHostAndPort(t *testing.T) {
 	c, calls := stubDash(t, 200, `{}`)
 	s := NewServer("t", "v")
-	registerMCPTools(s, c, true)
+	registerMCPTools(s, c, true, false)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"onboard_service","arguments":{"service":"app"}}}`
 	res, _ := rpc(t, s, body)
@@ -706,5 +706,190 @@ func TestOnboardServiceRequiresHostAndPort(t *testing.T) {
 	}
 	if len(*calls) != 0 {
 		t.Fatalf("calls = %v, want the dashboard never contacted", *calls)
+	}
+}
+
+// The 10 tools that support peer targeting, and the argument key each one
+// reads it under. onboard_service alone uses "peer_host" — its own "host"
+// key already means the hostname to ROUTE.
+var peerTargetableTools = map[string]string{
+	"check_for_update":  "host",
+	"scale_service":     "host",
+	"lifecycle_service": "host",
+	"set_autoupdate":    "host",
+	"stage_canary":      "host",
+	"replace_service":   "host",
+	"resolve_canary":    "host",
+	"onboard_service":   "peer_host",
+	"offboard_service":  "host",
+	"restart_replica":   "host",
+}
+
+// A host/peer_host argument must be refused before the dashboard is
+// contacted when MCP_ALLOW_PEER_WRITES is off, even with writes on, and the
+// error must point at the env var so an operator can fix it.
+func TestHostParamRejectedWithoutPeerWrites(t *testing.T) {
+	c, calls := stubDash(t, 200, `{"ok":true}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true, false)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"scale_service","arguments":{"service":"app","replicas":2,"host":"peer-b"}}}`
+	res, _ := rpc(t, s, body)
+	r, ok := res["result"].(map[string]any)
+	if !ok || r["isError"] != true {
+		t.Fatalf("expected isError, got %v", res)
+	}
+	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, "MCP_ALLOW_PEER_WRITES") {
+		t.Errorf("error doesn't mention MCP_ALLOW_PEER_WRITES: %q", text)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("the dashboard was contacted despite the rejection: %v", *calls)
+	}
+}
+
+// With MCP_ALLOW_PEER_WRITES on, the host/peer_host argument must reach the
+// dashboard as a ?host= query param on the forwarded request.
+func TestHostParamAppendedWhenPeerWritesAllowed(t *testing.T) {
+	cases := []struct{ tool, args, wantSuffix string }{
+		{"scale_service", `{"service":"app","replicas":2,"host":"peer-b"}`, "?host=peer-b"},
+		{"check_for_update", `{"service":"app","host":"peer-b"}`, "?host=peer-b"},
+		{"lifecycle_service", `{"service":"app","action":"stop","host":"peer-b"}`, "?host=peer-b"},
+		{"set_autoupdate", `{"service":"app","enabled":true,"host":"peer-b"}`, "?host=peer-b"},
+		{"stage_canary", `{"service":"app","image":"i:v2","host":"peer-b"}`, "?host=peer-b"},
+		{"replace_service", `{"service":"app","image":"i:v2","host":"peer-b"}`, "?host=peer-b"},
+		{"resolve_canary", `{"service":"app","action":"promote","host":"peer-b"}`, "?host=peer-b"},
+		{"resolve_canary", `{"service":"app","action":"discard","host":"peer-b"}`, "?host=peer-b"},
+		{"onboard_service", `{"service":"app","host":"app.example.com","port":8080,"peer_host":"peer-b"}`, "?host=peer-b"},
+		{"offboard_service", `{"service":"app","host":"peer-b"}`, "?host=peer-b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
+			c, calls := stubDash(t, 200, `{"ok":true}`)
+			s := NewServer("t", "v")
+			registerMCPTools(s, c, true, true)
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tc.tool + `","arguments":` + tc.args + `}}`
+			res, _ := rpc(t, s, body)
+			if r := res["result"].(map[string]any); r["isError"] == true {
+				t.Fatalf("tool errored: %v", r["content"])
+			}
+			if len(*calls) == 0 {
+				t.Fatalf("dashboard never contacted")
+			}
+			for _, call := range *calls {
+				if !strings.HasSuffix(call, tc.wantSuffix) {
+					t.Errorf("call %q does not end with %q", call, tc.wantSuffix)
+				}
+			}
+		})
+	}
+
+	// restart_replica with action=restart calls twice (stop then start),
+	// both of which must carry the host param.
+	t.Run("restart_replica restart", func(t *testing.T) {
+		c, calls := stubDash(t, 200, `{"ok":true}`)
+		s := NewServer("t", "v")
+		registerMCPTools(s, c, true, true)
+		body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"restart_replica","arguments":{"service":"app","member":"m1","action":"restart","host":"peer-b"}}}`
+		res, _ := rpc(t, s, body)
+		if r := res["result"].(map[string]any); r["isError"] == true {
+			t.Fatalf("tool errored: %v", r["content"])
+		}
+		want := []string{
+			"POST /api/services/app/replicas/m1/stop?host=peer-b",
+			"POST /api/services/app/replicas/m1/start?host=peer-b",
+		}
+		if len(*calls) != 2 || (*calls)[0] != want[0] || (*calls)[1] != want[1] {
+			t.Fatalf("calls = %v, want %v", *calls, want)
+		}
+	})
+}
+
+// Without a host argument, behavior is completely unaffected by the new
+// gate — even with MCP_ALLOW_PEER_WRITES off, the call must succeed and the
+// request must carry no ?host= at all.
+func TestHostParamOmittedIsUnaffected(t *testing.T) {
+	c, calls := stubDash(t, 200, `{"ok":true}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true, false)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"scale_service","arguments":{"service":"app","replicas":2}}}`
+	res, _ := rpc(t, s, body)
+	if r := res["result"].(map[string]any); r["isError"] == true {
+		t.Fatalf("tool errored: %v", r["content"])
+	}
+	if len(*calls) != 1 || strings.Contains((*calls)[0], "host=") {
+		t.Fatalf("calls = %v, want exactly one call with no host param", *calls)
+	}
+}
+
+// The new gate must not leak a host param into an unrelated tool's request —
+// list_dns never reads args["host"], so passing one must be silently ignored
+// rather than surfacing in the forwarded URI.
+func TestHostParamNotOnUnrelatedTools(t *testing.T) {
+	c, calls := stubDash(t, 200, `{"ok":true}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_dns","arguments":{"host":"peer-b"}}}`
+	res, _ := rpc(t, s, body)
+	if r := res["result"].(map[string]any); r["isError"] == true {
+		t.Fatalf("tool errored: %v", r["content"])
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("calls = %v, want exactly one", *calls)
+	}
+	if strings.Contains((*calls)[0], "host=") {
+		t.Errorf("host leaked into unrelated tool's request: %q", (*calls)[0])
+	}
+}
+
+// Exactly the 10 peer-targetable tools carry the new host/peer_host schema
+// property, and it is never in "required" — everywhere else the schema is
+// untouched by this change.
+func TestToolSchemasIncludeHostWhereExpected(t *testing.T) {
+	c, _ := stubDash(t, 200, `{}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true, true)
+
+	// Tools that legitimately have a pre-existing, unrelated "host" property
+	// (routed hostname), not the new peer-targeting one.
+	preexisting := map[string]bool{"set_maintenance": true, "onboard_service": true}
+
+	for _, tool := range s.toolList() {
+		props, ok := tool.InputSchema["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: no properties object", tool.Name)
+		}
+		req, _ := tool.InputSchema["required"].([]string)
+		requiredSet := map[string]bool{}
+		for _, r := range req {
+			requiredSet[r] = true
+		}
+
+		key, wantPeerParam := peerTargetableTools[tool.Name]
+		if wantPeerParam {
+			if _, present := props[key]; !present {
+				t.Errorf("%s: missing %q property", tool.Name, key)
+			}
+			if requiredSet[key] {
+				t.Errorf("%s: %q must not be required", tool.Name, key)
+			}
+			continue
+		}
+
+		if preexisting[tool.Name] {
+			// set_maintenance's "host" is its own pre-existing required
+			// param; onboard_service's "host" ditto — neither is the new
+			// peer-targeting property, so skip the negative check below.
+			continue
+		}
+
+		if _, present := props["host"]; present {
+			t.Errorf("%s: unexpected \"host\" property", tool.Name)
+		}
+		if _, present := props["peer_host"]; present {
+			t.Errorf("%s: unexpected \"peer_host\" property", tool.Name)
+		}
 	}
 }
