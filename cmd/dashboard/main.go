@@ -41,8 +41,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("auth store: %v", err)
 	}
+	var redisClient *redis.Client
 	if *redisAddr != "" {
-		redisClient := redis.NewClient(&redis.Options{Addr: *redisAddr, Password: os.Getenv("REDIS_PASSWORD")})
+		redisClient = redis.NewClient(&redis.Options{Addr: *redisAddr, Password: os.Getenv("REDIS_PASSWORD")})
 		auth.txRunner = &redisTxRunner{client: redisClient}
 		if err := auth.syncFromRedisOrImport(context.Background()); err != nil {
 			log.Printf("dashboard auth: redis sync failed at startup, continuing with local users until reachable: %v", err)
@@ -194,23 +195,6 @@ func main() {
 		go maintPages.SyncLoop(ctx, dc)
 	}
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages)
-
-	// MCP on its own port, proxied at mcp.<domain>/mcp/dashboard. Separate from
-	// :8093 because that one is loopback-only and serves the UI at "/", which
-	// the MCP transport also wants. Tools dispatch back through `mux` in-process
-	// so every API handler's guardrails and audit entries still apply.
-	//
-	// Does NO auth of its own: the proxy's oauth mode gates the path and binds
-	// the token to it. Never publish this port.
-	if err := mintInternalToken(); err != nil {
-		log.Fatalf("mcp: cannot mint internal credential: %v", err)
-	}
-	mcpSrv := NewServer("proxy-manager-dashboard", "1")
-	mcpWrites := isTrue(os.Getenv("MCP_ALLOW_WRITES"))
-	registerMCPTools(mcpSrv, &apiCaller{mux: mux}, mcpWrites)
-	serveMCP(*mcpAddr, mcpSrv, mcpWrites)
-
 	// Cross-host dashboard peer handshake (Stage 2 of the cross-host control
 	// feature). Identity must be distinguishable across instances — unlike
 	// cmd/proxy, both dashboard containers share container_name "dashboard",
@@ -232,14 +216,37 @@ func main() {
 	// between them.
 	peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
 	peerList := splitAndTrim(*peers)
+	registry := newPeerRegistry(peerList, peerSecret, identity, buildVersion, *peerSyncInterval, redisClient)
+
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages, registry)
+
+	// MCP on its own port, proxied at mcp.<domain>/mcp/dashboard. Separate from
+	// :8093 because that one is loopback-only and serves the UI at "/", which
+	// the MCP transport also wants. Tools dispatch back through `mux` in-process
+	// so every API handler's guardrails and audit entries still apply.
+	//
+	// Does NO auth of its own: the proxy's oauth mode gates the path and binds
+	// the token to it. Never publish this port.
+	if err := mintInternalToken(); err != nil {
+		log.Fatalf("mcp: cannot mint internal credential: %v", err)
+	}
+	mcpSrv := NewServer("proxy-manager-dashboard", "1")
+	mcpWrites := isTrue(os.Getenv("MCP_ALLOW_WRITES"))
+	registerMCPTools(mcpSrv, &apiCaller{mux: mux}, mcpWrites)
+	serveMCP(*mcpAddr, mcpSrv, mcpWrites)
+
+	if redisClient != nil {
+		go registry.ratchetOwnVersion(ctx)
+	}
+	if len(peerList) > 0 || redisClient != nil {
+		go registry.Run(ctx)
+	}
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
-		peerServer(*peerAddr, peerHandshakeHandler(peerSecret, identity))
-		registry := newPeerRegistry(peerList, peerSecret, identity, *peerSyncInterval)
-		go registry.Run(ctx)
+		peerServer(*peerAddr, peerHandshakeHandler(peerSecret, identity, buildVersion))
 		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake on %s", len(peerList), *peerSyncInterval, *peerAddr)
 	case peerSecret != "":
-		peerServer(*peerAddr, peerHandshakeHandler(peerSecret, identity))
+		peerServer(*peerAddr, peerHandshakeHandler(peerSecret, identity, buildVersion))
 		log.Printf("dashboard peers: /peer/handshake enabled on %s (receive-only, no outbound peers configured)", *peerAddr)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -205,5 +206,85 @@ func TestGuardUnscalable(t *testing.T) {
 	empty := fakeDocker(t, "[]")
 	if err := empty.guardUnscalable(context.Background(), "web", 5); err != nil {
 		t.Fatalf("no containers should allow scaling: %v", err)
+	}
+}
+
+// TestReplaceServiceRefusesPortBindings is the regression test for the
+// self-inflicted-outage bug: replaceService used to happily recreate a
+// container that published host ports, silently dropping the bindings.
+func TestReplaceServiceRefusesPortBindings(t *testing.T) {
+	var sawCreate bool
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "tpl1", Names: []string{"/goproxy-app-1"}, State: "running",
+				Image:  "ghcr.io/org/app:v1",
+				Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example"},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/tpl1/json"):
+			w.Write([]byte(`{
+				"Image": "sha256:abc",
+				"HostConfig": {"PortBindings": {"80/tcp": [{"HostPort": "8080"}]}},
+				"Config": {},
+				"NetworkSettings": {"Networks": {"edge": {}}}
+			}`))
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			sawCreate = true
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	if err := dc.replaceService(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}); err == nil {
+		t.Fatal("replaceService should refuse a template with PortBindings")
+	}
+	if sawCreate {
+		t.Fatal("no container should have been created")
+	}
+}
+
+// TestReplaceServiceProceedsWithoutHostPorts confirms the new guard doesn't
+// block the common case: a template with no unreproducible HostConfig
+// fields still gets replaced.
+func TestReplaceServiceProceedsWithoutHostPorts(t *testing.T) {
+	var sawCreate bool
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "tpl1", Names: []string{"/goproxy-app-1"}, State: "running",
+				Image:  "ghcr.io/org/app:v1",
+				Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example"},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/tpl1/json"):
+			w.Write([]byte(`{
+				"Image": "sha256:abc",
+				"Config": {"Env": []},
+				"HostConfig": {"Mounts": []},
+				"NetworkSettings": {"Networks": {"edge": {}}}
+			}`))
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			sawCreate = true
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	if err := dc.replaceService(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}); err != nil {
+		t.Fatalf("replaceService: %v", err)
+	}
+	if !sawCreate {
+		t.Fatal("no container was created")
 	}
 }

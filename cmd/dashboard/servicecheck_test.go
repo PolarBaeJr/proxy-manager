@@ -35,7 +35,7 @@ func TestServicesCheckEndpoint(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, nil, nil, nil, nil, nil, nil, nil)
 
 	do := func(path string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", path, nil)

@@ -1,5 +1,7 @@
 package main
 
+import "strings"
+
 const dashboardHTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -571,6 +573,7 @@ footer.app code{color:var(--muted)}
     <div class="wrap">
       <footer class="app">
         <span>Pi Dashboard <code>v2.4.0</code></span><span class="dotsep"></span>
+        <span id="footer-peers" hidden></span><span class="dotsep" id="footer-peers-sep" hidden></span>
         <span><a href="/api/health">/api/health</a></span>
       </footer>
     </div>
@@ -3608,6 +3611,24 @@ async function refreshStats() {
   } catch (e) { /* silent */ }
 }
 
+async function refreshPeers() {
+  if (!authState.authenticated) { $('#footer-peers').hidden = true; $('#footer-peers-sep').hidden = true; return; }
+  try {
+    const d = await (await fetch('/api/peers')).json();
+    const total = d.peers ? d.peers.length : 0;
+    if (!total) { $('#footer-peers').hidden = true; $('#footer-peers-sep').hidden = true; return; }
+    const ok = d.peers.filter(p => p.ok).length;
+    const anyBehind = d.peers.some(p => p.behind);
+    let txt = 'peers ' + ok + '/' + total;
+    if (d.mesh_floor != null) txt += ' · mesh run-' + d.mesh_floor;
+    $('#footer-peers').innerHTML = anyBehind
+      ? '<span style="color:var(--yellow)" title="one or more peers behind the mesh floor">' + esc(txt) + ' ⚠</span>'
+      : esc(txt);
+    $('#footer-peers').hidden = false;
+    $('#footer-peers-sep').hidden = false;
+  } catch (e) { /* silent */ }
+}
+
 /* ---------- utilities ---------- */
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -3633,8 +3654,22 @@ buildDialogs();
 setInterval(() => { refreshAuth().catch(()=>{}); }, 30000);
 setInterval(renderActive, 5000);
 setInterval(refreshStats, 5000);
+setInterval(refreshPeers, 30000);
 refreshAuth();
 refreshStats();
+refreshPeers();
 </script>
 </body>
 </html>`
+
+// renderDashboardHTML swaps the footer's hardcoded fallback version
+// literal for the real buildVersion when running a CI-built image
+// (buildVersion != "dev"). Rendered as "run-<N>" to match the GHCR
+// image tag from build.yml (run-${{ github.run_number }}). Local/dev
+// builds keep showing the v2.4.0 literal.
+func renderDashboardHTML() string {
+	if buildVersion == "dev" {
+		return dashboardHTML
+	}
+	return strings.Replace(dashboardHTML, "<code>v2.4.0</code>", "<code>run-"+buildVersion+"</code>", 1)
+}

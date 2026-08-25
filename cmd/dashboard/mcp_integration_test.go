@@ -24,7 +24,7 @@ func TestMCPToolReachesRealHandler(t *testing.T) {
 	// A real mux. The maintenance route tolerates nil stores and reports
 	// configured:false, which is enough to prove the request was authenticated
 	// and handled rather than rejected.
-	mux := newDashboardMux(nil, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(nil, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, nil)
 
 	srv := NewServer("t", "v")
 	registerMCPTools(srv, &apiCaller{mux: mux}, false)
@@ -55,7 +55,7 @@ func TestMCPToolRefusedWithoutInternalCredential(t *testing.T) {
 	t.Cleanup(func() { internalToken = prev })
 	internalToken = ""
 
-	mux := newDashboardMux(nil, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(nil, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, nil)
 	srv := NewServer("t", "v")
 	registerMCPTools(srv, &apiCaller{mux: mux}, false)
 
