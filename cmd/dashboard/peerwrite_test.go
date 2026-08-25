@@ -27,7 +27,7 @@ func TestPeerMutateSingleAttemptOnTimeout(t *testing.T) {
 
 	client := &http.Client{Timeout: 2 * time.Second}
 	start := time.Now()
-	code, body, err := peerMutate(context.Background(), client, srv.URL, "s3cret", http.MethodPost, "/anything", 50*time.Millisecond, nil, nil)
+	code, body, err := peerMutate(context.Background(), client, srv.URL, "s3cret", http.MethodPost, "/anything", 50*time.Millisecond, nil, nil, "")
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -59,7 +59,7 @@ func TestPeerMutateDecodesOnSuccess(t *testing.T) {
 	var out struct {
 		Status string `json:"status"`
 	}
-	code, body, err := peerMutate(context.Background(), client, srv.URL, "s3cret", http.MethodPost, "/anything", time.Second, nil, &out)
+	code, body, err := peerMutate(context.Background(), client, srv.URL, "s3cret", http.MethodPost, "/anything", time.Second, nil, &out, "")
 	if err != nil {
 		t.Fatalf("want success, got: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestPeerMutateNonSuccessDoesNotDecode(t *testing.T) {
 	var out struct {
 		Status string `json:"status"`
 	}
-	code, body, err := peerMutate(context.Background(), client, srv.URL, "s3cret", http.MethodPost, "/anything", time.Second, nil, &out)
+	code, body, err := peerMutate(context.Background(), client, srv.URL, "s3cret", http.MethodPost, "/anything", time.Second, nil, &out, "")
 	if err != nil {
 		t.Fatalf("want no transport-level error for a non-2xx response, got: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestMapPeerMutationErrNeverRelaysAuthFailureVerbatim(t *testing.T) {
 // the /api/access and /api/images handlers.
 func TestHostForReq(t *testing.T) {
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev")
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false)
 
 	cases := []struct {
 		name       string

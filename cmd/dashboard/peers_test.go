@@ -12,7 +12,7 @@ import (
 )
 
 func TestPeerHandshakeHandlerValidSecret(t *testing.T) {
-	h := peerHandshakeHandler("s3cret", "dashboard-a", "42")
+	h := peerHandshakeHandler("s3cret", "dashboard-a", "42", false)
 	req := httptest.NewRequest(http.MethodPost, "/peer/handshake", nil)
 	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
@@ -31,7 +31,7 @@ func TestPeerHandshakeHandlerValidSecret(t *testing.T) {
 }
 
 func TestPeerHandshakeHandlerWrongSecret(t *testing.T) {
-	h := peerHandshakeHandler("s3cret", "dashboard-a", "dev")
+	h := peerHandshakeHandler("s3cret", "dashboard-a", "dev", false)
 	req := httptest.NewRequest(http.MethodPost, "/peer/handshake", nil)
 	req.Header.Set("Authorization", "Bearer wrong")
 	rec := httptest.NewRecorder()
@@ -47,7 +47,7 @@ func TestPeerHandshakeHandlerWrongSecret(t *testing.T) {
 // reject it — this is the case that must actually reach
 // subtle.ConstantTimeCompare rather than a bare == comparison.
 func TestPeerHandshakeHandlerSameLengthWrongSecret(t *testing.T) {
-	h := peerHandshakeHandler("s3cret", "dashboard-a", "dev")
+	h := peerHandshakeHandler("s3cret", "dashboard-a", "dev", false)
 	for _, bad := range []string{"Bearer s3creX", "Bearer X3cret"} {
 		req := httptest.NewRequest(http.MethodPost, "/peer/handshake", nil)
 		req.Header.Set("Authorization", bad)
@@ -61,7 +61,7 @@ func TestPeerHandshakeHandlerSameLengthWrongSecret(t *testing.T) {
 }
 
 func TestPeerHandshakeHandlerMissingHeader(t *testing.T) {
-	h := peerHandshakeHandler("s3cret", "dashboard-a", "dev")
+	h := peerHandshakeHandler("s3cret", "dashboard-a", "dev", false)
 	req := httptest.NewRequest(http.MethodPost, "/peer/handshake", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -75,7 +75,7 @@ func TestPeerHandshakeHandlerMissingHeader(t *testing.T) {
 // peerHandshakeHandler: an unconfigured secret hides the endpoint entirely
 // (404) rather than accepting/rejecting bearer tokens.
 func TestPeerHandshakeHandlerEmptySecretDisabled(t *testing.T) {
-	h := peerHandshakeHandler("", "dashboard-a", "dev")
+	h := peerHandshakeHandler("", "dashboard-a", "dev", false)
 	req := httptest.NewRequest(http.MethodPost, "/peer/handshake", nil)
 	req.Header.Set("Authorization", "Bearer anything")
 	rec := httptest.NewRecorder()
@@ -87,7 +87,7 @@ func TestPeerHandshakeHandlerEmptySecretDisabled(t *testing.T) {
 }
 
 func TestPeerHandshakeHandlerWrongMethod(t *testing.T) {
-	h := peerHandshakeHandler("s3cret", "dashboard-a", "dev")
+	h := peerHandshakeHandler("s3cret", "dashboard-a", "dev", false)
 	req := httptest.NewRequest(http.MethodGet, "/peer/handshake", nil)
 	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
@@ -99,7 +99,7 @@ func TestPeerHandshakeHandlerWrongMethod(t *testing.T) {
 }
 
 func TestPeerRegistryRecordsSuccess(t *testing.T) {
-	srv := httptest.NewServer(peerHandshakeHandler("s3cret", "dashboard-b", "dev"))
+	srv := httptest.NewServer(peerHandshakeHandler("s3cret", "dashboard-b", "dev", false))
 	defer srv.Close()
 
 	reg := newPeerRegistry([]string{srv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
@@ -118,7 +118,7 @@ func TestPeerRegistryRecordsSuccess(t *testing.T) {
 }
 
 func TestPeerRegistryRecordsFailureOnWrongSecret(t *testing.T) {
-	srv := httptest.NewServer(peerHandshakeHandler("s3cret", "dashboard-b", "dev"))
+	srv := httptest.NewServer(peerHandshakeHandler("s3cret", "dashboard-b", "dev", false))
 	defer srv.Close()
 
 	reg := newPeerRegistry([]string{srv.URL}, "wrong-secret", "dashboard-a", "dev", 0, nil)
@@ -137,7 +137,7 @@ func TestPeerRegistryRecordsFailureOnWrongSecret(t *testing.T) {
 }
 
 func TestPeerRegistryRecordsFailureOnUnreachablePeer(t *testing.T) {
-	srv := httptest.NewServer(peerHandshakeHandler("s3cret", "dashboard-b", "dev"))
+	srv := httptest.NewServer(peerHandshakeHandler("s3cret", "dashboard-b", "dev", false))
 	url := srv.URL
 	srv.Close() // guarantees connection-refused without hardcoding a port
 
@@ -154,7 +154,7 @@ func TestPeerRegistryRecordsFailureOnUnreachablePeer(t *testing.T) {
 }
 
 func TestPeerRegistrySendCapturesVersion(t *testing.T) {
-	srv := httptest.NewServer(peerHandshakeHandler("s3cret", "dashboard-b", "77"))
+	srv := httptest.NewServer(peerHandshakeHandler("s3cret", "dashboard-b", "77", false))
 	defer srv.Close()
 
 	reg := newPeerRegistry([]string{srv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
@@ -401,7 +401,7 @@ func TestFetchPeerServicesSkipsUnreachablePeer(t *testing.T) {
 
 func TestURLForIdentityFound(t *testing.T) {
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "42")
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "42", false)
 
 	url, ok := reg.URLForIdentity("dashboard-b")
 	if !ok || url != "http://peer-b:8098" {
@@ -411,7 +411,7 @@ func TestURLForIdentityFound(t *testing.T) {
 
 func TestURLForIdentityNotFound(t *testing.T) {
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "42")
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "42", false)
 
 	if url, ok := reg.URLForIdentity("dashboard-c"); ok {
 		t.Fatalf("URLForIdentity(dashboard-c) = (%q, %v), want ok=false", url, ok)

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -41,6 +42,12 @@ type peerStatus struct {
 	OK          bool      `json:"ok"`
 	Identity    string    `json:"identity,omitempty"`
 	Version     string    `json:"version,omitempty"`
+	// Writes reports the peer's own -peer-writes setting, as of its last
+	// successful handshake — advisory display only (ui.go's peerWritable),
+	// never trusted for authorization. The peer's own /peer/images/*
+	// handlers re-check their own writesEnabled regardless of what this
+	// says.
+	Writes bool `json:"writes,omitempty"`
 }
 
 type PeerRegistry struct {
@@ -132,29 +139,33 @@ func (p *PeerRegistry) send(ctx context.Context, peer string) {
 	resp, err := p.client.Do(req)
 	if err != nil {
 		// Peer unreachable — expected during restarts / network blips. Silent.
-		p.recordResult(peer, false, "", "")
+		p.recordResult(peer, false, "", "", false)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// Auth failure or malformed request: worth surfacing so misconfig is visible.
 		log.Printf("dashboard peer handshake: %s → %s", url, resp.Status)
-		p.recordResult(peer, false, "", "")
+		p.recordResult(peer, false, "", "", false)
 		return
 	}
 	var body struct {
 		Peer    string `json:"peer"`
 		OK      bool   `json:"ok"`
 		Version string `json:"version"`
+		Writes  bool   `json:"writes"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&body)
-	p.recordResult(peer, true, body.Peer, body.Version)
+	p.recordResult(peer, true, body.Peer, body.Version, body.Writes)
 }
 
-// recordResult only overwrites Identity/Version on a successful handshake
-// with a non-empty version — a transient failure preserves the last-known
-// values instead of blanking them.
-func (p *PeerRegistry) recordResult(peer string, ok bool, identity, version string) {
+// recordResult only overwrites Identity/Version/Writes on a successful
+// handshake — a transient failure preserves the last-known values instead of
+// blanking them. Identity/Version are additionally guarded on non-empty
+// (their own zero value means "unknown", not "changed to empty"); Writes has
+// no such ambiguity — false is a meaningful, intentional value — so it's
+// simply copied whenever ok.
+func (p *PeerRegistry) recordResult(peer string, ok bool, identity, version string, writes bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	st := p.status[peer]
@@ -168,6 +179,9 @@ func (p *PeerRegistry) recordResult(peer string, ok bool, identity, version stri
 	}
 	if ok && identity != "" {
 		st.Identity = identity
+	}
+	if ok {
+		st.Writes = writes
 	}
 	p.status[peer] = st
 }
@@ -290,8 +304,11 @@ func (p *PeerRegistry) refreshMeshFloor(ctx context.Context) {
 // secret, constant-time compare — same approach as cmd/proxy/peers.go's
 // peerHandshakeHandler. Empty secret disables the endpoint entirely (404) so
 // an unconfigured dashboard can't accept handshakes. A valid request gets a
-// minimal ok:true body with this host's identity/version.
-func peerHandshakeHandler(secret, identity, version string) http.Handler {
+// minimal ok:true body with this host's identity/version/writesEnabled —
+// writesEnabled lets a peer's UI show write controls only where the target
+// actually accepts them (peerStatus.Writes / ui.go's peerWritable);
+// purely advisory, the /peer/images/* handlers re-check it themselves.
+func peerHandshakeHandler(secret, identity, version string, writesEnabled bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if secret == "" {
 			http.NotFound(w, r)
@@ -308,7 +325,7 @@ func peerHandshakeHandler(secret, identity, version string) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"peer": identity, "ok": true, "version": version})
+		_ = json.NewEncoder(w).Encode(map[string]any{"peer": identity, "ok": true, "version": version, "writes": writesEnabled})
 	})
 }
 
@@ -515,6 +532,166 @@ func peerImagesHandler(secret, identity string, dc *dockerClient, rs *ReleasesSt
 	})
 }
 
+// peerImagesMutateHandler returns the HTTP handler for POST/DELETE
+// /peer/images/{mark,delete,prune} on the dedicated peer-handshake port —
+// the write-side counterpart of peerImagesHandler. Gated on writesEnabled in
+// addition to the shared secret: a peer with writes not yet enabled answers
+// 404 here, same as an unconfigured secret does on every other /peer/*
+// route — mapPeerMutationErr's doc comment already covers why that
+// ambiguity is intentional, not disambiguated here.
+//
+// mark/unmark identify the target the same way the local /api/images/
+// handler's body does (service, tag) — no change needed, mark/unmark never
+// touched DeleteToken. delete identifies by (service, ref) instead of a
+// DeleteToken: ref is imageEntry.Ref, already unstripped on the read path
+// (for a tagged image it's the exact same string DeleteToken would be), so
+// nothing new is disclosed — the peer still independently resolves its own
+// DeleteToken from a fresh buildImagesInfo rather than trusting a
+// client-supplied one. Every branch recomputes protection LIVE from this
+// host's own Docker state before mutating anything, mirroring the local
+// handler's exact safety checks (api.go) — but against the peer's own
+// dc/rs/ih/onb, never the caller's claims.
+func peerImagesMutateHandler(secret, identity string, dc *dockerClient, rs *ReleasesStore, ih *ImageHistoryStore, onb *OnboardedStore, writesEnabled bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" || !writesEnabled {
+			http.NotFound(w, r)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		sub := strings.TrimPrefix(r.URL.Path, "/peer/images/")
+		switch {
+		case sub == "mark" && r.Method == http.MethodPost:
+			var body struct{ Service, Tag, Label string }
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			base, ok := resolveImageBase(r.Context(), dc, onb, body.Service)
+			if !ok {
+				http.Error(w, "unknown service", http.StatusNotFound)
+				return
+			}
+			if err := rs.Mark(base, body.Tag, body.Label, auditUser(r, "peer-mesh")); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(r, "peer-mesh", "image.mark", body.Service+":"+body.Tag)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "marked", "tag": body.Tag})
+		case sub == "mark" && r.Method == http.MethodDelete:
+			var body struct{ Service, Tag string }
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			base, ok := resolveImageBase(r.Context(), dc, onb, body.Service)
+			if !ok {
+				http.Error(w, "unknown service", http.StatusNotFound)
+				return
+			}
+			if err := rs.Unmark(base, body.Tag); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(r, "peer-mesh", "image.unmark", body.Service+":"+body.Tag)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "unmarked", "tag": body.Tag})
+		case sub == "delete" && r.Method == http.MethodDelete:
+			var body struct{ Service, Ref string }
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if body.Service == "" || body.Ref == "" {
+				http.Error(w, "service and ref required", http.StatusBadRequest)
+				return
+			}
+			svcs, err := dc.listServices(r.Context())
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			// SAFETY: recompute this peer's own image inventory + protection
+			// fresh, right here — never trust the requester's claim that ref
+			// is safe to delete.
+			info, err := buildImagesInfo(r.Context(), dc, rs, ih, svcs, onb.List())
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			var target *imageEntry
+			for i := range info.Services {
+				if info.Services[i].Service != body.Service {
+					continue
+				}
+				for j := range info.Services[i].Entries {
+					if info.Services[i].Entries[j].Ref == body.Ref {
+						target = &info.Services[i].Entries[j]
+					}
+				}
+			}
+			if target == nil || !target.OnDisk {
+				http.Error(w, "unknown image", http.StatusNotFound)
+				return
+			}
+			// target.Protected (protectedRefs[Ref] || protectedIDs[fullID])
+			// already subsumes both of the local handler's checks — direct
+			// token protection AND "in use under another tag" (an ID shared
+			// across tags is protected under either tag's Ref) — so there's
+			// no separate listImages loop to replicate here.
+			if target.Protected {
+				httpx.WriteJSON(w, http.StatusConflict, map[string]string{
+					"error": "image is protected (in use, current, or marked stable) — not deleted",
+				})
+				return
+			}
+			if err := dc.removeImage(r.Context(), target.DeleteToken, false); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(r, "peer-mesh", "image.delete", body.Service+":"+body.Ref)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted", "ref": body.Ref})
+		case sub == "prune" && r.Method == http.MethodPost:
+			var body struct {
+				Service string `json:"service"`
+				KeepN   int    `json:"keep_n"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			svcs, err := dc.listServices(r.Context())
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			info, err := buildImagesInfo(r.Context(), dc, rs, ih, svcs, onb.List())
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			deleted, failed, reclaimed := runImagePrune(r.Context(), dc, info, body.Service, body.KeepN, func(token string) {
+				audit(r, "peer-mesh", "image.delete", token)
+			})
+			target := "all"
+			if body.Service != "" {
+				target = body.Service
+			}
+			audit(r, "peer-mesh", "image.prune",
+				target+" keep_n="+strconv.Itoa(body.KeepN)+" deleted="+strconv.Itoa(len(deleted))+
+					" failed="+strconv.Itoa(len(failed))+" reclaimed_bytes="+strconv.FormatInt(reclaimed, 10))
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
+				"deleted": deleted, "failed": failed, "reclaimed_bytes": reclaimed,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
 // peerLogsContainersResp is the wire shape for GET /peer/logs/containers —
 // this peer's own FULL container list (dc.listContainerSummaries — every
 // container Docker knows about, NOT scoped to managed/labeled services, and
@@ -665,12 +842,16 @@ func peerGETTimeout(ctx context.Context, client *http.Client, peerBaseURL, secre
 // the caller can only log; the caller passes statusCode+body straight to
 // mapPeerMutationErr to relay a rejection verbatim. If respOut is non-nil and
 // the peer answered 2xx, the body is also JSON-decoded into respOut.
+// actorAssertion, when non-empty, is forwarded as the X-Pmgr-Actor header
+// (see actor.go) so the peer's own audit()/auditUser() attributes the action
+// to the real end user instead of a generic fallback — empty is a normal,
+// silent no-op, not an error.
 //
 // Never retries, not even on a timeout — see the doc comment above. A caller
 // that wants a retry must decide that itself, deliberately, with knowledge of
 // which side of the "definitely rejected" vs "outcome unknown" line the
 // failure fell on.
-func peerMutate(ctx context.Context, client *http.Client, peerBaseURL, secret, method, path string, timeout time.Duration, reqBody io.Reader, respOut any) (statusCode int, respBody []byte, err error) {
+func peerMutate(ctx context.Context, client *http.Client, peerBaseURL, secret, method, path string, timeout time.Duration, reqBody io.Reader, respOut any, actorAssertion string) (statusCode int, respBody []byte, err error) {
 	url := strings.TrimRight(peerBaseURL, "/") + path
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -679,6 +860,9 @@ func peerMutate(ctx context.Context, client *http.Client, peerBaseURL, secret, m
 		return 0, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
+	if actorAssertion != "" {
+		req.Header.Set(actorHeader, actorAssertion)
+	}
 	if reqBody != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -789,6 +973,9 @@ type peerView struct {
 	LastAttempt time.Time `json:"last_attempt,omitempty"`
 	LastSuccess time.Time `json:"last_success,omitempty"`
 	Behind      bool      `json:"behind,omitempty"`
+	// Writes mirrors peerStatus.Writes — the frontend's only signal for
+	// whether to show write controls for this peer (ui.go's peerWritable).
+	Writes bool `json:"writes,omitempty"`
 }
 
 // peersStatusHandler serves this host's own identity+version, each
@@ -812,7 +999,7 @@ func peersStatusHandler(registry *PeerRegistry) http.HandlerFunc {
 				resp.MeshFloor = &floor
 			}
 			for url, st := range registry.Status() {
-				v := peerView{URL: url, Identity: st.Identity, Version: st.Version, OK: st.OK, LastAttempt: st.LastAttempt, LastSuccess: st.LastSuccess}
+				v := peerView{URL: url, Identity: st.Identity, Version: st.Version, OK: st.OK, LastAttempt: st.LastAttempt, LastSuccess: st.LastSuccess, Writes: st.Writes}
 				if floorOK {
 					if n, err := strconv.Atoi(st.Version); err == nil && n < floor {
 						v.Behind = true

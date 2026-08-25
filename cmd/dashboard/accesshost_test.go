@@ -206,7 +206,7 @@ func TestAccessEndpointHostParamForwardsToPeer(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev")
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false)
 
 	mux := newAccessTestMux(t, reg)
 
@@ -226,7 +226,7 @@ func TestAccessEndpointHostParamUnknownHost(t *testing.T) {
 	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
 
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev")
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false)
 
 	mux := newAccessTestMux(t, reg)
 
@@ -259,7 +259,7 @@ func TestAccessEndpointHostParamEqualsSelfIdentityUsesLocal(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-a", "dev")
+	reg.recordResult(peerSrv.URL, true, "dashboard-a", "dev", false)
 
 	mux := newAccessTestMux(t, reg)
 
@@ -322,7 +322,7 @@ func TestAccessEndpointHostParamPeerUnreachable(t *testing.T) {
 	peerSrv.Close() // guarantees connection-refused without hardcoding a port
 
 	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(url, true, "dashboard-b", "dev")
+	reg.recordResult(url, true, "dashboard-b", "dev", false)
 
 	mux := newAccessTestMux(t, reg)
 
@@ -350,7 +350,7 @@ func TestAccessEndpointHostParamPeerRejectsSecretBecomes502(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev")
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false)
 
 	mux := newAccessTestMux(t, reg)
 
@@ -374,7 +374,7 @@ func TestAccessEndpointHostParamEmptyPeerSecretUnknownHost(t *testing.T) {
 	t.Setenv("DASHBOARD_PEER_SECRET", "")
 
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev")
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false)
 
 	mux := newAccessTestMux(t, reg)
 

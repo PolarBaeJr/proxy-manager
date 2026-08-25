@@ -1424,22 +1424,31 @@ let _lastServicesHash = '';
 // Left null on a failed fetch so the next render retries rather than
 // permanently locking every local, unlabeled row.
 let _selfIdentity = null;
+// _peerWrites: peer identity -> that peer's last-known -peer-writes setting
+// (from /api/peers' writes field — peers.go's peerStatus.Writes). Populated
+// wherever /api/peers gets fetched (loadSelfIdentity, loadImagesPeerOptions).
+// Missing/unreachable peers are simply absent, which peerWritable treats as
+// false — fail-safe, same "over-lock is safe, under-lock isn't" reasoning as
+// _selfIdentity above.
+let _peerWrites = {};
+function notePeerWrites(peers) {
+  for (const p of (peers || [])) if (p.identity) _peerWrites[p.identity] = !!p.writes;
+}
 async function loadSelfIdentity() {
   try {
     const d = await (await fetch('/api/peers')).json();
     _selfIdentity = (d.self && d.self.identity) || '';
+    notePeerWrites(d.peers);
   } catch (e) { /* leave null — retry next render */ }
 }
 // foreignSvc reports whether a service was merged in from another host's
 // dashboard (s.machine set and not this host) — such rows are read-only in
 // this UI; mutating actions stay local-only.
 function foreignSvc(s) { return !!s.machine && s.machine !== _selfIdentity; }
-// peerWritable is inert plumbing for the write-capable peer mesh (Phase 0) —
-// there's no backend signal yet for "this peer has writes enabled and is
-// currently reachable" (e.g. a future field on /api/peers), so this always
-// returns false and nothing calls it yet. A later phase wires it up and
-// starts using it to un-disable foreign-row actions that are safe to forward.
-function peerWritable(s) { return false; }
+// peerWritable reports whether s's owning peer (s.machine) is currently
+// known to have writes enabled — the real signal behind the write-capable
+// peer mesh's frontend gating (Phase 0 left this hardcoded false).
+function peerWritable(s) { return !!(s && s.machine && _peerWrites[s.machine]); }
 // machineLabel trims the shared ".polardev.org" suffix so the badge stays
 // short — same convention as cmd/statusbot/statuspager.go's machineSuffix.
 function machineLabel(m) { return String(m || '').replace(/\.polardev\.org$/, ''); }
@@ -2967,6 +2976,7 @@ let _imagesHost = loadPref('pmgr-images-host', '');
 async function loadImagesPeerOptions() {
   try {
     const d = await (await fetch('/api/peers')).json();
+    notePeerWrites(d.peers);
     return d.peers || [];
   } catch (e) { return []; }
 }
@@ -3009,11 +3019,13 @@ async function renderImages() {
     wireHostPicker();
     return;
   }
-  const hash = JSON.stringify(info) + '|' + _imagesHost;
+  const viewingPeer = imagesViewingPeer();
+  const writable = !viewingPeer || peerWritable({ machine: _imagesHost });
+  const hash = JSON.stringify(info) + '|' + _imagesHost + '|' + writable;
   if (hash === _lastImagesHash && el.children.length) return;
   _lastImagesHash = hash;
 
-  const viewingPeer = imagesViewingPeer();
+  const hostParam = viewingPeer ? '?host=' + encodeURIComponent(_imagesHost) : '';
   const blurb = '<div class="subhead">' + I.disk + 'Images'
     + ' <span style="color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none">— local images per service. Mark stable to protect; prune deletes from this disk only, never the registry. Sizes approx.</span>'
     + '</div>';
@@ -3022,7 +3034,7 @@ async function renderImages() {
   const totalBar = '<div class="card"><div class="card-head"><div class="ttl">' + I.disk + '<span>Reclaimable</span>'
     + ' <span class="pill warn">' + fmtBytes(info.total_reclaimable_bytes || 0) + ' approx</span></div>'
     + '<div class="spacer"></div>'
-    + (viewingPeer ? '' : ('<label style="color:var(--muted);font-size:12px">keep last</label> '
+    + (!writable ? '' : ('<label style="color:var(--muted);font-size:12px">keep last</label> '
       + '<input type="number" min="0" max="50" value="3" id="img-prune-all-n" style="width:64px"> '
       + '<button class="btn danger" data-img-prune="">' + I.scissors + 'Prune all services</button>'))
     + '</div></div>';
@@ -3032,7 +3044,7 @@ async function renderImages() {
       + ' <span class="pill">' + (svc.entries || []).length + ' version' + ((svc.entries || []).length === 1 ? '' : 's') + '</span>'
       + ' <span class="pill warn">' + fmtBytes(svc.reclaimable_bytes || 0) + ' reclaimable approx</span></div>'
       + '<div class="spacer"></div>'
-      + (viewingPeer ? '' : ('<label style="color:var(--muted);font-size:12px">keep last</label> '
+      + (!writable ? '' : ('<label style="color:var(--muted);font-size:12px">keep last</label> '
         + '<input type="number" min="0" max="50" value="3" data-prune-n="' + esc(svc.service) + '" style="width:64px"> '
         + '<button class="btn" data-img-prune="' + esc(svc.service) + '">' + I.scissors + 'Prune old</button>'))
       + '</div>';
@@ -3047,17 +3059,18 @@ async function renderImages() {
         : '';
       const idBit = e.short_id ? ' <span class="meta" style="font-size:11.5px">' + esc(e.short_id) + '</span>' : '';
       const actions = [];
-      if (!viewingPeer) {
+      if (writable) {
         if (e.tag && !e.is_stable) actions.push('<button class="btn sm ghost" data-img-mark="' + esc(svc.service) + '" data-tag="' + esc(e.tag) + '">' + I.bookmark + 'Mark stable</button>');
         if (e.tag && e.is_stable)  actions.push('<button class="btn sm ghost" data-img-unmark="' + esc(svc.service) + '" data-tag="' + esc(e.tag) + '">Unmark</button>');
-        if (e.delete_token)        actions.push('<button class="btn sm danger" data-img-del="' + esc(e.delete_token) + '">' + I.trash + 'Delete</button>');
+        if (!viewingPeer && e.delete_token) actions.push('<button class="btn sm danger" data-img-del="' + esc(e.delete_token) + '">' + I.trash + 'Delete</button>');
+        if (viewingPeer && e.on_disk && !e.protected) actions.push('<button class="btn sm danger" data-img-del-peer="' + esc(svc.service) + '" data-ref="' + esc(e.ref) + '">' + I.trash + 'Delete</button>');
       }
       return '<tr>'
         + '<td><code title="' + esc(e.ref) + '">' + esc(e.tag || e.ref) + '</code>' + idBit + markedBy + '</td>'
         + '<td>' + (e.on_disk ? fmtBytes(e.size_bytes || 0) : '—') + '</td>'
         + '<td>' + pills.join(' ') + '</td>'
         + '<td class="meta">' + (e.last_seen ? new Date(e.last_seen * 1000).toLocaleDateString() : '—') + '</td>'
-        + '<td style="text-align:right">' + (viewingPeer ? '<span class="lock" title="read-only — viewing ' + esc(machineLabel(_imagesHost)) + '">' + I.lock + '</span>' : actions.join(' ')) + '</td>'
+        + '<td style="text-align:right">' + (!writable ? '<span class="lock" title="read-only — viewing ' + esc(machineLabel(_imagesHost)) + '">' + I.lock + '</span>' : actions.join(' ')) + '</td>'
         + '</tr>';
     }).join('');
     const body = '<table class="acc-table"><thead><tr>'
@@ -3069,13 +3082,13 @@ async function renderImages() {
   el.innerHTML = picker + blurb + totalBar + (cards || '<div class="card">No managed services with tracked images yet.</div>');
   wireHostPicker();
 
-  if (!viewingPeer) {
+  if (writable) {
     el.querySelectorAll('[data-img-mark]').forEach(b => b.onclick = async () => {
       const svc = b.dataset.imgMark, tag = b.dataset.tag;
-      const label = await promptDialog('Label for stable ' + svc + ':' + tag + '?', '');
+      const label = await promptDialog('Label for stable ' + svc + ':' + tag + (viewingPeer ? ' on ' + machineLabel(_imagesHost) : '') + '?', '');
       if (label === null) return;
       try {
-        await api('/api/images/mark', { method: 'POST', body: JSON.stringify({ service: svc, tag, label }) });
+        await api('/api/images/mark' + hostParam, { method: 'POST', body: JSON.stringify({ service: svc, tag, label }) });
         toast('Marked ' + svc + ':' + tag + ' as stable', 'ok');
         _lastImagesHash = '';
         renderImages();
@@ -3083,9 +3096,9 @@ async function renderImages() {
     });
     el.querySelectorAll('[data-img-unmark]').forEach(b => b.onclick = async () => {
       const svc = b.dataset.imgUnmark, tag = b.dataset.tag;
-      if (!(await confirmDialog('Unmark ' + svc + ':' + tag + '? It loses deletion protection.'))) return;
+      if (!(await confirmDialog('Unmark ' + svc + ':' + tag + (viewingPeer ? ' on ' + machineLabel(_imagesHost) : '') + '? It loses deletion protection.'))) return;
       try {
-        await api('/api/images/mark', { method: 'DELETE', body: JSON.stringify({ service: svc, tag }) });
+        await api('/api/images/mark' + hostParam, { method: 'DELETE', body: JSON.stringify({ service: svc, tag }) });
         toast('Unmarked', 'ok');
         _lastImagesHash = '';
         renderImages();
@@ -3101,14 +3114,25 @@ async function renderImages() {
         renderImages();
       } catch (e) { toast(e.message, 'err'); }
     });
+    el.querySelectorAll('[data-img-del-peer]').forEach(b => b.onclick = async () => {
+      const svc = b.dataset.imgDelPeer, ref = b.dataset.ref;
+      if (!(await confirmDialog('Delete image ' + ref + ' on ' + machineLabel(_imagesHost) + '? Removes it from that machine only — the registry copy is untouched.', { danger: true }))) return;
+      try {
+        await api('/api/images/delete' + hostParam, { method: 'DELETE', body: JSON.stringify({ service: svc, ref }) });
+        toast('Deleted ' + ref, 'ok');
+        _lastImagesHash = '';
+        renderImages();
+      } catch (e) { toast(e.message, 'err'); }
+    });
     el.querySelectorAll('[data-img-prune]').forEach(b => b.onclick = async () => {
       const svc = b.getAttribute('data-img-prune');
       const nEl = svc ? el.querySelector('[data-prune-n="' + svc + '"]') : el.querySelector('#img-prune-all-n');
       const keep = Math.max(0, parseInt((nEl && nEl.value) || '3', 10) || 0);
       const scope = svc || 'ALL services';
-      if (!(await confirmDialog('Prune old images for ' + scope + '? Keeps stable + running + the ' + keep + ' newest; deletes the rest from local disk (never the registry).', { danger: true, okLabel: 'Prune' }))) return;
+      const onHost = viewingPeer ? ' on ' + machineLabel(_imagesHost) : '';
+      if (!(await confirmDialog('Prune old images for ' + scope + onHost + '? Keeps stable + running + the ' + keep + ' newest; deletes the rest from local disk (never the registry).', { danger: true, okLabel: 'Prune' }))) return;
       try {
-        const r = await api('/api/images/prune', { method: 'POST', body: JSON.stringify({ service: svc, keep_n: keep }) });
+        const r = await api('/api/images/prune' + hostParam, { method: 'POST', body: JSON.stringify({ service: svc, keep_n: keep }) });
         const nDel = (r.deleted || []).length, nFail = (r.failed || []).length;
         toast('Pruned ' + nDel + ' image(s) — reclaimed ~' + fmtBytes(r.reclaimed_bytes || 0) + (nFail ? ' · ' + nFail + ' failed' : ''), nFail ? 'err' : 'ok');
         _lastImagesHash = '';

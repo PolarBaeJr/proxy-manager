@@ -205,6 +205,24 @@ func mergedServices(svcs []Service, onb []OnboardedService) []Service {
 	return out
 }
 
+// resolveImageBase finds a merged service's image repo base — the same
+// base:tag keying the ReleasesStore uses — for image mark/unmark. Shared by
+// the local /api/images/ handler (api.go) and its peer-side counterpart
+// (peers.go's peerImagesMutateHandler).
+func resolveImageBase(ctx context.Context, dc *dockerClient, onb *OnboardedStore, service string) (string, bool) {
+	svcs, err := dc.listServices(ctx)
+	if err != nil {
+		return "", false
+	}
+	for _, s := range mergedServices(svcs, onb.List()) {
+		if s.Name == service && s.Image != "" {
+			base, _ := splitImageRef(s.Image)
+			return base, true
+		}
+	}
+	return "", false
+}
+
 // protectedSets computes, LIVE from the daemon, everything that must never
 // be deleted: the image ref + ID of every container (running AND stopped),
 // every current service image (live + canary), and every stable-marked
@@ -244,6 +262,76 @@ func protectedSets(ctx context.Context, dc *dockerClient, rs *ReleasesStore, svc
 		}
 	}
 	return protectedRefs, protectedIDs, nil
+}
+
+// runImagePrune deletes everything imagesToPrune identifies as safe to
+// remove within the given service scope (empty = all services), against
+// info's LIVE protection data — info must come from a buildImagesInfo call
+// the caller just made, never cached history. Shared by the local
+// /api/images/prune handler (api.go) and its peer-side counterpart
+// (peers.go's peerImagesMutateHandler) so the safety recomputation has one
+// implementation. onDelete, when non-nil, is called once per successfully
+// deleted token, before the next one is attempted — callers use it to audit
+// against their own actor.
+func runImagePrune(ctx context.Context, dc *dockerClient, info *imagesInfoResp, service string, keepN int, onDelete func(token string)) (deleted []string, failed []map[string]string, reclaimed int64) {
+	deleted = []string{}
+	failed = []map[string]string{}
+	doneIDs := map[string]bool{}
+	doneTokens := map[string]bool{}
+	for _, si := range info.Services {
+		if service != "" && si.Service != service {
+			continue
+		}
+		var metas []imgMeta
+		protRefs := map[string]bool{}
+		protIDs := map[string]bool{}
+		for _, e := range si.Entries {
+			if !e.OnDisk {
+				continue
+			}
+			var ls time.Time
+			if e.LastSeen > 0 {
+				ls = time.Unix(e.LastSeen, 0)
+			}
+			metas = append(metas, imgMeta{
+				Ref: e.Ref, ID: e.fullID, Tagged: e.tagged,
+				SizeBytes: e.SizeBytes, LastSeen: ls, Created: e.created,
+			})
+			if e.Protected {
+				protRefs[e.Ref] = true
+				if e.fullID != "" {
+					protIDs[e.fullID] = true
+				}
+			}
+		}
+		sizeByToken := map[string]imgMeta{}
+		for _, m := range metas {
+			if m.Tagged {
+				sizeByToken[m.Ref] = m
+			} else {
+				sizeByToken[m.ID] = m
+			}
+		}
+		for _, token := range imagesToPrune(metas, protRefs, protIDs, keepN) {
+			if doneTokens[token] {
+				continue
+			}
+			doneTokens[token] = true
+			if err := dc.removeImage(ctx, token, false); err != nil {
+				failed = append(failed, map[string]string{"token": token, "error": err.Error()})
+				continue
+			}
+			deleted = append(deleted, token)
+			if m, ok := sizeByToken[token]; ok && m.ID != "" && !doneIDs[m.ID] {
+				doneIDs[m.ID] = true
+				reclaimed += m.SizeBytes
+			}
+			if onDelete != nil {
+				onDelete(token)
+			}
+		}
+	}
+	return deleted, failed, reclaimed
 }
 
 // ---- GET /api/images response ----
