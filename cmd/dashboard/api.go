@@ -895,7 +895,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	}))
 
 	// ---- Container logs (read-only; auth-gated) ----
-	registerLogRoutes(mux, dc, auth)
+	registerLogRoutes(mux, dc, auth, registry)
 
 	// ---- Discovery: list containers NOT routed by the proxy (auth-gated) ----
 	registerDiscoveryRoutes(mux, dc, auth, onb, routesConfigPath)

@@ -514,6 +514,129 @@ func peerImagesHandler(secret, identity string, dc *dockerClient, rs *ReleasesSt
 	})
 }
 
+// peerLogsContainersResp is the wire shape for GET /peer/logs/containers —
+// this peer's own FULL container list (dc.listContainerSummaries — every
+// container Docker knows about, NOT scoped to managed/labeled services, and
+// NOT excludeSelf-filtered) plus its identity. Mirrors exactly what the
+// LOCAL /api/logs/containers handler (logs.go) returns today, so a peer's
+// Logs picker shows what logging into that peer directly would show —
+// deliberately NOT built from Phase 1's narrower Service.Members data.
+type peerLogsContainersResp struct {
+	Identity   string             `json:"identity"`
+	Containers []containerSummary `json:"containers"`
+}
+
+// peerLogsResp is the wire shape for GET /peer/logs/{container} — this
+// peer's own containerLogs() output for one container, plus its identity.
+type peerLogsResp struct {
+	Identity  string    `json:"identity"`
+	Container string    `json:"container"`
+	Tail      int       `json:"tail"`
+	Lines     []logLine `json:"lines"`
+}
+
+// peerLogsContainersHandler returns the HTTP handler for GET
+// /peer/logs/containers on the dedicated peer-handshake port — same
+// bearer-auth shape as peerImagesHandler.
+func peerLogsContainersHandler(secret, identity string, dc *dockerClient) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		list, err := dc.listContainerSummaries(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(peerLogsContainersResp{Identity: identity, Containers: list})
+	})
+}
+
+// peerLogsHandler returns the HTTP handler for GET /peer/logs/{container} on
+// the dedicated peer-handshake port. Re-validates the container name itself
+// (validContainerName) rather than trusting the forwarding host's own
+// check — this handler is reachable by anyone possessing the shared peer
+// secret and must be safe to call directly.
+func peerLogsHandler(secret, identity string, dc *dockerClient) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/peer/logs/")
+		if name == "" || name == "containers" || !validContainerName(name) {
+			http.NotFound(w, r)
+			return
+		}
+		tail := 200
+		if t := r.URL.Query().Get("tail"); t != "" {
+			if n, err := strconv.Atoi(t); err == nil {
+				tail = n
+			}
+		}
+		lines, err := dc.containerLogs(r.Context(), name, tail)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(peerLogsResp{Identity: identity, Container: name, Tail: tail, Lines: lines})
+	})
+}
+
+// peerGETTimeout is peerGET with a caller-chosen timeout instead of the
+// fixed 2s — for resources whose payload isn't small-and-fast like
+// service-status/services/images. Container logs can be up to 4MB of raw
+// daemon output demuxed and re-encoded as JSON; on a loaded peer a
+// tail=5000 fetch can plausibly exceed 2s, and peerGET's fixed timeout would
+// then look identical to "peer unreachable" in the UI. Callers must give
+// their own *http.Client a Timeout >= timeout — a shorter client.Timeout
+// silently defeats this function's whole purpose.
+func peerGETTimeout(ctx context.Context, client *http.Client, peerBaseURL, secret, path string, timeout time.Duration, out any) error {
+	url := strings.TrimRight(peerBaseURL, "/") + path
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s unreachable: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s → %s", url, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%s bad response: %w", url, err)
+	}
+	return nil
+}
+
 // fetchPeerServices polls every configured peer's /peer/services in parallel
 // and returns their services, each tagged with that peer's own identity as
 // Machine. A peer that's down, slow, or misconfigured is logged and simply
