@@ -33,6 +33,13 @@
       ]
     },
     {
+      "name": "badminton-mac-player (cross-host routing test)",
+      "host": "test.polardev.org",
+      "backends": [
+        "http://100.83.62.68:3100"
+      ]
+    },
+    {
       "name": "comp (broken backend)",
       "host": "comp.polardev.org",
       "backends": [
