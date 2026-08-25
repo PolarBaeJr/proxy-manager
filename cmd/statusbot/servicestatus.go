@@ -29,6 +29,13 @@ type serviceStatusEntry struct {
 type serviceStatusGroup struct {
 	Group    string               `json:"group"`
 	Services []serviceStatusEntry `json:"services"`
+	// Machine is the peer identity (DASHBOARD_HOST) whose dashboard instance
+	// this group came from — "" for the polled dashboard's own host, set on
+	// groups it merged in from a peer via /peer/service-status (see
+	// cmd/dashboard/peers.go's fetchPeerServiceStatus). statusbot never
+	// fetches peers itself — the dashboard it polls does the merging — this
+	// just carries the label through so statuspager.go can show it.
+	Machine string `json:"machine,omitempty"`
 }
 
 type serviceStatusResp struct {

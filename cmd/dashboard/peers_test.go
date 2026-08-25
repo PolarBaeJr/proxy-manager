@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -190,6 +191,106 @@ func TestMeshFloorFromComputesMinimum(t *testing.T) {
 	v, ok := meshFloorFrom([]int{5, 2, 9})
 	if !ok || v != 2 {
 		t.Fatalf("meshFloorFrom([5,2,9]) = (%d, %v), want (2, true)", v, ok)
+	}
+}
+
+func TestPeerServiceStatusHandlerValidSecret(t *testing.T) {
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c1", Names: []string{"/goproxy-app-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
+		}})
+	}))
+	h := peerServiceStatusHandler("s3cret", "dashboard-b", dc, "")
+	req := httptest.NewRequest(http.MethodGet, "/peer/service-status", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body peerServiceStatusResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Identity != "dashboard-b" {
+		t.Errorf("Identity = %q, want %q", body.Identity, "dashboard-b")
+	}
+	if len(body.Status.Groups) != 1 || body.Status.Groups[0].Machine != "" {
+		t.Errorf("Status = %+v, want one group with Machine unset (peer never tags its own local groups)", body.Status)
+	}
+}
+
+func TestPeerServiceStatusHandlerWrongSecret(t *testing.T) {
+	h := peerServiceStatusHandler("s3cret", "dashboard-b", nil, "")
+	req := httptest.NewRequest(http.MethodGet, "/peer/service-status", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestPeerServiceStatusHandlerEmptySecretDisabled(t *testing.T) {
+	h := peerServiceStatusHandler("", "dashboard-b", nil, "")
+	req := httptest.NewRequest(http.MethodGet, "/peer/service-status", nil)
+	req.Header.Set("Authorization", "Bearer anything")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestPeerServiceStatusHandlerWrongMethod(t *testing.T) {
+	h := peerServiceStatusHandler("s3cret", "dashboard-b", nil, "")
+	req := httptest.NewRequest(http.MethodPost, "/peer/service-status", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestFetchPeerServiceStatusTagsMachineAndMerges(t *testing.T) {
+	dcB := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c1", Names: []string{"/goproxy-b-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "svc-b", labelHost: "b.example", labelPort: "80"},
+		}})
+	}))
+	srvB := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", dcB, ""))
+	defer srvB.Close()
+
+	reg := newPeerRegistry([]string{srvB.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
+	groups := fetchPeerServiceStatus(context.Background(), reg, "s3cret")
+	if len(groups) != 1 {
+		t.Fatalf("groups = %+v, want 1", groups)
+	}
+	if groups[0].Machine != "dashboard-b" {
+		t.Errorf("Machine = %q, want %q", groups[0].Machine, "dashboard-b")
+	}
+}
+
+func TestFetchPeerServiceStatusSkipsUnreachablePeer(t *testing.T) {
+	srv := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", nil, ""))
+	url := srv.URL
+	srv.Close() // guarantees connection-refused without hardcoding a port
+
+	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
+	groups := fetchPeerServiceStatus(context.Background(), reg, "s3cret")
+	if groups != nil {
+		t.Fatalf("groups = %+v, want nil for an unreachable peer", groups)
+	}
+}
+
+func TestFetchPeerServiceStatusNoPeersConfigured(t *testing.T) {
+	reg := newPeerRegistry(nil, "s3cret", "dashboard-a", "dev", 0, nil)
+	if got := fetchPeerServiceStatus(context.Background(), reg, "s3cret"); got != nil {
+		t.Fatalf("groups = %+v, want nil with no peers configured", got)
 	}
 }
 

@@ -186,3 +186,70 @@ func TestServiceStatusEndpoint(t *testing.T) {
 		t.Fatalf("Groups = %+v", got.Groups)
 	}
 }
+
+// TestServiceStatusEndpointMergesPeer proves the full request path — not
+// just fetchPeerServiceStatus/peerServiceStatusHandler in isolation
+// (peers_test.go) — actually merges a peer's groups into /api/service-status
+// when called the way statusbot really calls it, through newDashboardMux's
+// auth+registry wiring. This is what "yes, both hosts" + "it should just
+// follow the labels" cash out to: no statusbot-side config, the dashboard
+// does all the merging.
+func TestServiceStatusEndpointMergesPeer(t *testing.T) {
+	t.Setenv("PROXY_URL", "")
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c1", Names: []string{"/goproxy-app-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
+		}})
+	}))
+	peerDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c2", Names: []string{"/goproxy-player-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "player", labelHost: "badminton-mac.example", labelPort: "3000"},
+		}})
+	}))
+
+	peerSrv := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", peerDC, ""))
+	t.Cleanup(peerSrv.Close)
+
+	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
+
+	auth, _ := newConfirmedStore(t, "alice", "correct horse")
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, reg)
+
+	tok, _, err := auth.CreateToken("alice", "test")
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	req := httptest.NewRequest("GET", "/api/service-status", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var got ServiceStatusResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Groups) != 2 {
+		t.Fatalf("Groups = %+v, want 2 (local + peer)", got.Groups)
+	}
+	var local, peer *ServiceStatusGroup
+	for i := range got.Groups {
+		switch got.Groups[i].Machine {
+		case "dashboard-a":
+			local = &got.Groups[i]
+		case "dashboard-b":
+			peer = &got.Groups[i]
+		}
+	}
+	if local == nil || len(local.Services) != 1 || local.Services[0].Name != "app" {
+		t.Fatalf("local group = %+v, want tagged dashboard-a with service app", local)
+	}
+	if peer == nil || len(peer.Services) != 1 || peer.Services[0].Name != "player" {
+		t.Fatalf("peer group = %+v, want tagged dashboard-b with service player", peer)
+	}
+}
