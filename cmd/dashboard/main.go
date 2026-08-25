@@ -289,7 +289,7 @@ func main() {
 		"/peer/handshake":       peerHandshakeHandler(peerSecret, identity, buildVersion, peerWritesEnabled),
 		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv()),
 		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic),
-		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, *staticConfig, proxyURLFromEnv(), peerWritesEnabled),
+		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, *staticConfig, proxyURLFromEnv(), peerWritesEnabled),
 		"/peer/images":          peerImagesHandler(peerSecret, identity, dc, releases, imageHistory, onboarded),
 		"/peer/images/":         peerImagesMutateHandler(peerSecret, identity, dc, releases, imageHistory, onboarded, peerWritesEnabled),
 		"/peer/access":          peerAccessHandler(peerSecret, identity, proxyURLFromEnv()),
