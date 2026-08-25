@@ -919,7 +919,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			return
 		}
 		if err := dc.onboardContainer(req.Context(), name, body); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeOnboardErr(w, err)
 			return
 		}
 		proxyRefresh(proxyURLFromEnv())
@@ -1681,6 +1681,21 @@ func runServiceAutoUpdateSet(ctx context.Context, dc *dockerClient, onb *Onboard
 // managed-only or a downstream Docker failure unrelated to identity).
 func writeAutoUpdateErr(w http.ResponseWriter, err error) {
 	if errors.Is(err, errAutoUpdateSelf) {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
+// writeOnboardErr maps onboardContainer's (and, transitively,
+// checkOnboardTarget's) error onto the response: errOnboardRefused ->
+// 403 (destructive action correctly refused — the dashboard's own container
+// or a fixed infra container, or an identity check that failed to run),
+// everything else -> 400 (preserves the existing plain-400 behavior for all
+// other error cases: invalid input, container not found, HostConfig
+// unknowns, etc).
+func writeOnboardErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, errOnboardRefused) {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}

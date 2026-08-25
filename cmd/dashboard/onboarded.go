@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -289,6 +290,49 @@ func (c *dockerClient) offboardLabelManaged(ctx context.Context, name string) er
 
 // ---- Onboarding flow ----
 
+// errOnboardRefused is returned by checkOnboardTarget when the resolved
+// target must not be destroyed by onboarding: the dashboard's own container,
+// or one of the fixed infra containers (proxy, in particular — destroying it
+// takes down routing for every service on the host, not just the
+// dashboard's own reachability).
+var errOnboardRefused = errors.New("refusing to onboard this container")
+
+// checkOnboardTarget refuses to onboard the dashboard's own container (by
+// identity, not label — onboard's targets never carry proxy.* labels yet,
+// since they haven't been onboarded, so the label-based
+// serviceContainsSelfByName check used elsewhere wouldn't work here) or any
+// of the fixed infra containers named in infraContainerNames.
+//
+// Fails CLOSED on a hostname-lookup error — deliberately does NOT reuse
+// isSelfContainer's own comparison as-is, because isSelfContainer fails OPEN
+// (returns false, i.e. "not self") on a selfHostname() error, which is
+// correct for its existing callers (they only filter a display/action list
+// where "not self" just means "still shown/actionable", and other guards
+// layered around them, like this one, exist for exactly this kind of case).
+// Here the same "can't verify" outcome must mean refuse: onboardContainer
+// stops and removes the original container after recreating replicas, with
+// no live re-read afterward that could rescue a wrong "not self"
+// determination. isSelfContainer itself is left untouched — other callers
+// may correctly depend on its current fail-open semantics.
+func checkOnboardTarget(ct dockerContainer) error {
+	name := ct.name()
+	if infraContainerNames[name] {
+		return fmt.Errorf("%q is a fixed infrastructure container: %w", name, errOnboardRefused)
+	}
+	hostname, err := selfHostname()
+	if err != nil {
+		return fmt.Errorf("could not verify container identity: %v: %w", err, errOnboardRefused)
+	}
+	h := strings.TrimSpace(hostname)
+	if h == "" {
+		return fmt.Errorf("could not verify container identity (empty hostname): %w", errOnboardRefused)
+	}
+	if ct.ID == h || strings.HasPrefix(ct.ID, h) {
+		return fmt.Errorf("%q is the dashboard's own container: %w", name, errOnboardRefused)
+	}
+	return nil
+}
+
 type OnboardRequest struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
@@ -343,6 +387,9 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	}
 	if ct == nil {
 		return fmt.Errorf("container %q not found", name)
+	}
+	if err := checkOnboardTarget(*ct); err != nil {
+		return err
 	}
 
 	// Fail closed: refuse rather than silently drop any HostConfig/Config/
@@ -440,6 +487,9 @@ func onboardManagedOnly(ctx context.Context, name string, c *dockerClient, store
 	}
 	if ct == nil {
 		return fmt.Errorf("container %q not found", name)
+	}
+	if err := checkOnboardTarget(*ct); err != nil {
+		return err
 	}
 	return store.Put(OnboardedService{
 		Name:           name,
