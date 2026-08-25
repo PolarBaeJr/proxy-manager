@@ -1332,7 +1332,7 @@ async function renderRoutes() {
   const el = $('#tab-routes');
   // Both feeds are in the hash: a flag flipped from the shell (or another
   // browser) has to repaint the badge even when the routes are unchanged.
-  const hash = JSON.stringify([groups, maint]);
+  const hash = JSON.stringify([groups, maint]) + '|' + authState.elevated_until;
   if (hash === _lastRoutesHash && el.children.length) return;
   _lastRoutesHash = hash;
   const inMaint = new Set((maint.hosts || []).map(h => h.toLowerCase()));
@@ -1482,7 +1482,7 @@ async function renderServices() {
   // Bail out of the full rebuild on the 5s tick if nothing about the services
   // changed — preserves scroll, hover, expanded-card state. We still refresh
   // the per-service stats panels (which DO change) without touching the rest.
-  const hash = JSON.stringify(svcs) + '|' + _selfIdentity + '|' + JSON.stringify(_peerWrites);
+  const hash = JSON.stringify(svcs) + '|' + _selfIdentity + '|' + JSON.stringify(_peerWrites) + '|' + authState.elevated_until;
   if (hash === _lastServicesHash && el.children.length) {
     fillServiceStatsPanels().catch(() => {});
     return;
@@ -1815,7 +1815,7 @@ async function renderDiscovery() {
   const el = $('#tab-discovery');
   const unmanaged = await api('/api/discovery').catch(() => []);
   _lastDiscoveryPayload = unmanaged || [];
-  const hash = JSON.stringify(unmanaged);
+  const hash = JSON.stringify(unmanaged) + '|' + authState.elevated_until;
   if (hash === _lastDiscoveryHash && el.children.length) return;
   _lastDiscoveryHash = hash;
   if (!unmanaged || !unmanaged.length) {
@@ -2344,7 +2344,7 @@ async function renderDNS() {
     recs = await api('/api/cf/records?zone=' + encodeURIComponent(zone));
   } catch (e) { zoneErr = e.message; }
   // Hash includes the zone: two zones that both return [] are not the same view.
-  const hash = JSON.stringify({zone, zones, recs, zoneErr});
+  const hash = JSON.stringify({zone, zones, recs, zoneErr}) + '|' + authState.elevated_until;
   if (hash === _lastDNSHash && el.children.length) return;
   _lastDNSHash = hash;
   // One dropdown rather than a chip per zone: auto-discovery means the list
@@ -2425,7 +2425,7 @@ async function renderUsers() {
     api('/api/users/passkeys').catch(() => []),
   ]);
   const el0 = $('#tab-users');
-  const hash = JSON.stringify({ users, myTokens, myPasskeys });
+  const hash = JSON.stringify({ users, myTokens, myPasskeys }) + '|' + authState.elevated_until;
   if (hash === _lastUsersHash && el0.children.length) return;
   _lastUsersHash = hash;
   const el = $('#tab-users');
