@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
 )
@@ -131,8 +134,35 @@ func splitLines(data []byte, stream string) []logLine {
 
 // registerLogRoutes wires the Logs endpoints onto the dashboard mux. Auth-gated
 // (read-only — no write surface here), so token-auth and session-auth both work.
-func registerLogRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore) {
+// registry may be nil (no cross-host peering configured); a ?host= param is
+// then treated as an unknown host, same as everywhere else in the peer mesh.
+func registerLogRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore, registry *PeerRegistry) {
 	mux.HandleFunc("/api/logs/containers", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		host := strings.TrimSpace(req.URL.Query().Get("host"))
+		if host != "" && (registry == nil || host != registry.Identity()) {
+			if registry == nil {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			peerURL, ok := registry.URLForIdentity(host)
+			if !ok {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+			if peerSecret == "" {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			client := &http.Client{Timeout: 6 * time.Second}
+			var resp peerLogsContainersResp
+			if err := peerGETTimeout(req.Context(), client, peerURL, peerSecret, "/peer/logs/containers", 5*time.Second, &resp); err != nil {
+				httpx.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, resp.Containers)
+			return
+		}
 		list, err := dc.listContainerSummaries(req.Context())
 		if err != nil {
 			httpx.WriteErr(w, err)
@@ -152,6 +182,36 @@ func registerLogRoutes(mux *http.ServeMux, dc *dockerClient, auth *AuthStore) {
 			if n, err := strconv.Atoi(t); err == nil {
 				tail = n
 			}
+		}
+		host := strings.TrimSpace(req.URL.Query().Get("host"))
+		if host != "" && (registry == nil || host != registry.Identity()) {
+			if registry == nil {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			peerURL, ok := registry.URLForIdentity(host)
+			if !ok {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+			if peerSecret == "" {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			client := &http.Client{Timeout: 6 * time.Second}
+			var resp peerLogsResp
+			path := "/peer/logs/" + url.PathEscape(name) + "?tail=" + strconv.Itoa(tail)
+			if err := peerGETTimeout(req.Context(), client, peerURL, peerSecret, path, 5*time.Second, &resp); err != nil {
+				httpx.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
+				"container": resp.Container,
+				"tail":      resp.Tail,
+				"lines":     resp.Lines,
+			})
+			return
 		}
 		lines, err := dc.containerLogs(req.Context(), name, tail)
 		if err != nil {

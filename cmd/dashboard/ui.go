@@ -2503,23 +2503,71 @@ async function deleteUser(name) {
 /* ---------- Logs ---------- */
 // State persists across re-renders so toolbar inputs and scroll position survive
 // the 5s auto-refresh; renderLogs only paints the toolbar shell on first entry.
-let logsState = { container:'', tail:200, filter:'', follow:true, mounted:false };
+// mountedHost tracks which host the currently-mounted toolbar was built for —
+// when it no longer matches _logsHost the toolbar (and container list) is
+// stale and must be rebuilt.
+let logsState = { container:'', tail:200, filter:'', follow:true, mounted:false, mountedHost:null };
+// _logsHost: '' = this host (local); anything else = a peer, viewed via
+// GET /api/logs/containers?host= and GET /api/logs/{name}?host=. Persisted
+// so the picker survives a tab switch / reload — same convention as Images'
+// _imagesHost.
+let _logsHost = loadPref('pmgr-logs-host', '');
+async function loadLogsPeerOptions() {
+  try {
+    const d = await (await fetch('/api/peers')).json();
+    return d.peers || [];
+  } catch (e) { return []; }
+}
+function logsHostPickerHTML(peers) {
+  const pickerOptions = ['<option value="">this host' + (_selfIdentity ? ' (' + esc(machineLabel(_selfIdentity)) + ')' : '') + '</option>']
+    .concat(peers.map(p => {
+      const disabled = p.identity ? '' : ' disabled';
+      const label = machineLabel(p.identity || p.url) + (!p.ok ? ' (unreachable)' : '');
+      const selected = p.identity && p.identity === _logsHost ? ' selected' : '';
+      return '<option value="' + esc(p.identity || '') + '"' + disabled + selected + '>' + esc(label) + '</option>';
+    }));
+  return '<div class="card"><div class="card-head"><div class="ttl">' + I.globe + '<span>Viewing</span></div>'
+    + '<div class="spacer"></div>'
+    + '<select id="log-host-picker">' + pickerOptions.join('') + '</select>'
+    + '</div></div>';
+}
+function wireLogsHostPicker() {
+  const sel = $('#log-host-picker');
+  if (sel) sel.onchange = (e) => {
+    _logsHost = e.target.value;
+    savePref('pmgr-logs-host', _logsHost);
+    logsState.mounted = false;
+    renderLogs();
+  };
+}
 
 async function renderLogs() {
   const el = $('#tab-logs');
+  if (_selfIdentity === null) await loadSelfIdentity();
+  const peers = await loadLogsPeerOptions();
+  if (_logsHost && _logsHost !== _selfIdentity && !peers.some(p => p.identity && p.identity === _logsHost)) {
+    _logsHost = '';
+    savePref('pmgr-logs-host', _logsHost);
+  }
+  if (logsState.mountedHost !== _logsHost) { logsState.mounted = false; logsState.lines = null; }
   if (!logsState.mounted) {
     let containers = [];
-    try { containers = await api('/api/logs/containers'); }
+    try { containers = await api('/api/logs/containers' + (_logsHost ? '?host=' + encodeURIComponent(_logsHost) : '')); }
     catch (e) {
-      el.innerHTML = emptyState(I.terminal, 'Docker unreachable', 'The dashboard could not list containers from the Docker socket: ' + e.message);
+      el.innerHTML = logsHostPickerHTML(peers) + emptyState(I.terminal, 'Docker unreachable', 'The dashboard could not list containers from the Docker socket: ' + e.message);
+      wireLogsHostPicker();
       return;
     }
     if (!containers.length) {
-      el.innerHTML = emptyState(I.terminal, 'No containers running', 'Start a service to view its logs here.');
+      el.innerHTML = logsHostPickerHTML(peers) + emptyState(I.terminal, 'No containers running', 'Start a service to view its logs here.');
+      wireLogsHostPicker();
       return;
     }
-    // Preferred default: first managed service, else first running, else first overall.
-    if (!logsState.container) {
+    // Keep the current selection if it still exists on this host — the
+    // common cross-host use case is comparing the same service across
+    // machines. Otherwise fall back: first managed service, else first
+    // running, else first overall.
+    if (!logsState.container || !containers.some(c => c.name === logsState.container)) {
       const managed = containers.find(c => c.service && c.state === 'running');
       const running = containers.find(c => c.state === 'running');
       logsState.container = (managed || running || containers[0]).name;
@@ -2529,7 +2577,7 @@ async function renderLogs() {
       const sel = c.name === logsState.container ? ' selected' : '';
       return '<option value="' + esc(c.name) + '"' + sel + '>' + esc(label) + '</option>';
     }).join('');
-    el.innerHTML =
+    el.innerHTML = logsHostPickerHTML(peers) +
       '<div class="subhead">' + I.terminal + 'Container logs</div>'
       + '<div class="card">'
       +   '<div class="logs-toolbar">'
@@ -2551,7 +2599,9 @@ async function renderLogs() {
     $('#log-filter').oninput     = e => { logsState.filter = e.target.value; paintLogs(); };
     $('#log-follow').onchange    = e => { logsState.follow = e.target.checked; };
     $('#log-refresh-btn').onclick = () => fetchLogs(true);
+    wireLogsHostPicker();
     logsState.mounted = true;
+    logsState.mountedHost = _logsHost;
   }
   if (logsState.follow || !logsState.lines) {
     await fetchLogs(false);
@@ -2568,7 +2618,9 @@ async function fetchLogs(force) {
   if (meta) meta.className = 'log-status';
   if (metaTxt) metaTxt.textContent = 'fetching ' + logsState.container + '…';
   try {
-    const r = await api('/api/logs/' + encodeURIComponent(logsState.container) + '?tail=' + logsState.tail);
+    const q = '/api/logs/' + encodeURIComponent(logsState.container) + '?tail=' + logsState.tail
+      + (_logsHost ? '&host=' + encodeURIComponent(_logsHost) : '');
+    const r = await api(q);
     logsState.lines = r.lines || [];
     logsState.fetchedAt = Date.now();
     paintLogs();

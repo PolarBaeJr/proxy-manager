@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPeerHandshakeHandlerValidSecret(t *testing.T) {
@@ -515,5 +516,165 @@ func TestPeerImagesHandlerWrongMethod(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestPeerLogsContainersHandlerValidSecret(t *testing.T) {
+	dc := logsContainersStub(t, nil)
+	h := peerLogsContainersHandler("s3cret", "dashboard-b", dc)
+	req := httptest.NewRequest(http.MethodGet, "/peer/logs/containers", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body peerLogsContainersResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Identity != "dashboard-b" {
+		t.Errorf("Identity = %q, want %q", body.Identity, "dashboard-b")
+	}
+	if len(body.Containers) != 1 || body.Containers[0].Name != "app-1" {
+		t.Errorf("Containers = %+v, want the stub's one container", body.Containers)
+	}
+}
+
+func TestPeerLogsContainersHandlerWrongSecret(t *testing.T) {
+	h := peerLogsContainersHandler("s3cret", "dashboard-b", nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/logs/containers", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestPeerLogsContainersHandlerEmptySecretDisabled(t *testing.T) {
+	h := peerLogsContainersHandler("", "dashboard-b", nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/logs/containers", nil)
+	req.Header.Set("Authorization", "Bearer anything")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestPeerLogsContainersHandlerWrongMethod(t *testing.T) {
+	h := peerLogsContainersHandler("s3cret", "dashboard-b", nil)
+	req := httptest.NewRequest(http.MethodPost, "/peer/logs/containers", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestPeerLogsHandlerValidSecret(t *testing.T) {
+	frames := framedLogBody("hello", "world")
+	dc := logsContainersStub(t, frames)
+	h := peerLogsHandler("s3cret", "dashboard-b", dc)
+	req := httptest.NewRequest(http.MethodGet, "/peer/logs/app-1?tail=50", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body peerLogsResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Identity != "dashboard-b" || body.Container != "app-1" || body.Tail != 50 {
+		t.Errorf("body = %+v, want identity=dashboard-b container=app-1 tail=50", body)
+	}
+	if len(body.Lines) == 0 {
+		t.Fatal("Lines = [], want the framed stub's non-empty lines")
+	}
+}
+
+func TestPeerLogsHandlerWrongSecret(t *testing.T) {
+	h := peerLogsHandler("s3cret", "dashboard-b", nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/logs/app-1", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestPeerLogsHandlerEmptySecretDisabled(t *testing.T) {
+	h := peerLogsHandler("", "dashboard-b", nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/logs/app-1", nil)
+	req.Header.Set("Authorization", "Bearer anything")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestPeerLogsHandlerWrongMethod(t *testing.T) {
+	h := peerLogsHandler("s3cret", "dashboard-b", nil)
+	req := httptest.NewRequest(http.MethodPost, "/peer/logs/app-1", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+// TestPeerLogsHandlerInvalidContainerName proves a hostile name hits the
+// peer handler's own validContainerName re-check directly — this handler is
+// reachable by anyone possessing the shared peer secret and must be safe to
+// call directly, not merely rely on the forwarding host's own check.
+func TestPeerLogsHandlerInvalidContainerName(t *testing.T) {
+	h := peerLogsHandler("s3cret", "dashboard-b", nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/logs/evil/name", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body %s, want %d", rec.Code, rec.Body.String(), http.StatusNotFound)
+	}
+}
+
+// TestPeerGETTimeoutRespectsCustomDuration proves the timeout argument is
+// actually honored: a handler slower than a short timeout errors, while the
+// same handler with a longer timeout succeeds.
+func TestPeerGETTimeoutRespectsCustomDuration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"ok": "yes"})
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	var fast map[string]string
+	start := time.Now()
+	err := peerGETTimeout(context.Background(), client, srv.URL, "s3cret", "/anything", 100*time.Millisecond, &fast)
+	if err == nil {
+		t.Fatal("want an error for a handler slower than the timeout, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("elapsed = %s, want it bounded near the 100ms timeout, not the handler's 300ms sleep", elapsed)
+	}
+
+	var slow map[string]string
+	if err := peerGETTimeout(context.Background(), client, srv.URL, "s3cret", "/anything", time.Second, &slow); err != nil {
+		t.Fatalf("want success with a 1s timeout against a 300ms handler, got: %v", err)
+	}
+	if slow["ok"] != "yes" {
+		t.Errorf("slow = %+v, want ok=yes", slow)
 	}
 }
