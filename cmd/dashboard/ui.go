@@ -1465,11 +1465,12 @@ function svcLk(s) {
 // svcLockedAttr/svcLk — used by the controls whose backing endpoint forwards
 // to a peer (replica-count +/-/Apply, service Stop/Start, per-replica
 // Stop/Start, Check now, Auto-update toggle, Promote, Discard, Stage,
-// Replace, Add env, Rollback), never by svcLockedAttr/svcLk's remaining
-// callers (Add route, Pull update, Delete service, menu). Add route and
-// Delete service have no peer endpoint; Pull update reuses /replace's wire
-// call but is deliberately kept local-only for now. All of those must keep
-// firing against the LOCAL daemon guard.
+// Replace, Add env, Rollback, Delete service), never by svcLockedAttr/svcLk's
+// remaining callers (Add route, Pull update). Add route has no peer
+// endpoint; Pull update reuses /replace's wire call but is deliberately kept
+// local-only for now — both must keep firing against the LOCAL daemon guard.
+// Offboard forwards too (api.go's forwardServiceMutation), but has no
+// dedicated UI entry point yet — API/MCP parity only this phase.
 function svcWriteAttr(s) {
   return (foreignSvc(s) && !peerWritable(s)) ? svcLockedAttr(s) : (isElevated() ? '' : lockedAttr());
 }
@@ -1608,12 +1609,21 @@ async function renderServices() {
     // so any request hitting the proxy right now gets 503 — show a
     // prominent "down" pill instead of the muted "stopped" it used to be.
     if (s.all_stopped) badges += ' <span class="pill bad">' + I.alert + 'down</span>';
-    // Foreign rows drop the menu entirely rather than disabling it in place —
-    // its id="m-<name>" collides with a same-named local card's menu (both
-    // hosts commonly run identically-named services), and toggleMenu/
-    // getElementById resolves to whichever one is first in the DOM.
-    const menu = foreignSvc(s) ? '' : '<div class="menu"><button class="btn icon" onclick="toggleMenu(event,\'m-' + sn + '\')">' + I.dots + '</button>'
-               + '<div class="menu-pop" id="m-' + sn + '"><button class="danger" ' + svcLockedAttr(s) + ' onclick="deleteSvc(\'' + sn + '\')">' + I.trash + 'Delete service</button></div></div>';
+    // Foreign rows now render the menu too when write-mesh-writable
+    // (peerWritable) — Delete forwards to the owning peer just like the
+    // other svcWriteAttr-gated actions. The menu id is host-qualified
+    // ("m-<machine>-<name>") to avoid colliding with a same-named local
+    // card's menu (both hosts commonly run identically-named services) —
+    // toggleMenu/getElementById would otherwise resolve to whichever one is
+    // first in the DOM. The id is threaded through a data-menu attribute
+    // rather than spliced into the onclick JS literal directly: same
+    // rationale as hostAttr above — s.machine is unvalidated operator text,
+    // and esc()'s HTML-entity escaping doesn't protect a single-quoted JS
+    // string literal, since attribute-value entity-decoding happens BEFORE
+    // the onclick body is parsed as JS.
+    const menuId = 'm-' + esc(s.machine || 'local') + '-' + sn;
+    const menu = (foreignSvc(s) && !peerWritable(s)) ? '' : '<div class="menu"><button class="btn icon" data-menu="' + menuId + '" onclick="toggleMenu(event, this.dataset.menu)">' + I.dots + '</button>'
+               + '<div class="menu-pop" id="' + menuId + '"><button class="danger" ' + svcWriteAttr(s) + hostAttr + ' onclick="deleteSvc(\'' + sn + '\', this.dataset.host)">' + I.trash + 'Delete service</button></div></div>';
 
     // Per-card collapse: clicking the svc-head folds facts + actionzone to a
     // one-line summary. Persisted in localStorage keyed by service name.
@@ -2292,10 +2302,11 @@ async function rollback(name, prevImage, host) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
-async function deleteSvc(name) {
+async function deleteSvc(name, host) {
   if (!(await confirmDialog('Delete service "' + name + '" and all its containers?', {title: 'Delete service', danger: true}))) return;
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
   try {
-    await api('/api/services/' + encodeURIComponent(name), { method:'DELETE' });
+    await api('/api/services/' + encodeURIComponent(name) + hostParam, { method:'DELETE' });
     toast('deleted ' + name);
     renderActive();
   } catch (e) { toast(e.message, 'err'); }

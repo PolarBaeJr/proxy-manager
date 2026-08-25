@@ -806,13 +806,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		// OnboardedStore keeps its old teardown-the-clones-and-drop-the-
 		// route behavior instead, so existing onboarded entries don't break.
 		if len(parts) == 2 && parts[1] == "offboard" && req.Method == "POST" {
-			if _, ok := onb.Get(name); ok {
-				if err := dc.offboardContainer(req.Context(), name, onb, routesConfigPath); err != nil {
-					httpx.WriteErr(w, err)
-					return
-				}
-			} else if err := dc.offboardLabelManaged(req.Context(), name); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+			_, wasOnboarded := onb.Get(name)
+			if err := runServiceOffboard(req.Context(), dc, onb, routesConfigPath, name); err != nil {
+				writeServiceRemovalErr(w, err, !wasOnboarded)
 				return
 			}
 			proxyRefresh(proxyURLFromEnv())
@@ -821,24 +817,52 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			return
 		}
 		if req.Method == "DELETE" {
-			// Onboarded services: tear down the clones + route, leave the
-			// original container alone (the user started it).
-			if _, ok := onb.Get(name); ok {
-				if err := dc.offboardContainer(req.Context(), name, onb, routesConfigPath); err != nil {
+			// Optional confirmation body: {"confirm": "<name>"}. Absent or
+			// empty preserves the pre-existing no-body-required behavior
+			// (not a breaking change for existing direct-API/MCP callers);
+			// present, it must equal name or the request is rejected before
+			// any Docker mutation. forwardServiceMutation always sends this
+			// field (constructed server-side, never trusted from the
+			// incoming request) so cross-host deletes get the same guard.
+			data, err := io.ReadAll(req.Body)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if len(bytes.TrimSpace(data)) > 0 {
+				var confirmBody struct {
+					Confirm string `json:"confirm"`
+				}
+				if err := json.Unmarshal(data, &confirmBody); err != nil {
 					httpx.WriteErr(w, err)
 					return
 				}
+				if confirmBody.Confirm != "" && confirmBody.Confirm != name {
+					http.Error(w, "confirmation does not match service name", http.StatusBadRequest)
+					return
+				}
+			}
+			// Onboarded services: tear down the clones + route, leave the
+			// original container alone (the user started it) — DELETE on an
+			// onboarded service has always meant "offboard", not "destroy".
+			_, wasOnboarded := onb.Get(name)
+			membersActed, err := runServiceDelete(req.Context(), dc, onb, routesConfigPath, name)
+			if err != nil {
+				if wasOnboarded {
+					writeServiceRemovalErr(w, err, false)
+				} else {
+					writeServiceDeleteErr(w, membersActed, err)
+				}
+				return
+			}
+			if wasOnboarded {
 				proxyRefresh(proxyURLFromEnv())
 				audit(req, sessionUser(info), "service.offboard", name)
 				httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "offboarded"})
 				return
 			}
-			if err := dc.deleteService(req.Context(), name); err != nil {
-				httpx.WriteErr(w, err)
-				return
-			}
 			audit(req, sessionUser(info), "service.delete", name)
-			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "deleted", "members_acted": membersActed})
 			return
 		}
 		http.NotFound(w, req)
@@ -1702,6 +1726,115 @@ func writeOnboardErr(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
+// errServiceRemovalSelf is returned by runServiceOffboard and runServiceDelete
+// when removing a service would remove or reroute away from the dashboard's
+// own container — either because the service demonstrably IS the dashboard,
+// or because a Docker error means that can't be ruled out. Both cases are
+// wrapped in this same sentinel (via %w), mirroring errAutoUpdateSelf, for
+// two independent reasons depending on which function raised it:
+//
+//   - runServiceOffboard, onboarded path: offboardContainer's final step
+//     (store.Remove) is a pure store write with no live Docker re-read
+//     afterward — same hazard class as onb.SetAutoUpdate. The outer
+//     per-request self-guard (dc.serviceContainsSelfByName, checked before
+//     subpath dispatch) fails OPEN on a Docker error by design, so this
+//     independent check must fail CLOSED instead.
+//   - runServiceDelete, label-managed path: dc.deleteService DOES re-read
+//     live container state itself, so the outer guard's fail-open behavior
+//     is less obviously a gap here — but the consequence is irreversible
+//     container destruction (unlike stop/scale, there's no way back), so an
+//     independent fail-closed check is added anyway.
+//
+// A single shared sentinel is used for both offboard and delete rather than
+// two: both are "you are about to remove or disconnect the dashboard's own
+// service" refusals with identical caller-facing semantics (403, same
+// message shape), and every call site already knows which action it's
+// performing without needing to distinguish by error identity.
+var errServiceRemovalSelf = errors.New("refusing to offboard or delete the dashboard's own service — could destroy or reroute away from it with no way back")
+
+// runServiceOffboard is the offboard logic shared by the local /offboard and
+// DELETE-on-an-onboarded-service handlers and peers.go's peer branch.
+// Onboarded services go through offboardContainer (see errServiceRemovalSelf
+// for why the self-check is required here); label-managed services go
+// through offboardLabelManaged, which re-reads live state itself and so
+// needs no additional check.
+func runServiceOffboard(ctx context.Context, dc *dockerClient, onb *OnboardedStore, routesPath, name string) error {
+	if _, ok := onb.Get(name); ok {
+		self, err := dc.serviceContainsSelfByName(ctx, name)
+		if err != nil {
+			return fmt.Errorf("could not verify service identity: %v: %w", err, errServiceRemovalSelf)
+		}
+		if self {
+			return errServiceRemovalSelf
+		}
+		return dc.offboardContainer(ctx, name, onb, routesPath)
+	}
+	return dc.offboardLabelManaged(ctx, name)
+}
+
+// runServiceDelete is the DELETE logic shared by the local DELETE handler
+// and peers.go's peer branch. Onboarded services are delegated to
+// runServiceOffboard (DELETE-on-onboarded has always meant "offboard", not
+// "destroy the user's original container" — see offboardContainer's doc
+// comment); membersActed is 0 for that path since offboardContainer doesn't
+// report a member count. Label-managed services go through dc.deleteService,
+// which — despite re-reading live state itself — performs irreversible
+// container destruction, so it gets its own independent fail-closed
+// self-check rather than relying solely on the outer per-request guard.
+func runServiceDelete(ctx context.Context, dc *dockerClient, onb *OnboardedStore, routesPath, name string) (membersActed int, err error) {
+	if _, ok := onb.Get(name); ok {
+		return 0, runServiceOffboard(ctx, dc, onb, routesPath, name)
+	}
+	self, err := dc.serviceContainsSelfByName(ctx, name)
+	if err != nil {
+		return 0, fmt.Errorf("could not verify service identity: %v: %w", err, errServiceRemovalSelf)
+	}
+	if self {
+		return 0, errServiceRemovalSelf
+	}
+	return dc.deleteService(ctx, name)
+}
+
+// writeServiceRemovalErr maps runServiceOffboard's error onto the response:
+// errServiceRemovalSelf -> 403, a real refusal; everything else falls back
+// to whichever status the pre-extraction handler used for that branch —
+// badRequestOnFail=true for offboardLabelManaged's failures (always 400,
+// preserved as-is), false for offboardContainer's (always 500 via
+// httpx.WriteErr, preserved as-is). This is NOT used for runServiceDelete's
+// label-managed failures — see writeServiceDeleteErr, which additionally
+// carries membersActed.
+func writeServiceRemovalErr(w http.ResponseWriter, err error, badRequestOnFail bool) {
+	if errors.Is(err, errServiceRemovalSelf) {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	if badRequestOnFail {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	httpx.WriteErr(w, err)
+}
+
+// writeServiceDeleteErr maps runServiceDelete's label-managed-path error onto
+// the response. errServiceRemovalSelf -> 403 (membersActed is always 0 on
+// that path, since the self-check runs before any Docker mutation — no
+// partial-teardown count to report). Everything else -> 400 with a JSON body
+// carrying both the error and membersActed, a deliberate deviation from the
+// pre-existing plain-500 (httpx.WriteErr) that deleteService's failures used
+// to produce: a bare 500 can't carry membersActed, and mapPeerMutationErr
+// only relays a peer's response body verbatim for 400/404/409 (401/403 are
+// collapsed to a generic 502, everything else — including a bare 500 — to an
+// opaque "peer mutation outcome unknown" 502) — so 400 is also what's needed
+// for a forwarded partial-teardown count to survive the hop back to the
+// local caller.
+func writeServiceDeleteErr(w http.ResponseWriter, membersActed int, err error) {
+	if errors.Is(err, errServiceRemovalSelf) {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "members_acted": membersActed})
+}
+
 // runServiceCheckImage is the "check now" logic shared by the local
 // /api/services/{name}/check handler and peers.go's peer branch. Reproduces
 // the pre-extraction handler's three response shapes exactly:
@@ -1773,9 +1906,15 @@ func runServiceCheckImage(ctx context.Context, dc *dockerClient, ic *imageChecke
 // request to the peer identified by host, translating (parts, method) onto
 // its /peer/services/{name}/<sub> counterpart — the write-mesh sibling of
 // forwardImageMutation above. Covers scale, stop, start, replicas/{member}/
-// {stop,start}, autoupdate, check, replace, stage, promote, and canary
-// (discard) — every mutating service endpoint except offboard and delete,
-// which stay genuinely local-only and fall through to the default 404.
+// {stop,start}, autoupdate, check, replace, stage, promote, canary
+// (discard), offboard, and delete — every mutating service action now
+// forwards. The only thing still genuinely local-only among service writes
+// is onboard, which lives under the separate /api/discovery/ path and is out
+// of scope here. DELETE has no subpath (parts is length 1, unlike every
+// other action here), and its outgoing body is always {"confirm": name}
+// constructed server-side below — never read from the incoming request —
+// so a forwarded delete can't be sent without confirmation and can't have
+// its confirmation spoofed by whatever the original caller happened to send.
 func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host string, registry *PeerRegistry, name string, parts []string, actor string) {
 	var method, peerPath string
 	switch {
@@ -1806,6 +1945,10 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/promote"
 	case len(parts) == 2 && parts[1] == "canary" && req.Method == http.MethodDelete:
 		method, peerPath = http.MethodDelete, "/peer/services/"+url.PathEscape(name)+"/canary"
+	case len(parts) == 2 && parts[1] == "offboard" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/offboard"
+	case len(parts) == 1 && req.Method == http.MethodDelete:
+		method, peerPath = http.MethodDelete, "/peer/services/"+url.PathEscape(name)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -1824,10 +1967,22 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		http.Error(w, "unknown host", http.StatusNotFound)
 		return
 	}
-	reqBody, err := io.ReadAll(req.Body)
-	if err != nil {
-		httpx.WriteErr(w, err)
-		return
+	var reqBody []byte
+	var err error
+	if method == http.MethodDelete && len(parts) == 1 {
+		// Server-side confirm, never trusted from the incoming request — see
+		// the doc comment above.
+		reqBody, err = json.Marshal(map[string]string{"confirm": name})
+		if err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+	} else {
+		reqBody, err = io.ReadAll(req.Body)
+		if err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	code, respBody, mutErr := peerMutate(req.Context(), client, peerURL, peerSecret, method, peerPath,

@@ -735,6 +735,55 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "discarded"})
 			return
 		}
+		if len(parts) == 2 && parts[1] == "offboard" && r.Method == http.MethodPost {
+			_, wasOnboarded := onb.Get(name)
+			if err := runServiceOffboard(r.Context(), dc, onb, routesConfigPath, name); err != nil {
+				writeServiceRemovalErr(w, err, !wasOnboarded)
+				return
+			}
+			proxyRefresh(proxyURL)
+			audit(r, "peer-mesh", "service.offboard", name)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "offboarded"})
+			return
+		}
+		if len(parts) == 1 && r.Method == http.MethodDelete {
+			// Unlike the local handler, confirmation is REQUIRED here, not
+			// optional — this branch is only ever reached via
+			// forwardServiceMutation, which always sends {"confirm": name}
+			// constructed server-side. A missing/mismatched confirm this far
+			// in means something upstream is malformed or spoofed, so it's
+			// rejected before any Docker mutation regardless of cause.
+			var body struct {
+				Confirm string `json:"confirm"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if body.Confirm == "" || body.Confirm != name {
+				http.Error(w, "confirmation does not match service name", http.StatusBadRequest)
+				return
+			}
+			_, wasOnboarded := onb.Get(name)
+			membersActed, err := runServiceDelete(r.Context(), dc, onb, routesConfigPath, name)
+			if err != nil {
+				if wasOnboarded {
+					writeServiceRemovalErr(w, err, false)
+				} else {
+					writeServiceDeleteErr(w, membersActed, err)
+				}
+				return
+			}
+			if wasOnboarded {
+				proxyRefresh(proxyURL)
+				audit(r, "peer-mesh", "service.offboard", name)
+				httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "offboarded"})
+				return
+			}
+			audit(r, "peer-mesh", "service.delete", name)
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "deleted", "members_acted": membersActed})
+			return
+		}
 		http.NotFound(w, r)
 	})
 }
