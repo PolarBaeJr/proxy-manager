@@ -20,7 +20,10 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry, rm *rolloutManager) http.Handler {
+	if rm == nil {
+		rm = newRolloutManager(dc)
+	}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -720,6 +723,50 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			}
 			audit(req, sessionUser(info), "service.discard_canary", name)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "discarded"})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "rollout" && req.Method == "POST" {
+			var body RolloutRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			st, err := rm.startRollout(req.Context(), name, ReplaceServiceRequest{Image: body.Image, Env: body.Env, EnvAck: body.EnvAck}, body.Steps)
+			if err != nil {
+				writeServiceErr(w, err)
+				return
+			}
+			audit(req, sessionUser(info), "service.rollout_start", name+" => "+body.Image)
+			httpx.WriteJSON(w, http.StatusOK, st)
+			return
+		}
+		if len(parts) == 2 && parts[1] == "rollout" && req.Method == "GET" {
+			st, ok := rm.get(name)
+			if !ok {
+				http.Error(w, "no active rollout for "+name, http.StatusNotFound)
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, st)
+			return
+		}
+		if len(parts) == 2 && parts[1] == "rollout/advance" && req.Method == "POST" {
+			st, err := rm.advanceRollout(req.Context(), name)
+			if err != nil {
+				writeServiceErr(w, err)
+				return
+			}
+			audit(req, sessionUser(info), "service.rollout_advance", name)
+			httpx.WriteJSON(w, http.StatusOK, st)
+			return
+		}
+		if len(parts) == 2 && parts[1] == "rollout/abort" && req.Method == "POST" {
+			st, err := rm.abortRollout(req.Context(), name)
+			if err != nil {
+				writeServiceErr(w, err)
+				return
+			}
+			audit(req, sessionUser(info), "service.rollout_abort", name)
+			httpx.WriteJSON(w, http.StatusOK, st)
 			return
 		}
 		// ---- Stop / Start (per-service or per-replica) ----

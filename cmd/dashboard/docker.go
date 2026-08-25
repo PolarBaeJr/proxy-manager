@@ -36,6 +36,7 @@ const (
 	labelPrevImage  = "proxy.previous_image" // set on Replace; enables one-click Rollback
 	labelCanary     = "proxy.canary"         // "true" → staged replicas, served alongside live
 	labelAutoUpdate = "proxy.autoupdate"     // "true" → engine replaces on newer registry digest
+	labelHealth     = "proxy.health"         // optional HTTP health-check path, e.g. "/healthz"
 	// labelMaintPage lives in maintpage.go, next to the sync that consumes it.
 
 	// ociImageLabelPrefix marks labels that describe the IMAGE (baked in by
@@ -330,6 +331,25 @@ func (c *dockerClient) inspectEnv(ctx context.Context, id string) ([]string, err
 		return nil, err
 	}
 	return resp.Config.Env, nil
+}
+
+// inspectRestartCount returns how many times Docker has auto-restarted a
+// container since it was created — used by the rollout health gate as a
+// signal a healthcheck-less (or slow-to-fail) canary is actually crash
+// looping.
+func (c *dockerClient) inspectRestartCount(ctx context.Context, id string) (int, error) {
+	body, err := c.get(ctx, "/containers/"+id+"/json")
+	if err != nil {
+		return 0, err
+	}
+	defer body.Close()
+	var resp struct {
+		RestartCount int `json:"RestartCount"`
+	}
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		return 0, err
+	}
+	return resp.RestartCount, nil
 }
 
 // inspectCloneSpec returns the HostConfig fields a recreate must carry
@@ -1072,10 +1092,12 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	return nil
 }
 
-// stageCanary creates additional replicas of a service with a new image. They
-// share the live service's host/port labels, so the proxy round-robins traffic
-// across BOTH live and canary while they coexist. No old containers removed.
-func (c *dockerClient) stageCanary(ctx context.Context, name string, req ReplaceServiceRequest) error {
+// createCanaryReplicas creates `count` new canary replicas of a service,
+// cloned from the current live template's env/mounts/labels but running
+// req.Image — the shared primitive behind stageCanary (which always wants
+// len(live), an immediate ~50/50 split) and a rollout's ramp steps (which
+// want a smaller, growing count).
+func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, req ReplaceServiceRequest, count int) error {
 	if req.Image == "" {
 		return fmt.Errorf("image is required")
 	}
@@ -1118,7 +1140,7 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 
 	c.pullImage(ctx, req.Image)
 	startIdx := nextReplicaIndex(all, name)
-	for i := 0; i < len(live); i++ {
+	for i := 0; i < count; i++ {
 		cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
 			Image: req.Image, Labels: canaryLabels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts},
@@ -1128,6 +1150,89 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 		}
 		if err := c.startContainer(ctx, id); err != nil {
 			return fmt.Errorf("start canary %s: %w", cname, err)
+		}
+	}
+	return nil
+}
+
+// stageCanary creates additional replicas of a service with a new image. They
+// share the live service's host/port labels, so the proxy round-robins traffic
+// across BOTH live and canary while they coexist. No old containers removed.
+func (c *dockerClient) stageCanary(ctx context.Context, name string, req ReplaceServiceRequest) error {
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+	if err != nil {
+		return err
+	}
+	return c.createCanaryReplicas(ctx, name, req, len(liveOnly(all)))
+}
+
+// nextCanaryReplicaIndex mirrors nextReplicaIndex but keys off the
+// "goproxy-<service>-canary-" naming scheme — needed by scaleCanary so
+// repeated ramp-step scale-ups (unlike stageCanary's single-shot creation)
+// don't collide with canary names already in use.
+func nextCanaryReplicaIndex(existing []dockerContainer, service string) int {
+	max := 0
+	prefix := "goproxy-" + service + "-canary-"
+	for _, ct := range existing {
+		n := ct.name()
+		if !strings.HasPrefix(n, prefix) {
+			continue
+		}
+		if v, err := strconv.Atoi(n[len(prefix):]); err == nil && v > max {
+			max = v
+		}
+	}
+	return max + 1
+}
+
+// scaleCanary mirrors scaleService but operates on a service's canary
+// replicas instead of its live ones — the primitive a rollout uses to grow
+// or shrink the canary pool at each ramp step.
+func (c *dockerClient) scaleCanary(ctx context.Context, name string, target int) error {
+	if target < 0 {
+		return fmt.Errorf("replicas must be >= 0")
+	}
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+	if err != nil {
+		return err
+	}
+	existing := canaryOnly(all)
+	if len(existing) == 0 {
+		return fmt.Errorf("service %q has no canary replicas", name)
+	}
+	tpl := existing[0]
+	current := len(existing)
+	switch {
+	case current == target:
+		return nil
+	case current < target:
+		env, err := c.inspectEnv(ctx, tpl.ID)
+		if err != nil {
+			return fmt.Errorf("inspect canary template %s: %w", tpl.name(), err)
+		}
+		clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+		if err != nil {
+			return fmt.Errorf("inspect canary template %s: %w", tpl.name(), err)
+		}
+		startIdx := nextCanaryReplicaIndex(all, name)
+		for i := 0; i < target-current; i++ {
+			cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
+			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
+			if err != nil {
+				return fmt.Errorf("create canary %s: %w", cname, err)
+			}
+			if err := c.startContainer(ctx, id); err != nil {
+				return fmt.Errorf("start canary %s: %w", cname, err)
+			}
+		}
+	default:
+		toRemove := current - target
+		sort.Slice(existing, func(i, j int) bool { return existing[i].name() > existing[j].name() })
+		for i := 0; i < toRemove; i++ {
+			_ = c.stopContainer(ctx, existing[i].ID)
+			if err := c.removeContainer(ctx, existing[i].ID); err != nil {
+				return fmt.Errorf("remove %s: %w", existing[i].name(), err)
+			}
 		}
 	}
 	return nil
@@ -1144,6 +1249,17 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 	live := liveOnly(all)
 	if len(canary) == 0 {
 		return fmt.Errorf("no canary to promote for %q", name)
+	}
+	// Health-gate BEFORE any recreate: once a canary container is recreated
+	// without labelCanary below, it can no longer be found by anything that
+	// looks up canary containers by label — including this same health
+	// check and discardCanary-style rollback. Gating here, while the canary
+	// set is still fully labeled, is what keeps a failed gate recoverable;
+	// gating right before the old-live teardown (after the recreate loop)
+	// would leave a failure in an unrecoverable state (see git history for
+	// the bug this replaced).
+	if err := c.waitForCanaryHealthy(ctx, name); err != nil {
+		return fmt.Errorf("promote %s: %w", name, err)
 	}
 	// Recreate each canary container WITHOUT the canary label (Docker doesn't allow
 	// label edits on running containers). Same env, same image, new name.

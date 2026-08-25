@@ -146,7 +146,7 @@ func TestServiceStatusEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadAuthStore: %v", err)
 	}
-	freshMux := newDashboardMux(dc, nil, fresh, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, nil)
+	freshMux := newDashboardMux(dc, nil, fresh, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	rec := httptest.NewRecorder()
 	freshMux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/service-status", nil))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -154,7 +154,7 @@ func TestServiceStatusEndpoint(t *testing.T) {
 	}
 
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// No credentials → 401.
 	rec = httptest.NewRecorder()
@@ -217,7 +217,7 @@ func TestServiceStatusEndpointMergesPeer(t *testing.T) {
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
 
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, reg)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, reg, nil)
 
 	tok, _, err := auth.CreateToken("alice", "test")
 	if err != nil {

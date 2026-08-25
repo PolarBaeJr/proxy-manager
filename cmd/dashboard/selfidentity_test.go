@@ -192,7 +192,7 @@ func TestServicesStopRefusesSelf(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), "", nil, nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), "", nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/api/services/dashboard/stop", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)
