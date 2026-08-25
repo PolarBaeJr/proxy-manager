@@ -1462,12 +1462,14 @@ function svcLk(s) {
   return foreignSvc(s) ? '<span class="lock" title="managed on ' + esc(machineLabel(s.machine)) + '">' + I.lock + '</span>' : lk();
 }
 // svcWriteAttr/svcWriteLk are the narrow write-mesh counterparts of
-// svcLockedAttr/svcLk — used ONLY by the controls that actually forward
-// (replica-count +/-/Apply, service Stop/Start, per-replica Stop/Start, Check
-// now, Auto-update toggle), never by svcLockedAttr/svcLk's other callers (Add
-// route, Promote, Discard, Pull update, Stage, Replace, Add env, Rollback,
-// Delete service, menu), which have no peer endpoint and must keep firing
-// against the LOCAL daemon guard.
+// svcLockedAttr/svcLk — used by the controls whose backing endpoint forwards
+// to a peer (replica-count +/-/Apply, service Stop/Start, per-replica
+// Stop/Start, Check now, Auto-update toggle, Promote, Discard, Stage,
+// Replace, Add env, Rollback), never by svcLockedAttr/svcLk's remaining
+// callers (Add route, Pull update, Delete service, menu). Add route and
+// Delete service have no peer endpoint; Pull update reuses /replace's wire
+// call but is deliberately kept local-only for now. All of those must keep
+// firing against the LOCAL daemon guard.
 function svcWriteAttr(s) {
   return (foreignSvc(s) && !peerWritable(s)) ? svcLockedAttr(s) : (isElevated() ? '' : lockedAttr());
 }
@@ -1543,8 +1545,8 @@ async function renderServices() {
     if (managed) {
       actions = '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="onboardDialog(\'' + sn + '\', ' + (s.port || 0) + ', \'' + esc(s.path || '') + '\')">' + I.rocket + 'Add route…' + svcLk(s) + '</button>';
     } else if (canary) {
-      actions = '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="promoteCanary(\'' + sn + '\')">' + I.check + 'Promote canary' + svcLk(s) + '</button>'
-              + '<button class="btn" ' + svcLockedAttr(s) + ' onclick="discardCanary(\'' + sn + '\')">' + I.x + 'Discard' + svcLk(s) + '</button>';
+      actions = '<button class="btn primary" ' + svcWriteAttr(s) + hostAttr + ' onclick="promoteCanary(\'' + sn + '\', this.dataset.host)">' + I.check + 'Promote canary' + svcWriteLk(s) + '</button>'
+              + '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="discardCanary(\'' + sn + '\', this.dataset.host)">' + I.x + 'Discard' + svcWriteLk(s) + '</button>';
     } else {
       // When update_available is true, surface a one-click Update before
       // the other actions — it's the most common click in this state.
@@ -1553,9 +1555,9 @@ async function renderServices() {
         : '');
       actions = updateBtn
               + (s.update_available
-                  ? '<button class="btn" ' + svcLockedAttr(s) + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + svcLk(s) + '</button>'
-                  : '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + svcLk(s) + '</button>')
-              + '<button class="btn" ' + svcLockedAttr(s) + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.swap + 'Replace' + svcLk(s) + '</button>'
+                  ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.rocket + 'Stage new version' + svcWriteLk(s) + '</button>'
+                  : '<button class="btn primary" ' + svcWriteAttr(s) + hostAttr + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.rocket + 'Stage new version' + svcWriteLk(s) + '</button>')
+              + '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.swap + 'Replace' + svcWriteLk(s) + '</button>'
               // Force an immediate registry check instead of waiting on the
               // ~10min background poller — mirrors the MCP check_for_update tool.
               + '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="checkForUpdate(\'' + sn + '\', this, this.dataset.host)">' + I.refresh + 'Check now' + svcWriteLk(s) + '</button>'
@@ -1567,7 +1569,7 @@ async function renderServices() {
               // clones a live replica's config, so there has to be one.
               + (s.all_stopped
                   ? '<button class="btn" disabled title="Start the service first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
-                  : '<button class="btn" ' + svcLockedAttr(s) + ' onclick="openAddEnv(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.plus + 'Add env…' + svcLk(s) + '</button>')
+                  : '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="openAddEnv(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.plus + 'Add env…' + svcWriteLk(s) + '</button>')
               // Auto-update toggle: available for any routed service, label-
               // managed or onboarded. For a label-managed service this
               // flips proxy.autoupdate via the same clone-and-recreate as
@@ -1575,7 +1577,7 @@ async function renderServices() {
               + (s.auto_update
                   ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', false, this.dataset.host)">' + I.arrowup + 'Auto-update: on' + svcWriteLk(s) + '</button>'
                   : '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', true, this.dataset.host)">' + I.arrowup + 'Auto-update: off' + svcWriteLk(s) + '</button>')
-              + (s.previous_image ? '<button class="linkbtn" ' + svcLockedAttr(s) + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\')">' + I.rewind + 'Rollback</button>' : '');
+              + (s.previous_image ? '<button class="linkbtn" ' + svcWriteAttr(s) + hostAttr + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\', this.dataset.host)">' + I.rewind + 'Rollback' + svcWriteLk(s) + '</button>' : '');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
     // replica AND no stopped members (saves card height for the common case).
@@ -2224,7 +2226,12 @@ function setReplaceDialogMode(mode, name) {
 // restart — the replicas are recreated from the SAME image with the merged env,
 // which is exactly the replace path (new ones up first, then the old removed).
 // That also means the conflict picker applies here unchanged.
-function openAddEnv(name, currentImage) {
+// openAddEnv/openReplace/openStage stash host onto the form's dataset —
+// same data-* convention as hostAttr above (s.machine is unvalidated
+// operator text, so it never gets spliced into a JS string literal) — for
+// the shared #form-replace-service onsubmit handler below to read back and
+// append to its api() URL.
+function openAddEnv(name, currentImage, host) {
   const f = $('#form-replace-service');
   f.serviceName.value = name;
   f.currentImage.value = currentImage;
@@ -2232,10 +2239,11 @@ function openAddEnv(name, currentImage) {
   f.env.value = '';
   clearEnvChoices();
   f.dataset.mode = 'env';
+  f.dataset.host = host || '';
   setReplaceDialogMode('env', name);
   $('#dlg-replace-service').showModal();
 }
-function openReplace(name, currentImage) {
+function openReplace(name, currentImage, host) {
   const f = $('#form-replace-service');
   f.serviceName.value = name;
   f.currentImage.value = currentImage;
@@ -2243,10 +2251,11 @@ function openReplace(name, currentImage) {
   f.env.value = '';
   clearEnvChoices();
   f.dataset.mode = 'replace';
+  f.dataset.host = host || '';
   setReplaceDialogMode('replace', name);
   $('#dlg-replace-service').showModal();
 }
-function openStage(name, currentImage) {
+function openStage(name, currentImage, host) {
   const f = $('#form-replace-service');
   f.serviceName.value = name;
   f.currentImage.value = currentImage;
@@ -2254,25 +2263,29 @@ function openStage(name, currentImage) {
   f.env.value = '';
   clearEnvChoices();
   f.dataset.mode = 'stage';
+  f.dataset.host = host || '';
   setReplaceDialogMode('stage', name);
   $('#dlg-replace-service').showModal();
 }
 
-async function promoteCanary(name) {
+async function promoteCanary(name, host) {
   if (!(await confirmDialog('Promote canary to live? Old replicas will be removed.', {title: 'Promote canary'}))) return;
-  try { await api('/api/services/' + encodeURIComponent(name) + '/promote', { method:'POST' });
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
+  try { await api('/api/services/' + encodeURIComponent(name) + '/promote' + hostParam, { method:'POST' });
     toast('promoted ' + name); renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
-async function discardCanary(name) {
+async function discardCanary(name, host) {
   if (!(await confirmDialog('Discard canary? Live continues unchanged.', {title: 'Discard canary', danger: true, okLabel: 'Discard'}))) return;
-  try { await api('/api/services/' + encodeURIComponent(name) + '/canary', { method:'DELETE' });
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
+  try { await api('/api/services/' + encodeURIComponent(name) + '/canary' + hostParam, { method:'DELETE' });
     toast('discarded canary for ' + name); renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
-async function rollback(name, prevImage) {
+async function rollback(name, prevImage, host) {
   if (!(await confirmDialog('Replace ' + name + ' with ' + prevImage + '?', {title: 'Rollback', okLabel: 'Rollback'}))) return;
-  try { await api('/api/services/' + encodeURIComponent(name) + '/replace', {
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
+  try { await api('/api/services/' + encodeURIComponent(name) + '/replace' + hostParam, {
       method:'POST', body: JSON.stringify({ image: prevImage }),
     });
     toast('rolled back ' + name); renderActive();
@@ -3693,8 +3706,11 @@ function wireDialogForms() {
     const submitBtn = f.querySelector('button[type="submit"]');
     const original = submitBtn ? submitBtn.innerHTML : '';
     if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Working…'; }
+    // host was stashed onto the form by whichever opener (openReplace/
+    // openStage/openAddEnv) launched this dialog — see the comment there.
+    const hostParam = f.dataset.host ? '?host=' + encodeURIComponent(f.dataset.host) : '';
     try {
-      await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/' + mode, {
+      await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/' + mode + hostParam, {
         method: 'POST',
         body: JSON.stringify({
           image: normalizeImageRef(f.image.value),
@@ -3708,6 +3724,7 @@ function wireDialogForms() {
         : (mode === 'stage' ? 'staged ' : 'replaced ') + f.serviceName.value + ' → ' + f.image.value);
       $('#dlg-replace-service').close();
       f.dataset.mode = 'replace';
+      f.dataset.host = '';
       setReplaceDialogMode('replace', f.serviceName.value);
       renderActive();
     } catch (e) {

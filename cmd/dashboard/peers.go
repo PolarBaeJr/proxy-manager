@@ -657,6 +657,84 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 			httpx.WriteJSON(w, status, payload)
 			return
 		}
+		if len(parts) == 2 && parts[1] == "replace" && r.Method == http.MethodPost {
+			var body ReplaceServiceRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			// No additional fail-closed self-check beyond the outer guard
+			// above (unlike Phase 3's autoupdate case): the residual risk on
+			// the onboarded path here is route-mutation on the dashboard's
+			// own onboarded entry (a traffic split), not container
+			// destruction — a materially smaller blast radius that doesn't
+			// warrant its own guard.
+			if _, ok := onb.Get(name); ok {
+				if err := dc.replaceOnboarded(r.Context(), name, body, onb, routesConfigPath); err != nil {
+					writeServiceErr(w, err)
+					return
+				}
+				proxyRefresh(proxyURL)
+			} else if err := dc.replaceService(r.Context(), name, body); err != nil {
+				writeServiceErr(w, err)
+				return
+			}
+			audit(r, "peer-mesh", "service.replace", name+" => "+body.Image)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "replaced", "image": body.Image})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "stage" && r.Method == http.MethodPost {
+			var body ReplaceServiceRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			// Same reasoning as replace above: route-mutation risk only, so
+			// the outer self-guard is judged sufficient here too.
+			if _, ok := onb.Get(name); ok {
+				if err := dc.stageOnboarded(r.Context(), name, body, onb, routesConfigPath); err != nil {
+					writeServiceErr(w, err)
+					return
+				}
+				proxyRefresh(proxyURL)
+			} else if err := dc.stageCanary(r.Context(), name, body); err != nil {
+				writeServiceErr(w, err)
+				return
+			}
+			audit(r, "peer-mesh", "service.stage", name+" => "+body.Image)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "staged"})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "promote" && r.Method == http.MethodPost {
+			if _, ok := onb.Get(name); ok {
+				if err := dc.promoteOnboarded(r.Context(), name, onb, routesConfigPath); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				proxyRefresh(proxyURL)
+			} else if err := dc.promoteCanary(r.Context(), name); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			audit(r, "peer-mesh", "service.promote", name)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "promoted"})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "canary" && r.Method == http.MethodDelete {
+			if _, ok := onb.Get(name); ok {
+				if err := dc.discardOnboarded(r.Context(), name, onb, routesConfigPath); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				proxyRefresh(proxyURL)
+			} else if err := dc.discardCanary(r.Context(), name); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			audit(r, "peer-mesh", "service.discard_canary", name)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "discarded"})
+			return
+		}
 		http.NotFound(w, r)
 	})
 }
