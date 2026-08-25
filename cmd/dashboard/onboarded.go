@@ -873,6 +873,16 @@ func sortByNameDesc(in []dockerContainer) {
 // the static route, drop the onboarded record, disconnect original from edge.
 // The original container itself is left intact (the user started it, the user
 // can stop it).
+//
+// Its final step, store.Remove(name), is a pure store write with no live
+// Docker re-read afterward — unlike offboardLabelManaged, which re-reads live
+// state itself. That makes an independent fail-closed self-identity check
+// required before calling this function. That check does NOT live in here:
+// it lives in api.go's runServiceOffboard, the single wrapper both call sites
+// (the local /offboard and DELETE handlers, and peers.go's peer branch) route
+// through — mirroring runServiceAutoUpdateSet's placement for the same
+// reason (onb.SetAutoUpdate). If a future caller invokes offboardContainer
+// directly instead of through runServiceOffboard, it bypasses that guard.
 func (c *dockerClient) offboardContainer(ctx context.Context, name string, store *OnboardedStore, routesPath string) error {
 	svc, ok := store.Get(name)
 	if !ok {

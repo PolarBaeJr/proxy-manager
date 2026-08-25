@@ -1207,18 +1207,26 @@ func (c *dockerClient) discardCanary(ctx context.Context, name string) error {
 	return nil
 }
 
-func (c *dockerClient) deleteService(ctx context.Context, name string) error {
+// deleteService permanently removes every container backing a label-managed
+// service. It returns how many members were actually torn down (membersActed)
+// alongside any error, so a partial failure partway through a multi-replica
+// service can be reported accurately instead of as a bare status string —
+// stopContainer is best-effort and deliberately NOT counted (only a
+// successful removeContainer increments membersActed), since a stop with no
+// matching remove leaves the container stopped but still present.
+func (c *dockerClient) deleteService(ctx context.Context, name string) (membersActed int, err error) {
 	existing, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	for _, ct := range existing {
 		_ = c.stopContainer(ctx, ct.ID)
 		if err := c.removeContainer(ctx, ct.ID); err != nil {
-			return err
+			return membersActed, err
 		}
+		membersActed++
 	}
-	return nil
+	return membersActed, nil
 }
 
 // ---- Routes view (independent of the proxy process) ----
