@@ -293,7 +293,7 @@ func main() {
 	}
 	peerHandlers := map[string]http.Handler{
 		"/peer/handshake":       peerHandshakeHandler(peerSecret, identity, buildVersion, peerWritesEnabled),
-		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv()),
+		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv(), monitorURLFromEnv()),
 		"/peer/stats":           peerStatsHandler(peerSecret, identity),
 		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic),
 		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, *staticConfig, proxyURLFromEnv(), peerWritesEnabled),

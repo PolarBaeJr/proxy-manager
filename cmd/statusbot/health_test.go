@@ -88,7 +88,7 @@ func TestStatusReply(t *testing.T) {
 }
 
 func TestDegradedSummaryNoDetail(t *testing.T) {
-	if s := degradedSummary(healthStatus{Targets: nil}); s == "" {
+	if s := degradedSummary(nil); s == "" {
 		t.Error("empty target list should still return a non-empty summary")
 	}
 }

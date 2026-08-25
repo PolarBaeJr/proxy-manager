@@ -86,12 +86,31 @@ func overviewPage(resp serviceStatusResp) *discordgo.MessageEmbed {
 	} else {
 		embed.Timestamp = resp.SampledAt.UTC().Format(time.RFC3339)
 	}
+	// One field per host in resp.Hosts, rendered before the per-group fields
+	// so a down peer's "unreachable" summary sits right at the top of the
+	// overview page, side by side with the other host(s). Unlike the group
+	// loop below, this one is NOT capped against discordMaxFields — fine at
+	// today's 2-node mesh, but a roster past ~25 hosts would overflow
+	// Discord's per-embed field limit and get the whole message rejected.
+	for _, h := range resp.Hosts {
+		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+			Name:   fmt.Sprintf("%s %s", hostIcon(h), trimMachineLabel(h.Machine)),
+			Value:  hostSummary(h),
+			Inline: true,
+		})
+	}
+
 	// Even a compact one-line-per-group field can't exceed discordMaxFields
 	// groups on the overview page — a big enough fleet (e.g. today's 30+
 	// group synthetic test, or a mesh with several peers merged in) needs
 	// the same deterministic "+N more" truncation groupPage already applies
-	// per-service.
-	const maxFields = discordMaxFields - 1 // headroom for a trailing "+N more" field
+	// per-service. maxFields also reserves one slot per host field added
+	// above, so N host fields can't silently push real groups into "+N
+	// more" truncation.
+	maxFields := discordMaxFields - 1 - len(resp.Hosts) // headroom for a trailing "+N more" field
+	if maxFields < 0 {
+		maxFields = 0
+	}
 	shown := 0
 	for _, g := range resp.Groups {
 		if shown >= maxFields {
@@ -114,16 +133,47 @@ func overviewPage(resp serviceStatusResp) *discordgo.MessageEmbed {
 	return embed
 }
 
+// trimMachineLabel strips the shared ".polardev.org" suffix off a Machine
+// identity so it stays short — shared by machineSuffix (group labels) and
+// the host-roster field names in overviewPage.
+func trimMachineLabel(machine string) string {
+	return strings.TrimSuffix(machine, ".polardev.org")
+}
+
 // machineSuffix renders a group's origin host as a short " · label" tag, or
 // "" when Machine is unset (this host's own groups, or a mesh with no peers
 // configured at all — the common case, and the only case before any peer is
-// wired up). Trims the shared ".polardev.org" suffix so the tag stays short
-// enough to sit comfortably next to a group name.
+// wired up).
 func machineSuffix(machine string) string {
 	if machine == "" {
 		return ""
 	}
-	return " · " + strings.TrimSuffix(machine, ".polardev.org")
+	return " · " + trimMachineLabel(machine)
+}
+
+// hostIcon maps one host-roster entry to the same icon set stateIcon uses
+// elsewhere. !Reachable must be checked before Status — an unreachable
+// host's Status is always "" (never populated on the failure path), which
+// would otherwise fall through to the "up" icon.
+func hostIcon(h hostHealth) string {
+	if !h.Reachable {
+		return stateIcon("down")
+	}
+	if h.Status == "degraded" {
+		return stateIcon("degraded")
+	}
+	return stateIcon("up")
+}
+
+// hostSummary renders one host-roster field's value.
+func hostSummary(h hostHealth) string {
+	if !h.Reachable {
+		return "unreachable"
+	}
+	if h.Status == "degraded" {
+		return "⚠️ degraded — " + degradedSummary(h.Targets)
+	}
+	return "up"
 }
 
 // overviewGroupState maps a group's tally back to the "up"/"degraded"/"down"

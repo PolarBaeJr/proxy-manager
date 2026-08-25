@@ -135,11 +135,33 @@ type ServiceStatusGroup struct {
 	Machine string `json:"machine,omitempty"`
 }
 
+// HealthTarget mirrors one entry of the monitor's per-target health list —
+// see fetchMonitorHealth (api.go) and /api/health's response shape.
+type HealthTarget struct {
+	Name   string `json:"name"`
+	Health string `json:"health"`
+}
+
+// HostHealth is one host's monitor-derived reachability summary, carried
+// alongside ServiceStatusResp.Groups so a dead peer shows up explicitly as
+// "unreachable" instead of silently contributing zero groups. Machine
+// matches ServiceStatusGroup.Machine's convention — this host's own
+// identity for the local entry, the peer's identity (or its raw peer URL,
+// if never successfully handshaked) for a merged-in one.
+type HostHealth struct {
+	Machine   string         `json:"machine"`
+	Reachable bool           `json:"reachable"`
+	Status    string         `json:"status,omitempty"`
+	Targets   []HealthTarget `json:"targets,omitempty"`
+	CheckedAt string         `json:"checked_at,omitempty"`
+}
+
 type ServiceStatusResp struct {
 	SampledAt      time.Time            `json:"sampled_at"`
 	StatsSampledAt time.Time            `json:"stats_sampled_at"`
 	WindowSeconds  int                  `json:"window_seconds"`
 	Groups         []ServiceStatusGroup `json:"groups"`
+	Hosts          []HostHealth         `json:"hosts,omitempty"`
 }
 
 // buildServiceStatus combines listServices, the request-rate aggregator

@@ -174,6 +174,70 @@ func TestBuildStatusPagesShowsMachineLabel(t *testing.T) {
 	}
 }
 
+func TestOverviewPageHostRoster(t *testing.T) {
+	resp := serviceStatusResp{
+		Groups: []serviceStatusGroup{
+			{Group: "core", Services: []serviceStatusEntry{{Name: "proxy", State: "up"}}},
+		},
+		Hosts: []hostHealth{
+			{Machine: "dashboard.polardev.org", Reachable: true, Status: "up"},
+			{Machine: "dashboard-mac.polardev.org", Reachable: true, Status: "degraded", Targets: []healthTarget{{Name: "proxy", Health: "down"}}},
+			{Machine: "dashboard-b", Reachable: false},
+		},
+	}
+	pages := buildStatusPages(resp)
+	overview := pages[0]
+	if len(overview.Fields) != 4 { // 3 hosts + 1 group
+		t.Fatalf("overview Fields = %d, want 4 (3 hosts + 1 group)", len(overview.Fields))
+	}
+
+	up := overview.Fields[0]
+	if up.Name != "✅ dashboard" || up.Value != "up" {
+		t.Errorf("up host field = %+v, want name %q value %q", up, "✅ dashboard", "up")
+	}
+	degraded := overview.Fields[1]
+	if degraded.Name != "⚠️ dashboard-mac" {
+		t.Errorf("degraded host field name = %q, want %q", degraded.Name, "⚠️ dashboard-mac")
+	}
+	if !strings.Contains(degraded.Value, "degraded") || !strings.Contains(degraded.Value, "proxy") {
+		t.Errorf("degraded host field value = %q, want it to mention degraded and proxy", degraded.Value)
+	}
+	unreachable := overview.Fields[2]
+	if unreachable.Name != "🔴 dashboard-b" || unreachable.Value != "unreachable" {
+		t.Errorf("unreachable host field = %+v, want name %q value %q", unreachable, "🔴 dashboard-b", "unreachable")
+	}
+	// The group field comes after all host fields.
+	if overview.Fields[3].Name != "✅ core" {
+		t.Errorf("overview Fields[3].Name = %q, want the group field last", overview.Fields[3].Name)
+	}
+}
+
+// TestBuildStatusPagesHostsDontStealGroupBudget proves the overview's
+// maxFields budget reserves one slot per host so a mesh with several peers
+// merged in doesn't silently push real groups into "+N more" truncation.
+func TestBuildStatusPagesHostsDontStealGroupBudget(t *testing.T) {
+	var groups []serviceStatusGroup
+	for g := 0; g < 24; g++ {
+		groups = append(groups, serviceStatusGroup{Group: fmt.Sprintf("group-%d", g), Services: []serviceStatusEntry{{Name: "svc", State: "up"}}})
+	}
+	resp := serviceStatusResp{
+		Groups: groups,
+		Hosts: []hostHealth{
+			{Machine: "dashboard-a", Reachable: true, Status: "up"},
+			{Machine: "dashboard-b", Reachable: true, Status: "up"},
+		},
+	}
+	pages := buildStatusPages(resp)
+	overview := pages[0]
+	if len(overview.Fields) > discordMaxFields {
+		t.Fatalf("overview Fields = %d, want <= %d", len(overview.Fields), discordMaxFields)
+	}
+	last := overview.Fields[len(overview.Fields)-1]
+	if !strings.Contains(last.Value, "more") {
+		t.Errorf("last field = %+v, want a truncation note since 2 hosts + 24 groups can't all fit in %d fields", last, discordMaxFields)
+	}
+}
+
 func TestStatusPageComponentsBoundaries(t *testing.T) {
 	cases := []struct {
 		name             string

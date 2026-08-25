@@ -82,8 +82,10 @@ h1{
   display:grid;place-items:center;font-size:11px;font-weight:700;color:var(--accent)}
 
 /* sysstats */
-#sys-stats-host{display:flex;justify-content:flex-end;margin:8px 0 0}
-#sys-stats{display:flex;gap:12px;margin:22px 0 0;flex-wrap:wrap}
+#sys-stats{display:flex;gap:16px;margin:22px 0 0;flex-wrap:wrap}
+.stats-group{flex:1;min-width:320px}
+.stats-group-label{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600;margin:0 0 6px 2px}
+.stats-group-tiles{display:flex;gap:8px}
 .sysstat{
   flex:1;min-width:190px;display:flex;align-items:center;gap:13px;
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);
@@ -102,6 +104,13 @@ h1{
   background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width var(--transition-slow)}
 .sysstat.warn .ico{color:var(--yellow)} .sysstat.warn .bar>span{background:linear-gradient(90deg,var(--yellow),#e08c12)}
 .sysstat.bad .ico{color:var(--red)} .sysstat.bad .bar>span{background:linear-gradient(90deg,var(--red),#c0282b)}
+.sysstat.compact{min-width:0;gap:8px;padding:9px 10px}
+.sysstat.compact .ico{width:26px;height:26px;border-radius:7px}
+.sysstat.compact .ico svg{width:14px;height:14px}
+.sysstat.compact .label{font-size:9px}
+.sysstat.compact .val{font-size:14px;margin:1px 0 5px;gap:4px}
+.sysstat.compact .val small{font-size:9.5px}
+.sysstat.compact .bar{height:4px}
 #status{font-size:12px;color:var(--muted);margin:14px 0 0;display:flex;align-items:center;gap:7px}
 #status .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
 #status.err .dot{background:var(--red);box-shadow:0 0 8px var(--red)}
@@ -524,7 +533,6 @@ footer.app code{color:var(--muted)}
           <button class="btn" onclick="logout()" id="logout-btn">Logout</button>
         </div>
       </div>
-      <div id="sys-stats-host"></div>
       <div id="sys-stats"></div>
       <div id="status">loading…</div>
       <nav>
@@ -1012,7 +1020,6 @@ function renderHeader() {
     b.innerHTML = NAVICON[k] + '<span>' + NAVMETA[k] + '</span>';
   });
   renderLockBanner();
-  renderStatsHostPicker();
 }
 function renderLockBanner() {
   const el = $('#lock-banner');
@@ -1612,6 +1619,7 @@ async function renderServices() {
     // so any request hitting the proxy right now gets 503 — show a
     // prominent "down" pill instead of the muted "stopped" it used to be.
     if (s.all_stopped) badges += ' <span class="pill bad">' + I.alert + 'down</span>';
+    if (s.image_check_error) badges += ' <span class="pill bad" title="' + esc(s.image_check_error) + '">' + I.alert + 'image check failing</span>';
     // Foreign rows now render the menu too when write-mesh-writable
     // (peerWritable) — Delete forwards to the owning peer just like the
     // other svcWriteAttr-gated actions. The menu id is host-qualified
@@ -3865,67 +3873,24 @@ function refreshDNSFormShape() {
 
 /* ---------- sys-stats (CPU / Mem / Disk) ---------- */
 function statClass(pct) { return pct >= 90 ? ' bad' : pct >= 75 ? ' warn' : ''; }
-function tileMarkup(icon, label, valHtml, p) {
+function tileMarkup(icon, label, valHtml, p, compact) {
   const cls = statClass(p);
   const w = Math.min(100, p).toFixed(1);
-  return '<div class="sysstat' + cls + '" title="' + esc(label + ': ' + (p.toFixed ? p.toFixed(1) : p) + '%') + '">'
+  return '<div class="sysstat' + cls + (compact ? ' compact' : '') + '" title="' + esc(label + ': ' + (p.toFixed ? p.toFixed(1) : p) + '%') + '">'
        + '<div class="ico">' + icon + '</div>'
        + '<div class="body"><div class="label">' + label + '</div>'
        + '<div class="val">' + valHtml + '</div>'
        + '<div class="bar"><span style="width:' + w + '%"></span></div></div></div>';
 }
-// _statsHost: '' = this host; anything else = a peer, viewed read-only via
-// GET /api/stats?host=. Persisted like _imagesHost/_logsHost. Unlike those,
-// the picker is NOT rebuilt on every stats tick (see refreshStats) — it would
-// destroy an open <select> mid-interaction every 5s, since GetStats' cpu_pct
-// changes every tick and there is no content-hash guard like Images/Logs use.
-let _statsHost = loadPref('pmgr-stats-host', '');
-// _statsPeersKey caches the last-seen peer identity/ok set so the picker
-// options are only rebuilt when that set actually changes (piggybacked on
-// refreshPeers' existing 30s /api/peers poll), not on every render.
-let _statsPeersKey = '';
-async function loadStatsPeerOptions() {
+function statsGroupMarkup(label, tilesHtml) {
+  return '<div class="stats-group"><div class="stats-group-label">' + label + '</div>'
+       + '<div class="stats-group-tiles">' + tilesHtml + '</div></div>';
+}
+async function statsGroupFor(identity, label) {
   try {
-    const d = await (await fetch('/api/peers')).json();
-    return d.peers || [];
-  } catch (e) { return []; }
-}
-function statsHostPickerHTML(peers) {
-  const pickerOptions = ['<option value="">this host' + (_selfIdentity ? ' (' + esc(machineLabel(_selfIdentity)) + ')' : '') + '</option>']
-    .concat(peers.map(p => {
-      const disabled = p.identity ? '' : ' disabled';
-      const label = machineLabel(p.identity || p.url) + (!p.ok ? ' (unreachable)' : '');
-      const selected = p.identity && p.identity === _statsHost ? ' selected' : '';
-      return '<option value="' + esc(p.identity || '') + '"' + disabled + selected + '>' + esc(label) + '</option>';
-    }));
-  return '<select id="stats-host-picker" title="Viewing stats for">' + pickerOptions.join('') + '</select>';
-}
-async function renderStatsHostPicker(peers) {
-  const el = $('#sys-stats-host');
-  if (!el) return;
-  if (!authState.authenticated) { el.innerHTML = ''; return; }
-  if (_selfIdentity === null) await loadSelfIdentity();
-  if (!peers) peers = await loadStatsPeerOptions();
-  if (!peers.length) { el.innerHTML = ''; return; }
-  if (_statsHost && _statsHost !== _selfIdentity && !peers.some(p => p.identity && p.identity === _statsHost)) {
-    _statsHost = '';
-    savePref('pmgr-stats-host', _statsHost);
-  }
-  el.innerHTML = statsHostPickerHTML(peers);
-  const sel = $('#stats-host-picker');
-  if (sel) sel.onchange = (e) => {
-    _statsHost = e.target.value;
-    savePref('pmgr-stats-host', _statsHost);
-    refreshStats();
-  };
-}
-async function refreshStats() {
-  if (!authState.authenticated) { $('#sys-stats').textContent = ''; $('#sys-stats-host').textContent = ''; return; }
-  try {
-    const r = await fetch('/api/stats' + (_statsHost ? '?host=' + encodeURIComponent(_statsHost) : ''));
+    const r = await fetch('/api/stats' + (identity ? '?host=' + encodeURIComponent(identity) : ''));
     if (!r.ok) {
-      $('#sys-stats').innerHTML = tileMarkup(I.cpu, 'Stats', '<small>' + esc(machineLabel(_statsHost) || 'host') + ' unreachable</small>', 0);
-      return;
+      return statsGroupMarkup(label, tileMarkup(I.cpu, 'Stats', '<small>unreachable</small>', 0, true));
     }
     const s = await r.json();
     const cpuPct  = Math.max(0, Math.min(100, s.cpu_pct || 0));
@@ -3933,22 +3898,33 @@ async function refreshStats() {
     const diskPct = s.disk_total ? 100 * s.disk_used / s.disk_total : 0;
     const memGB   = (s.mem_used  / 1073741824).toFixed(1);
     const memTotG = (s.mem_total / 1073741824).toFixed(1);
-    $('#sys-stats').innerHTML =
-        tileMarkup(I.cpu,  'CPU',    '<span class="num">' + cpuPct.toFixed(0) + '</span><small>% load</small>', cpuPct)
-      + tileMarkup(I.mem,  'Memory', '<span class="num">' + memGB + '</span><small>/ ' + memTotG + ' GB used · ' + fmtBytes(s.mem_free) + ' free</small>', memPct)
-      + tileMarkup(I.disk, 'Disk',   '<span class="num">' + fmtBytes(s.disk_used) + '</span><small>/ ' + fmtBytes(s.disk_total) + ' used · ' + fmtBytes(s.disk_free) + ' free</small>', diskPct);
-  } catch (e) { /* silent */ }
+    const tiles =
+        tileMarkup(I.cpu,  'CPU',    '<span class="num">' + cpuPct.toFixed(0) + '</span><small>% load</small>', cpuPct, true)
+      + tileMarkup(I.mem,  'Memory', '<span class="num">' + memGB + '</span><small>/ ' + memTotG + ' GB used · ' + fmtBytes(s.mem_free) + ' free</small>', memPct, true)
+      + tileMarkup(I.disk, 'Disk',   '<span class="num">' + fmtBytes(s.disk_used) + '</span><small>/ ' + fmtBytes(s.disk_total) + ' used · ' + fmtBytes(s.disk_free) + ' free</small>', diskPct, true);
+    return statsGroupMarkup(label, tiles);
+  } catch (e) {
+    return statsGroupMarkup(label, tileMarkup(I.cpu, 'Stats', '<small>unreachable</small>', 0, true));
+  }
+}
+async function refreshStats() {
+  if (!authState.authenticated) { $('#sys-stats').textContent = ''; return; }
+  if (_selfIdentity === null) await loadSelfIdentity();
+  let peers = [];
+  try {
+    const d = await (await fetch('/api/peers')).json();
+    peers = (d.peers || []).filter(p => p.identity);
+  } catch (e) { /* no peers, still show self */ }
+  const hosts = [{ identity: '', label: 'This host' + (_selfIdentity ? ' (' + esc(machineLabel(_selfIdentity)) + ')' : '') }]
+    .concat(peers.map(p => ({ identity: p.identity, label: esc(machineLabel(p.identity)) })));
+  const groups = await Promise.all(hosts.map(h => statsGroupFor(h.identity, h.label)));
+  $('#sys-stats').innerHTML = groups.join('');
 }
 
 async function refreshPeers() {
   if (!authState.authenticated) { $('#footer-peers').hidden = true; $('#footer-peers-sep').hidden = true; return; }
   try {
     const d = await (await fetch('/api/peers')).json();
-    const key = JSON.stringify((d.peers || []).map(p => p.identity + ':' + p.ok).sort());
-    if (key !== _statsPeersKey) {
-      _statsPeersKey = key;
-      renderStatsHostPicker(d.peers || []);
-    }
     const total = d.peers ? d.peers.length : 0;
     if (!total) { $('#footer-peers').hidden = true; $('#footer-peers-sep').hidden = true; return; }
     const ok = d.peers.filter(p => p.ok).length;
@@ -3990,7 +3966,6 @@ setInterval(renderActive, 5000);
 setInterval(refreshStats, 5000);
 setInterval(refreshPeers, 30000);
 refreshAuth();
-renderStatsHostPicker();
 refreshStats();
 refreshPeers();
 </script>

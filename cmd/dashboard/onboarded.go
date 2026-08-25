@@ -406,6 +406,11 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 
 	// Capture image, env, and mounts so the replacements are equivalent.
 	image := ct.Image
+	if looksLikeBareDigest(image) {
+		if ref, err := c.inspectConfigImage(ctx, ct.ID); err == nil && ref != "" && !looksLikeBareDigest(ref) {
+			image = ref
+		}
+	}
 	env, err := c.inspectEnv(ctx, ct.ID)
 	if err != nil {
 		return fmt.Errorf("inspect env: %w", err)
@@ -491,9 +496,15 @@ func onboardManagedOnly(ctx context.Context, name string, c *dockerClient, store
 	if err := checkOnboardTarget(*ct); err != nil {
 		return err
 	}
+	image := ct.Image
+	if looksLikeBareDigest(image) {
+		if ref, err := c.inspectConfigImage(ctx, ct.ID); err == nil && ref != "" && !looksLikeBareDigest(ref) {
+			image = ref
+		}
+	}
 	return store.Put(OnboardedService{
 		Name:           name,
-		Image:          ct.Image,
+		Image:          image,
 		Replicas:       1,
 		OriginalRouted: false,
 		CreatedAt:      time.Now().Unix(),
@@ -909,8 +920,16 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 		return redactRefConflicts(err, refs)
 	}
 	c.pullImage(ctx, req.Image)
-	// Spin up replacements named -r2 to avoid colliding with existing -1..N.
-	startIdx := 1000
+	// Spin up replacements at the next available index — mirrors
+	// scaleOnboarded's nextCloneIndex so a second replaceOnboarded call right
+	// after the first doesn't try to recreate a container name still held by
+	// the previous replace's live clones. (Previously a fixed startIdx :=
+	// 1000, which 409-conflicted on every call after the first.)
+	existingClones, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
+	if err != nil {
+		return err
+	}
+	startIdx := nextCloneIndex(existingClones, name)
 	var newIDs []string
 	for i := 0; i < svc.Replicas; i++ {
 		cname := fmt.Sprintf("goproxy-onb-%s-%d", name, startIdx+i)
@@ -930,7 +949,7 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 		newIDs = append(newIDs, id)
 	}
 	// Give the new clones a few seconds to bind before swapping.
-	time.Sleep(3 * time.Second)
+	time.Sleep(replaceSettleDelay)
 	// Remove any clone that isn't one of the freshly-created ones. The only
 	// thing we preserve is an ACTIVE canary (svc.CanaryImage set) — but
 	// replaceOnboarded already rejected that case earlier, so post-promote

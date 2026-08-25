@@ -196,6 +196,7 @@ func TestServiceStatusEndpoint(t *testing.T) {
 // does all the merging.
 func TestServiceStatusEndpointMergesPeer(t *testing.T) {
 	t.Setenv("PROXY_URL", "")
+	t.Setenv("MONITOR_URL", "")
 	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
 
 	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +212,7 @@ func TestServiceStatusEndpointMergesPeer(t *testing.T) {
 		}})
 	}))
 
-	peerSrv := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", peerDC, ""))
+	peerSrv := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", peerDC, "", ""))
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
@@ -251,5 +252,79 @@ func TestServiceStatusEndpointMergesPeer(t *testing.T) {
 	}
 	if peer == nil || len(peer.Services) != 1 || peer.Services[0].Name != "player" {
 		t.Fatalf("peer group = %+v, want tagged dashboard-b with service player", peer)
+	}
+	if len(got.Hosts) != 2 {
+		t.Fatalf("Hosts = %+v, want 2 (local + peer)", got.Hosts)
+	}
+	var localHost, peerHost *HostHealth
+	for i := range got.Hosts {
+		switch got.Hosts[i].Machine {
+		case "dashboard-a":
+			localHost = &got.Hosts[i]
+		case "dashboard-b":
+			peerHost = &got.Hosts[i]
+		}
+	}
+	if localHost == nil || !localHost.Reachable {
+		t.Errorf("localHost = %+v, want a reachable dashboard-a entry", localHost)
+	}
+	if peerHost == nil || !peerHost.Reachable {
+		t.Errorf("peerHost = %+v, want a reachable dashboard-b entry", peerHost)
+	}
+}
+
+// TestServiceStatusEndpointReportsUnreachablePeer proves /api/service-status
+// still returns 200 — with an explicit Reachable:false host entry, not a
+// silently-vanished peer — when a configured peer can't be reached at all.
+func TestServiceStatusEndpointReportsUnreachablePeer(t *testing.T) {
+	t.Setenv("PROXY_URL", "")
+	t.Setenv("MONITOR_URL", "")
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c1", Names: []string{"/goproxy-app-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
+		}})
+	}))
+
+	peerSrv := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", nil, "", ""))
+	peerURL := peerSrv.URL
+	peerSrv.Close() // guarantees connection-refused without hardcoding a port
+
+	reg := newPeerRegistry([]string{peerURL}, "s3cret", "dashboard-a", "dev", 0, nil)
+
+	auth, _ := newConfirmedStore(t, "alice", "correct horse")
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), nil, "", nil, nil, nil, nil, nil, nil, nil, reg, nil)
+
+	tok, _, err := auth.CreateToken("alice", "test")
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	req := httptest.NewRequest("GET", "/api/service-status", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var got ServiceStatusResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Groups) != 1 {
+		t.Fatalf("Groups = %+v, want 1 (local only, peer unreachable)", got.Groups)
+	}
+	if len(got.Hosts) != 2 {
+		t.Fatalf("Hosts = %+v, want 2 (local + unreachable peer)", got.Hosts)
+	}
+	var peerHost *HostHealth
+	for i := range got.Hosts {
+		if got.Hosts[i].Machine == peerURL {
+			peerHost = &got.Hosts[i]
+		}
+	}
+	if peerHost == nil || peerHost.Reachable {
+		t.Errorf("peerHost = %+v, want an unreachable entry labeled %q", peerHost, peerURL)
 	}
 }

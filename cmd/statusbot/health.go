@@ -75,13 +75,13 @@ func statusReply(hs healthStatus, err error) string {
 		}
 		return msg
 	default:
-		return "⚠️ degraded — " + degradedSummary(hs) + " (checked " + hs.CheckedAt + ")"
+		return "⚠️ degraded — " + degradedSummary(hs.Targets) + " (checked " + hs.CheckedAt + ")"
 	}
 }
 
-func degradedSummary(hs healthStatus) string {
+func degradedSummary(targets []healthTarget) string {
 	var down []string
-	for _, t := range hs.Targets {
+	for _, t := range targets {
 		if t.Health != "up" {
 			down = append(down, t.Name+" ("+t.Health+")")
 		}

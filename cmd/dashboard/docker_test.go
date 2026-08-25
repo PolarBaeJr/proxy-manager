@@ -96,6 +96,75 @@ func TestListServicesGrouping(t *testing.T) {
 	}
 }
 
+// TestListServicesSelfHealsBareDigest is the regression test for the
+// listServices half of Bug B: /containers/json's Image field can decay to a
+// bare "sha256:<digest>" once the tag a container was created from is
+// retagged/removed locally. listServices must fall back to the container's
+// own inspect Config.Image (fixed at creation time) rather than surfacing
+// the bare digest as the service's Image — this is the path that feeds
+// shouldAutoUpdate's gate for label-managed services, so a stuck bare digest
+// here silently and permanently blocks auto-update.
+func TestListServicesSelfHealsBareDigest(t *testing.T) {
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "c1", Names: []string{"/goproxy-app-1"}, State: "running",
+				Image:  "sha256:" + strings.Repeat("a", 64),
+				Labels: map[string]string{labelService: "app", labelHost: "app.example.org", labelPort: "80"},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/c1/json"):
+			json.NewEncoder(w).Encode(map[string]any{"Config": map[string]any{"Image": "ghcr.io/org/app:v1"}})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+	svcs, err := dc.listServices(context.Background())
+	if err != nil {
+		t.Fatalf("listServices: %v", err)
+	}
+	app := pickService(svcs, "app")
+	if app == nil {
+		t.Fatal("app service missing")
+	}
+	if app.Image != "ghcr.io/org/app:v1" {
+		t.Fatalf("Image = %q, want ghcr.io/org/app:v1 (self-healed from inspect)", app.Image)
+	}
+}
+
+// TestListServicesNormalImageSkipsInspect locks in the "zero extra Docker
+// calls in the common case" property: a normal (non-decayed) image must
+// never trigger the inspect fallback.
+func TestListServicesNormalImageSkipsInspect(t *testing.T) {
+	var inspectCalls int
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "c1", Names: []string{"/goproxy-app-1"}, State: "running",
+				Image:  "ghcr.io/org/app:v1",
+				Labels: map[string]string{labelService: "app", labelHost: "app.example.org", labelPort: "80"},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/c1/json"):
+			inspectCalls++
+			json.NewEncoder(w).Encode(map[string]any{"Config": map[string]any{"Image": "ghcr.io/org/app:v1"}})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+	svcs, err := dc.listServices(context.Background())
+	if err != nil {
+		t.Fatalf("listServices: %v", err)
+	}
+	app := pickService(svcs, "app")
+	if app == nil || app.Image != "ghcr.io/org/app:v1" {
+		t.Fatalf("app = %+v", app)
+	}
+	if inspectCalls != 0 {
+		t.Fatalf("inspectCalls = %d, want 0 (non-decayed image should skip inspect)", inspectCalls)
+	}
+}
+
 func TestListServicesGroupLabel(t *testing.T) {
 	rogue := ct("rogue-group", "x:1", "running", map[string]string{labelService: "roguegroup", labelGroup: "<script>"})
 	dc := fakeDocker(t, ctJSON(
