@@ -38,11 +38,23 @@ type serviceStatusGroup struct {
 	Machine string `json:"machine,omitempty"`
 }
 
+// hostHealth mirrors cmd/dashboard/servicestatus.go's HostHealth JSON shape.
+// Reuses healthTarget (health.go) for Targets — identical shape, no need to
+// duplicate it a second time.
+type hostHealth struct {
+	Machine   string         `json:"machine"`
+	Reachable bool           `json:"reachable"`
+	Status    string         `json:"status,omitempty"`
+	Targets   []healthTarget `json:"targets,omitempty"`
+	CheckedAt string         `json:"checked_at,omitempty"`
+}
+
 type serviceStatusResp struct {
 	SampledAt      time.Time            `json:"sampled_at"`
 	StatsSampledAt time.Time            `json:"stats_sampled_at"`
 	WindowSeconds  int                  `json:"window_seconds"`
 	Groups         []serviceStatusGroup `json:"groups"`
+	Hosts          []hostHealth         `json:"hosts,omitempty"`
 }
 
 // errNoDashboardToken is returned by fetchServiceStatus without attempting a

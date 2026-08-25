@@ -39,6 +39,41 @@ func TestManagedOnlyGuards(t *testing.T) {
 	check("promote", dc.promoteOnboarded(ctx, "mo", store, routes))
 }
 
+// TestOnboardManagedOnlySelfHealsBareDigest is the regression test for Bug
+// B's onboardManagedOnly path: when the container's /containers/json Image
+// has already decayed to a bare digest, onboardManagedOnly must fall back to
+// the container's own inspect Config.Image rather than persisting the bare
+// digest into the store record.
+func TestOnboardManagedOnlySelfHealsBareDigest(t *testing.T) {
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "orig-id", Names: []string{"/mo"}, State: "running",
+				Image: "sha256:" + strings.Repeat("a", 64),
+			}})
+		case strings.HasSuffix(r.URL.Path, "/orig-id/json"):
+			json.NewEncoder(w).Encode(map[string]any{"Config": map[string]any{"Image": "ghcr.io/org/mo:v1"}})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+	store, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := onboardManagedOnly(context.Background(), "mo", dc, store); err != nil {
+		t.Fatalf("onboardManagedOnly: %v", err)
+	}
+	got, ok := store.Get("mo")
+	if !ok {
+		t.Fatal("mo missing from store")
+	}
+	if got.Image != "ghcr.io/org/mo:v1" {
+		t.Fatalf("Image = %q, want ghcr.io/org/mo:v1 (self-healed from inspect)", got.Image)
+	}
+}
+
 func TestNextCloneIndex(t *testing.T) {
 	clones := []dockerContainer{
 		{Names: []string{"/goproxy-onb-app-1"}},
@@ -257,6 +292,135 @@ func newFakeDockerServer(t *testing.T, seed ...*fakeContainer) *dockerClient {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 		},
 	}}}
+}
+
+// conflictFakeContainer/newConflictFakeDockerServer is a LOCAL stateful fake
+// (not shared — unlike rolloutFakeDocker in rollout_test.go, other tests
+// don't depend on this one's exact behavior) that rejects a duplicate
+// container name on create with a 409, mirroring the real daemon. That's
+// exactly the behavior needed to reproduce replaceOnboarded's old hardcoded
+// startIdx bug: a second replaceOnboarded call tried to recreate a name the
+// first call's live clones still held.
+type conflictFakeContainer struct {
+	id, name, image string
+	removed         bool
+}
+
+func newConflictFakeDockerServer(t *testing.T, seed ...*conflictFakeContainer) *dockerClient {
+	t.Helper()
+	var mu sync.Mutex
+	containers := map[string]*conflictFakeContainer{}
+	for _, c := range seed {
+		containers[c.id] = c
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		path := strings.TrimPrefix(r.URL.Path, "/"+dockerAPI)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET" && path == "/containers/json":
+			var nameSubstr string
+			if fq := r.URL.Query().Get("filters"); fq != "" {
+				var f struct {
+					Name []string `json:"name"`
+				}
+				_ = json.Unmarshal([]byte(fq), &f)
+				if len(f.Name) > 0 {
+					nameSubstr = f.Name[0]
+				}
+			}
+			var out []map[string]any
+			for _, c := range containers {
+				if c.removed {
+					continue
+				}
+				if nameSubstr != "" && !strings.Contains(c.name, nameSubstr) {
+					continue
+				}
+				out = append(out, map[string]any{
+					"Id": c.id, "Names": []string{"/" + c.name}, "Image": c.image, "State": "running",
+				})
+			}
+			b, _ := json.Marshal(out)
+			_, _ = w.Write(b)
+		case r.Method == "POST" && path == "/containers/create":
+			name := r.URL.Query().Get("name")
+			for _, c := range containers {
+				if !c.removed && c.name == name {
+					w.WriteHeader(http.StatusConflict)
+					_, _ = w.Write([]byte(`{"message":"Conflict. The container name \"` + name + `\" is already in use"}`))
+					return
+				}
+			}
+			var body createBody
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			id := name + "-id"
+			containers[id] = &conflictFakeContainer{id: id, name: name, image: body.Image}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]string{"Id": id})
+		case r.Method == "POST" && strings.HasSuffix(path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == "POST" && strings.HasSuffix(path, "/stop"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == "GET" && strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/json"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"Config": map[string]any{"Env": []string{}}})
+		case r.Method == "DELETE" && strings.HasPrefix(path, "/containers/"):
+			id := strings.TrimPrefix(path, "/containers/")
+			if c, ok := containers[id]; ok {
+				c.removed = true
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	return &dockerClient{http: &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		},
+	}}}
+}
+
+// TestReplaceOnboardedTwiceDoesNotConflict is the regression test for Bug A:
+// replaceOnboarded used to hardcode startIdx := 1000 for every call, so a
+// second replace right after the first tried to recreate
+// goproxy-onb-<name>-1000, which the first replace's still-live clone
+// already held — a 409 on every replace after the first.
+func TestReplaceOnboardedTwiceDoesNotConflict(t *testing.T) {
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	dc := newConflictFakeDockerServer(t)
+	store, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := filepath.Join(t.TempDir(), "routes.json")
+	svc := OnboardedService{
+		Name: "app", Host: "app.example.org", Port: 8080,
+		Replicas: 1, Image: "old:v1",
+	}
+	if err := store.Put(svc); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := dc.replaceOnboarded(context.Background(), "app", ReplaceServiceRequest{Image: "new:v2"}, store, routes); err != nil {
+		t.Fatalf("first replaceOnboarded: %v", err)
+	}
+	if err := dc.replaceOnboarded(context.Background(), "app", ReplaceServiceRequest{Image: "new:v3"}, store, routes); err != nil {
+		t.Fatalf("second replaceOnboarded: %v (this is the 409 regression)", err)
+	}
+	got, ok := store.Get("app")
+	if !ok {
+		t.Fatal("app missing from store")
+	}
+	if got.Image != "new:v3" {
+		t.Fatalf("Image after second replace = %q, want new:v3", got.Image)
+	}
 }
 
 // TestPromoteOnboardedPersistsEnv is the regression test for bug #2: an env

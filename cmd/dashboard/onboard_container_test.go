@@ -19,6 +19,10 @@ type onboardFakeContainer struct {
 	env                    []string
 	labels                 map[string]string
 	hostConfig             map[string]any
+	// configImage simulates the container's inspect Config.Image, which can
+	// legitimately differ from the list-endpoint image (to simulate the
+	// bare-digest decay Bug B guards against). Defaults to image when unset.
+	configImage string
 }
 
 // newOnboardFakeDockerServer stands in for the daemon across the full
@@ -72,7 +76,7 @@ func newOnboardFakeDockerServer(t *testing.T, seed *onboardFakeContainer) *docke
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"Image":      "sha256:fakeimg",
-				"Config":     map[string]any{"Env": c.env},
+				"Config":     map[string]any{"Env": c.env, "Image": firstNonEmpty(c.configImage, c.image)},
 				"HostConfig": hc,
 			})
 		case r.Method == "GET" && strings.HasPrefix(path, "/images/"):
@@ -165,6 +169,48 @@ func TestOnboardContainerRelabelsAndRecreates(t *testing.T) {
 		if c.name() == "myapp" && c.ID == "orig-id" {
 			t.Fatalf("original container %q still present after onboarding", c.name())
 		}
+	}
+}
+
+// TestOnboardContainerSelfHealsBareDigest is the regression test for the
+// onboardContainer half of Bug B: when the original container's
+// /containers/json Image has decayed to a bare digest, the newly created
+// replicas must be created with the proper reference recovered from
+// Config.Image, not the bare digest baked in permanently.
+func TestOnboardContainerSelfHealsBareDigest(t *testing.T) {
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	dc := newOnboardFakeDockerServer(t, &onboardFakeContainer{
+		id: "orig-id", name: "myapp",
+		image:       "sha256:" + strings.Repeat("a", 64),
+		configImage: "ghcr.io/org/myapp:v1",
+		env:         []string{"FOO=1"}, state: "running", labels: map[string]string{},
+	})
+
+	err := dc.onboardContainer(context.Background(), "myapp", OnboardRequest{
+		Host: "myapp.example.org", Port: 8080, Replicas: 1,
+	})
+	if err != nil {
+		t.Fatalf("onboardContainer: %v", err)
+	}
+
+	all, err := dc.listAll(context.Background(), "")
+	if err != nil {
+		t.Fatalf("listAll: %v", err)
+	}
+	var live *dockerContainer
+	for i := range all {
+		if all[i].Labels[labelService] == "myapp" {
+			live = &all[i]
+		}
+	}
+	if live == nil {
+		t.Fatal("no live label-managed replica found")
+	}
+	if live.Image != "ghcr.io/org/myapp:v1" {
+		t.Fatalf("Image = %q, want ghcr.io/org/myapp:v1 (self-healed from inspect)", live.Image)
 	}
 }
 

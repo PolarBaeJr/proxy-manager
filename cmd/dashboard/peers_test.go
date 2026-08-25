@@ -203,7 +203,7 @@ func TestPeerServiceStatusHandlerValidSecret(t *testing.T) {
 			Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
 		}})
 	}))
-	h := peerServiceStatusHandler("s3cret", "dashboard-b", dc, "")
+	h := peerServiceStatusHandler("s3cret", "dashboard-b", dc, "", "")
 	req := httptest.NewRequest(http.MethodGet, "/peer/service-status", nil)
 	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
@@ -225,7 +225,7 @@ func TestPeerServiceStatusHandlerValidSecret(t *testing.T) {
 }
 
 func TestPeerServiceStatusHandlerWrongSecret(t *testing.T) {
-	h := peerServiceStatusHandler("s3cret", "dashboard-b", nil, "")
+	h := peerServiceStatusHandler("s3cret", "dashboard-b", nil, "", "")
 	req := httptest.NewRequest(http.MethodGet, "/peer/service-status", nil)
 	req.Header.Set("Authorization", "Bearer wrong")
 	rec := httptest.NewRecorder()
@@ -236,7 +236,7 @@ func TestPeerServiceStatusHandlerWrongSecret(t *testing.T) {
 }
 
 func TestPeerServiceStatusHandlerEmptySecretDisabled(t *testing.T) {
-	h := peerServiceStatusHandler("", "dashboard-b", nil, "")
+	h := peerServiceStatusHandler("", "dashboard-b", nil, "", "")
 	req := httptest.NewRequest(http.MethodGet, "/peer/service-status", nil)
 	req.Header.Set("Authorization", "Bearer anything")
 	rec := httptest.NewRecorder()
@@ -247,7 +247,7 @@ func TestPeerServiceStatusHandlerEmptySecretDisabled(t *testing.T) {
 }
 
 func TestPeerServiceStatusHandlerWrongMethod(t *testing.T) {
-	h := peerServiceStatusHandler("s3cret", "dashboard-b", nil, "")
+	h := peerServiceStatusHandler("s3cret", "dashboard-b", nil, "", "")
 	req := httptest.NewRequest(http.MethodPost, "/peer/service-status", nil)
 	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
@@ -264,35 +264,44 @@ func TestFetchPeerServiceStatusTagsMachineAndMerges(t *testing.T) {
 			Labels: map[string]string{labelEnable: "true", labelService: "svc-b", labelHost: "b.example", labelPort: "80"},
 		}})
 	}))
-	srvB := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", dcB, ""))
+	srvB := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", dcB, "", ""))
 	defer srvB.Close()
 
 	reg := newPeerRegistry([]string{srvB.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	groups := fetchPeerServiceStatus(context.Background(), reg, "s3cret")
+	groups, hosts := fetchPeerServiceStatus(context.Background(), reg, "s3cret")
 	if len(groups) != 1 {
 		t.Fatalf("groups = %+v, want 1", groups)
 	}
 	if groups[0].Machine != "dashboard-b" {
 		t.Errorf("Machine = %q, want %q", groups[0].Machine, "dashboard-b")
 	}
+	if len(hosts) != 1 || hosts[0].Machine != "dashboard-b" || !hosts[0].Reachable {
+		t.Errorf("hosts = %+v, want one reachable dashboard-b entry", hosts)
+	}
 }
 
 func TestFetchPeerServiceStatusSkipsUnreachablePeer(t *testing.T) {
-	srv := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", nil, ""))
+	srv := httptest.NewServer(peerServiceStatusHandler("s3cret", "dashboard-b", nil, "", ""))
 	url := srv.URL
 	srv.Close() // guarantees connection-refused without hardcoding a port
 
 	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
-	groups := fetchPeerServiceStatus(context.Background(), reg, "s3cret")
+	groups, hosts := fetchPeerServiceStatus(context.Background(), reg, "s3cret")
 	if groups != nil {
 		t.Fatalf("groups = %+v, want nil for an unreachable peer", groups)
+	}
+	// No prior successful handshake was ever recorded (Run() was never
+	// started), so the label falls back to the raw configured peer URL.
+	if len(hosts) != 1 || hosts[0].Machine != url || hosts[0].Reachable {
+		t.Errorf("hosts = %+v, want one unreachable entry labeled %q", hosts, url)
 	}
 }
 
 func TestFetchPeerServiceStatusNoPeersConfigured(t *testing.T) {
 	reg := newPeerRegistry(nil, "s3cret", "dashboard-a", "dev", 0, nil)
-	if got := fetchPeerServiceStatus(context.Background(), reg, "s3cret"); got != nil {
-		t.Fatalf("groups = %+v, want nil with no peers configured", got)
+	groups, hosts := fetchPeerServiceStatus(context.Background(), reg, "s3cret")
+	if groups != nil || hosts != nil {
+		t.Fatalf("groups, hosts = %+v, %+v, want nil, nil with no peers configured", groups, hosts)
 	}
 }
 

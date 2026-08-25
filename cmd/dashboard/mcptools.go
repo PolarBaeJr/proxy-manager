@@ -121,7 +121,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 	s.Register(Tool{
 		Name:        "list_services",
 		Title:       "List services",
-		Description: "List every service the proxy manages: image, replica count, running count, host, whether an image update is available, and canary state.",
+		Description: "List every service the proxy manages: image, replica count, running count, host, whether an image update is available, canary state, and (image_check_error) whether the registry/distribution check for its image is currently failing.",
 		InputSchema: schema(map[string]any{}),
 		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
 			b, err := a.call(ctx, "GET", "/api/services", nil)

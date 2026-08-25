@@ -372,6 +372,46 @@ func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSp
 	return cloneSpec{Mounts: resp.HostConfig.Mounts}, nil
 }
 
+// looksLikeBareDigest reports whether s is a bare "sha256:<hex>" image
+// reference with no repo/tag component — the shape Docker's /containers/json
+// list endpoint's "Image" field decays into once the tag a container was
+// created from is later retagged or removed locally. A proper reference
+// (repo:tag, or repo@sha256:<hex>) never matches this.
+func looksLikeBareDigest(image string) bool {
+	return strings.HasPrefix(image, "sha256:")
+}
+
+// inspectConfigImage returns Config.Image from a container's inspect — the
+// exact reference (e.g. "myapp:latest") passed to `docker create` at
+// creation time, immutable regardless of what a tag is later repointed to.
+// Contrast with dockerContainer.Image (the /containers/json list endpoint's
+// "Image" field), which Docker degrades to a bare image ID/digest once the
+// creating tag is retagged or removed locally.
+//
+// Verified live (2026-08-25) against the raw Engine API: after tagging,
+// creating, and starting a container, then removing its creating tag, the
+// list endpoint's Image field decayed to "sha256:<digest>" while this
+// container's own /containers/{id}/json Config.Image stayed the original
+// "name:tag" reference used at creation. No currently-decayed container
+// existed on the Pi or Mac to spot-check directly, so the decay was
+// reproduced synthetically rather than observed on a real workload.
+func (c *dockerClient) inspectConfigImage(ctx context.Context, id string) (string, error) {
+	body, err := c.get(ctx, "/containers/"+id+"/json")
+	if err != nil {
+		return "", err
+	}
+	defer body.Close()
+	var resp struct {
+		Config struct {
+			Image string `json:"Image"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		return "", err
+	}
+	return resp.Config.Image, nil
+}
+
 // hostConfigRefuseFields is a CLOSED allowlist of HostConfig field names that,
 // if set to a non-zero value, mean the container carries config a recreate
 // (createContainer, Phase 0's Mounts aside) has no way to reproduce — refuse
@@ -568,8 +608,14 @@ type Service struct {
 	Unscalable      bool   `json:"unscalable,omitempty"`
 	PreviousImage   string `json:"previous_image,omitempty"`   // for one-click rollback
 	UpdateAvailable bool   `json:"update_available,omitempty"` // set by image checker
-	AutoUpdate      bool   `json:"auto_update,omitempty"`      // opted in to unattended updates
-	CanaryImage     string `json:"canary_image,omitempty"`     // non-empty when a stage is in progress
+	// ImageCheckError mirrors the image-checker's last error for this
+	// service's Image (imageStatus.Err in images.go). Non-empty means the
+	// registry/distribution check has been failing — which also means
+	// UpdateAvailable can never flip true until it's fixed. Empty when the
+	// last check succeeded or hasn't run yet.
+	ImageCheckError string `json:"image_check_error,omitempty"`
+	AutoUpdate      bool   `json:"auto_update,omitempty"`  // opted in to unattended updates
+	CanaryImage     string `json:"canary_image,omitempty"` // non-empty when a stage is in progress
 	CanaryReplicas  int    `json:"canary_replicas,omitempty"`
 	Onboarded       bool   `json:"onboarded,omitempty"` // adopted from an unlabelled container
 	// DualTracked is true when this service is BOTH still label-managed (a
@@ -658,7 +704,13 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 			s.CanaryReplicas++
 		} else {
 			port, _ := strconv.Atoi(ct.Labels[labelPort])
-			s.Image = ct.Image
+			img := ct.Image
+			if looksLikeBareDigest(img) {
+				if ref, err := c.inspectConfigImage(ctx, ct.ID); err == nil && ref != "" && !looksLikeBareDigest(ref) {
+					img = ref
+				}
+			}
+			s.Image = img
 			s.ImageID = ct.ImageID
 			s.Host = host
 			s.Port = port

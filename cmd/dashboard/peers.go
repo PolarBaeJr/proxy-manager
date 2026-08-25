@@ -336,6 +336,11 @@ func peerHandshakeHandler(secret, identity, version string, writesEnabled bool) 
 type peerServiceStatusResp struct {
 	Identity string            `json:"identity"`
 	Status   ServiceStatusResp `json:"status"`
+	// Health is this peer's own monitor-derived reachability summary —
+	// Machine/Reachable are left zero here (same convention as Machine on
+	// Status.Groups) and filled in by the caller (fetchPeerServiceStatus)
+	// after decoding.
+	Health HostHealth `json:"health"`
 }
 
 // peerServiceStatusHandler returns the HTTP handler for GET
@@ -345,7 +350,7 @@ type peerServiceStatusResp struct {
 // peer's Machine) — the caller (api.go's /api/service-status) is the one
 // that fans out to every configured peer, so a peer answering this request
 // never needs to know about the mesh beyond itself.
-func peerServiceStatusHandler(secret, identity string, dc *dockerClient, proxyURL string) http.Handler {
+func peerServiceStatusHandler(secret, identity string, dc *dockerClient, proxyURL, monitorURL string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if secret == "" {
 			http.NotFound(w, r)
@@ -366,8 +371,10 @@ func peerServiceStatusHandler(secret, identity string, dc *dockerClient, proxyUR
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		healthStatus, healthTargets := fetchMonitorHealth(monitorURL)
+		health := HostHealth{Status: healthStatus, Targets: healthTargets, CheckedAt: time.Now().UTC().Format(time.RFC3339)}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(peerServiceStatusResp{Identity: identity, Status: status})
+		_ = json.NewEncoder(w).Encode(peerServiceStatusResp{Identity: identity, Status: status, Health: health})
 	})
 }
 
@@ -402,17 +409,28 @@ func peerGET(ctx context.Context, client *http.Client, peerBaseURL, secret, path
 // fetchPeerServiceStatus polls every configured peer's /peer/service-status
 // in parallel (bounded by a short per-peer timeout, so one unreachable peer
 // can't stall /api/service-status past a fraction of a second) and returns
-// their groups, each tagged with that peer's own identity as Machine. A
-// peer that's down, slow, or misconfigured is logged and simply omitted —
-// this is advisory display only, same as the rest of the peer mesh, never
-// something the caller should fail on.
-func fetchPeerServiceStatus(ctx context.Context, registry *PeerRegistry, secret string) []ServiceStatusGroup {
+// their groups, each tagged with that peer's own identity as Machine, plus
+// one HostHealth per configured peer — including a Reachable:false entry for
+// a peer that's down, slow, or misconfigured, so it shows up as explicitly
+// unreachable in the caller's response instead of silently contributing zero
+// groups. Groups remain advisory display only (a failed peer contributes
+// none), but the host roster is not: every configured peer gets exactly one
+// entry, success or failure.
+func fetchPeerServiceStatus(ctx context.Context, registry *PeerRegistry, secret string) ([]ServiceStatusGroup, []HostHealth) {
 	peers := registry.Peers()
 	if len(peers) == 0 || secret == "" {
-		return nil
+		return nil, nil
 	}
+	// Snapshot of last-known handshake identity per peer URL, used only as
+	// the failure-path label fallback below — a peer that's never
+	// successfully handshaked has no better name than its raw configured URL.
+	statuses := registry.Status()
 	client := &http.Client{Timeout: 2 * time.Second}
-	results := make(chan []ServiceStatusGroup, len(peers))
+	type result struct {
+		groups []ServiceStatusGroup
+		host   HostHealth
+	}
+	results := make(chan result, len(peers))
 	var wg sync.WaitGroup
 	for _, peer := range peers {
 		wg.Add(1)
@@ -421,7 +439,11 @@ func fetchPeerServiceStatus(ctx context.Context, registry *PeerRegistry, secret 
 			var body peerServiceStatusResp
 			if err := peerGET(ctx, client, peer, secret, "/peer/service-status", &body); err != nil {
 				log.Printf("dashboard peer service-status: %v", err)
-				results <- nil
+				machine := statuses[peer].Identity
+				if machine == "" {
+					machine = peer // fallback label so a peer with no prior successful handshake still shows up as *something*
+				}
+				results <- result{host: HostHealth{Machine: machine, Reachable: false}}
 				return
 			}
 			machine := body.Identity
@@ -432,16 +454,21 @@ func fetchPeerServiceStatus(ctx context.Context, registry *PeerRegistry, secret 
 			for i := range groups {
 				groups[i].Machine = machine
 			}
-			results <- groups
+			health := body.Health
+			health.Machine = machine
+			health.Reachable = true
+			results <- result{groups: groups, host: health}
 		}(peer)
 	}
 	wg.Wait()
 	close(results)
-	var out []ServiceStatusGroup
-	for g := range results {
-		out = append(out, g...)
+	var groups []ServiceStatusGroup
+	var hosts []HostHealth
+	for r := range results {
+		groups = append(groups, r.groups...)
+		hosts = append(hosts, r.host)
 	}
-	return out
+	return groups, hosts
 }
 
 // peerServicesResp is the wire shape for GET /peer/services — this peer's

@@ -20,6 +20,56 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
+// fetchMonitorHealth polls the monitor binary's /api/overview and recomputes
+// an overall "up"/"degraded" status from its non-absent targets — shared by
+// /api/health (this host's own public health check) and /api/service-status
+// (which also stamps a per-host reachability summary onto its Hosts field).
+// Always returns a non-nil, possibly-empty targets slice — monitorURL == ""
+// (no MONITOR_URL configured), an unreachable monitor, a decode error, and
+// an all-targets-absent response all fall through to the same empty-slice
+// shape, matching /api/health's pre-existing JSON ("targets": [], never
+// null) for every one of those cases.
+func fetchMonitorHealth(monitorURL string) (string, []HealthTarget) {
+	overall := "up"
+	targets := []HealthTarget{}
+	if monitorURL == "" {
+		return overall, targets
+	}
+	client := http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(monitorURL + "/api/overview")
+	if err != nil {
+		return "degraded", targets
+	}
+	defer resp.Body.Close()
+	var o struct {
+		Health  string `json:"health"`
+		Targets []struct {
+			Name   string `json:"name"`
+			Health string `json:"health"`
+		} `json:"targets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&o); err != nil {
+		return overall, targets
+	}
+	// Recompute overall from non-absent targets so the public health
+	// endpoint isn't poisoned by services the user hasn't deployed (e.g.
+	// edge with profile off).
+	anyDegraded := false
+	for _, t := range o.Targets {
+		if t.Health == "absent" {
+			continue
+		}
+		targets = append(targets, HealthTarget{Name: t.Name, Health: t.Health})
+		if t.Health != "up" {
+			anyDegraded = true
+		}
+	}
+	if anyDegraded {
+		overall = "degraded"
+	}
+	return overall, targets
+}
+
 func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry, rm *rolloutManager) http.Handler {
 	if rm == nil {
 		rm = newRolloutManager(dc, onb, routesConfigPath, proxyURLFromEnv())
@@ -40,42 +90,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	// Uptime Kuma / Pingdom / Statuspage / curl scripts. Does NOT leak host names,
 	// route details, or traffic counts. Returns only per-binary up/down state.
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
-		overall := "up"
-		targets := []map[string]any{}
-		if monitorURLFromEnv() != "" {
-			client := http.Client{Timeout: 3 * time.Second}
-			resp, err := client.Get(monitorURLFromEnv() + "/api/overview")
-			if err == nil {
-				defer resp.Body.Close()
-				var o struct {
-					Health  string `json:"health"`
-					Targets []struct {
-						Name   string `json:"name"`
-						Health string `json:"health"`
-					} `json:"targets"`
-				}
-				if err := json.NewDecoder(resp.Body).Decode(&o); err == nil {
-					// Recompute overall from non-absent targets so the public
-					// health endpoint isn't poisoned by services the user
-					// hasn't deployed (e.g. edge with profile off).
-					anyDegraded := false
-					for _, t := range o.Targets {
-						if t.Health == "absent" {
-							continue
-						}
-						targets = append(targets, map[string]any{"name": t.Name, "health": t.Health})
-						if t.Health != "up" {
-							anyDegraded = true
-						}
-					}
-					if anyDegraded {
-						overall = "degraded"
-					}
-				}
-			} else {
-				overall = "degraded"
-			}
-		}
+		overall, targets := fetchMonitorHealth(monitorURLFromEnv())
 		status := http.StatusOK
 		if overall != "up" {
 			status = http.StatusServiceUnavailable
@@ -139,8 +154,16 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			for i := range status.Groups {
 				status.Groups[i].Machine = registry.Identity()
 			}
+			localStatus, localTargets := fetchMonitorHealth(monitorURLFromEnv())
+			status.Hosts = append(status.Hosts, HostHealth{
+				Machine: registry.Identity(), Reachable: true,
+				Status: localStatus, Targets: localTargets,
+				CheckedAt: time.Now().UTC().Format(time.RFC3339),
+			})
 			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
-			status.Groups = append(status.Groups, fetchPeerServiceStatus(req.Context(), registry, peerSecret)...)
+			peerGroups, peerHosts := fetchPeerServiceStatus(req.Context(), registry, peerSecret)
+			status.Groups = append(status.Groups, peerGroups...)
+			status.Hosts = append(status.Hosts, peerHosts...)
 		}
 		httpx.WriteJSON(w, http.StatusOK, status)
 	}))
@@ -1575,8 +1598,13 @@ func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedS
 	// Enrich with image-checker results AFTER the merge so
 	// onboarded-only entries get the update badge too.
 	for i := range svcs {
-		if st := ic.Get(svcs[i].Image); st != nil && st.UpdateAvailable {
-			svcs[i].UpdateAvailable = true
+		if st := ic.Get(svcs[i].Image); st != nil {
+			if st.UpdateAvailable {
+				svcs[i].UpdateAvailable = true
+			}
+			if st.Err != "" {
+				svcs[i].ImageCheckError = st.Err
+			}
 		}
 	}
 	return svcs, nil
