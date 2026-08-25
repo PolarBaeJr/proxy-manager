@@ -272,13 +272,18 @@ func main() {
 	if len(peerList) > 0 || redisClient != nil {
 		go registry.Run(ctx)
 	}
+	peerHandlers := map[string]http.Handler{
+		"/peer/handshake":      peerHandshakeHandler(peerSecret, identity, buildVersion),
+		"/peer/service-status": peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv()),
+		"/peer/services":       peerServicesHandler(peerSecret, identity, dc, onboarded, ic),
+	}
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
-		peerServer(*peerAddr, peerHandshakeHandler(peerSecret, identity, buildVersion), peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv()))
-		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake and /peer/service-status on %s", len(peerList), *peerSyncInterval, *peerAddr)
+		peerServer(*peerAddr, peerHandlers)
+		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, and /peer/services on %s", len(peerList), *peerSyncInterval, *peerAddr)
 	case peerSecret != "":
-		peerServer(*peerAddr, peerHandshakeHandler(peerSecret, identity, buildVersion), peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv()))
-		log.Printf("dashboard peers: /peer/handshake and /peer/service-status enabled on %s (receive-only, no outbound peers configured)", *peerAddr)
+		peerServer(*peerAddr, peerHandlers)
+		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, and /peer/services enabled on %s (receive-only, no outbound peers configured)", *peerAddr)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}

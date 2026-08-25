@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -181,6 +182,21 @@ func (p *PeerRegistry) Status() map[string]peerStatus {
 	return out
 }
 
+// URLForIdentity scans the current per-peer bookkeeping for a peer whose
+// last-known handshake identity matches identity, returning its base URL.
+// Not wired into anything yet — colocated here for a later phase that needs
+// to resolve a peer's URL from a Machine tag.
+func (p *PeerRegistry) URLForIdentity(identity string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for url, st := range p.status {
+		if st.Identity == identity {
+			return url, true
+		}
+	}
+	return "", false
+}
+
 // MeshFloor returns the minimum ratcheted version currently known across the
 // mesh, and whether it's known yet.
 func (p *PeerRegistry) MeshFloor() (int, bool) {
@@ -337,6 +353,34 @@ func peerServiceStatusHandler(secret, identity string, dc *dockerClient, proxyUR
 	})
 }
 
+// peerGET performs one bearer-authenticated GET against peerBaseURL+path,
+// bounded by a 2s timeout, and decodes the JSON response body into out. The
+// shared plumbing behind every /peer/<resource> fetcher (fetchPeerServiceStatus,
+// fetchPeerServices, …) — callers only differ in the response shape and what
+// they do with a failure.
+func peerGET(ctx context.Context, client *http.Client, peerBaseURL, secret, path string, out any) error {
+	url := strings.TrimRight(peerBaseURL, "/") + path
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s unreachable: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s → %s", url, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%s bad response: %w", url, err)
+	}
+	return nil
+}
+
 // fetchPeerServiceStatus polls every configured peer's /peer/service-status
 // in parallel (bounded by a short per-peer timeout, so one unreachable peer
 // can't stall /api/service-status past a fraction of a second) and returns
@@ -356,30 +400,9 @@ func fetchPeerServiceStatus(ctx context.Context, registry *PeerRegistry, secret 
 		wg.Add(1)
 		go func(peer string) {
 			defer wg.Done()
-			url := strings.TrimRight(peer, "/") + "/peer/service-status"
-			reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			defer cancel()
-			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-			if err != nil {
-				results <- nil
-				return
-			}
-			req.Header.Set("Authorization", "Bearer "+secret)
-			resp, err := client.Do(req)
-			if err != nil {
-				log.Printf("dashboard peer service-status: %s unreachable: %v", url, err)
-				results <- nil
-				return
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				log.Printf("dashboard peer service-status: %s → %s", url, resp.Status)
-				results <- nil
-				return
-			}
 			var body peerServiceStatusResp
-			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-				log.Printf("dashboard peer service-status: %s bad response: %v", url, err)
+			if err := peerGET(ctx, client, peer, secret, "/peer/service-status", &body); err != nil {
+				log.Printf("dashboard peer service-status: %v", err)
 				results <- nil
 				return
 			}
@@ -399,6 +422,88 @@ func fetchPeerServiceStatus(ctx context.Context, registry *PeerRegistry, secret 
 	var out []ServiceStatusGroup
 	for g := range results {
 		out = append(out, g...)
+	}
+	return out
+}
+
+// peerServicesResp is the wire shape for GET /peer/services — this peer's
+// own local managed services (self already excluded by buildManagedServices)
+// plus its identity, since the fetcher needs both to label the services it
+// merges in.
+type peerServicesResp struct {
+	Identity string    `json:"identity"`
+	Services []Service `json:"services"`
+}
+
+// peerServicesHandler returns the HTTP handler for GET /peer/services on the
+// dedicated peer-handshake port — same bearer-auth shape as
+// peerServiceStatusHandler. Always returns THIS host's own managed services
+// (self-excluded via buildManagedServices) — the caller (api.go's
+// /api/services) is the one that fans out to every configured peer.
+func peerServicesHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, ic *imageChecker) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		svcs, err := buildManagedServices(r.Context(), dc, onb, ic)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(peerServicesResp{Identity: identity, Services: svcs})
+	})
+}
+
+// fetchPeerServices polls every configured peer's /peer/services in parallel
+// and returns their services, each tagged with that peer's own identity as
+// Machine. A peer that's down, slow, or misconfigured is logged and simply
+// omitted — advisory display only, same as fetchPeerServiceStatus.
+func fetchPeerServices(ctx context.Context, registry *PeerRegistry, secret string) []Service {
+	peers := registry.Peers()
+	if len(peers) == 0 || secret == "" {
+		return nil
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	results := make(chan []Service, len(peers))
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+			var body peerServicesResp
+			if err := peerGET(ctx, client, peer, secret, "/peer/services", &body); err != nil {
+				log.Printf("dashboard peer services: %v", err)
+				results <- nil
+				return
+			}
+			machine := body.Identity
+			if machine == "" {
+				machine = peer // fallback label so a peer that forgot to set DASHBOARD_HOST still shows up as *something*
+			}
+			svcs := body.Services
+			for i := range svcs {
+				svcs[i].Machine = machine
+			}
+			results <- svcs
+		}(peer)
+	}
+	wg.Wait()
+	close(results)
+	var out []Service
+	for s := range results {
+		out = append(out, s...)
 	}
 	return out
 }

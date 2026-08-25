@@ -571,6 +571,12 @@ type Service struct {
 	// services can share one host (badminton.polardev.org fans out to four),
 	// so host alone cannot attribute a request — the UI matches on these.
 	Backends []string `json:"backends,omitempty"`
+	// Machine is the peer identity (DASHBOARD_HOST, see peers.go) whose
+	// dashboard instance this service's data came from — "" for this host's
+	// own services (the common case, and the only case before any peers are
+	// configured), set only on services merged in from a peer's
+	// /peer/services. Mirrors ServiceStatusGroup.Machine in servicestatus.go.
+	Machine string `json:"machine,omitempty"`
 }
 
 // ServiceMember is one container's surface for the UI — name (DNS-routable),
