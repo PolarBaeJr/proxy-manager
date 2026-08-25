@@ -215,6 +215,11 @@ func main() {
 		return imgs
 	}, au.runOnce)
 
+	// Background: health-gate every service currently mid-rollout and
+	// auto-roll-back the moment a canary looks unhealthy between steps.
+	rm := newRolloutManager(dc)
+	go rm.Run(ctx)
+
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
@@ -262,7 +267,7 @@ func main() {
 	peerList := splitAndTrim(*peers)
 	registry := newPeerRegistry(peerList, peerSecret, identity, buildVersion, *peerSyncInterval, redisClient)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages, registry)
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages, registry, rm)
 
 	// MCP on its own port, proxied at mcp.<domain>/mcp/dashboard. Separate from
 	// :8093 because that one is loopback-only and serves the UI at "/", which

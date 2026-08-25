@@ -257,7 +257,7 @@ func TestOnboardEndpointRefusesSelf(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), "", nil, nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), "", nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	body := `{"host":"dashboard.example.org","port":8093}`
 	req := httptest.NewRequest("POST", "/api/discovery/dashboard/onboard", strings.NewReader(body))

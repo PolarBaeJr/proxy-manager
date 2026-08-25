@@ -235,7 +235,7 @@ func newLocalTestMux(t *testing.T, localDC *dockerClient, reg *PeerRegistry) htt
 	localOnb := newTestOnboardedStore(t)
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
-	return newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg)
+	return newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil)
 }
 
 func doReq(mux http.Handler, method, path string) *httptest.ResponseRecorder {
@@ -781,7 +781,7 @@ func TestServicesMutationForwardsActorAssertion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/services/app/scale?host=dashboard-b", strings.NewReader(`{"replicas":1}`))
 	req.Header.Set("Authorization", "Bearer "+raw)
@@ -1336,7 +1336,7 @@ func TestServicesPromoteMutationForwardsActorAssertion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/services/app/promote?host=dashboard-b", nil)
 	req.Header.Set("Authorization", "Bearer "+raw)
@@ -1753,7 +1753,7 @@ func TestServicesDeleteLocalConfirmBehavior(t *testing.T) {
 		routesPath := filepath.Join(t.TempDir(), "routes.json")
 		auth, _ := newConfirmedStore(t, "alice", "correct horse")
 		setInternalToken(t)
-		mux := newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), routesPath, nil, onb, nil, nil, nil, nil, nil, nil)
+		mux := newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), routesPath, nil, onb, nil, nil, nil, nil, nil, nil, nil)
 		rec := doReq(mux, http.MethodDelete, "/api/services/app")
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
@@ -1917,7 +1917,7 @@ func TestServicesDeleteMutationForwardsActorAssertion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/services/app?host=dashboard-b", nil)
 	req.Header.Set("Authorization", "Bearer "+raw)
