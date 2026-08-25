@@ -362,6 +362,58 @@ func TestPeerServicesHandlerWrongMethod(t *testing.T) {
 	}
 }
 
+func TestPeerStatsHandlerValidSecret(t *testing.T) {
+	h := peerStatsHandler("s3cret", "dashboard-b")
+	req := httptest.NewRequest(http.MethodGet, "/peer/stats", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body peerStatsResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Identity != "dashboard-b" {
+		t.Errorf("Identity = %q, want %q", body.Identity, "dashboard-b")
+	}
+}
+
+func TestPeerStatsHandlerWrongSecret(t *testing.T) {
+	h := peerStatsHandler("s3cret", "dashboard-b")
+	req := httptest.NewRequest(http.MethodGet, "/peer/stats", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestPeerStatsHandlerEmptySecretDisabled(t *testing.T) {
+	h := peerStatsHandler("", "dashboard-b")
+	req := httptest.NewRequest(http.MethodGet, "/peer/stats", nil)
+	req.Header.Set("Authorization", "Bearer anything")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestPeerStatsHandlerWrongMethod(t *testing.T) {
+	h := peerStatsHandler("s3cret", "dashboard-b")
+	req := httptest.NewRequest(http.MethodPost, "/peer/stats", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
 func TestFetchPeerServicesTagsMachineAndMerges(t *testing.T) {
 	dcB := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]dockerContainer{{

@@ -82,6 +82,7 @@ h1{
   display:grid;place-items:center;font-size:11px;font-weight:700;color:var(--accent)}
 
 /* sysstats */
+#sys-stats-host{display:flex;justify-content:flex-end;margin:8px 0 0}
 #sys-stats{display:flex;gap:12px;margin:22px 0 0;flex-wrap:wrap}
 .sysstat{
   flex:1;min-width:190px;display:flex;align-items:center;gap:13px;
@@ -523,6 +524,7 @@ footer.app code{color:var(--muted)}
           <button class="btn" onclick="logout()" id="logout-btn">Logout</button>
         </div>
       </div>
+      <div id="sys-stats-host"></div>
       <div id="sys-stats"></div>
       <div id="status">loading…</div>
       <nav>
@@ -1010,6 +1012,7 @@ function renderHeader() {
     b.innerHTML = NAVICON[k] + '<span>' + NAVMETA[k] + '</span>';
   });
   renderLockBanner();
+  renderStatsHostPicker();
 }
 function renderLockBanner() {
   const el = $('#lock-banner');
@@ -3871,21 +3874,69 @@ function tileMarkup(icon, label, valHtml, p) {
        + '<div class="val">' + valHtml + '</div>'
        + '<div class="bar"><span style="width:' + w + '%"></span></div></div></div>';
 }
-async function refreshStats() {
-  if (!authState.authenticated) { $('#sys-stats').textContent = ''; return; }
+// _statsHost: '' = this host; anything else = a peer, viewed read-only via
+// GET /api/stats?host=. Persisted like _imagesHost/_logsHost. Unlike those,
+// the picker is NOT rebuilt on every stats tick (see refreshStats) — it would
+// destroy an open <select> mid-interaction every 5s, since GetStats' cpu_pct
+// changes every tick and there is no content-hash guard like Images/Logs use.
+let _statsHost = loadPref('pmgr-stats-host', '');
+// _statsPeersKey caches the last-seen peer identity/ok set so the picker
+// options are only rebuilt when that set actually changes (piggybacked on
+// refreshPeers' existing 30s /api/peers poll), not on every render.
+let _statsPeersKey = '';
+async function loadStatsPeerOptions() {
   try {
-    const s = await (await fetch('/api/stats')).json();
+    const d = await (await fetch('/api/peers')).json();
+    return d.peers || [];
+  } catch (e) { return []; }
+}
+function statsHostPickerHTML(peers) {
+  const pickerOptions = ['<option value="">this host' + (_selfIdentity ? ' (' + esc(machineLabel(_selfIdentity)) + ')' : '') + '</option>']
+    .concat(peers.map(p => {
+      const disabled = p.identity ? '' : ' disabled';
+      const label = machineLabel(p.identity || p.url) + (!p.ok ? ' (unreachable)' : '');
+      const selected = p.identity && p.identity === _statsHost ? ' selected' : '';
+      return '<option value="' + esc(p.identity || '') + '"' + disabled + selected + '>' + esc(label) + '</option>';
+    }));
+  return '<select id="stats-host-picker" title="Viewing stats for">' + pickerOptions.join('') + '</select>';
+}
+async function renderStatsHostPicker(peers) {
+  const el = $('#sys-stats-host');
+  if (!el) return;
+  if (!authState.authenticated) { el.innerHTML = ''; return; }
+  if (_selfIdentity === null) await loadSelfIdentity();
+  if (!peers) peers = await loadStatsPeerOptions();
+  if (!peers.length) { el.innerHTML = ''; return; }
+  if (_statsHost && _statsHost !== _selfIdentity && !peers.some(p => p.identity && p.identity === _statsHost)) {
+    _statsHost = '';
+    savePref('pmgr-stats-host', _statsHost);
+  }
+  el.innerHTML = statsHostPickerHTML(peers);
+  const sel = $('#stats-host-picker');
+  if (sel) sel.onchange = (e) => {
+    _statsHost = e.target.value;
+    savePref('pmgr-stats-host', _statsHost);
+    refreshStats();
+  };
+}
+async function refreshStats() {
+  if (!authState.authenticated) { $('#sys-stats').textContent = ''; $('#sys-stats-host').textContent = ''; return; }
+  try {
+    const r = await fetch('/api/stats' + (_statsHost ? '?host=' + encodeURIComponent(_statsHost) : ''));
+    if (!r.ok) {
+      $('#sys-stats').innerHTML = tileMarkup(I.cpu, 'Stats', '<small>' + esc(machineLabel(_statsHost) || 'host') + ' unreachable</small>', 0);
+      return;
+    }
+    const s = await r.json();
     const cpuPct  = Math.max(0, Math.min(100, s.cpu_pct || 0));
     const memPct  = s.mem_total  ? 100 * s.mem_used  / s.mem_total  : 0;
     const diskPct = s.disk_total ? 100 * s.disk_used / s.disk_total : 0;
     const memGB   = (s.mem_used  / 1073741824).toFixed(1);
     const memTotG = (s.mem_total / 1073741824).toFixed(1);
-    const diskGB  = (s.disk_used  / 1073741824).toFixed(1);
-    const diskTotT= (s.disk_total / 1099511627776).toFixed(1);
     $('#sys-stats').innerHTML =
         tileMarkup(I.cpu,  'CPU',    '<span class="num">' + cpuPct.toFixed(0) + '</span><small>% load</small>', cpuPct)
       + tileMarkup(I.mem,  'Memory', '<span class="num">' + memGB + '</span><small>/ ' + memTotG + ' GB used · ' + fmtBytes(s.mem_free) + ' free</small>', memPct)
-      + tileMarkup(I.disk, 'Disk',   '<span class="num">' + diskGB + '</span><small>/ ' + diskTotT + ' TB used · ' + fmtBytes(s.disk_free) + ' free</small>', diskPct);
+      + tileMarkup(I.disk, 'Disk',   '<span class="num">' + fmtBytes(s.disk_used) + '</span><small>/ ' + fmtBytes(s.disk_total) + ' used · ' + fmtBytes(s.disk_free) + ' free</small>', diskPct);
   } catch (e) { /* silent */ }
 }
 
@@ -3893,6 +3944,11 @@ async function refreshPeers() {
   if (!authState.authenticated) { $('#footer-peers').hidden = true; $('#footer-peers-sep').hidden = true; return; }
   try {
     const d = await (await fetch('/api/peers')).json();
+    const key = JSON.stringify((d.peers || []).map(p => p.identity + ':' + p.ok).sort());
+    if (key !== _statsPeersKey) {
+      _statsPeersKey = key;
+      renderStatsHostPicker(d.peers || []);
+    }
     const total = d.peers ? d.peers.length : 0;
     if (!total) { $('#footer-peers').hidden = true; $('#footer-peers-sep').hidden = true; return; }
     const ok = d.peers.filter(p => p.ok).length;
@@ -3934,6 +3990,7 @@ setInterval(renderActive, 5000);
 setInterval(refreshStats, 5000);
 setInterval(refreshPeers, 30000);
 refreshAuth();
+renderStatsHostPicker();
 refreshStats();
 refreshPeers();
 </script>
