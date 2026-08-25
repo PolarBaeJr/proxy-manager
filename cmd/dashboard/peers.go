@@ -5,11 +5,15 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // PeerRegistry discovers and authenticates with sibling dashboard instances
@@ -23,22 +27,33 @@ import (
 // success/failure + last-contact time per peer. A peer being unreachable is
 // expected during restarts/network blips, not an error condition.
 
+// dashboardVersionsRedisKey is the shared hash storing each dashboard host's
+// own ratcheted last-stable build version, keyed by identity. Matches the
+// existing "pmgr:" prefix convention (see auth.go's authRedisKey).
+const dashboardVersionsRedisKey = "pmgr:dashboard:versions"
+
 // peerStatus is the last-known bookkeeping for one configured peer.
 type peerStatus struct {
 	LastAttempt time.Time `json:"last_attempt"`
 	LastSuccess time.Time `json:"last_success"`
 	OK          bool      `json:"ok"`
+	Identity    string    `json:"identity,omitempty"`
+	Version     string    `json:"version,omitempty"`
 }
 
 type PeerRegistry struct {
 	peers    []string // full URLs, e.g. http://100.83.62.68:8098
 	secret   string
 	identity string
+	version  string // this host's own buildVersion
 	interval time.Duration
 	client   *http.Client
+	rdb      *redis.Client // nil disables all redis-backed behavior
 
-	mu     sync.Mutex
-	status map[string]peerStatus
+	mu             sync.Mutex
+	status         map[string]peerStatus
+	meshFloor      int
+	meshFloorKnown bool
 }
 
 func splitAndTrim(s string) []string {
@@ -54,12 +69,14 @@ func splitAndTrim(s string) []string {
 	return out
 }
 
-func newPeerRegistry(peers []string, secret, identity string, interval time.Duration) *PeerRegistry {
+func newPeerRegistry(peers []string, secret, identity, version string, interval time.Duration, rdb *redis.Client) *PeerRegistry {
 	return &PeerRegistry{
 		peers:    peers,
 		secret:   secret,
 		identity: identity,
+		version:  version,
 		interval: interval,
+		rdb:      rdb,
 		client: &http.Client{
 			Timeout: 3 * time.Second,
 			Transport: &http.Transport{
@@ -71,6 +88,9 @@ func newPeerRegistry(peers []string, secret, identity string, interval time.Dura
 		status: map[string]peerStatus{},
 	}
 }
+
+// Identity returns this host's own peer identity.
+func (p *PeerRegistry) Identity() string { return p.identity }
 
 func (p *PeerRegistry) Run(ctx context.Context) {
 	t := time.NewTicker(p.interval)
@@ -86,13 +106,15 @@ func (p *PeerRegistry) Run(ctx context.Context) {
 }
 
 func (p *PeerRegistry) tick(ctx context.Context) {
+	p.refreshMeshFloor(ctx)
 	for _, peer := range p.peers {
 		go p.send(ctx, peer)
 	}
 }
 
 // send POSTs a placeholder handshake payload to peer's /peer/handshake and
-// records the outcome. No service data yet.
+// records the outcome, including the peer's own identity/version from the
+// response body.
 func (p *PeerRegistry) send(ctx context.Context, peer string) {
 	url := strings.TrimRight(peer, "/") + "/peer/handshake"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte("{}")))
@@ -104,18 +126,29 @@ func (p *PeerRegistry) send(ctx context.Context, peer string) {
 	resp, err := p.client.Do(req)
 	if err != nil {
 		// Peer unreachable — expected during restarts / network blips. Silent.
-		p.recordResult(peer, false)
+		p.recordResult(peer, false, "", "")
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// Auth failure or malformed request: worth surfacing so misconfig is visible.
 		log.Printf("dashboard peer handshake: %s → %s", url, resp.Status)
+		p.recordResult(peer, false, "", "")
+		return
 	}
-	p.recordResult(peer, resp.StatusCode == http.StatusOK)
+	var body struct {
+		Peer    string `json:"peer"`
+		OK      bool   `json:"ok"`
+		Version string `json:"version"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	p.recordResult(peer, true, body.Peer, body.Version)
 }
 
-func (p *PeerRegistry) recordResult(peer string, ok bool) {
+// recordResult only overwrites Identity/Version on a successful handshake
+// with a non-empty version — a transient failure preserves the last-known
+// values instead of blanking them.
+func (p *PeerRegistry) recordResult(peer string, ok bool, identity, version string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	st := p.status[peer]
@@ -124,6 +157,12 @@ func (p *PeerRegistry) recordResult(peer string, ok bool) {
 		st.LastSuccess = time.Now()
 	}
 	st.OK = ok
+	if ok && version != "" {
+		st.Version = version
+	}
+	if ok && identity != "" {
+		st.Identity = identity
+	}
 	p.status[peer] = st
 }
 
@@ -138,13 +177,100 @@ func (p *PeerRegistry) Status() map[string]peerStatus {
 	return out
 }
 
+// MeshFloor returns the minimum ratcheted version currently known across the
+// mesh, and whether it's known yet.
+func (p *PeerRegistry) MeshFloor() (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.meshFloor, p.meshFloorKnown
+}
+
+// ratchetOwnVersion writes this host's own buildVersion into the shared
+// Redis hash, never decreasing it — even across a restart to an older build.
+//
+// Only this process ever writes this specific hash field (its own identity)
+// — a plain read-then-conditionally-write has no concurrent-writer race, no
+// WATCH/transaction needed. Note: if DASHBOARD_HOST/hostname are both unset
+// on two peer instances, both fall back to the literal "dashboard" identity
+// and would race on this same field — pre-existing ambiguity, not new to
+// this write path.
+func (p *PeerRegistry) ratchetOwnVersion(ctx context.Context) {
+	if p.rdb == nil || p.version == "dev" {
+		return
+	}
+	v, err := strconv.Atoi(p.version)
+	if err != nil {
+		log.Printf("dashboard peers: buildVersion %q is not numeric, skipping ratchet: %v", p.version, err)
+		return
+	}
+	cur, err := p.rdb.HGet(ctx, dashboardVersionsRedisKey, p.identity).Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		log.Printf("dashboard peers: redis read for version ratchet failed: %v", err)
+		return
+	}
+	if err == nil && cur >= v {
+		return
+	}
+	if err := p.rdb.HSet(ctx, dashboardVersionsRedisKey, p.identity, v).Err(); err != nil {
+		log.Printf("dashboard peers: redis write for version ratchet failed: %v", err)
+	}
+}
+
+// parseVersions extracts the parseable-int subset of a raw
+// identity→version-string map (as HGetAll returns), dropping "dev" and
+// any garbage entry.
+func parseVersions(raw map[string]string) []int {
+	var out []int
+	for _, s := range raw {
+		if v, err := strconv.Atoi(s); err == nil {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// meshFloorFrom returns the minimum of vals, or (0, false) when empty.
+func meshFloorFrom(vals []int) (int, bool) {
+	if len(vals) == 0 {
+		return 0, false
+	}
+	min := vals[0]
+	for _, v := range vals[1:] {
+		if v < min {
+			min = v
+		}
+	}
+	return min, true
+}
+
+// refreshMeshFloor recomputes the mesh floor from Redis's current per-host
+// version hash — the minimum across all currently-known hosts.
+func (p *PeerRegistry) refreshMeshFloor(ctx context.Context) {
+	if p.rdb == nil {
+		return
+	}
+	raw, err := p.rdb.HGetAll(ctx, dashboardVersionsRedisKey).Result()
+	if err != nil {
+		log.Printf("dashboard peers: redis read for mesh floor failed: %v", err)
+		return
+	}
+	floor, ok := meshFloorFrom(parseVersions(raw))
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	p.meshFloor = floor
+	p.meshFloorKnown = true
+	p.mu.Unlock()
+}
+
 // peerHandshakeHandler returns the HTTP handler for POST /peer/handshake on
 // the dedicated peer-handshake port. Bearer-authenticated with the shared
 // secret, constant-time compare — same approach as cmd/proxy/peers.go's
 // peerHandshakeHandler. Empty secret disables the endpoint entirely (404) so
 // an unconfigured dashboard can't accept handshakes. A valid request gets a
-// minimal ok:true body — no service data yet.
-func peerHandshakeHandler(secret, identity string) http.Handler {
+// minimal ok:true body with this host's identity/version.
+func peerHandshakeHandler(secret, identity, version string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if secret == "" {
 			http.NotFound(w, r)
@@ -161,6 +287,51 @@ func peerHandshakeHandler(secret, identity string) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"peer": identity, "ok": true})
+		_ = json.NewEncoder(w).Encode(map[string]any{"peer": identity, "ok": true, "version": version})
 	})
+}
+
+type peerView struct {
+	URL         string    `json:"url"`
+	Identity    string    `json:"identity,omitempty"`
+	Version     string    `json:"version,omitempty"`
+	OK          bool      `json:"ok"`
+	LastAttempt time.Time `json:"last_attempt,omitempty"`
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	Behind      bool      `json:"behind,omitempty"`
+}
+
+// peersStatusHandler serves this host's own identity+version, each
+// configured peer's last-known identity/version/reachability, and the
+// derived mesh floor — advisory display only, never gates any action.
+func peersStatusHandler(registry *PeerRegistry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		resp := struct {
+			Self struct {
+				Identity string `json:"identity"`
+				Version  string `json:"version"`
+			} `json:"self"`
+			Peers     []peerView `json:"peers"`
+			MeshFloor *int       `json:"mesh_floor,omitempty"`
+		}{}
+		resp.Self.Version = buildVersion
+		if registry != nil {
+			resp.Self.Identity = registry.Identity()
+			floor, floorOK := registry.MeshFloor()
+			if floorOK {
+				resp.MeshFloor = &floor
+			}
+			for url, st := range registry.Status() {
+				v := peerView{URL: url, Identity: st.Identity, Version: st.Version, OK: st.OK, LastAttempt: st.LastAttempt, LastSuccess: st.LastSuccess}
+				if floorOK {
+					if n, err := strconv.Atoi(st.Version); err == nil && n < floor {
+						v.Behind = true
+					}
+				}
+				resp.Peers = append(resp.Peers, v)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
 }

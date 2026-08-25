@@ -895,6 +895,22 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	}
 	tpl := existing[0]
 
+	// Refuse rather than silently strip host config a recreate can't
+	// reproduce — see hostConfigRefuseFields's doc comment. This is the
+	// self-inflicted-outage guard: without it, replacing a container that
+	// publishes host ports (e.g. this dashboard's own :8093/:8098) creates
+	// a portless replacement, then removes the old container that actually
+	// held the bindings, taking the service unreachable with no error.
+	for _, ct := range existing {
+		unknowns, err := c.inspectHostConfigUnknowns(ctx, ct.ID)
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", ct.name(), err)
+		}
+		if len(unknowns) > 0 {
+			return fmt.Errorf("refusing to replace %q: %s would drop %s on recreate — resolve manually first", name, ct.name(), strings.Join(unknowns, ", "))
+		}
+	}
+
 	// Resolve env by merging any edits onto what the template is running.
 	// Read unconditionally: the merge needs the current values to compare
 	// against, not just as a fallback when no edits were sent.

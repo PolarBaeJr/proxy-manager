@@ -17,7 +17,7 @@ import (
 func monitorURLFromEnv() string { return os.Getenv("MONITOR_URL") }
 func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -26,7 +26,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(dashboardHTML))
+		w.Write([]byte(renderDashboardHTML()))
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 
@@ -85,6 +85,10 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	mux.HandleFunc("/api/stats", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, GetStats())
 	}))
+
+	// Cross-host dashboard peer identity/version/reachability — advisory
+	// display only, never gates any action.
+	mux.HandleFunc("/api/peers", auth.requireAuth(peersStatusHandler(registry)))
 
 	// Per-service-group health/usage for the Status sub-tab (and later,
 	// statusbot's Discord embed). Combines listServices, the proxy's access

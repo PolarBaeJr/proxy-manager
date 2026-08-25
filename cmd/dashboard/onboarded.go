@@ -711,6 +711,10 @@ func (c *dockerClient) discardOnboarded(ctx context.Context, name string, store 
 // replaceOnboarded is stage + promote in one shot, without the dual-serving
 // canary window. New clones come up first; only after they're started is the
 // route swapped and the old clones removed. PreviousImage stamped for rollback.
+//
+// Exempt from replaceService's inspectHostConfigUnknowns guard: this only
+// ever recreates goproxy-onb-<name>-* clones, which never have PortBindings
+// set and are already gated once at onboard time.
 func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req ReplaceServiceRequest, store *OnboardedStore, routesPath string) error {
 	svc, ok := store.Get(name)
 	if !ok {
