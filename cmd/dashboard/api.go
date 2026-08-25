@@ -22,7 +22,7 @@ func proxyURLFromEnv() string   { return os.Getenv("PROXY_URL") }
 
 func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry, rm *rolloutManager) http.Handler {
 	if rm == nil {
-		rm = newRolloutManager(dc)
+		rm = newRolloutManager(dc, onb, routesConfigPath, proxyURLFromEnv())
 	}
 	mux := http.NewServeMux()
 
@@ -598,6 +598,24 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			return
 		}
 		info, _ := auth.sessionFrom(req)
+		// A service actively mid-rollout must only be touched via the
+		// rollout endpoints themselves — any other mutation (stage/promote/
+		// canary/scale/replicas/offboard/delete/etc.) racing the rollout
+		// manager's own container manipulation could leave both in an
+		// inconsistent state. This also closes a pre-existing gap for
+		// label-managed services: before this guard, nothing stopped
+		// stageCanary/promoteCanary/discardCanary/scaleService from racing
+		// an in-progress rollout, for either substrate.
+		// "check" is exempt too: it only queries the registry for image-
+		// update availability (runServiceCheckImage) and never touches
+		// containers, so it can't race the rollout manager.
+		exemptFromRolloutGuard := len(parts) == 2 && (parts[1] == "rollout" || parts[1] == "rollout/advance" || parts[1] == "rollout/abort" || parts[1] == "check")
+		if !exemptFromRolloutGuard {
+			if st, ok := rm.get(name); ok && rolloutActive(st.Status) {
+				http.Error(w, fmt.Sprintf("%q has an active rollout — advance or abort it before other mutations", name), http.StatusConflict)
+				return
+			}
+		}
 		if len(parts) == 2 && parts[1] == "scale" && req.Method == "POST" {
 			var body struct{ Replicas int }
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {

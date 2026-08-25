@@ -217,7 +217,7 @@ func main() {
 
 	// Background: health-gate every service currently mid-rollout and
 	// auto-roll-back the moment a canary looks unhealthy between steps.
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, onboarded, *staticConfig, proxyURLFromEnv())
 	go rm.Run(ctx)
 
 	// Background: sample CPU once per second for the header stats widget.

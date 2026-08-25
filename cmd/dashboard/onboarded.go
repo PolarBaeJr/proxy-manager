@@ -580,6 +580,78 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 	return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
 }
 
+// scaleOnboardedCanary mirrors scaleOnboarded's grow/shrink pattern but
+// targets the canary set (goproxy-onb-<name>-c* containers) instead of live
+// replicas. Unlike scaleOnboarded, there is no floor of 1 here — a canary
+// can be scaled all the way to 0, since there's no "original" to protect in
+// the canary set.
+func (c *dockerClient) scaleOnboardedCanary(ctx context.Context, name string, target int, store *OnboardedStore, routesPath string) error {
+	svc, ok := store.Get(name)
+	if !ok {
+		return fmt.Errorf("not an onboarded service")
+	}
+	if target < 0 {
+		return fmt.Errorf("replicas must be >= 0")
+	}
+	if svc.CanaryImage == "" {
+		return fmt.Errorf("has no canary staged for %q", name)
+	}
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-c"]}`, name))
+	if err != nil {
+		return err
+	}
+	cPrefix := fmt.Sprintf("goproxy-onb-%s-c", name)
+	var canary []dockerContainer
+	for _, cl := range all {
+		if strings.HasPrefix(cl.name(), cPrefix) {
+			canary = append(canary, cl)
+		}
+	}
+	current := len(canary)
+	if current == target {
+		svc.CanaryReplicas = target
+		if err := store.Put(svc); err != nil {
+			return err
+		}
+		return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
+	}
+	if target > current {
+		if len(canary) == 0 {
+			return fmt.Errorf("%q has no canary containers to clone from", name)
+		}
+		env, err := c.inspectEnv(ctx, canary[0].ID)
+		if err != nil {
+			return fmt.Errorf("inspect canary template: %w", err)
+		}
+		needed := target - current
+		next := nextOnboardedCanaryIndex(canary, name)
+		for i := 0; i < needed; i++ {
+			cname := fmt.Sprintf("goproxy-onb-%s-c%d", name, next+i)
+			id, err := c.createContainer(ctx, cname, createBody{Image: svc.CanaryImage, Env: env})
+			if err != nil {
+				return fmt.Errorf("create %s: %w", cname, err)
+			}
+			if err := c.startContainer(ctx, id); err != nil {
+				return fmt.Errorf("start %s: %w", cname, err)
+			}
+		}
+	} else {
+		toRemove := current - target
+		sortByNameDesc(canary)
+		for i := 0; i < toRemove; i++ {
+			_ = c.stopContainer(ctx, canary[i].ID)
+			if err := c.removeContainer(ctx, canary[i].ID); err != nil {
+				return fmt.Errorf("remove %s: %w", canary[i].name(), err)
+			}
+		}
+	}
+	svc.CanaryReplicas = target
+	if err := store.Put(svc); err != nil {
+		return err
+	}
+	return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
+}
+
 // rebuildOnboardedRoute rewrites routes.json for this service from current
 // state: original (if still routed) + live clones + canaries (if any).
 //
@@ -660,6 +732,55 @@ func (c *dockerClient) stageOnboarded(ctx context.Context, name string, req Repl
 	}
 	svc.CanaryImage = req.Image
 	svc.CanaryReplicas = svc.Replicas
+	if err := store.Put(svc); err != nil {
+		return err
+	}
+	return rebuildOnboardedRoute(ctx, c, name, svc, routesPath)
+}
+
+// stageOnboardedCanary is stageOnboarded's rollout-aware counterpart: same
+// canary-creation body, except the canary replica count is the caller's
+// ramp-step count instead of always mirroring svc.Replicas 1:1.
+// stageOnboarded itself is left untouched — its existing caller (the plain
+// "stage" endpoint) depends on its always-1:1 behavior.
+func (c *dockerClient) stageOnboardedCanary(ctx context.Context, name string, req ReplaceServiceRequest, count int, store *OnboardedStore, routesPath string) error {
+	svc, ok := store.Get(name)
+	if !ok {
+		return fmt.Errorf("not onboarded: %s", name)
+	}
+	if svc.Host == "" {
+		return fmt.Errorf("%q is managed-only (no route) — manage it via docker compose", name)
+	}
+	if req.Image == "" {
+		return fmt.Errorf("image is required")
+	}
+	if svc.CanaryImage != "" {
+		return fmt.Errorf("%q already has a canary — promote or discard first", name)
+	}
+	if count < 1 {
+		return fmt.Errorf("canary count must be >= 1")
+	}
+	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
+	if err != nil {
+		return err
+	}
+	env, err := mergeEnv(c.onboardedBaseEnv(ctx, name, svc), edits, req.EnvAck)
+	if err != nil {
+		return redactRefConflicts(err, refs)
+	}
+	c.pullImage(ctx, req.Image)
+	for i := 1; i <= count; i++ {
+		cname := fmt.Sprintf("goproxy-onb-%s-c%d", name, i)
+		id, err := c.createContainer(ctx, cname, createBody{Image: req.Image, Env: env})
+		if err != nil {
+			return fmt.Errorf("create canary %s: %w", cname, err)
+		}
+		if err := c.startContainer(ctx, id); err != nil {
+			return fmt.Errorf("start canary %s: %w", cname, err)
+		}
+	}
+	svc.CanaryImage = req.Image
+	svc.CanaryReplicas = count
 	if err := store.Put(svc); err != nil {
 		return err
 	}
@@ -846,6 +967,30 @@ func nextCloneIndex(clones []dockerContainer, name string) int {
 	prefix := "goproxy-onb-" + name + "-"
 	max := 0
 	for _, c := range clones {
+		n := c.name()
+		if !strings.HasPrefix(n, prefix) {
+			continue
+		}
+		var v int
+		_, _ = fmt.Sscanf(n[len(prefix):], "%d", &v)
+		if v > max {
+			max = v
+		}
+	}
+	return max + 1
+}
+
+// nextOnboardedCanaryIndex mirrors nextCloneIndex but strips the canary
+// prefix "goproxy-onb-<name>-c" instead of the plain clone prefix
+// "goproxy-onb-<name>-". nextCloneIndex can't be reused directly here:
+// stripping only the shorter prefix would leave a leading "c" in front of
+// the trailing integer (e.g. "c3"), which fmt.Sscanf's %d can't parse and
+// would always yield 0, causing new-container name collisions on repeated
+// grow calls.
+func nextOnboardedCanaryIndex(canary []dockerContainer, name string) int {
+	prefix := "goproxy-onb-" + name + "-c"
+	max := 0
+	for _, c := range canary {
 		n := c.name()
 		if !strings.HasPrefix(n, prefix) {
 			continue

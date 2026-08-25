@@ -11,14 +11,24 @@
 // by serviceLock — the map mutex alone would only stop concurrent map
 // access, not a ticker-driven auto-rollback interleaving with a concurrent
 // manual advance for the same service.
+//
+// Two substrates: label-managed services (docker.go's canary primitives,
+// keyed by proxy.* labels) and onboarded services (onboarded.go's
+// OnboardedStore-backed services, keyed by container name prefix). The
+// dispatch wrapper methods below (checkHealth/scaleCanaryTo/scaleLiveTo/
+// promote/discard) pick the right substrate per-service; everything above
+// them (startRollout/doAdvance/rollbackContainers/checkOne) is substrate-
+// agnostic.
 package main
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,8 +39,6 @@ const (
 	rolloutStatusRolledBack      = "rolled-back"
 	rolloutStatusCompleted       = "completed"
 	rolloutStatusFailed          = "failed"
-
-	rolloutCheckInterval = 15 * time.Second
 
 	// canaryHealthProbeTimeout mirrors cmd/proxy/health.go's healthTimeout —
 	// the budget for a single HTTP health-path probe against a canary
@@ -46,11 +54,13 @@ const (
 )
 
 // canaryPromoteHealthTimeout/canaryPromoteHealthPoll bound promoteCanary's
-// pre-teardown health gate. Package vars only so tests can shrink them —
-// same seam as replaceSettleDelay.
+// pre-teardown health gate. rolloutCheckInterval paces the background
+// ticker. Package vars only so tests can shrink them — same seam as
+// replaceSettleDelay.
 var (
 	canaryPromoteHealthTimeout = 30 * time.Second
 	canaryPromoteHealthPoll    = 3 * time.Second
+	rolloutCheckInterval       = 15 * time.Second
 )
 
 var defaultRolloutSteps = []int{25, 50, 100}
@@ -90,15 +100,32 @@ type RolloutRequest struct {
 // autoUpdater, has two entry points (the ticker AND direct API calls) that
 // can race on the same service's containers.
 type rolloutManager struct {
-	dc *dockerClient
+	dc         *dockerClient
+	onb        *OnboardedStore
+	routesPath string
+	proxyURL   string
 
 	mu       sync.Mutex
 	rollouts map[string]*rolloutState
 	locks    map[string]*sync.Mutex
 }
 
-func newRolloutManager(dc *dockerClient) *rolloutManager {
-	return &rolloutManager{dc: dc, rollouts: map[string]*rolloutState{}, locks: map[string]*sync.Mutex{}}
+func newRolloutManager(dc *dockerClient, onb *OnboardedStore, routesPath, proxyURL string) *rolloutManager {
+	return &rolloutManager{
+		dc: dc, onb: onb, routesPath: routesPath, proxyURL: proxyURL,
+		rollouts: map[string]*rolloutState{}, locks: map[string]*sync.Mutex{},
+	}
+}
+
+// onboardedSvc is a nil-safe wrapper around onb.Get: some newDashboardMux
+// callers (tests exercising unrelated endpoints) construct a rolloutManager
+// with a nil onboarded store, and every dispatch method below checks
+// onboarded-ness unconditionally, even for label-managed calls.
+func (m *rolloutManager) onboardedSvc(name string) (OnboardedService, bool) {
+	if m.onb == nil {
+		return OnboardedService{}, false
+	}
+	return m.onb.Get(name)
 }
 
 func (m *rolloutManager) serviceLock(name string) *sync.Mutex {
@@ -187,24 +214,55 @@ func (m *rolloutManager) startRollout(ctx context.Context, name string, req Repl
 		return nil, fmt.Errorf("%q already has an active rollout — advance or abort it first", name)
 	}
 
-	all, err := m.dc.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
-	if err != nil {
-		return nil, err
-	}
-	if len(canaryOnly(all)) > 0 {
-		return nil, fmt.Errorf("%q already has a canary — promote or discard it first", name)
-	}
-	orig := len(liveOnly(all))
-	if orig == 0 {
-		return nil, fmt.Errorf("service %q has no live replicas", name)
-	}
+	var orig int
+	if svc, ok := m.onboardedSvc(name); ok {
+		if svc.Host == "" {
+			return nil, fmt.Errorf("%q is managed-only (no route) — manage it via docker compose", name)
+		}
+		if svc.CanaryImage != "" {
+			return nil, fmt.Errorf("%q already has a canary — promote or discard it first", name)
+		}
+		orig = svc.Replicas
+		if orig == 0 {
+			return nil, fmt.Errorf("service %q has no live replicas", name)
+		}
 
-	canaryCount := ceilPct(orig, steps[0])
-	if err := m.dc.createCanaryReplicas(ctx, name, req, canaryCount); err != nil {
-		return nil, err
-	}
-	if err := m.scaleLiveTo(ctx, name, orig-canaryCount); err != nil {
-		return nil, err
+		canaryCount := ceilPct(orig, steps[0])
+		if err := m.dc.stageOnboardedCanary(ctx, name, req, canaryCount, m.onb, m.routesPath); err != nil {
+			return nil, err
+		}
+		proxyRefresh(m.proxyURL)
+		// canaryCount can reach or exceed orig at step 0 already (small orig,
+		// ceilPct's floor-of-1) — nothing to scale down in that case; the
+		// first advance detects target >= orig and promotes directly rather
+		// than trying to scale live to zero via scaleOnboarded (which
+		// refuses desired < 1).
+		if canaryCount < orig {
+			if err := m.dc.scaleOnboarded(ctx, name, orig-canaryCount, m.onb, m.routesPath); err != nil {
+				return nil, err
+			}
+			proxyRefresh(m.proxyURL)
+		}
+	} else {
+		all, err := m.dc.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+		if err != nil {
+			return nil, err
+		}
+		if len(canaryOnly(all)) > 0 {
+			return nil, fmt.Errorf("%q already has a canary — promote or discard it first", name)
+		}
+		orig = len(liveOnly(all))
+		if orig == 0 {
+			return nil, fmt.Errorf("service %q has no live replicas", name)
+		}
+
+		canaryCount := ceilPct(orig, steps[0])
+		if err := m.dc.createCanaryReplicas(ctx, name, req, canaryCount); err != nil {
+			return nil, err
+		}
+		if err := m.scaleLiveTo(ctx, name, orig-canaryCount); err != nil {
+			return nil, err
+		}
 	}
 
 	st := &rolloutState{
@@ -218,9 +276,8 @@ func (m *rolloutManager) startRollout(ctx context.Context, name string, req Repl
 	return &cp, nil
 }
 
-// advanceRollout health-gates the current canary, then either auto-rolls-back
-// (unhealthy), promotes (healthy and at the last step), or scales up to the
-// next ramp step.
+// advanceRollout is a thin locking wrapper around doAdvance — acquire the
+// service lock, look up the active state, and hand off.
 func (m *rolloutManager) advanceRollout(ctx context.Context, name string) (*rolloutState, error) {
 	lock := m.serviceLock(name)
 	lock.Lock()
@@ -230,8 +287,19 @@ func (m *rolloutManager) advanceRollout(ctx context.Context, name string) (*roll
 	if !ok || !rolloutActive(st.Status) {
 		return nil, fmt.Errorf("%q has no active rollout", name)
 	}
+	return m.doAdvance(ctx, st)
+}
 
-	healthy, reason, err := m.dc.checkCanaryHealth(ctx, name)
+// doAdvance health-gates the current canary, then either auto-rolls-back
+// (unhealthy), promotes (healthy and either at the last step, or — for an
+// onboarded service — the next step's target already reaches full live
+// capacity), or scales up to the next ramp step.
+//
+// Caller must already hold the service's lock: both advanceRollout and
+// checkOne call this after acquiring the lock themselves — locking here too
+// would deadlock checkOne's call path.
+func (m *rolloutManager) doAdvance(ctx context.Context, st *rolloutState) (*rolloutState, error) {
+	healthy, reason, err := m.checkHealth(ctx, st.Service)
 	if err != nil {
 		return nil, err
 	}
@@ -239,42 +307,134 @@ func (m *rolloutManager) advanceRollout(ctx context.Context, name string) (*roll
 		return m.autoRollback(ctx, st, reason), nil
 	}
 
-	if st.StepIdx == len(st.Steps)-1 {
-		if err := m.dc.promoteCanary(ctx, name); err != nil {
-			m.update(name, func(r *rolloutState) { r.Status = rolloutStatusFailed; r.LastError = err.Error() })
-			res, _ := m.get(name)
+	_, onboarded := m.onboardedSvc(st.Service)
+	atLastStep := st.StepIdx == len(st.Steps)-1
+
+	targetPct := st.Steps[st.StepIdx]
+	if !atLastStep {
+		targetPct = st.Steps[st.StepIdx+1]
+	}
+	target := ceilPct(st.OrigLiveReplicas, targetPct)
+
+	// Onboarded has no valid "live==0, not-yet-promoted" intermediate state
+	// (scaleOnboarded refuses desired < 1, unlike scaleService) — so the
+	// moment the next step's target reaches full live capacity, cut straight
+	// to promote instead of scaling live down. Always true at the actual
+	// last step (ceilPct(orig,100) == orig), and can also be true one or
+	// more steps early when a small OrigLiveReplicas makes ceilPct's
+	// floor-of-1 reach full capacity ahead of schedule.
+	if onboarded && target >= st.OrigLiveReplicas {
+		if err := m.scaleCanaryTo(ctx, st.Service, target); err != nil {
+			m.update(st.Service, func(r *rolloutState) { r.Status = rolloutStatusFailed; r.LastError = err.Error() })
+			res, _ := m.get(st.Service)
 			return res, nil
 		}
-		m.update(name, func(r *rolloutState) { r.Status = rolloutStatusCompleted; r.LastError = "" })
-		res, _ := m.get(name)
+		if err := m.promote(ctx, st.Service); err != nil {
+			m.update(st.Service, func(r *rolloutState) { r.Status = rolloutStatusFailed; r.LastError = err.Error() })
+			res, _ := m.get(st.Service)
+			return res, nil
+		}
+		m.update(st.Service, func(r *rolloutState) { r.Status = rolloutStatusCompleted; r.LastError = "" })
+		res, _ := m.get(st.Service)
 		return res, nil
 	}
 
-	nextPct := st.Steps[st.StepIdx+1]
-	canaryCount := ceilPct(st.OrigLiveReplicas, nextPct)
-	if err := m.dc.scaleCanary(ctx, name, canaryCount); err != nil {
+	if atLastStep {
+		if err := m.promote(ctx, st.Service); err != nil {
+			m.update(st.Service, func(r *rolloutState) { r.Status = rolloutStatusFailed; r.LastError = err.Error() })
+			res, _ := m.get(st.Service)
+			return res, nil
+		}
+		m.update(st.Service, func(r *rolloutState) { r.Status = rolloutStatusCompleted; r.LastError = "" })
+		res, _ := m.get(st.Service)
+		return res, nil
+	}
+
+	if err := m.scaleCanaryTo(ctx, st.Service, target); err != nil {
 		return nil, err
 	}
-	if err := m.scaleLiveTo(ctx, name, st.OrigLiveReplicas-canaryCount); err != nil {
+	if err := m.scaleLiveTo(ctx, st.Service, st.OrigLiveReplicas-target); err != nil {
 		return nil, err
 	}
-	m.update(name, func(r *rolloutState) { r.StepIdx++ })
-	res, _ := m.get(name)
+	m.update(st.Service, func(r *rolloutState) { r.StepIdx++ })
+	res, _ := m.get(st.Service)
 	return res, nil
 }
 
+// checkHealth dispatches a canary health check to the substrate-appropriate
+// implementation — onboarded containers carry none of the proxy.* labels
+// checkCanaryHealth keys off.
+func (m *rolloutManager) checkHealth(ctx context.Context, name string) (bool, string, error) {
+	if svc, ok := m.onboardedSvc(name); ok {
+		return m.dc.checkOnboardedCanaryHealth(ctx, name, svc.Port)
+	}
+	return m.dc.checkCanaryHealth(ctx, name)
+}
+
+// scaleCanaryTo dispatches a canary scale to the substrate-appropriate
+// implementation, refreshing the proxy afterward for the onboarded path
+// (scaleCanary's label-managed callers are picked up by docker discovery on
+// the next render; onboarded's static routes.json entry needs an explicit
+// refresh).
+func (m *rolloutManager) scaleCanaryTo(ctx context.Context, name string, target int) error {
+	if _, ok := m.onboardedSvc(name); ok {
+		if err := m.dc.scaleOnboardedCanary(ctx, name, target, m.onb, m.routesPath); err != nil {
+			return err
+		}
+		proxyRefresh(m.proxyURL)
+		return nil
+	}
+	return m.dc.scaleCanary(ctx, name, target)
+}
+
 // scaleLiveTo scales live replicas down to target, except when target is 0:
-// scaleService refuses by design to remove a service's one non-removable
-// "original" container, so it can never legitimately reach 0 for a realistic
-// compose-managed service. Only promoteCanary (which tears down live
-// containers directly, with no such guard) may remove the last live
-// replica — so a target of 0 here is a no-op, leaving live as-is until the
-// rollout's final advance calls promoteCanary.
+// neither scaleService nor scaleOnboarded may legitimately reach 0 (each
+// refuses to remove a service's last non-removable "original" container), so
+// a target of 0 here is a no-op, leaving live as-is until the rollout's
+// final advance calls promote (which tears down live containers directly,
+// with no such guard).
 func (m *rolloutManager) scaleLiveTo(ctx context.Context, name string, target int) error {
 	if target == 0 {
 		return nil
 	}
+	if _, ok := m.onboardedSvc(name); ok {
+		if err := m.dc.scaleOnboarded(ctx, name, target, m.onb, m.routesPath); err != nil {
+			return err
+		}
+		proxyRefresh(m.proxyURL)
+		return nil
+	}
 	return m.dc.scaleService(ctx, name, target)
+}
+
+// promote dispatches the final "canary becomes live" step. For onboarded,
+// promoteOnboarded doesn't update svc.Replicas itself (only CanaryImage/
+// CanaryReplicas), so a completed ramp would otherwise leave Replicas stuck
+// at its pre-ramp value — SetReplicas corrects that after promoteOnboarded
+// clears CanaryReplicas.
+func (m *rolloutManager) promote(ctx context.Context, name string) error {
+	if svc, ok := m.onboardedSvc(name); ok {
+		finalCanaryCount := svc.CanaryReplicas
+		if err := m.dc.promoteOnboarded(ctx, name, m.onb, m.routesPath); err != nil {
+			return err
+		}
+		proxyRefresh(m.proxyURL)
+		return m.onb.SetReplicas(name, finalCanaryCount)
+	}
+	return m.dc.promoteCanary(ctx, name)
+}
+
+// discard dispatches a canary discard to the substrate-appropriate
+// implementation.
+func (m *rolloutManager) discard(ctx context.Context, name string) error {
+	if _, ok := m.onboardedSvc(name); ok {
+		if err := m.dc.discardOnboarded(ctx, name, m.onb, m.routesPath); err != nil {
+			return err
+		}
+		proxyRefresh(m.proxyURL)
+		return nil
+	}
+	return m.dc.discardCanary(ctx, name)
 }
 
 // abortRollout rolls back immediately regardless of current canary health.
@@ -302,6 +462,14 @@ func (m *rolloutManager) abortRollout(ctx context.Context, name string) (*rollou
 // mechanics behind both an auto-rollback (health gate failure) and a manual
 // abort. Caller must already hold the service's lock.
 func (m *rolloutManager) rollbackContainers(ctx context.Context, st *rolloutState) error {
+	if svc, ok := m.onboardedSvc(st.Service); ok {
+		if svc.CanaryImage != "" {
+			if err := m.discard(ctx, st.Service); err != nil {
+				return err
+			}
+		}
+		return m.scaleLiveTo(ctx, st.Service, st.OrigLiveReplicas)
+	}
 	all, err := m.dc.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, st.Service))
 	if err != nil {
 		return err
@@ -314,9 +482,9 @@ func (m *rolloutManager) rollbackContainers(ctx context.Context, st *rolloutStat
 	return m.dc.scaleService(ctx, st.Service, st.OrigLiveReplicas)
 }
 
-// autoRollback is the shared failure path for both advanceRollout's health
-// check and the background ticker's between-steps check. Caller must
-// already hold the service's lock.
+// autoRollback is the shared failure path for both doAdvance's health check
+// and the background ticker's between-steps check. Caller must already hold
+// the service's lock.
 func (m *rolloutManager) autoRollback(ctx context.Context, st *rolloutState, reason string) *rolloutState {
 	m.update(st.Service, func(r *rolloutState) { r.Status = rolloutStatusRollingBack })
 	if err := m.rollbackContainers(ctx, st); err != nil {
@@ -376,7 +544,8 @@ func (m *rolloutManager) checkOne(ctx context.Context, name string) {
 	if !ok || st.Status != rolloutStatusAwaitingAdvance {
 		return
 	}
-	healthy, reason, err := m.dc.checkCanaryHealth(ctx, name)
+
+	healthy, reason, err := m.checkHealth(ctx, name)
 	if err != nil {
 		log.Printf("rollout %s: health check error: %v", name, err)
 		return
@@ -457,6 +626,56 @@ func (c *dockerClient) checkCanaryHealth(ctx context.Context, name string) (bool
 		if resp.StatusCode/100 != 2 {
 			return false, fmt.Sprintf("%s: health probe %s returned %d", ct.name(), url, resp.StatusCode), nil
 		}
+	}
+	return true, "", nil
+}
+
+// checkOnboardedCanaryHealth is checkCanaryHealth's onboarded-substrate
+// counterpart. Onboarded containers carry none of the proxy.* labels
+// checkCanaryHealth keys off, so canary discovery goes by name prefix
+// instead (same idiom discardOnboarded uses), and the health probe is a
+// bare TCP dial rather than an HTTP GET requiring a 2xx — OnboardedService
+// has no health-path field/convention today, and requiring a 2xx from "/"
+// would false-positive-rollback apps that redirect or 404 there. A real
+// HTTP-path probe is a natural follow-up once OnboardedService gains a
+// health-path field; not built here.
+func (c *dockerClient) checkOnboardedCanaryHealth(ctx context.Context, name string, port int) (bool, string, error) {
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-c"]}`, name))
+	if err != nil {
+		return false, "", err
+	}
+	prefix := fmt.Sprintf("goproxy-onb-%s-c", name)
+	var canary []dockerContainer
+	for _, cl := range all {
+		if strings.HasPrefix(cl.name(), prefix) {
+			canary = append(canary, cl)
+		}
+	}
+	if len(canary) == 0 {
+		return false, fmt.Sprintf("%q has no canary containers", name), nil
+	}
+	for _, ct := range canary {
+		if parseHealth(ct.Status) == "unhealthy" {
+			return false, fmt.Sprintf("%s: docker healthcheck reports unhealthy", ct.name()), nil
+		}
+		restarts, err := c.inspectRestartCount(ctx, ct.ID)
+		if err != nil {
+			return false, "", fmt.Errorf("inspect %s: %w", ct.name(), err)
+		}
+		if restarts > canaryMaxRestarts {
+			return false, fmt.Sprintf("%s: restarted %d times since creation", ct.name(), restarts), nil
+		}
+
+		addr := containerIP(ct)
+		if addr == "" {
+			addr = ct.name()
+		}
+		dialer := net.Dialer{Timeout: canaryHealthProbeTimeout}
+		conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", addr, port))
+		if err != nil {
+			return false, fmt.Sprintf("%s: dial %s:%d failed: %v", ct.name(), addr, port, err), nil
+		}
+		conn.Close()
 	}
 	return true, "", nil
 }
