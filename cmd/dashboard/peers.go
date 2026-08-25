@@ -466,6 +466,54 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 	})
 }
 
+// peerImagesResp is the wire shape for GET /peer/images — this peer's own
+// local per-service image inventory (buildImagesInfo) plus its identity.
+// Machine is left unset on Images — the peer never tags its own local data
+// (same convention as peerServicesResp/peerServiceStatusResp); the caller
+// tags it after decoding.
+type peerImagesResp struct {
+	Identity string          `json:"identity"`
+	Images   *imagesInfoResp `json:"images"`
+}
+
+// peerImagesHandler returns the HTTP handler for GET /peer/images on the
+// dedicated peer-handshake port — same bearer-auth shape as
+// peerServicesHandler. Always returns THIS host's own local image inventory
+// — mirrors what the LOCAL /api/images handler does today (api.go), calling
+// dc.listServices directly rather than buildManagedServices, so this is NOT
+// self-excluding. The caller (api.go's /api/images host-forwarding branch)
+// is the one that resolves which peer to ask.
+func peerImagesHandler(secret, identity string, dc *dockerClient, rs *ReleasesStore, ih *ImageHistoryStore, onb *OnboardedStore) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		svcs, err := dc.listServices(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		info, err := buildImagesInfo(r.Context(), dc, rs, ih, svcs, onb.List())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(peerImagesResp{Identity: identity, Images: info})
+	})
+}
+
 // fetchPeerServices polls every configured peer's /peer/services in parallel
 // and returns their services, each tagged with that peer's own identity as
 // Machine. A peer that's down, slow, or misconfigured is logged and simply
