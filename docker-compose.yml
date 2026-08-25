@@ -171,6 +171,12 @@ services:
       MAINT_DIR:            /etc/maint.d            # nginx maintenance flag files
       MAINT_PAGE_DIR:       /var/www/maint-pages    # per-host custom 503 pages
       SECRETS_DIR:          /etc/secrets            # ref:NAME env values, one file per service (see mount above)
+      # Shared cross-peer state — auth's redis-backed user sync and the
+      # peer-registry's version ratchet/mesh-floor tracking. -redis-addr is
+      # passed as a command-line flag (see command: below); the password
+      # isn't, so it has to come in as a real env var or redis.NewClient
+      # connects unauthenticated and every call fails with NOAUTH.
+      REDIS_PASSWORD:       ${REDIS_PASSWORD:-}
       # Verifies the proxy's attribution assertion so an action taken through
       # another backend (the MCP server) is audited against the person who
       # asked, not the shared API token. AUDIT ONLY — never authorization.
