@@ -973,23 +973,37 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	// ---- Passkeys / WebAuthn (when PASSKEY_RP_ID is set or default localhost) ----
 	registerPasskeyRoutes(mux, auth, pm, rl)
 
-	// ---- Proxy access log (read-only; auth-gated) ----
-	if px := proxyURLFromEnv(); px != "" {
-		mux.HandleFunc("/api/access", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-			url := px + "/access"
-			if q := req.URL.RawQuery; q != "" {
-				url += "?" + q
-			}
-			resp, err := http.Get(url)
-			if err != nil {
-				http.Error(w, "proxy unreachable", http.StatusBadGateway)
+	// ---- Proxy access log (read-only; auth-gated). Always registered (not
+	// gated on PROXY_URL like /api/ratelimit below) — an instance with no local
+	// proxy configured must still be able to view a PEER's access log via
+	// ?host=. Local viewing on such an instance returns 503, not a missing
+	// route. ----
+	mux.HandleFunc("/api/access", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		host := strings.TrimSpace(req.URL.Query().Get("host"))
+		if host != "" && registry != nil && host != registry.Identity() {
+			peerBase, ok := registry.URLForIdentity(host)
+			if !ok {
+				http.Error(w, "unknown host: "+host, http.StatusNotFound)
 				return
 			}
-			defer resp.Body.Close()
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.Copy(w, resp.Body)
-		}))
+			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+			if peerSecret == "" {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			forwardAccessLogToPeer(req.Context(), w, peerBase, peerSecret, req.URL.RawQuery)
+			return
+		}
+		px := proxyURLFromEnv()
+		if px == "" {
+			http.Error(w, "no local proxy configured on this host", http.StatusServiceUnavailable)
+			return
+		}
+		forwardAccessLog(req.Context(), w, px, req.URL.RawQuery)
+	}))
 
+	// ---- Rate limits ----
+	if px := proxyURLFromEnv(); px != "" {
 		// Rate-limit bucket state (read-only; auth-gated). Empty {"routes":[]}
 		// whenever no route has proxy.ratelimit=true, whether the proxy's own
 		// rate limiting is in-memory-only or Redis-backed — the dashboard
