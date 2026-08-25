@@ -1461,6 +1461,17 @@ function svcLockedAttr(s) {
 function svcLk(s) {
   return foreignSvc(s) ? '<span class="lock" title="managed on ' + esc(machineLabel(s.machine)) + '">' + I.lock + '</span>' : lk();
 }
+// svcWriteAttr/svcWriteLk are the narrow write-mesh counterparts of
+// svcLockedAttr/svcLk — used ONLY by the controls this phase actually
+// forwards (replica-count +/-/Apply, service Stop/Start, per-replica
+// Stop/Start), never by svcLockedAttr/svcLk's other callers (Add route,
+// Promote, Discard, Pull update, Stage, Replace, Check now, Add env,
+// Auto-update toggle, Rollback, Delete service, menu), which have no peer
+// endpoint and must keep firing against the LOCAL daemon guard.
+function svcWriteAttr(s) {
+  return (foreignSvc(s) && !peerWritable(s)) ? svcLockedAttr(s) : (isElevated() ? '' : lockedAttr());
+}
+function svcWriteLk(s) { return (foreignSvc(s) && !peerWritable(s)) ? svcLk(s) : lk(); }
 async function renderServices() {
   if (_selfIdentity === null) await loadSelfIdentity();
   const svcs = await api('/api/services');
@@ -1468,7 +1479,7 @@ async function renderServices() {
   // Bail out of the full rebuild on the 5s tick if nothing about the services
   // changed — preserves scroll, hover, expanded-card state. We still refresh
   // the per-service stats panels (which DO change) without touching the rest.
-  const hash = JSON.stringify(svcs) + '|' + _selfIdentity;
+  const hash = JSON.stringify(svcs) + '|' + _selfIdentity + '|' + JSON.stringify(_peerWrites);
   if (hash === _lastServicesHash && el.children.length) {
     fillServiceStatsPanels().catch(() => {});
     return;
@@ -1480,6 +1491,22 @@ async function renderServices() {
   if (!svcs.length) { el.innerHTML = html + emptyState(I.services, 'No managed services', 'Deploy a container and the proxy will scale, canary, and roll it back from here.'); return; }
   for (const s of svcs) {
     const sn = esc(s.name);
+    // hostAttr renders a data-host attribute on the write-mesh call sites
+    // (scaleSvc, lifecycleSvc, lifecycleReplica stop/start) so a
+    // foreign+writable row's action forwards to its owning peer via ?host=.
+    // Read back via this.dataset.host in the onclick — never spliced
+    // directly into the handler string. s.machine is operator-set
+    // (DASHBOARD_HOST) freeform text with no format validation, so putting
+    // it straight into a single-quoted JS literal inside onclick="..." is
+    // exploitable: esc()'s HTML-entity escaping of the quote is undone by
+    // the browser's attribute-value entity-decoding BEFORE the onclick body
+    // is parsed as JS, so a crafted identity can still break out of the
+    // string literal. A data-* attribute is read via .dataset, never
+    // re-parsed as script, so the same string is inert there. Local rows
+    // (and foreign-but-not-writable ones, which svcWriteAttr already
+    // disables) get no data-host — this.dataset.host is then undefined,
+    // which the callees treat the same as "no host".
+    const hostAttr = (foreignSvc(s) && peerWritable(s)) ? ' data-host="' + esc(s.machine) + '"' : '';
     const canary = !!s.canary_image;
     // Managed-only: no route (either adopted for lifecycle/image tracking
     // only, or a label-managed container that only carries proxy.service —
@@ -1533,8 +1560,8 @@ async function renderServices() {
               // ~10min background poller — mirrors the MCP check_for_update tool.
               + '<button class="btn ghost" ' + svcLockedAttr(s) + ' onclick="checkForUpdate(\'' + sn + '\', this)">' + I.refresh + 'Check now' + svcLk(s) + '</button>'
               + (s.all_stopped
-                  ? '<button class="btn" ' + svcLockedAttr(s) + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\')">' + I.bolt + 'Start service' + svcLk(s) + '</button>'
-                  : '<button class="btn" ' + svcLockedAttr(s) + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\')">' + I.lock + 'Stop service' + svcLk(s) + '</button>')
+                  ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\', this.dataset.host)">' + I.bolt + 'Start service' + svcWriteLk(s) + '</button>'
+                  : '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\', this.dataset.host)">' + I.lock + 'Stop service' + svcWriteLk(s) + '</button>')
               // Add env: recreates the replicas on the SAME image with the new
               // variables merged in. Disabled while stopped — the recreate
               // clones a live replica's config, so there has to be one.
@@ -1565,9 +1592,12 @@ async function renderServices() {
         const canaryPill = m.is_canary ? ' <span class="pill info">canary</span>' : '';
         const btn = m.is_canary ? ''
           : (live
+              // Restart stays local-only (svcLockedAttr/svcLk, no hostArg) —
+              // it's two sequential mutations with a definite-outcome
+              // success message that doesn't survive a network hop cleanly.
               ? '<button class="btn sm ghost" ' + svcLockedAttr(s) + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'restart\')" title="Stop then start this replica">' + I.refresh + 'Restart' + svcLk(s) + '</button>'
-              + '<button class="btn sm ghost" ' + svcLockedAttr(s) + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'stop\')">' + I.lock + 'Stop' + svcLk(s) + '</button>'
-              : '<button class="btn sm" ' + svcLockedAttr(s) + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'start\')">' + I.bolt + 'Start' + svcLk(s) + '</button>');
+              + '<button class="btn sm ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'stop\', this.dataset.host)">' + I.lock + 'Stop' + svcWriteLk(s) + '</button>'
+              : '<button class="btn sm" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'start\', this.dataset.host)">' + I.bolt + 'Start' + svcWriteLk(s) + '</button>');
         memberList += '<div class="member-row"><span class="ident dim">' + esc(m.name) + '</span> ' + pill + canaryPill + '<span class="spacer"></span>' + btn + '</div>';
       }
       memberList += '</div>';
@@ -2011,12 +2041,16 @@ function discoveryShowLabels(name, port) {
 function replicaCtrl(s) {
   if (s.unscalable) return '<span class="singleton-lock">' + I.lock + 'Singleton <span class="pill muted" style="margin-left:4px">fixed at 1</span></span>';
   const sn = esc(s.name);
-  const dis = svcLockedAttr(s);
+  const dis = svcWriteAttr(s);
+  // See the hostAttr comment in renderServices — data-host, never spliced
+  // into the onclick string directly, because s.machine is unvalidated
+  // operator-set text.
+  const hostAttr = (foreignSvc(s) && peerWritable(s)) ? ' data-host="' + esc(s.machine) + '"' : '';
   return '<span class="replica-ctrl">'
-       + '<button ' + dis + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas - 1) + ')">−</button>'
-       + '<input type="number" min="0" value="' + s.replicas + '" id="rep-' + sn + '"' + ((isElevated() && !foreignSvc(s)) ? '' : ' disabled') + '>'
-       + '<button ' + dis + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas + 1) + ')">+</button>'
-       + '<button class="apply" ' + dis + ' onclick="scaleSvc(\'' + sn + '\', +document.getElementById(\'rep-' + sn + '\').value)">Apply</button>'
+       + '<button ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas - 1) + ', this.dataset.host)">−</button>'
+       + '<input type="number" min="0" value="' + s.replicas + '" id="rep-' + sn + '"' + ((isElevated() && (!foreignSvc(s) || peerWritable(s))) ? '' : ' disabled') + '>'
+       + '<button ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas + 1) + ', this.dataset.host)">+</button>'
+       + '<button class="apply" ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', +document.getElementById(\'rep-' + sn + '\').value, this.dataset.host)">Apply</button>'
        + '</span>';
 }
 
@@ -2029,10 +2063,11 @@ function toggleMenu(e, id) {
 }
 document.addEventListener('click', () => { document.querySelectorAll('.menu-pop.open').forEach(x => x.classList.remove('open')); });
 
-async function scaleSvc(name, n) {
+async function scaleSvc(name, n, host) {
   if (n < 0) return;
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
   try {
-    await api('/api/services/' + encodeURIComponent(name) + '/scale', { method:'POST', body: JSON.stringify({replicas: n}) });
+    await api('/api/services/' + encodeURIComponent(name) + '/scale' + hostParam, { method:'POST', body: JSON.stringify({replicas: n}) });
     toast('scaled ' + name + ' → ' + n);
     renderActive();
   } catch (e) { toast(e.message, 'err'); }
@@ -2042,12 +2077,14 @@ async function scaleSvc(name, n) {
 // replica. Containers retain config; "start" just brings the same container
 // back. First stop of a labeled-but-not-onboarded service auto-promotes it
 // to onboarded so it picks up Stage/Promote/Replace/Rollback.
-async function lifecycleSvc(name, act) {
+async function lifecycleSvc(name, act, host) {
   if (act === 'stop') {
-    if (!(await confirmDialog('Stop all replicas of ' + name + '? They retain config and can be restarted instantly.', {title: 'Stop service'}))) return;
+    const onHost = host ? ' on ' + machineLabel(host) : '';
+    if (!(await confirmDialog('Stop all replicas of ' + name + onHost + '? They retain config and can be restarted instantly.', {title: 'Stop service'}))) return;
   }
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
   try {
-    await api('/api/services/' + encodeURIComponent(name) + '/' + act, { method:'POST' });
+    await api('/api/services/' + encodeURIComponent(name) + '/' + act + hostParam, { method:'POST' });
     toast(act === 'stop' ? 'stopped ' + name : 'started ' + name, 'ok');
     _lastServicesHash = '';
     renderActive();
@@ -2122,9 +2159,11 @@ async function checkForUpdate(name, btn) {
   finally { if (btn) btn.disabled = false; }
 }
 
-async function lifecycleReplica(svc, member, act) {
+async function lifecycleReplica(svc, member, act, host) {
   try {
     if (act === 'restart') {
+      // Local-only, deliberately: no host param even if the caller passed
+      // one — see the "Restart stays local-only" comment at its call site.
       await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/stop', { method:'POST' });
       try {
         await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/start', { method:'POST' });
@@ -2141,7 +2180,8 @@ async function lifecycleReplica(svc, member, act) {
       renderActive();
       return;
     }
-    await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/' + act, { method:'POST' });
+    const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
+    await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/' + act + hostParam, { method:'POST' });
     toast(act === 'stop' ? 'stopped ' + member : 'started ' + member, 'ok');
     _lastServicesHash = '';
     renderActive();

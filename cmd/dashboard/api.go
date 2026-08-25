@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -562,6 +563,25 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			http.NotFound(w, req)
 			return
 		}
+		// Forwarding must be checked BEFORE the self-guard below: a local
+		// service that happens to share a name with an unrelated peer
+		// service (a common case — see buildManagedServices) must never be
+		// judged by the LOCAL self-guard when the mutation targets a peer.
+		// The peer's own peerServicesMutateHandler runs its own self-guard
+		// against its own Docker state.
+		if host, isPeer := hostForReq(req, registry); isPeer {
+			actor := sessionUser(sessionFromReq(auth, req))
+			if actor == "" {
+				// Same fallback as /api/images/'s forwarding branch (see the
+				// comment there): a token-authenticated call has no session
+				// cookie, so without this the forwarded assertion would
+				// always be empty for exactly the callers that most need
+				// correct attribution.
+				actor = principalFrom(req)
+			}
+			forwardServiceMutation(w, req, host, registry, name, parts, actor)
+			return
+		}
 		// Centralized guard, before any subpath dispatch (scale/replace/
 		// stop/start/canary/etc.) — refuses ANY mutating action targeting
 		// the dashboard's own service. Lives here rather than per-branch so
@@ -581,16 +601,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				httpx.WriteErr(w, err)
 				return
 			}
-			// Onboarded services have a separate scale path that clones via
-			// the saved template image+env and rewrites routes.json instead
-			// of relying on label-based discovery.
-			if _, ok := onb.Get(name); ok {
-				if err := dc.scaleOnboarded(req.Context(), name, body.Replicas, onb, routesConfigPath); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-				proxyRefresh(proxyURLFromEnv())
-			} else if err := dc.scaleService(req.Context(), name, body.Replicas); err != nil {
+			if err := runServiceScale(req.Context(), dc, onb, routesConfigPath, proxyURLFromEnv(), name, body.Replicas); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -774,17 +785,11 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				return
 			}
 			act := parts[1]
-			var acted int
-			if act == "stop" {
-				acted, err = stopServiceMembers(req.Context(), dc, svc)
-			} else {
-				acted, err = startServiceMembers(req.Context(), dc, svc)
-			}
+			acted, err := runServiceLifecycle(req.Context(), dc, proxyURLFromEnv(), svc, act)
 			if err != nil {
 				httpx.WriteErr(w, err)
 				return
 			}
-			proxyRefresh(proxyURLFromEnv())
 			audit(req, sessionUser(info), "service."+act, name)
 			msg := act + "ped"
 			if acted == 0 {
@@ -1604,6 +1609,108 @@ func forwardImageMutation(w http.ResponseWriter, req *http.Request, host string,
 		method, peerPath = http.MethodDelete, "/peer/images/delete"
 	case sub == "prune" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/images/prune"
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if registry == nil {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	peerURL, ok := registry.URLForIdentity(host)
+	if !ok {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+	if peerSecret == "" {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	reqBody, err := io.ReadAll(req.Body)
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	code, respBody, mutErr := peerMutate(req.Context(), client, peerURL, peerSecret, method, peerPath,
+		10*time.Second, bytes.NewReader(reqBody), nil, mintForwardedActor(req, actor))
+	if mutErr != nil {
+		mapPeerMutationErr(w, 0, []byte(mutErr.Error()))
+		return
+	}
+	if code < 200 || code >= 300 {
+		mapPeerMutationErr(w, code, respBody)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(respBody)
+}
+
+// runServiceScale is the scale logic shared by the local /api/services/
+// {name}/scale handler and peers.go's peerServicesMutateHandler. Onboarded
+// services have a separate scale path that clones via the saved template
+// image+env and rewrites routes.json instead of relying on label-based
+// discovery — that path calls proxyRefresh on success because routes.json
+// needs an explicit nudge; scaleService (label-managed) does NOT, because
+// label routing self-discovers via docker events. This asymmetry is
+// intentional — do not "fix" it.
+func runServiceScale(ctx context.Context, dc *dockerClient, onb *OnboardedStore, routesPath, proxyURL, name string, replicas int) error {
+	if _, ok := onb.Get(name); ok {
+		if err := dc.scaleOnboarded(ctx, name, replicas, onb, routesPath); err != nil {
+			return err
+		}
+		proxyRefresh(proxyURL)
+		return nil
+	}
+	return dc.scaleService(ctx, name, replicas)
+}
+
+// runServiceLifecycle is the stop/start logic shared by the local
+// /api/services/{name}/{stop,start} handler and peers.go's
+// peerServicesMutateHandler. Unlike runServiceScale, there's no
+// onboarded/label-managed asymmetry here — proxyRefresh always runs on
+// success, for both paths.
+func runServiceLifecycle(ctx context.Context, dc *dockerClient, proxyURL string, svc Service, act string) (acted int, err error) {
+	if act == "stop" {
+		acted, err = stopServiceMembers(ctx, dc, svc)
+	} else {
+		acted, err = startServiceMembers(ctx, dc, svc)
+	}
+	if err != nil {
+		return acted, err
+	}
+	proxyRefresh(proxyURL)
+	return acted, nil
+}
+
+// forwardServiceMutation relays one mutating /api/services/{name}/<sub>
+// request to the peer identified by host, translating (parts, method) onto
+// its /peer/services/{name}/<sub> counterpart — the write-mesh sibling of
+// forwardImageMutation above, established as the pattern later write-mesh
+// phases (3-5) should follow for their own subpaths. Scoped to exactly the
+// five endpoints below — replace/stage/promote/discard/autoupdate/check/
+// offboard/delete are out of scope for this phase and fall through to the
+// default 404.
+func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host string, registry *PeerRegistry, name string, parts []string, actor string) {
+	var method, peerPath string
+	switch {
+	case len(parts) == 2 && parts[1] == "scale" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/scale"
+	case len(parts) == 2 && parts[1] == "stop" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/stop"
+	case len(parts) == 2 && parts[1] == "start" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/start"
+	case len(parts) == 2 && strings.HasPrefix(parts[1], "replicas/") && req.Method == http.MethodPost:
+		sub := strings.TrimPrefix(parts[1], "replicas/")
+		memberParts := strings.SplitN(sub, "/", 2)
+		if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start") {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		method = http.MethodPost
+		peerPath = "/peer/services/" + url.PathEscape(name) + "/replicas/" + url.PathEscape(memberParts[0]) + "/" + memberParts[1]
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 		return

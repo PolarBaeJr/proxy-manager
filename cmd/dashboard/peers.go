@@ -484,6 +484,134 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 	})
 }
 
+// peerServicesMutateHandler returns the HTTP handler for POST
+// /peer/services/{name}/{scale,stop,start,replicas/{member}/{stop,start}}
+// on the dedicated peer-handshake port — the write-side counterpart of
+// peerServicesHandler. This establishes the copyable pattern later
+// write-mesh phases (3-5) should reuse: gate on secret+writesEnabled,
+// constant-time bearer compare, parse the subpath, self-guard, then dispatch
+// against THIS host's own live Docker state (never the requester's claims),
+// auditing every branch as peer-mesh.
+func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, routesConfigPath, proxyURL string, writesEnabled bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" || !writesEnabled {
+			http.NotFound(w, r)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		sub := strings.TrimPrefix(r.URL.Path, "/peer/services/")
+		parts := strings.SplitN(sub, "/", 2)
+		name := parts[0]
+		if name == "" {
+			http.NotFound(w, r)
+			return
+		}
+		// Fails OPEN on a Docker error (err == nil && self): every branch
+		// below still requires a subsequent successful live-state read
+		// (findService / MemberSummaries lookup) before it can act, so an
+		// error here can't be exploited into a blind mutation. A FUTURE
+		// phase (3-5) adding a peer-write branch that can mutate WITHOUT
+		// first re-reading live state must fail CLOSED instead of copying
+		// this assumption blindly.
+		if self, err := dc.serviceContainsSelfByName(r.Context(), name); err == nil && self {
+			http.Error(w, "refusing to manage the dashboard's own service from within itself — use docker compose on the host", http.StatusForbidden)
+			return
+		}
+		if len(parts) == 2 && parts[1] == "scale" && r.Method == http.MethodPost {
+			var body struct{ Replicas int }
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if err := runServiceScale(r.Context(), dc, onb, routesConfigPath, proxyURL, name, body.Replicas); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			audit(r, "peer-mesh", "service.scale", name)
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "scaled", "replicas": body.Replicas})
+			return
+		}
+		if len(parts) == 2 && (parts[1] == "stop" || parts[1] == "start") && r.Method == http.MethodPost {
+			svc, ok, err := findService(r.Context(), dc, name)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if !ok {
+				http.Error(w, "service not found", http.StatusNotFound)
+				return
+			}
+			act := parts[1]
+			acted, err := runServiceLifecycle(r.Context(), dc, proxyURL, svc, act)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			audit(r, "peer-mesh", "service."+act, name)
+			msg := act + "ped"
+			if acted == 0 {
+				msg = "already-" + act + "ped"
+			}
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": msg, "members_acted": acted})
+			return
+		}
+		if len(parts) == 2 && strings.HasPrefix(parts[1], "replicas/") && r.Method == http.MethodPost {
+			sub := strings.TrimPrefix(parts[1], "replicas/")
+			memberParts := strings.SplitN(sub, "/", 2)
+			if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start") {
+				http.NotFound(w, r)
+				return
+			}
+			member, act := memberParts[0], memberParts[1]
+			svc, ok, err := findService(r.Context(), dc, name)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if !ok {
+				http.Error(w, "service not found", http.StatusNotFound)
+				return
+			}
+			var targetID string
+			var targetIsCanary bool
+			for _, m := range svc.MemberSummaries {
+				if m.Name == member {
+					targetID = m.ID
+					targetIsCanary = m.IsCanary
+					break
+				}
+			}
+			if targetID == "" {
+				http.Error(w, "replica not found", http.StatusNotFound)
+				return
+			}
+			if targetIsCanary {
+				http.Error(w, "canary replicas can't be stopped here — use Discard or Promote", http.StatusConflict)
+				return
+			}
+			if act == "stop" {
+				err = dc.stopContainer(r.Context(), targetID)
+			} else {
+				err = dc.startContainer(r.Context(), targetID)
+			}
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			proxyRefresh(proxyURL)
+			audit(r, "peer-mesh", "service.replica_"+act, name+"/"+member)
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": act + "ped", "member": member})
+			return
+		}
+		http.NotFound(w, r)
+	})
+}
+
 // peerImagesResp is the wire shape for GET /peer/images — this peer's own
 // local per-service image inventory (buildImagesInfo) plus its identity.
 // Machine is left unset on Images — the peer never tags its own local data
