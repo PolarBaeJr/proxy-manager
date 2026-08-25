@@ -579,7 +579,7 @@ func newUserInternal(username, password string) (User, string, string, error) {
 		TOTPSecret:   secret,
 		CreatedAt:    time.Now().Unix(),
 	}
-	return u, secret, totpURI("Pi Dashboard", username, secret), nil
+	return u, secret, totpURI("Dashboard", username, secret), nil
 }
 
 func validUsername(s string) bool {

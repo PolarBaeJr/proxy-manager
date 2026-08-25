@@ -81,7 +81,7 @@ func newPasskeyManager(rpID, rpOrigins string) (*passkeyManager, error) {
 	}
 	w, err := webauthn.New(&webauthn.Config{
 		RPID:          rpID,
-		RPDisplayName: "Pi Dashboard",
+		RPDisplayName: "Dashboard",
 		RPOrigins:     origins,
 	})
 	if err != nil {
