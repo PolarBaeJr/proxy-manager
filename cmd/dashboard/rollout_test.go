@@ -7,7 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -245,7 +247,7 @@ func TestStartRolloutComputesSplit(t *testing.T) {
 		f := newRolloutFakeDocker()
 		seedLiveReplicas(f, "app", c.orig)
 		dc := newRolloutDockerStub(t, f)
-		rm := newRolloutManager(dc)
+		rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 		st, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, c.steps)
 		if err != nil {
@@ -269,7 +271,7 @@ func TestStartRolloutRejectsExistingCanary(t *testing.T) {
 		Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80", labelCanary: "true"},
 	})
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil); err == nil {
 		t.Fatal("startRollout should reject a service that already has a plain canary")
@@ -282,7 +284,7 @@ func TestStartRolloutRejectsExistingRollout(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 4)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil); err != nil {
 		t.Fatalf("first startRollout: %v", err)
@@ -298,7 +300,7 @@ func TestStartRolloutRejectsMalformedSteps(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 4)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, []int{50, 25, 100}); err == nil {
 		t.Fatal("startRollout should reject non-ascending steps")
@@ -309,7 +311,7 @@ func TestStartRolloutDefaultsSteps(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 4)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	st, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil)
 	if err != nil {
@@ -328,7 +330,7 @@ func TestSingleStepRolloutToCompletion(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicasRealistic(f, "app", 4)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	st, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, []int{100})
 	if err != nil {
@@ -359,7 +361,7 @@ func TestAdvanceRolloutToCompletion(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 4)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	st, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, []int{25, 50, 100})
 	if err != nil {
@@ -421,7 +423,7 @@ func TestAdvanceRolloutToCompletionRealisticNaming(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicasRealistic(f, "app", 4)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, []int{25, 50, 100}); err != nil {
 		t.Fatalf("startRollout: %v", err)
@@ -472,7 +474,7 @@ func TestAdvanceRolloutAutoRollbackOnUnhealthy(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 2)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, []int{50, 100}); err != nil {
 		t.Fatalf("startRollout: %v", err)
@@ -510,7 +512,7 @@ func TestAbortRollout(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 4)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, []int{25, 50, 100}); err != nil {
 		t.Fatalf("startRollout: %v", err)
@@ -533,7 +535,7 @@ func TestAbortRolloutIgnoresHealth(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 2)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, []int{50, 100}); err != nil {
 		t.Fatalf("startRollout: %v", err)
@@ -552,7 +554,7 @@ func TestAdvanceRolloutNoActiveRollout(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 2)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.advanceRollout(context.Background(), "app"); err == nil {
 		t.Fatal("advanceRollout should error when no rollout is active")
@@ -569,7 +571,7 @@ func TestCheckOneAutoRollback(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 2)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
+	rm := newRolloutManager(dc, newTestOnboardedStore(t), "", "")
 
 	if _, err := rm.startRollout(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, []int{50, 100}); err != nil {
 		t.Fatalf("startRollout: %v", err)
@@ -749,12 +751,16 @@ func TestPromoteCanarySucceedsWhenHealthy(t *testing.T) {
 
 // ---- HTTP endpoint tests ----
 
-func newRolloutTestMux(t *testing.T, dc *dockerClient, rm *rolloutManager) http.Handler {
+// newRolloutTestMux wires a local dashboard mux against the SAME
+// *OnboardedStore and routesPath as the caller's rm — the mux's own
+// dispatch (self-guard, stage/promote/etc.) and rm's dispatch must agree
+// about whether a service is onboarded, or the two would race against
+// independent stores.
+func newRolloutTestMux(t *testing.T, dc *dockerClient, rm *rolloutManager, onb *OnboardedStore, routesPath string) http.Handler {
 	t.Helper()
-	onb := newTestOnboardedStore(t)
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
-	return newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), "", nil, onb, nil, nil, nil, nil, nil, nil, rm)
+	return newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), routesPath, nil, onb, nil, nil, nil, nil, nil, nil, rm)
 }
 
 func doJSONReq(mux http.Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -769,8 +775,9 @@ func TestRolloutEndpointsHappyPath(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 4)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
-	mux := newRolloutTestMux(t, dc, rm)
+	onb := newTestOnboardedStore(t)
+	rm := newRolloutManager(dc, onb, "", "")
+	mux := newRolloutTestMux(t, dc, rm, onb, "")
 
 	rec := doJSONReq(mux, http.MethodGet, "/api/services/app/rollout", "")
 	if rec.Code != http.StatusNotFound {
@@ -813,8 +820,9 @@ func TestRolloutEndpointsAdvanceAbortNoActiveRollout(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 2)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
-	mux := newRolloutTestMux(t, dc, rm)
+	onb := newTestOnboardedStore(t)
+	rm := newRolloutManager(dc, onb, "", "")
+	mux := newRolloutTestMux(t, dc, rm, onb, "")
 
 	rec := doJSONReq(mux, http.MethodPost, "/api/services/app/rollout/advance", "")
 	if rec.Code != http.StatusBadRequest {
@@ -830,8 +838,9 @@ func TestRolloutEndpointsRequireAuth(t *testing.T) {
 	f := newRolloutFakeDocker()
 	seedLiveReplicas(f, "app", 2)
 	dc := newRolloutDockerStub(t, f)
-	rm := newRolloutManager(dc)
-	mux := newRolloutTestMux(t, dc, rm)
+	onb := newTestOnboardedStore(t)
+	rm := newRolloutManager(dc, onb, "", "")
+	mux := newRolloutTestMux(t, dc, rm, onb, "")
 
 	paths := []struct {
 		method, path string
@@ -860,11 +869,341 @@ func TestRolloutStartSelfGuardRejects(t *testing.T) {
 	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"Id":"abc123def456","Names":["/dashboard"],"State":"running","Labels":{"proxy.service":"dashboard","proxy.host":"dashboard.example","proxy.port":"8093"}}]`))
 	}))
-	rm := newRolloutManager(dc)
-	mux := newRolloutTestMux(t, dc, rm)
+	onb := newTestOnboardedStore(t)
+	rm := newRolloutManager(dc, onb, "", "")
+	mux := newRolloutTestMux(t, dc, rm, onb, "")
 
 	rec := doJSONReq(mux, http.MethodPost, "/api/services/dashboard/rollout", `{"image":"ghcr.io/org/dashboard:v2"}`)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ---- onboarded-substrate rollout tests ----
+
+// newOnboardedRolloutDockerStub is newRolloutDockerStub's onboarded-rollout
+// counterpart: every newly created container's edge-network address is a
+// fixed real address (an httptest server's host) instead of a synthetic
+// "10.10.0.N", so checkOnboardedCanaryHealth's bare TCP dial actually
+// succeeds.
+func newOnboardedRolloutDockerStub(t *testing.T, f *rolloutFakeDocker, ip string) *dockerClient {
+	t.Helper()
+	return dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode(f.list())
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/containers/create"):
+			var body createBody
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			name := r.URL.Query().Get("name")
+			f.mu.Lock()
+			f.seq++
+			id := fmt.Sprintf("gen-%d", f.seq)
+			nc := dockerContainer{ID: id, Names: []string{"/" + name}, Image: body.Image, State: "running", Labels: body.Labels}
+			nc.NetworkSettings.Networks = map[string]struct {
+				IPAddress string `json:"IPAddress"`
+			}{managedNetwork: {IPAddress: ip}}
+			f.items[id] = nc
+			f.mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{"Id": id})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/stop"):
+			id := idFromContainersPath(r.URL.Path)
+			f.mu.Lock()
+			if c, ok := f.items[id]; ok {
+				c.State = "exited"
+				f.items[id] = c
+			}
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/containers/"):
+			id := idFromContainersPath(r.URL.Path)
+			f.mu.Lock()
+			delete(f.items, id)
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			id := idFromContainersPath(r.URL.Path)
+			f.mu.Lock()
+			restarts := f.restarts[id]
+			f.mu.Unlock()
+			fmt.Fprintf(w, `{"Image":"sha256:abc","Config":{"Env":[]},"HostConfig":{"Mounts":[]},"NetworkSettings":{"Networks":{"edge":{}}},"RestartCount":%d}`, restarts)
+		case strings.Contains(r.URL.Path, "/images/create"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+}
+
+// seedOnboardedLiveReplicas Puts an OnboardedStore entry for a routed
+// onboarded service with n live replicas (the original + n-1
+// goproxy-onb-<name>-<i> clones) and seeds matching fake docker containers
+// for the clones — the onboarded-substrate counterpart of
+// seedLiveReplicasRealistic.
+func seedOnboardedLiveReplicas(t *testing.T, f *rolloutFakeDocker, onb *OnboardedStore, name string, n, port int) {
+	t.Helper()
+	if err := onb.Put(OnboardedService{
+		Name: name, Host: name + ".example", Port: port, Image: "ghcr.io/org/" + name + ":v1",
+		Replicas: n, OriginalRouted: true, CreatedAt: time.Now().Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 2; i <= n; i++ {
+		id := fmt.Sprintf("onb-live-%s-%d", name, i)
+		c := dockerContainer{
+			ID: id, Names: []string{fmt.Sprintf("/goproxy-onb-%s-%d", name, i)}, Image: "ghcr.io/org/" + name + ":v1", State: "running",
+		}
+		c.NetworkSettings.Networks = map[string]struct {
+			IPAddress string `json:"IPAddress"`
+		}{managedNetwork: {IPAddress: fmt.Sprintf("10.20.0.%d", i)}}
+		f.seed(c)
+	}
+}
+
+// countOnboardedCanary counts an onboarded service's current canary
+// (goproxy-onb-<name>-c*) containers by name prefix — onboarded containers
+// carry no proxy.* labels, unlike countByRole's label-managed fixtures.
+func countOnboardedCanary(f *rolloutFakeDocker, name string) int {
+	prefix := fmt.Sprintf("goproxy-onb-%s-c", name)
+	n := 0
+	for _, c := range f.list() {
+		if strings.HasPrefix(c.name(), prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// newOnboardedRolloutFixture wires an onboarded service with n live
+// replicas behind a real TCP listener (so checkOnboardedCanaryHealth's bare
+// dial succeeds) and a rolloutManager pointed at a temp routes.json + a
+// no-op proxy stub — the shared setup for every onboarded rollout test
+// below.
+func newOnboardedRolloutFixture(t *testing.T, f *rolloutFakeDocker, onb *OnboardedStore, name string, n int) *rolloutManager {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(srv.Close)
+	host, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("Atoi: %v", err)
+	}
+	seedOnboardedLiveReplicas(t, f, onb, name, n, port)
+
+	dc := newOnboardedRolloutDockerStub(t, f, host)
+	routesPath := filepath.Join(t.TempDir(), "routes.json")
+	proxy := noopProxyStub(t)
+	return newRolloutManager(dc, onb, routesPath, proxy)
+}
+
+// TestOnboardedRolloutToCompletion is the onboarded-substrate counterpart of
+// TestAdvanceRolloutToCompletionRealisticNaming: a full 3-step ramp to
+// completion, verifying the promoted image, cleared canary fields, restored
+// Replicas count, and rebuilt route.
+func TestOnboardedRolloutToCompletion(t *testing.T) {
+	f := newRolloutFakeDocker()
+	onb := newTestOnboardedStore(t)
+	rm := newOnboardedRolloutFixture(t, f, onb, "onbapp", 4)
+
+	st, err := rm.startRollout(context.Background(), "onbapp", ReplaceServiceRequest{Image: "ghcr.io/org/onbapp:v2"}, []int{25, 50, 100})
+	if err != nil {
+		t.Fatalf("startRollout: %v", err)
+	}
+	if st.OrigLiveReplicas != 4 {
+		t.Fatalf("OrigLiveReplicas = %d, want 4", st.OrigLiveReplicas)
+	}
+	svc, _ := onb.Get("onbapp")
+	if svc.Replicas != 3 || svc.CanaryReplicas != 1 || svc.CanaryImage != "ghcr.io/org/onbapp:v2" {
+		t.Fatalf("after start: svc = %+v, want Replicas=3 CanaryReplicas=1 CanaryImage=v2", svc)
+	}
+	if got := countOnboardedCanary(f, "onbapp"); got != 1 {
+		t.Fatalf("canary containers = %d, want 1", got)
+	}
+
+	for i := 0; i < 10; i++ { // generous bound; the cut-to-promote branch may finish early
+		st, err = rm.advanceRollout(context.Background(), "onbapp")
+		if err != nil {
+			t.Fatalf("advance %d: %v", i, err)
+		}
+		if st.Status == rolloutStatusCompleted {
+			break
+		}
+		if st.Status == rolloutStatusFailed {
+			t.Fatalf("advance %d: unexpected failure: %s", i, st.LastError)
+		}
+	}
+	if st.Status != rolloutStatusCompleted {
+		t.Fatalf("rollout never completed: last state %+v", st)
+	}
+
+	svc, ok := onb.Get("onbapp")
+	if !ok {
+		t.Fatal("onbapp missing from store after promote")
+	}
+	if svc.Image != "ghcr.io/org/onbapp:v2" {
+		t.Fatalf("Image = %q, want v2", svc.Image)
+	}
+	if svc.CanaryImage != "" || svc.CanaryReplicas != 0 {
+		t.Fatalf("canary fields not cleared: %+v", svc)
+	}
+	if svc.Replicas != 4 {
+		t.Fatalf("Replicas = %d, want 4 (promote's finalCanaryCount)", svc.Replicas)
+	}
+}
+
+// TestOnboardedRolloutAutoRollbackOnRestartCount is the onboarded-substrate
+// counterpart of TestAdvanceRolloutAutoRollbackOnUnhealthy: a crash-looping
+// canary (restarts over threshold) triggers auto-rollback via
+// discardOnboarded + scaleOnboarded restore.
+func TestOnboardedRolloutAutoRollbackOnRestartCount(t *testing.T) {
+	f := newRolloutFakeDocker()
+	onb := newTestOnboardedStore(t)
+	rm := newOnboardedRolloutFixture(t, f, onb, "onbapp", 2)
+
+	if _, err := rm.startRollout(context.Background(), "onbapp", ReplaceServiceRequest{Image: "ghcr.io/org/onbapp:v2"}, []int{50, 100}); err != nil {
+		t.Fatalf("startRollout: %v", err)
+	}
+
+	var canaryID string
+	for _, c := range f.list() {
+		if strings.HasPrefix(c.name(), "goproxy-onb-onbapp-c") {
+			canaryID = c.ID
+		}
+	}
+	if canaryID == "" {
+		t.Fatal("no canary container found after startRollout")
+	}
+	f.setRestarts(canaryID, canaryMaxRestarts+1)
+
+	st, err := rm.advanceRollout(context.Background(), "onbapp")
+	if err != nil {
+		t.Fatalf("advanceRollout: %v", err)
+	}
+	if st.Status != rolloutStatusFailed {
+		t.Fatalf("status = %q, want %q", st.Status, rolloutStatusFailed)
+	}
+	if !strings.Contains(st.LastError, "restarted") {
+		t.Fatalf("LastError = %q, want mention of restarts", st.LastError)
+	}
+	svc, ok := onb.Get("onbapp")
+	if !ok {
+		t.Fatal("onbapp missing from store after rollback")
+	}
+	if svc.CanaryImage != "" || svc.CanaryReplicas != 0 {
+		t.Fatalf("canary fields not cleared after rollback: %+v", svc)
+	}
+	if svc.Replicas != 2 {
+		t.Fatalf("Replicas = %d, want 2 (restored to OrigLiveReplicas)", svc.Replicas)
+	}
+	if got := countOnboardedCanary(f, "onbapp"); got != 0 {
+		t.Fatalf("canary containers after rollback = %d, want 0", got)
+	}
+}
+
+// TestOnboardedRolloutManualAbort is the onboarded-substrate counterpart of
+// TestAbortRollout: an abort mid-ramp discards the canary and restores live.
+func TestOnboardedRolloutManualAbort(t *testing.T) {
+	f := newRolloutFakeDocker()
+	onb := newTestOnboardedStore(t)
+	rm := newOnboardedRolloutFixture(t, f, onb, "onbapp", 4)
+
+	if _, err := rm.startRollout(context.Background(), "onbapp", ReplaceServiceRequest{Image: "ghcr.io/org/onbapp:v2"}, []int{25, 50, 100}); err != nil {
+		t.Fatalf("startRollout: %v", err)
+	}
+	if _, err := rm.advanceRollout(context.Background(), "onbapp"); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+
+	st, err := rm.abortRollout(context.Background(), "onbapp")
+	if err != nil {
+		t.Fatalf("abortRollout: %v", err)
+	}
+	if st.Status != rolloutStatusRolledBack {
+		t.Fatalf("status = %q, want %q", st.Status, rolloutStatusRolledBack)
+	}
+	svc, ok := onb.Get("onbapp")
+	if !ok {
+		t.Fatal("onbapp missing from store after abort")
+	}
+	if svc.CanaryImage != "" || svc.CanaryReplicas != 0 {
+		t.Fatalf("canary fields not cleared after abort: %+v", svc)
+	}
+	if svc.Replicas != 4 {
+		t.Fatalf("Replicas = %d, want 4 (restored to OrigLiveReplicas)", svc.Replicas)
+	}
+	if got := countOnboardedCanary(f, "onbapp"); got != 0 {
+		t.Fatalf("canary containers after abort = %d, want 0", got)
+	}
+}
+
+// TestOnboardedRolloutSmallOrigCutToPromote covers orig=1: ceilPct's
+// floor-of-1 already reaches full live capacity at step 0, so the very
+// first advance must complete via doAdvance's cut-to-promote branch rather
+// than erroring (scaleOnboarded refuses to scale live to 0).
+func TestOnboardedRolloutSmallOrigCutToPromote(t *testing.T) {
+	f := newRolloutFakeDocker()
+	onb := newTestOnboardedStore(t)
+	rm := newOnboardedRolloutFixture(t, f, onb, "onbapp", 1)
+
+	st, err := rm.startRollout(context.Background(), "onbapp", ReplaceServiceRequest{Image: "ghcr.io/org/onbapp:v2"}, []int{25, 50, 100})
+	if err != nil {
+		t.Fatalf("startRollout: %v", err)
+	}
+	if st.OrigLiveReplicas != 1 {
+		t.Fatalf("OrigLiveReplicas = %d, want 1", st.OrigLiveReplicas)
+	}
+	svc, _ := onb.Get("onbapp")
+	if svc.Replicas != 1 || svc.CanaryReplicas != 1 {
+		t.Fatalf("after start: svc = %+v, want Replicas=1 CanaryReplicas=1", svc)
+	}
+
+	st, err = rm.advanceRollout(context.Background(), "onbapp")
+	if err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	if st.Status != rolloutStatusCompleted {
+		t.Fatalf("status = %q, want %q (must complete via cut-to-promote at the first advance)", st.Status, rolloutStatusCompleted)
+	}
+	svc, ok := onb.Get("onbapp")
+	if !ok {
+		t.Fatal("onbapp missing after promote")
+	}
+	if svc.Image != "ghcr.io/org/onbapp:v2" || svc.CanaryImage != "" || svc.Replicas != 1 {
+		t.Fatalf("after promote: svc = %+v", svc)
+	}
+}
+
+// TestRolloutActiveGuardRejectsOtherMutations proves api.go's new
+// concurrency guard: a service with an active rollout must reject any other
+// mutating subpath with 409, while the rollout endpoints themselves keep
+// working.
+func TestRolloutActiveGuardRejectsOtherMutations(t *testing.T) {
+	f := newRolloutFakeDocker()
+	onb := newTestOnboardedStore(t)
+	rm := newOnboardedRolloutFixture(t, f, onb, "onbapp", 2)
+	mux := newRolloutTestMux(t, rm.dc, rm, onb, rm.routesPath)
+
+	rec := doJSONReq(mux, http.MethodPost, "/api/services/onbapp/rollout", `{"image":"ghcr.io/org/onbapp:v2","steps":[50,100]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("start rollout: status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	rec = doJSONReq(mux, http.MethodPost, "/api/services/onbapp/stage", `{"image":"ghcr.io/org/onbapp:v3"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("stage during active rollout: status = %d, want 409; body %s", rec.Code, rec.Body.String())
+	}
+
+	rec = doJSONReq(mux, http.MethodGet, "/api/services/onbapp/rollout", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET rollout during active rollout: status = %d, want 200 (rollout endpoints must still work)", rec.Code)
+	}
+	rec = doJSONReq(mux, http.MethodPost, "/api/services/onbapp/rollout/advance", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("advance during active rollout: status = %d, want 200 (rollout endpoints must still work); body %s", rec.Code, rec.Body.String())
 	}
 }
