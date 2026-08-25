@@ -83,11 +83,8 @@ h1{
 
 /* sysstats */
 #sys-stats{display:flex;gap:16px;margin:22px 0 0;flex-wrap:wrap}
-.stats-group{flex:1;min-width:320px}
-.stats-group-label{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600;margin:0 0 6px 2px}
-.stats-group-tiles{display:flex;gap:8px}
 .sysstat{
-  flex:1;min-width:190px;display:flex;align-items:center;gap:13px;
+  flex:1;min-width:220px;display:flex;align-items:center;gap:13px;
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);
   padding:13px 15px;position:relative;overflow:hidden;transition:border-color var(--transition-fast);
 }
@@ -97,20 +94,20 @@ h1{
 .sysstat .ico svg{width:18px;height:18px}
 .sysstat .body{flex:1;min-width:0}
 .sysstat .label{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.sysstat .stat-row{margin-top:7px}
+.sysstat .stat-row:first-of-type{margin-top:1px}
+.sysstat .stat-row-head{display:flex;align-items:baseline;gap:6px}
+.sysstat .stat-row-name{font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;flex:none;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sysstat .val{font-size:19px;font-weight:700;letter-spacing:-.01em;font-variant-numeric:tabular-nums;margin:1px 0 7px;display:flex;align-items:baseline;gap:5px}
+.sysstat .stat-row .val{font-size:14px;margin:0 0 4px}
 .sysstat .val small{font-size:11.5px;font-weight:500;color:var(--muted)}
+.sysstat .stat-row .val small{font-size:9.5px}
 .sysstat .bar{height:6px;border-radius:var(--radius-pill);background:var(--surface-3);overflow:hidden}
+.sysstat .stat-row .bar{height:4px}
 .sysstat .bar>span{display:block;height:100%;border-radius:inherit;
   background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width var(--transition-slow)}
-.sysstat.warn .ico{color:var(--yellow)} .sysstat.warn .bar>span{background:linear-gradient(90deg,var(--yellow),#e08c12)}
-.sysstat.bad .ico{color:var(--red)} .sysstat.bad .bar>span{background:linear-gradient(90deg,var(--red),#c0282b)}
-.sysstat.compact{min-width:0;gap:8px;padding:9px 10px}
-.sysstat.compact .ico{width:26px;height:26px;border-radius:7px}
-.sysstat.compact .ico svg{width:14px;height:14px}
-.sysstat.compact .label{font-size:9px}
-.sysstat.compact .val{font-size:14px;margin:1px 0 5px;gap:4px}
-.sysstat.compact .val small{font-size:9.5px}
-.sysstat.compact .bar{height:4px}
+.sysstat .stat-row.warn .bar>span{background:linear-gradient(90deg,var(--yellow),#e08c12)}
+.sysstat .stat-row.bad .bar>span{background:linear-gradient(90deg,var(--red),#c0282b)}
 #status{font-size:12px;color:var(--muted);margin:14px 0 0;display:flex;align-items:center;gap:7px}
 #status .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
 #status.err .dot{background:var(--red);box-shadow:0 0 8px var(--red)}
@@ -3871,41 +3868,40 @@ function refreshDNSFormShape() {
   slot.innerHTML = html;
 }
 
-/* ---------- sys-stats (CPU / Mem / Disk) ---------- */
+/* ---------- sys-stats (CPU / Mem / Disk, one tile per metric, one row per host) ---------- */
 function statClass(pct) { return pct >= 90 ? ' bad' : pct >= 75 ? ' warn' : ''; }
-function tileMarkup(icon, label, valHtml, p, compact) {
-  const cls = statClass(p);
-  const w = Math.min(100, p).toFixed(1);
-  return '<div class="sysstat' + cls + (compact ? ' compact' : '') + '" title="' + esc(label + ': ' + (p.toFixed ? p.toFixed(1) : p) + '%') + '">'
-       + '<div class="ico">' + icon + '</div>'
-       + '<div class="body"><div class="label">' + label + '</div>'
-       + '<div class="val">' + valHtml + '</div>'
-       + '<div class="bar"><span style="width:' + w + '%"></span></div></div></div>';
+function statRow(hostLabel, entry) {
+  if (!entry) {
+    return '<div class="stat-row"><div class="stat-row-head"><span class="stat-row-name">' + hostLabel + '</span>'
+         + '<span class="val"><small>unreachable</small></span></div></div>';
+  }
+  const cls = statClass(entry.pct);
+  const w = Math.min(100, entry.pct).toFixed(1);
+  return '<div class="stat-row' + cls + '" title="' + esc(hostLabel + ': ' + entry.pct.toFixed(1) + '%') + '">'
+       + '<div class="stat-row-head"><span class="stat-row-name">' + hostLabel + '</span>'
+       + '<span class="val">' + entry.html + '</span></div>'
+       + '<div class="bar"><span style="width:' + w + '%"></span></div></div>';
 }
-function statsGroupMarkup(label, tilesHtml) {
-  return '<div class="stats-group"><div class="stats-group-label">' + label + '</div>'
-       + '<div class="stats-group-tiles">' + tilesHtml + '</div></div>';
+function tileMarkup(icon, label, rowsHtml) {
+  return '<div class="sysstat"><div class="ico">' + icon + '</div>'
+       + '<div class="body"><div class="label">' + label + '</div>' + rowsHtml + '</div></div>';
 }
-async function statsGroupFor(identity, label) {
+async function hostStatsFor(identity) {
   try {
     const r = await fetch('/api/stats' + (identity ? '?host=' + encodeURIComponent(identity) : ''));
-    if (!r.ok) {
-      return statsGroupMarkup(label, tileMarkup(I.cpu, 'Stats', '<small>unreachable</small>', 0, true));
-    }
+    if (!r.ok) return null;
     const s = await r.json();
     const cpuPct  = Math.max(0, Math.min(100, s.cpu_pct || 0));
     const memPct  = s.mem_total  ? 100 * s.mem_used  / s.mem_total  : 0;
     const diskPct = s.disk_total ? 100 * s.disk_used / s.disk_total : 0;
     const memGB   = (s.mem_used  / 1073741824).toFixed(1);
     const memTotG = (s.mem_total / 1073741824).toFixed(1);
-    const tiles =
-        tileMarkup(I.cpu,  'CPU',    '<span class="num">' + cpuPct.toFixed(0) + '</span><small>% load</small>', cpuPct, true)
-      + tileMarkup(I.mem,  'Memory', '<span class="num">' + memGB + '</span><small>/ ' + memTotG + ' GB used · ' + fmtBytes(s.mem_free) + ' free</small>', memPct, true)
-      + tileMarkup(I.disk, 'Disk',   '<span class="num">' + fmtBytes(s.disk_used) + '</span><small>/ ' + fmtBytes(s.disk_total) + ' used · ' + fmtBytes(s.disk_free) + ' free</small>', diskPct, true);
-    return statsGroupMarkup(label, tiles);
-  } catch (e) {
-    return statsGroupMarkup(label, tileMarkup(I.cpu, 'Stats', '<small>unreachable</small>', 0, true));
-  }
+    return {
+      cpu:  { pct: cpuPct,  html: '<span class="num">' + cpuPct.toFixed(0) + '</span><small>% load</small>' },
+      mem:  { pct: memPct,  html: '<span class="num">' + memGB + '</span><small>/ ' + memTotG + ' GB used · ' + fmtBytes(s.mem_free) + ' free</small>' },
+      disk: { pct: diskPct, html: '<span class="num">' + fmtBytes(s.disk_used) + '</span><small>/ ' + fmtBytes(s.disk_total) + ' used · ' + fmtBytes(s.disk_free) + ' free</small>' },
+    };
+  } catch (e) { return null; }
 }
 async function refreshStats() {
   if (!authState.authenticated) { $('#sys-stats').textContent = ''; return; }
@@ -3915,10 +3911,16 @@ async function refreshStats() {
     const d = await (await fetch('/api/peers')).json();
     peers = (d.peers || []).filter(p => p.identity);
   } catch (e) { /* no peers, still show self */ }
-  const hosts = [{ identity: '', label: 'This host' + (_selfIdentity ? ' (' + esc(machineLabel(_selfIdentity)) + ')' : '') }]
+  const hosts = [{ identity: '', label: esc(_selfIdentity ? machineLabel(_selfIdentity) : 'this host') }]
     .concat(peers.map(p => ({ identity: p.identity, label: esc(machineLabel(p.identity)) })));
-  const groups = await Promise.all(hosts.map(h => statsGroupFor(h.identity, h.label)));
-  $('#sys-stats').innerHTML = groups.join('');
+  const results = await Promise.all(hosts.map(h => hostStatsFor(h.identity)));
+  const cpuRows  = hosts.map((h, i) => statRow(h.label, results[i] && results[i].cpu)).join('');
+  const memRows  = hosts.map((h, i) => statRow(h.label, results[i] && results[i].mem)).join('');
+  const diskRows = hosts.map((h, i) => statRow(h.label, results[i] && results[i].disk)).join('');
+  $('#sys-stats').innerHTML =
+      tileMarkup(I.cpu,  'CPU',    cpuRows)
+    + tileMarkup(I.mem,  'Memory', memRows)
+    + tileMarkup(I.disk, 'Disk',   diskRows);
 }
 
 async function refreshPeers() {
