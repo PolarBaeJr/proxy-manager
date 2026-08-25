@@ -1200,6 +1200,55 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	// POST   /api/images/prune   → body {"service","keep_n"} — keep stable+running+last N,
 	//                              delete the rest (empty service = all)
 	mux.HandleFunc("/api/images", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		host := strings.TrimSpace(req.URL.Query().Get("host"))
+		if host != "" && (registry == nil || host != registry.Identity()) {
+			if registry == nil {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			peerURL, ok := registry.URLForIdentity(host)
+			if !ok {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+			if peerSecret == "" {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			client := &http.Client{Timeout: 2 * time.Second}
+			var resp peerImagesResp
+			if err := peerGET(req.Context(), client, peerURL, peerSecret, "/peer/images", &resp); err != nil {
+				httpx.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			if resp.Images == nil {
+				httpx.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": "peer returned no data"})
+				return
+			}
+			machine := resp.Identity
+			if machine == "" {
+				machine = host
+			}
+			resp.Images.Machine = machine
+			// SECURITY: never let a mutating token minted on another host's disk
+			// cross back over as something this UI could hand to the LOCAL
+			// mutating endpoints. DeleteToken is the only field that round-trips
+			// as an actionable value — zero it on every entry so a peer's image
+			// ref/ID can never reach /api/images/delete, even if a future
+			// frontend change accidentally emits a delete button for a peer row.
+			// This Go-side stripping is the actual security boundary; the
+			// frontend gating below is defense-in-depth on top of it, not the
+			// primary control. Do not remove this as "dead code" — a future
+			// frontend bug depends on it staying here.
+			for i := range resp.Images.Services {
+				for j := range resp.Images.Services[i].Entries {
+					resp.Images.Services[i].Entries[j].DeleteToken = ""
+				}
+			}
+			httpx.WriteJSON(w, http.StatusOK, resp.Images)
+			return
+		}
 		svcs, err := dc.listServices(req.Context())
 		if err != nil {
 			httpx.WriteErr(w, err)
@@ -1210,9 +1259,16 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteErr(w, err)
 			return
 		}
+		if registry != nil {
+			info.Machine = registry.Identity()
+		}
 		httpx.WriteJSON(w, http.StatusOK, info)
 	}))
 	mux.HandleFunc("/api/images/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Query().Get("host") != "" {
+			http.Error(w, "image mutations are local-only; host parameter not supported", http.StatusBadRequest)
+			return
+		}
 		actor := sessionUser(sessionFromReq(auth, req))
 		sub := strings.TrimPrefix(req.URL.Path, "/api/images/")
 		// Resolve a managed service's image base for mark/unmark (same base

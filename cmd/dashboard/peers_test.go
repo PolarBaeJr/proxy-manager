@@ -425,3 +425,95 @@ func TestRatchetOwnVersionSkipsDevAndNilRedis(t *testing.T) {
 	reg := newPeerRegistry(nil, "", "id", "dev", 0, nil)
 	reg.ratchetOwnVersion(context.Background())
 }
+
+// imagesDockerStub answers /containers/json (listAll and listServices both
+// hit this, with different query strings — the stub ignores the query, same
+// as every other dockerStub in this package) and /images/json (listImages),
+// giving buildImagesInfo enough on-disk data to produce at least one
+// unprotected, tagged entry (a non-empty DeleteToken to assert on).
+func imagesDockerStub(t *testing.T) *dockerClient {
+	t.Helper()
+	return dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/images/json"):
+			json.NewEncoder(w).Encode([]dockerImage{
+				{Id: "sha256:aaa111", RepoTags: []string{"ghcr.io/org/app:v1"}, Size: 100000000, Created: 2000},
+				{Id: "sha256:bbb222", RepoTags: []string{"ghcr.io/org/app:v2"}, Size: 50000000, Created: 1000},
+			})
+		default:
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "c1", Names: []string{"/goproxy-app-1"}, State: "running",
+				Image: "ghcr.io/org/app:v1", ImageID: "sha256:aaa111",
+				Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
+			}})
+		}
+	}))
+}
+
+func TestPeerImagesHandlerValidSecret(t *testing.T) {
+	dc := imagesDockerStub(t)
+	rs, err := loadReleasesStore(filepath.Join(t.TempDir(), "releases.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ih, err := loadImageHistoryStore(filepath.Join(t.TempDir(), "image-history.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	onb, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := peerImagesHandler("s3cret", "dashboard-b", dc, rs, ih, onb)
+	req := httptest.NewRequest(http.MethodGet, "/peer/images", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body peerImagesResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Identity != "dashboard-b" {
+		t.Errorf("Identity = %q, want %q", body.Identity, "dashboard-b")
+	}
+	if body.Images == nil || body.Images.Machine != "" {
+		t.Errorf("Images = %+v, want non-nil with Machine unset (peer never tags its own local data)", body.Images)
+	}
+}
+
+func TestPeerImagesHandlerWrongSecret(t *testing.T) {
+	h := peerImagesHandler("s3cret", "dashboard-b", nil, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/images", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestPeerImagesHandlerEmptySecretDisabled(t *testing.T) {
+	h := peerImagesHandler("", "dashboard-b", nil, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/images", nil)
+	req.Header.Set("Authorization", "Bearer anything")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestPeerImagesHandlerWrongMethod(t *testing.T) {
+	h := peerImagesHandler("s3cret", "dashboard-b", nil, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/peer/images", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}

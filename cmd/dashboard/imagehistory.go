@@ -281,6 +281,7 @@ type imageServiceInfo struct {
 type imagesInfoResp struct {
 	Services              []imageServiceInfo `json:"services"`
 	TotalReclaimableBytes int64              `json:"total_reclaimable_bytes"`
+	Machine               string             `json:"machine,omitempty"`
 }
 
 func shortImageID(id string) string {

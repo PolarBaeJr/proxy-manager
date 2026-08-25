@@ -276,14 +276,15 @@ func main() {
 		"/peer/handshake":      peerHandshakeHandler(peerSecret, identity, buildVersion),
 		"/peer/service-status": peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv()),
 		"/peer/services":       peerServicesHandler(peerSecret, identity, dc, onboarded, ic),
+		"/peer/images":         peerImagesHandler(peerSecret, identity, dc, releases, imageHistory, onboarded),
 	}
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
 		peerServer(*peerAddr, peerHandlers)
-		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, and /peer/services on %s", len(peerList), *peerSyncInterval, *peerAddr)
+		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, and /peer/images on %s", len(peerList), *peerSyncInterval, *peerAddr)
 	case peerSecret != "":
 		peerServer(*peerAddr, peerHandlers)
-		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, and /peer/services enabled on %s (receive-only, no outbound peers configured)", *peerAddr)
+		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, and /peer/images enabled on %s (receive-only, no outbound peers configured)", *peerAddr)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}
