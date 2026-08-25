@@ -1434,6 +1434,12 @@ async function loadSelfIdentity() {
 // dashboard (s.machine set and not this host) — such rows are read-only in
 // this UI; mutating actions stay local-only.
 function foreignSvc(s) { return !!s.machine && s.machine !== _selfIdentity; }
+// peerWritable is inert plumbing for the write-capable peer mesh (Phase 0) —
+// there's no backend signal yet for "this peer has writes enabled and is
+// currently reachable" (e.g. a future field on /api/peers), so this always
+// returns false and nothing calls it yet. A later phase wires it up and
+// starts using it to un-disable foreign-row actions that are safe to forward.
+function peerWritable(s) { return false; }
 // machineLabel trims the shared ".polardev.org" suffix so the badge stays
 // short — same convention as cmd/statusbot/statuspager.go's machineSuffix.
 function machineLabel(m) { return String(m || '').replace(/\.polardev\.org$/, ''); }

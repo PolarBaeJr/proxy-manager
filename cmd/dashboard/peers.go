@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -635,6 +636,107 @@ func peerGETTimeout(ctx context.Context, client *http.Client, peerBaseURL, secre
 		return fmt.Errorf("%s bad response: %w", url, err)
 	}
 	return nil
+}
+
+// peerMutate and mapPeerMutationErr are the write-side siblings of
+// peerGET/peerGETTimeout, for the write-capable peer mesh (Phase 0 plumbing
+// only — no /peer/* route calls these yet). Two things set writes apart from
+// the read-only forwarding above:
+//
+//  1. Mutations are NOT idempotent. Onboarding, replacing an image, pruning —
+//     all have side effects that must not double-fire. peerGET/peerGETTimeout
+//     have no retry logic today either, but a future read-side retry would be
+//     harmless; a future write-side retry is not, so peerMutate is written to
+//     make a single attempt a structural guarantee, not just current behavior.
+//  2. The error mapping is deliberately NOT the same collapse-everything-to-502
+//     pattern peerGET's callers use (see writeCFErr for the read-side/Cloudflare
+//     equivalent). A spurious 502 on a GET costs nothing — the caller just
+//     retries the read. A mutation's caller needs to know the difference
+//     between "the peer definitively rejected this" (400/404/409 — safe to
+//     retry with corrected input) and "outcome unknown" (timeout, network
+//     error, 5xx — the request may have already applied on the peer; blindly
+//     retrying could double-fire it). mapPeerMutationErr preserves that
+//     distinction instead of erasing it.
+
+// peerMutate performs exactly ONE bearer-authenticated write request (method
+// may be POST/DELETE/…) against peerBaseURL+path, bounded by the given
+// timeout, and returns the peer's raw status code and response body bytes —
+// unlike peerGET/peerGETTimeout, it does not collapse a non-2xx into an error
+// the caller can only log; the caller passes statusCode+body straight to
+// mapPeerMutationErr to relay a rejection verbatim. If respOut is non-nil and
+// the peer answered 2xx, the body is also JSON-decoded into respOut.
+//
+// Never retries, not even on a timeout — see the doc comment above. A caller
+// that wants a retry must decide that itself, deliberately, with knowledge of
+// which side of the "definitely rejected" vs "outcome unknown" line the
+// failure fell on.
+func peerMutate(ctx context.Context, client *http.Client, peerBaseURL, secret, method, path string, timeout time.Duration, reqBody io.Reader, respOut any) (statusCode int, respBody []byte, err error) {
+	url := strings.TrimRight(peerBaseURL, "/") + path
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, method, url, reqBody)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+secret)
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("%s unreachable: %w", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("%s bad response: %w", url, err)
+	}
+	if respOut != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := json.Unmarshal(body, respOut); err != nil {
+			return resp.StatusCode, body, fmt.Errorf("%s bad response: %w", url, err)
+		}
+	}
+	return resp.StatusCode, body, nil
+}
+
+// mapPeerMutationErr relays a peer's mutation response onto w. peerBody is
+// only the already-drained response bytes (see peerMutate) — not the
+// original *http.Response — so the peer's own Content-Type header isn't
+// available here; relayed bodies are written as application/json, which
+// matches every JSON-emitting /peer/* handler in this codebase.
+//
+//   - 400, 404, 409: the peer definitively rejected the request. Relay its
+//     status code and body verbatim — the caller sees exactly why and can
+//     safely retry with corrected input. Note: every existing /peer/*
+//     handler also answers 404 when its bearer secret is empty (endpoint
+//     disabled) — a peer with writes not yet enabled will therefore show up
+//     here as "not found" rather than "writes disabled." That ambiguity is
+//     inherent to relaying the peer's status verbatim, not a bug; a future
+//     phase wanting to distinguish the two needs a signal outside this status
+//     code (e.g. the writes-enabled field peerWritable in ui.go is waiting on).
+//   - 401, 403: NOT relayed verbatim. That's the dashboard's own auth
+//     vocabulary for the browser's session (see writeCFErr) — relaying a
+//     peer's auth failure as-is would incorrectly pop a "session expired"
+//     dialog in the requesting user's own browser. Mapped to 502.
+//   - anything else (5xx, or peerStatusCode == 0 meaning a transport-level
+//     error/timeout from peerMutate): 502 with a generic, debuggable message.
+//     This is the "outcome unknown" case — the request may have already
+//     applied on the peer before the error/timeout fired, so the caller must
+//     not treat this the same as a definitive rejection. Convention for the
+//     peerStatusCode == 0 case: callers pass peerMutate's returned error as
+//     peerBody (i.e. []byte(err.Error())) so the message below still carries
+//     the underlying transport error instead of being empty.
+func mapPeerMutationErr(w http.ResponseWriter, peerStatusCode int, peerBody []byte) {
+	switch peerStatusCode {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(peerStatusCode)
+		w.Write(peerBody)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		http.Error(w, "peer rejected mesh credentials", http.StatusBadGateway)
+	default:
+		http.Error(w, fmt.Sprintf("peer mutation outcome unknown (peer status %d): %s", peerStatusCode, string(peerBody)), http.StatusBadGateway)
+	}
 }
 
 // fetchPeerServices polls every configured peer's /peer/services in parallel

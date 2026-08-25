@@ -16,6 +16,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// peerWritesEnabled mirrors the -peer-writes flag for the rest of the
+// package (peerHandlers construction, future write-side gating) — there's no
+// write behavior to gate on it yet in this phase, but future phases need a
+// signal to check.
+var peerWritesEnabled bool
+
 func main() {
 	addr := flag.String("addr", ":8093", "dashboard listen address")
 	metricsAddr := flag.String("metrics-addr", ":8094", "internal metrics endpoint listen address")
@@ -32,7 +38,14 @@ func main() {
 	peers := flag.String("peers", "", "comma-separated peer dashboard peer-handshake base URLs, e.g. http://100.83.62.68:8098 (empty = outbound handshake disabled)")
 	peerSyncInterval := flag.Duration("peer-sync-interval", 5*time.Second, "how often to handshake with peer dashboards")
 	peerAddr := flag.String("peer-addr", ":8098", "internal peer-handshake listen address (only started if DASHBOARD_PEER_SECRET is set)")
+	// Separate opt-in from DASHBOARD_PEER_SECRET on purpose: the write mesh
+	// changes the blast radius of a leaked/misused peer secret from "data
+	// disclosure" (today's read-only mesh) to "arbitrary container mutation
+	// on both hosts" — it must not silently activate for every existing
+	// deployment the moment someone sets a peer secret.
+	peerWrites := flag.Bool("peer-writes", false, "enable write-capable /peer/* handlers on top of the read-only peer mesh (requires DASHBOARD_PEER_SECRET too)")
 	flag.Parse()
+	peerWritesEnabled = *peerWrites
 
 	metrics := NewMetrics()
 	metricsServer(*metricsAddr, metrics)
@@ -281,13 +294,17 @@ func main() {
 		"/peer/logs/containers": peerLogsContainersHandler(peerSecret, identity, dc),
 		"/peer/logs/":           peerLogsHandler(peerSecret, identity, dc),
 	}
+	writesMsg := "(writes disabled)"
+	if peerWritesEnabled {
+		writesMsg = "(writes enabled)"
+	}
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
 		peerServer(*peerAddr, peerHandlers)
-		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/images, /peer/access, /peer/logs/containers, and /peer/logs/ on %s", len(peerList), *peerSyncInterval, *peerAddr)
+		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/images, /peer/access, /peer/logs/containers, and /peer/logs/ on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
 	case peerSecret != "":
 		peerServer(*peerAddr, peerHandlers)
-		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/images, /peer/access, /peer/logs/containers, and /peer/logs/ enabled on %s (receive-only, no outbound peers configured)", *peerAddr)
+		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/images, /peer/access, /peer/logs/containers, and /peer/logs/ enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}

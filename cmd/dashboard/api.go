@@ -979,8 +979,8 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	// ?host=. Local viewing on such an instance returns 503, not a missing
 	// route. ----
 	mux.HandleFunc("/api/access", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-		host := strings.TrimSpace(req.URL.Query().Get("host"))
-		if host != "" && registry != nil && host != registry.Identity() {
+		host, isPeer := hostForReq(req, registry)
+		if isPeer && registry != nil {
 			peerBase, ok := registry.URLForIdentity(host)
 			if !ok {
 				http.Error(w, "unknown host: "+host, http.StatusNotFound)
@@ -1214,8 +1214,8 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	// POST   /api/images/prune   → body {"service","keep_n"} — keep stable+running+last N,
 	//                              delete the rest (empty service = all)
 	mux.HandleFunc("/api/images", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-		host := strings.TrimSpace(req.URL.Query().Get("host"))
-		if host != "" && (registry == nil || host != registry.Identity()) {
+		host, isPeer := hostForReq(req, registry)
+		if isPeer {
 			if registry == nil {
 				http.Error(w, "unknown host", http.StatusNotFound)
 				return
@@ -1607,6 +1607,26 @@ func cfZoneFromReq(cf *cloudflareRegistry, req *http.Request) (*cloudflareClient
 		domain = cf.DefaultDomain()
 	}
 	return c, domain, true
+}
+
+// hostForReq resolves the optional ?host= query parameter against registry.
+// host is the trimmed query value (possibly empty). isPeer is true iff host
+// names something other than this instance's own identity — i.e. host is
+// non-empty and either registry is nil (nothing to compare against) or host
+// doesn't match registry.Identity(). Callers still need to resolve host to a
+// peer URL (registry.URLForIdentity) and validate the peer secret themselves,
+// since existing call sites differ in exactly how they respond to a nil
+// registry / unresolvable host / missing secret — this only factors out the
+// query-param parsing and local-vs-other comparison shared by all of them.
+func hostForReq(req *http.Request, registry *PeerRegistry) (host string, isPeer bool) {
+	host = strings.TrimSpace(req.URL.Query().Get("host"))
+	if host == "" {
+		return "", false
+	}
+	if registry != nil && host == registry.Identity() {
+		return host, false
+	}
+	return host, true
 }
 
 // writeCFErr maps a Cloudflare failure onto the response. Cloudflare's own
