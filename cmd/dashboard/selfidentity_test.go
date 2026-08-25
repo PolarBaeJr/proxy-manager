@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -135,6 +136,38 @@ func TestServiceContainsSelfByName(t *testing.T) {
 	}
 	if self {
 		t.Error("serviceContainsSelfByName() = true, want false")
+	}
+}
+
+// TestBuildManagedServicesExcludesSelf proves buildManagedServices (api.go) —
+// the shared assembly behind both /api/services and peers.go's
+// peerServicesHandler — still excludes the dashboard's own service, same as
+// the inline logic it replaced.
+func TestBuildManagedServicesExcludesSelf(t *testing.T) {
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[
+			{"Id":"abc123def456","Names":["/dashboard"],"State":"running","Labels":{"proxy.service":"dashboard","proxy.host":"dashboard.example","proxy.port":"8093"}},
+			{"Id":"other","Names":["/app"],"State":"running","Labels":{"proxy.service":"app","proxy.host":"app.example","proxy.port":"80"}}
+		]`))
+	}))
+	withSelfHostname(t, func() (string, error) { return "abc123def456", nil })
+
+	onb, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := newImageChecker(dc)
+
+	svcs, err := buildManagedServices(context.Background(), dc, onb, ic)
+	if err != nil {
+		t.Fatalf("buildManagedServices: %v", err)
+	}
+	if pickService(svcs, "dashboard") != nil {
+		t.Error("buildManagedServices() included the dashboard's own service, want it excluded")
+	}
+	if pickService(svcs, "app") == nil {
+		t.Error("buildManagedServices() dropped the unrelated service, want it kept")
 	}
 }
 

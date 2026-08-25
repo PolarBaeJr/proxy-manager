@@ -1418,13 +1418,42 @@ async function renderRoutes() {
 
 /* ---------- Services ---------- */
 let _lastServicesHash = '';
+// This host's own peer identity (DASHBOARD_HOST, see peers.go), lazily
+// fetched once from /api/peers. null means "not known yet" — foreignSvc()
+// treats that as foreign (fail-safe: over-lock is safe, under-lock isn't).
+// Left null on a failed fetch so the next render retries rather than
+// permanently locking every local, unlabeled row.
+let _selfIdentity = null;
+async function loadSelfIdentity() {
+  try {
+    const d = await (await fetch('/api/peers')).json();
+    _selfIdentity = (d.self && d.self.identity) || '';
+  } catch (e) { /* leave null — retry next render */ }
+}
+// foreignSvc reports whether a service was merged in from another host's
+// dashboard (s.machine set and not this host) — such rows are read-only in
+// this UI; mutating actions stay local-only.
+function foreignSvc(s) { return !!s.machine && s.machine !== _selfIdentity; }
+// machineLabel trims the shared ".polardev.org" suffix so the badge stays
+// short — same convention as cmd/statusbot/statuspager.go's machineSuffix.
+function machineLabel(m) { return String(m || '').replace(/\.polardev\.org$/, ''); }
+// svcLockedAttr/svcLk extend lockedAttr()/lk() with a per-card foreign-host
+// guard: a peer-owned row is disabled here regardless of this host's own
+// elevation state, since mutating actions never forward to peers.
+function svcLockedAttr(s) {
+  return foreignSvc(s) ? 'disabled title="managed on ' + esc(machineLabel(s.machine)) + '"' : lockedAttr();
+}
+function svcLk(s) {
+  return foreignSvc(s) ? '<span class="lock" title="managed on ' + esc(machineLabel(s.machine)) + '">' + I.lock + '</span>' : lk();
+}
 async function renderServices() {
+  if (_selfIdentity === null) await loadSelfIdentity();
   const svcs = await api('/api/services');
   const el = $('#tab-services');
   // Bail out of the full rebuild on the 5s tick if nothing about the services
   // changed — preserves scroll, hover, expanded-card state. We still refresh
   // the per-service stats panels (which DO change) without touching the rest.
-  const hash = JSON.stringify(svcs);
+  const hash = JSON.stringify(svcs) + '|' + _selfIdentity;
   if (hash === _lastServicesHash && el.children.length) {
     fillServiceStatsPanels().catch(() => {});
     return;
@@ -1459,6 +1488,7 @@ async function renderServices() {
     // promote, stale OCI labels on replace). Not broken by itself, just
     // worth a human's eye.
     if (s.dual_tracked) badges += ' <span class="pill warn" title="Both label-managed (docker ps) and onboarded (onboarded.json) under the same name — edits should go through one path consistently">' + I.rocket + 'dual-tracked</span>';
+    if (foreignSvc(s)) badges += ' <span class="pill muted" title="Managed on ' + esc(machineLabel(s.machine)) + ' — read-only here">' + I.layers + esc(machineLabel(s.machine)) + '</span>';
     let facts = '<table class="facts">';
     facts += '<tr><td>Host</td><td>' + (managed ? '<span class="meta">—</span>' : '<span class="ident">' + esc(s.host) + (s.path ? esc(s.path) : '') + '</span>') + '</td></tr>';
     if (canary)              facts += '<tr><td>Canary</td><td><span class="ident" style="color:#5eb4ff">' + esc(s.canary_image) + '</span> <span class="meta">· ' + s.canary_replicas + ' replica' + (s.canary_replicas === 1 ? '' : 's') + '</span></td></tr>';
@@ -1469,41 +1499,41 @@ async function renderServices() {
 
     let actions;
     if (managed) {
-      actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="onboardDialog(\'' + sn + '\', ' + (s.port || 0) + ', \'' + esc(s.path || '') + '\')">' + I.rocket + 'Add route…' + lk() + '</button>';
+      actions = '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="onboardDialog(\'' + sn + '\', ' + (s.port || 0) + ', \'' + esc(s.path || '') + '\')">' + I.rocket + 'Add route…' + svcLk(s) + '</button>';
     } else if (canary) {
-      actions = '<button class="btn primary" ' + lockedAttr() + ' onclick="promoteCanary(\'' + sn + '\')">' + I.check + 'Promote canary' + lk() + '</button>'
-              + '<button class="btn" ' + lockedAttr() + ' onclick="discardCanary(\'' + sn + '\')">' + I.x + 'Discard' + lk() + '</button>';
+      actions = '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="promoteCanary(\'' + sn + '\')">' + I.check + 'Promote canary' + svcLk(s) + '</button>'
+              + '<button class="btn" ' + svcLockedAttr(s) + ' onclick="discardCanary(\'' + sn + '\')">' + I.x + 'Discard' + svcLk(s) + '</button>';
     } else {
       // When update_available is true, surface a one-click Update before
       // the other actions — it's the most common click in this state.
       const updateBtn = (s.update_available
-        ? '<button class="btn primary" ' + lockedAttr() + ' onclick="oneClickUpdate(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.arrowup + 'Pull update + restart' + lk() + '</button>'
+        ? '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="oneClickUpdate(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.arrowup + 'Pull update + restart' + svcLk(s) + '</button>'
         : '');
       actions = updateBtn
               + (s.update_available
-                  ? '<button class="btn" ' + lockedAttr() + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + lk() + '</button>'
-                  : '<button class="btn primary" ' + lockedAttr() + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + lk() + '</button>')
-              + '<button class="btn" ' + lockedAttr() + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.swap + 'Replace' + lk() + '</button>'
+                  ? '<button class="btn" ' + svcLockedAttr(s) + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + svcLk(s) + '</button>'
+                  : '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.rocket + 'Stage new version' + svcLk(s) + '</button>')
+              + '<button class="btn" ' + svcLockedAttr(s) + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.swap + 'Replace' + svcLk(s) + '</button>'
               // Force an immediate registry check instead of waiting on the
               // ~10min background poller — mirrors the MCP check_for_update tool.
-              + '<button class="btn ghost" ' + lockedAttr() + ' onclick="checkForUpdate(\'' + sn + '\', this)">' + I.refresh + 'Check now' + lk() + '</button>'
+              + '<button class="btn ghost" ' + svcLockedAttr(s) + ' onclick="checkForUpdate(\'' + sn + '\', this)">' + I.refresh + 'Check now' + svcLk(s) + '</button>'
               + (s.all_stopped
-                  ? '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\')">' + I.bolt + 'Start service' + lk() + '</button>'
-                  : '<button class="btn" ' + lockedAttr() + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\')">' + I.lock + 'Stop service' + lk() + '</button>')
+                  ? '<button class="btn" ' + svcLockedAttr(s) + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\')">' + I.bolt + 'Start service' + svcLk(s) + '</button>'
+                  : '<button class="btn" ' + svcLockedAttr(s) + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\')">' + I.lock + 'Stop service' + svcLk(s) + '</button>')
               // Add env: recreates the replicas on the SAME image with the new
               // variables merged in. Disabled while stopped — the recreate
               // clones a live replica's config, so there has to be one.
               + (s.all_stopped
                   ? '<button class="btn" disabled title="Start the service first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
-                  : '<button class="btn" ' + lockedAttr() + ' onclick="openAddEnv(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.plus + 'Add env…' + lk() + '</button>')
+                  : '<button class="btn" ' + svcLockedAttr(s) + ' onclick="openAddEnv(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.plus + 'Add env…' + svcLk(s) + '</button>')
               // Auto-update toggle: available for any routed service, label-
               // managed or onboarded. For a label-managed service this
               // flips proxy.autoupdate via the same clone-and-recreate as
               // Add env, above — same image/env/mounts, just the label changes.
               + (s.auto_update
-                  ? '<button class="btn" ' + lockedAttr() + ' onclick="toggleAutoUpdate(\'' + sn + '\', false)">' + I.arrowup + 'Auto-update: on' + lk() + '</button>'
-                  : '<button class="btn ghost" ' + lockedAttr() + ' onclick="toggleAutoUpdate(\'' + sn + '\', true)">' + I.arrowup + 'Auto-update: off' + lk() + '</button>')
-              + (s.previous_image ? '<button class="linkbtn" ' + lockedAttr() + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\')">' + I.rewind + 'Rollback</button>' : '');
+                  ? '<button class="btn" ' + svcLockedAttr(s) + ' onclick="toggleAutoUpdate(\'' + sn + '\', false)">' + I.arrowup + 'Auto-update: on' + svcLk(s) + '</button>'
+                  : '<button class="btn ghost" ' + svcLockedAttr(s) + ' onclick="toggleAutoUpdate(\'' + sn + '\', true)">' + I.arrowup + 'Auto-update: off' + svcLk(s) + '</button>')
+              + (s.previous_image ? '<button class="linkbtn" ' + svcLockedAttr(s) + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\')">' + I.rewind + 'Rollback</button>' : '');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
     // replica AND no stopped members (saves card height for the common case).
@@ -1520,9 +1550,9 @@ async function renderServices() {
         const canaryPill = m.is_canary ? ' <span class="pill info">canary</span>' : '';
         const btn = m.is_canary ? ''
           : (live
-              ? '<button class="btn sm ghost" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'restart\')" title="Stop then start this replica">' + I.refresh + 'Restart' + lk() + '</button>'
-              + '<button class="btn sm ghost" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'stop\')">' + I.lock + 'Stop' + lk() + '</button>'
-              : '<button class="btn sm" ' + lockedAttr() + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'start\')">' + I.bolt + 'Start' + lk() + '</button>');
+              ? '<button class="btn sm ghost" ' + svcLockedAttr(s) + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'restart\')" title="Stop then start this replica">' + I.refresh + 'Restart' + svcLk(s) + '</button>'
+              + '<button class="btn sm ghost" ' + svcLockedAttr(s) + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'stop\')">' + I.lock + 'Stop' + svcLk(s) + '</button>'
+              : '<button class="btn sm" ' + svcLockedAttr(s) + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'start\')">' + I.bolt + 'Start' + svcLk(s) + '</button>');
         memberList += '<div class="member-row"><span class="ident dim">' + esc(m.name) + '</span> ' + pill + canaryPill + '<span class="spacer"></span>' + btn + '</div>';
       }
       memberList += '</div>';
@@ -1531,8 +1561,12 @@ async function renderServices() {
     // so any request hitting the proxy right now gets 503 — show a
     // prominent "down" pill instead of the muted "stopped" it used to be.
     if (s.all_stopped) badges += ' <span class="pill bad">' + I.alert + 'down</span>';
-    const menu = '<div class="menu"><button class="btn icon" onclick="toggleMenu(event,\'m-' + sn + '\')">' + I.dots + '</button>'
-               + '<div class="menu-pop" id="m-' + sn + '"><button class="danger" ' + lockedAttr() + ' onclick="deleteSvc(\'' + sn + '\')">' + I.trash + 'Delete service</button></div></div>';
+    // Foreign rows drop the menu entirely rather than disabling it in place —
+    // its id="m-<name>" collides with a same-named local card's menu (both
+    // hosts commonly run identically-named services), and toggleMenu/
+    // getElementById resolves to whichever one is first in the DOM.
+    const menu = foreignSvc(s) ? '' : '<div class="menu"><button class="btn icon" onclick="toggleMenu(event,\'m-' + sn + '\')">' + I.dots + '</button>'
+               + '<div class="menu-pop" id="m-' + sn + '"><button class="danger" ' + svcLockedAttr(s) + ' onclick="deleteSvc(\'' + sn + '\')">' + I.trash + 'Delete service</button></div></div>';
 
     // Per-card collapse: clicking the svc-head folds facts + actionzone to a
     // one-line summary. Persisted in localStorage keyed by service name.
@@ -1554,7 +1588,7 @@ async function renderServices() {
          +    facts
          +    memberList
          +    '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
-         +    (managed ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-service="' + sn + '" data-backends="' + esc((s.backends || []).join(' ')) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
+         +    ((managed || foreignSvc(s)) ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-service="' + sn + '" data-backends="' + esc((s.backends || []).join(' ')) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
          +  '</div>'
          +  '</div>';
   }
@@ -1962,10 +1996,10 @@ function discoveryShowLabels(name, port) {
 function replicaCtrl(s) {
   if (s.unscalable) return '<span class="singleton-lock">' + I.lock + 'Singleton <span class="pill muted" style="margin-left:4px">fixed at 1</span></span>';
   const sn = esc(s.name);
-  const dis = lockedAttr();
+  const dis = svcLockedAttr(s);
   return '<span class="replica-ctrl">'
        + '<button ' + dis + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas - 1) + ')">−</button>'
-       + '<input type="number" min="0" value="' + s.replicas + '" id="rep-' + sn + '"' + (isElevated() ? '' : ' disabled') + '>'
+       + '<input type="number" min="0" value="' + s.replicas + '" id="rep-' + sn + '"' + ((isElevated() && !foreignSvc(s)) ? '' : ' disabled') + '>'
        + '<button ' + dis + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas + 1) + ')">+</button>'
        + '<button class="apply" ' + dis + ' onclick="scaleSvc(\'' + sn + '\', +document.getElementById(\'rep-' + sn + '\').value)">Apply</button>'
        + '</span>';

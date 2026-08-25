@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -291,6 +292,128 @@ func TestFetchPeerServiceStatusNoPeersConfigured(t *testing.T) {
 	reg := newPeerRegistry(nil, "s3cret", "dashboard-a", "dev", 0, nil)
 	if got := fetchPeerServiceStatus(context.Background(), reg, "s3cret"); got != nil {
 		t.Fatalf("groups = %+v, want nil with no peers configured", got)
+	}
+}
+
+func TestPeerServicesHandlerValidSecret(t *testing.T) {
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c1", Names: []string{"/goproxy-app-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
+		}})
+	}))
+	onb, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := newImageChecker(dc)
+	h := peerServicesHandler("s3cret", "dashboard-b", dc, onb, ic)
+	req := httptest.NewRequest(http.MethodGet, "/peer/services", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	var body peerServicesResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Identity != "dashboard-b" {
+		t.Errorf("Identity = %q, want %q", body.Identity, "dashboard-b")
+	}
+	if len(body.Services) != 1 || body.Services[0].Machine != "" {
+		t.Errorf("Services = %+v, want one service with Machine unset (peer never tags its own local services)", body.Services)
+	}
+}
+
+func TestPeerServicesHandlerWrongSecret(t *testing.T) {
+	h := peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/services", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestPeerServicesHandlerEmptySecretDisabled(t *testing.T) {
+	h := peerServicesHandler("", "dashboard-b", nil, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/peer/services", nil)
+	req.Header.Set("Authorization", "Bearer anything")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestPeerServicesHandlerWrongMethod(t *testing.T) {
+	h := peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/peer/services", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestFetchPeerServicesTagsMachineAndMerges(t *testing.T) {
+	dcB := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c1", Names: []string{"/goproxy-b-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "svc-b", labelHost: "b.example", labelPort: "80"},
+		}})
+	}))
+	onb, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := newImageChecker(dcB)
+	srvB := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", dcB, onb, ic))
+	defer srvB.Close()
+
+	reg := newPeerRegistry([]string{srvB.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
+	svcs := fetchPeerServices(context.Background(), reg, "s3cret")
+	if len(svcs) != 1 {
+		t.Fatalf("svcs = %+v, want 1", svcs)
+	}
+	if svcs[0].Machine != "dashboard-b" {
+		t.Errorf("Machine = %q, want %q", svcs[0].Machine, "dashboard-b")
+	}
+}
+
+func TestFetchPeerServicesSkipsUnreachablePeer(t *testing.T) {
+	srv := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil))
+	url := srv.URL
+	srv.Close() // guarantees connection-refused without hardcoding a port
+
+	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
+	svcs := fetchPeerServices(context.Background(), reg, "s3cret")
+	if svcs != nil {
+		t.Fatalf("svcs = %+v, want nil for an unreachable peer", svcs)
+	}
+}
+
+func TestURLForIdentityFound(t *testing.T) {
+	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "42")
+
+	url, ok := reg.URLForIdentity("dashboard-b")
+	if !ok || url != "http://peer-b:8098" {
+		t.Fatalf("URLForIdentity(dashboard-b) = (%q, %v), want (http://peer-b:8098, true)", url, ok)
+	}
+}
+
+func TestURLForIdentityNotFound(t *testing.T) {
+	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "42")
+
+	if url, ok := reg.URLForIdentity("dashboard-c"); ok {
+		t.Fatalf("URLForIdentity(dashboard-c) = (%q, %v), want ok=false", url, ok)
 	}
 }
 

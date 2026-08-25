@@ -77,3 +77,70 @@ func TestServicesDualTrackedFlag(t *testing.T) {
 		t.Error("solo: DualTracked=true, want false (onboarded-only, not label-managed)")
 	}
 }
+
+// TestServicesEndpointMergesPeer proves the full request path — not just
+// fetchPeerServices/peerServicesHandler in isolation (peers_test.go) —
+// actually merges a peer's services into /api/services when called through
+// newDashboardMux's auth+registry wiring, mirroring
+// TestServiceStatusEndpointMergesPeer (servicestatus_test.go).
+func TestServicesEndpointMergesPeer(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c1", Names: []string{"/goproxy-app-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
+		}})
+	}))
+	peerDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{{
+			ID: "c2", Names: []string{"/goproxy-player-1"}, State: "running",
+			Labels: map[string]string{labelEnable: "true", labelService: "player", labelHost: "badminton-mac.example", labelPort: "3000"},
+		}})
+	}))
+
+	onb, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerOnb, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	peerSrv := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC)))
+	t.Cleanup(peerSrv.Close)
+
+	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
+
+	ic := newImageChecker(dc)
+	auth, _ := newConfirmedStore(t, "alice", "correct horse")
+
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg)
+
+	req := httptest.NewRequest("GET", "/api/services", nil)
+	req.Header.Set("Authorization", "Bearer "+internalToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	var svcs []Service
+	if err := json.Unmarshal(rec.Body.Bytes(), &svcs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	local := pickService(svcs, "app")
+	if local == nil || local.Machine != "dashboard-a" {
+		t.Fatalf("local service = %+v, want tagged dashboard-a", local)
+	}
+	peer := pickService(svcs, "player")
+	if peer == nil || peer.Machine != "dashboard-b" {
+		t.Fatalf("peer service = %+v, want tagged dashboard-b", peer)
+	}
+}

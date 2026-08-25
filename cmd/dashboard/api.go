@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -512,73 +513,23 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		switch req.Method {
 		case "GET":
 			auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-				svcs, err := dc.listServices(req.Context())
+				svcs, err := buildManagedServices(req.Context(), dc, onb, ic)
 				if err != nil {
 					httpx.WriteErr(w, err)
 					return
 				}
-				// Drop the dashboard's own service — it must never appear as
-				// something you can stop/replace/scale from within its own
-				// UI. Deliberately asymmetric with /api/service-status
-				// (servicestatus.go), which does NOT filter itself out, so
-				// statusbot/Observability still reports the dashboard's own
-				// health.
-				svcs = excludeSelf(svcs)
-				// NOTE: excludeSelf runs before the onboarded-merge dedupe
-				// below, which matches by name against svcs. In practice
-				// this never collides — the discovery/onboarding UI only
-				// offers containers WITHOUT proxy labels, and the
-				// dashboard's own container always carries them — but if a
-				// "dashboard" entry were ever forced into the onboarded
-				// store anyway, it would no longer find a name match here
-				// and would get appended as a second (onboarded-only) card.
-				// Mutations would still be blocked by the guard below.
-				// Merge in onboarded services. If a labeled service already
-				// has the same name (auto-promoted via the lifecycle Stop
-				// path), DON'T append a second entry — just mark the
-				// existing labeled view as Onboarded so it picks up the
-				// unified surface (Stage/Promote/Replace/Rollback). Pure
-				// onboarded-only entries (adopted from unlabelled
-				// containers) get appended as standalone Service cards.
-				labeledIdx := map[string]int{}
-				for i := range svcs {
-					labeledIdx[svcs[i].Name] = i
-				}
-				for _, o := range onb.List() {
-					if i, ok := labeledIdx[o.Name]; ok {
-						svcs[i].Onboarded = true
-						svcs[i].DualTracked = true
-						// Opt-in from either source (label or dashboard toggle) wins.
-						svcs[i].AutoUpdate = svcs[i].AutoUpdate || o.AutoUpdate
-						if svcs[i].PreviousImage == "" {
-							svcs[i].PreviousImage = o.PreviousImage
-						}
-						if svcs[i].CanaryImage == "" {
-							svcs[i].CanaryImage = o.CanaryImage
-							svcs[i].CanaryReplicas = o.CanaryReplicas
-						}
-						continue
+				// Merge in every configured peer's own managed services (see
+				// peers.go's fetchPeerServices) so one dashboard's
+				// /api/services reports the whole mesh, not just this host.
+				// Local services get this host's own identity as Machine
+				// too, so every service in the response is consistently
+				// labeled, not just the merged-in ones.
+				if registry != nil {
+					for i := range svcs {
+						svcs[i].Machine = registry.Identity()
 					}
-					svcs = append(svcs, Service{
-						Name:           o.Name,
-						Image:          o.Image,
-						Host:           o.Host,
-						Port:           o.Port,
-						Replicas:       o.Replicas,
-						PreviousImage:  o.PreviousImage,
-						AutoUpdate:     o.AutoUpdate,
-						CanaryImage:    o.CanaryImage,
-						CanaryReplicas: o.CanaryReplicas,
-						Onboarded:      true,
-						Unscalable:     o.Host == "",
-					})
-				}
-				// Enrich with image-checker results AFTER the merge so
-				// onboarded-only entries get the update badge too.
-				for i := range svcs {
-					if st := ic.Get(svcs[i].Image); st != nil && st.UpdateAvailable {
-						svcs[i].UpdateAvailable = true
-					}
+					peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+					svcs = append(svcs, fetchPeerServices(req.Context(), registry, peerSecret)...)
 				}
 				httpx.WriteJSON(w, http.StatusOK, svcs)
 			})(w, req)
@@ -1457,6 +1408,82 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	}))
 
 	return mux
+}
+
+// buildManagedServices is the shared local-services assembly behind both
+// GET /api/services and GET /peer/services (peers.go's peerServicesHandler)
+// — self-exclusion (Phase 0's excludeSelf) is automatically applied to both,
+// since both funnel through here, so a peer never learns about the
+// dashboard managing itself either.
+func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedStore, ic *imageChecker) ([]Service, error) {
+	svcs, err := dc.listServices(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Drop the dashboard's own service — it must never appear as
+	// something you can stop/replace/scale from within its own
+	// UI. Deliberately asymmetric with /api/service-status
+	// (servicestatus.go), which does NOT filter itself out, so
+	// statusbot/Observability still reports the dashboard's own
+	// health.
+	svcs = excludeSelf(svcs)
+	// NOTE: excludeSelf runs before the onboarded-merge dedupe
+	// below, which matches by name against svcs. In practice
+	// this never collides — the discovery/onboarding UI only
+	// offers containers WITHOUT proxy labels, and the
+	// dashboard's own container always carries them — but if a
+	// "dashboard" entry were ever forced into the onboarded
+	// store anyway, it would no longer find a name match here
+	// and would get appended as a second (onboarded-only) card.
+	// Mutations would still be blocked by the guard below.
+	// Merge in onboarded services. If a labeled service already
+	// has the same name (auto-promoted via the lifecycle Stop
+	// path), DON'T append a second entry — just mark the
+	// existing labeled view as Onboarded so it picks up the
+	// unified surface (Stage/Promote/Replace/Rollback). Pure
+	// onboarded-only entries (adopted from unlabelled
+	// containers) get appended as standalone Service cards.
+	labeledIdx := map[string]int{}
+	for i := range svcs {
+		labeledIdx[svcs[i].Name] = i
+	}
+	for _, o := range onb.List() {
+		if i, ok := labeledIdx[o.Name]; ok {
+			svcs[i].Onboarded = true
+			svcs[i].DualTracked = true
+			// Opt-in from either source (label or dashboard toggle) wins.
+			svcs[i].AutoUpdate = svcs[i].AutoUpdate || o.AutoUpdate
+			if svcs[i].PreviousImage == "" {
+				svcs[i].PreviousImage = o.PreviousImage
+			}
+			if svcs[i].CanaryImage == "" {
+				svcs[i].CanaryImage = o.CanaryImage
+				svcs[i].CanaryReplicas = o.CanaryReplicas
+			}
+			continue
+		}
+		svcs = append(svcs, Service{
+			Name:           o.Name,
+			Image:          o.Image,
+			Host:           o.Host,
+			Port:           o.Port,
+			Replicas:       o.Replicas,
+			PreviousImage:  o.PreviousImage,
+			AutoUpdate:     o.AutoUpdate,
+			CanaryImage:    o.CanaryImage,
+			CanaryReplicas: o.CanaryReplicas,
+			Onboarded:      true,
+			Unscalable:     o.Host == "",
+		})
+	}
+	// Enrich with image-checker results AFTER the merge so
+	// onboarded-only entries get the update badge too.
+	for i := range svcs {
+		if st := ic.Get(svcs[i].Image); st != nil && st.UpdateAvailable {
+			svcs[i].UpdateAvailable = true
+		}
+	}
+	return svcs, nil
 }
 
 // sessionFromReq is the nil-safe form of AuthStore.sessionFrom — returns
