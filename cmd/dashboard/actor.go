@@ -22,12 +22,18 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/PolarBaeJr/proxy-manager/internal/sso"
 )
 
 // actorHeader must match cmd/proxy's ActorHeader.
 const actorHeader = "X-Pmgr-Actor"
+
+// forwardedActorTTL only has to cover this host -> peer host, in flight —
+// same reasoning as cmd/proxy/auth.go's actorTTL, just for one hop instead
+// of two.
+const forwardedActorTTL = 2 * time.Minute
 
 // actorSecret is the shared secret for verifying assertions. Empty means the
 // feature is off and every caller is audited as the token owner.
@@ -102,4 +108,22 @@ func actorIP(req *http.Request) string {
 		return ""
 	}
 	return claims.IP
+}
+
+// mintForwardedActor signs an X-Pmgr-Actor assertion naming actor, for the
+// dashboard's own outbound peer-mutation requests (api.go's image-mutation
+// forwarding) — the write-mesh sibling of cmd/proxy/auth.go's stampActor,
+// reusing the exact same assertion format so the peer's existing auditUser
+// verification needs no changes at all. Empty when attribution is
+// unconfigured or actor is unknown, matching stampActor's own no-op guard:
+// an absent header is honest, a placeholder one is not.
+func mintForwardedActor(req *http.Request, actor string) string {
+	if len(actorSecret) == 0 || actor == "" {
+		return ""
+	}
+	return sso.SignActor(sso.ActorClaims{
+		Username: actor,
+		IP:       clientIP(req),
+		Exp:      time.Now().Add(forwardedActorTTL).Unix(),
+	}, actorSecret)
 }

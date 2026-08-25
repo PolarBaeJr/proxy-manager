@@ -286,10 +286,11 @@ func main() {
 		go registry.Run(ctx)
 	}
 	peerHandlers := map[string]http.Handler{
-		"/peer/handshake":       peerHandshakeHandler(peerSecret, identity, buildVersion),
+		"/peer/handshake":       peerHandshakeHandler(peerSecret, identity, buildVersion, peerWritesEnabled),
 		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv()),
 		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic),
 		"/peer/images":          peerImagesHandler(peerSecret, identity, dc, releases, imageHistory, onboarded),
+		"/peer/images/":         peerImagesMutateHandler(peerSecret, identity, dc, releases, imageHistory, onboarded, peerWritesEnabled),
 		"/peer/access":          peerAccessHandler(peerSecret, identity, proxyURLFromEnv()),
 		"/peer/logs/containers": peerLogsContainersHandler(peerSecret, identity, dc),
 		"/peer/logs/":           peerLogsHandler(peerSecret, identity, dc),
@@ -301,10 +302,10 @@ func main() {
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
 		peerServer(*peerAddr, peerHandlers)
-		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/images, /peer/access, /peer/logs/containers, and /peer/logs/ on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
+		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, and /peer/logs/ on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
 	case peerSecret != "":
 		peerServer(*peerAddr, peerHandlers)
-		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/images, /peer/access, /peer/logs/containers, and /peer/logs/ enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
+		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, and /peer/logs/ enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}

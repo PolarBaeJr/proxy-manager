@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1279,26 +1280,27 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		httpx.WriteJSON(w, http.StatusOK, info)
 	}))
 	mux.HandleFunc("/api/images/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Query().Get("host") != "" {
-			http.Error(w, "image mutations are local-only; host parameter not supported", http.StatusBadRequest)
-			return
-		}
 		actor := sessionUser(sessionFromReq(auth, req))
 		sub := strings.TrimPrefix(req.URL.Path, "/api/images/")
+		if host, isPeer := hostForReq(req, registry); isPeer {
+			fwdActor := actor
+			if fwdActor == "" {
+				// Same fallback audit() applies internally (see audit.go): a
+				// token-authenticated call — MCP, most of all — has no
+				// session cookie for sessionFromReq to read, so without this
+				// the forwarded assertion would always be empty for exactly
+				// the callers actor-forwarding exists for. Scoped to the
+				// forwarding branch only — the local mutation path below
+				// keeps its existing (unfallen-back) actor value unchanged.
+				fwdActor = principalFrom(req)
+			}
+			forwardImageMutation(w, req, host, registry, sub, fwdActor)
+			return
+		}
 		// Resolve a managed service's image base for mark/unmark (same base
 		// keying the ReleasesStore uses for infra services).
 		resolveBase := func(service string) (string, bool) {
-			svcs, err := dc.listServices(req.Context())
-			if err != nil {
-				return "", false
-			}
-			for _, s := range mergedServices(svcs, onb.List()) {
-				if s.Name == service && s.Image != "" {
-					base, _ := splitImageRef(s.Image)
-					return base, true
-				}
-			}
-			return "", false
+			return resolveImageBase(req.Context(), dc, onb, service)
 		}
 		switch {
 		case sub == "mark" && req.Method == "POST":
@@ -1406,62 +1408,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				httpx.WriteErr(w, err)
 				return
 			}
-			deleted := []string{}
-			failed := []map[string]string{}
-			var reclaimed int64
-			doneIDs := map[string]bool{}
-			doneTokens := map[string]bool{}
-			for _, si := range info.Services {
-				if body.Service != "" && si.Service != body.Service {
-					continue
-				}
-				var metas []imgMeta
-				protRefs := map[string]bool{}
-				protIDs := map[string]bool{}
-				for _, e := range si.Entries {
-					if !e.OnDisk {
-						continue
-					}
-					var ls time.Time
-					if e.LastSeen > 0 {
-						ls = time.Unix(e.LastSeen, 0)
-					}
-					metas = append(metas, imgMeta{
-						Ref: e.Ref, ID: e.fullID, Tagged: e.tagged,
-						SizeBytes: e.SizeBytes, LastSeen: ls, Created: e.created,
-					})
-					if e.Protected {
-						protRefs[e.Ref] = true
-						if e.fullID != "" {
-							protIDs[e.fullID] = true
-						}
-					}
-				}
-				sizeByToken := map[string]imgMeta{}
-				for _, m := range metas {
-					if m.Tagged {
-						sizeByToken[m.Ref] = m
-					} else {
-						sizeByToken[m.ID] = m
-					}
-				}
-				for _, token := range imagesToPrune(metas, protRefs, protIDs, body.KeepN) {
-					if doneTokens[token] {
-						continue
-					}
-					doneTokens[token] = true
-					if err := dc.removeImage(req.Context(), token, false); err != nil {
-						failed = append(failed, map[string]string{"token": token, "error": err.Error()})
-						continue
-					}
-					deleted = append(deleted, token)
-					if m, ok := sizeByToken[token]; ok && m.ID != "" && !doneIDs[m.ID] {
-						doneIDs[m.ID] = true
-						reclaimed += m.SizeBytes
-					}
-					audit(req, actor, "image.delete", token)
-				}
-			}
+			deleted, failed, reclaimed := runImagePrune(req.Context(), dc, info, body.Service, body.KeepN, func(token string) {
+				audit(req, actor, "image.delete", token)
+			})
 			target := "all"
 			if body.Service != "" {
 				target = body.Service
@@ -1627,6 +1576,71 @@ func hostForReq(req *http.Request, registry *PeerRegistry) (host string, isPeer 
 		return host, false
 	}
 	return host, true
+}
+
+// forwardImageMutation relays one mutating /api/images/<sub> request to the
+// peer identified by host, translating the request's (sub, method) pair onto
+// its /peer/images/<sub> counterpart — the write-mesh sibling of the
+// /api/images GET handler's own forwarding branch above. Unlike that GET
+// forwarder, this never sanitizes the peer's response body before relaying
+// it: mark/unmark/delete/prune don't return anything as sensitive as a
+// DeleteToken, and mapPeerMutationErr already keeps a peer's own auth
+// failures from leaking through.
+//
+// Forwards the mutation unconditionally, regardless of whether THIS host's
+// own -peer-writes is set — that flag only gates whether this host accepts
+// inbound peer mutations, not whether it may request them of others. The
+// target peer alone decides whether it accepts (peerImagesMutateHandler
+// re-checks its own writesEnabled), the same way GET forwarding never checks
+// anything about this host before asking a peer to answer.
+func forwardImageMutation(w http.ResponseWriter, req *http.Request, host string, registry *PeerRegistry, sub, actor string) {
+	var method, peerPath string
+	switch {
+	case sub == "mark" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/images/mark"
+	case sub == "mark" && req.Method == http.MethodDelete:
+		method, peerPath = http.MethodDelete, "/peer/images/mark"
+	case sub == "delete" && req.Method == http.MethodDelete:
+		method, peerPath = http.MethodDelete, "/peer/images/delete"
+	case sub == "prune" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/images/prune"
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if registry == nil {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	peerURL, ok := registry.URLForIdentity(host)
+	if !ok {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+	if peerSecret == "" {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	reqBody, err := io.ReadAll(req.Body)
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	code, respBody, mutErr := peerMutate(req.Context(), client, peerURL, peerSecret, method, peerPath,
+		10*time.Second, bytes.NewReader(reqBody), nil, mintForwardedActor(req, actor))
+	if mutErr != nil {
+		mapPeerMutationErr(w, 0, []byte(mutErr.Error()))
+		return
+	}
+	if code < 200 || code >= 300 {
+		mapPeerMutationErr(w, code, respBody)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(respBody)
 }
 
 // writeCFErr maps a Cloudflare failure onto the response. Cloudflare's own

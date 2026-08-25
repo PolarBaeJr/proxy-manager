@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -66,7 +65,7 @@ func TestImagesEndpointHostParamForwardsToPeer(t *testing.T) {
 	}
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev")
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false)
 
 	rs, err := loadReleasesStore(filepath.Join(t.TempDir(), "releases.json"))
 	if err != nil {
@@ -195,7 +194,7 @@ func TestImagesEndpointHostParamUnknownHost(t *testing.T) {
 	t.Cleanup(func() { internalToken = prev })
 
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev")
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false)
 
 	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg)
 
@@ -256,7 +255,7 @@ func TestImagesEndpointHostParamPeerUnreachable(t *testing.T) {
 	peerSrv.Close() // guarantees connection-refused without hardcoding a port
 
 	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(url, true, "dashboard-b", "dev")
+	reg.recordResult(url, true, "dashboard-b", "dev", false)
 
 	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg)
 
@@ -276,65 +275,6 @@ func TestImagesEndpointHostParamPeerUnreachable(t *testing.T) {
 	}
 }
 
-// TestImagesMutatingEndpointsRejectHostParam proves every mutating route
-// under /api/images/ rejects a ?host= query param with 400 BEFORE touching
-// any store or the docker daemon — the plan's constraint that image
-// mutations stay strictly local-only.
-func TestImagesMutatingEndpointsRejectHostParam(t *testing.T) {
-	var mutated atomic.Bool
-	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/images/") {
-			mutated.Store(true)
-		}
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/images/json"):
-			json.NewEncoder(w).Encode([]dockerImage{})
-		default:
-			json.NewEncoder(w).Encode([]dockerContainer{})
-		}
-	}))
-	rs, err := loadReleasesStore(filepath.Join(t.TempDir(), "releases.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ih, err := loadImageHistoryStore(filepath.Join(t.TempDir(), "image-history.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	onb, err := loadOnboardedStore(filepath.Join(t.TempDir(), "onboarded.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ic := newImageChecker(dc)
-	auth, _ := newConfirmedStore(t, "alice", "correct horse")
-
-	prev := internalToken
-	internalToken = "pmt_internal_test"
-	t.Cleanup(func() { internalToken = prev })
-
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, rs, nil, ih, nil, nil, nil)
-
-	cases := []struct {
-		method, path, body string
-	}{
-		{"POST", "/api/images/mark?host=dashboard-b", `{"service":"app","tag":"v1","label":"x"}`},
-		{"DELETE", "/api/images/mark?host=dashboard-b", `{"service":"app","tag":"v1"}`},
-		{"DELETE", "/api/images/delete?host=dashboard-b", `{"token":"ghcr.io/org/app:v2"}`},
-		{"POST", "/api/images/prune?host=dashboard-b", `{"service":"","keep_n":0}`},
-	}
-	for _, c := range cases {
-		req := httptest.NewRequest(c.method, c.path, strings.NewReader(c.body))
-		req.Header.Set("Authorization", "Bearer "+internalToken)
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
-		if rec.Code != http.StatusBadRequest {
-			t.Errorf("%s %s: status = %d, body %s, want %d", c.method, c.path, rec.Code, rec.Body.String(), http.StatusBadRequest)
-		}
-	}
-	if mutated.Load() {
-		t.Error("docker image removal endpoint was hit — a rejected ?host= mutation must not reach the daemon")
-	}
-	if all := rs.All(); len(all) != 0 {
-		t.Errorf("rs.All() = %v, want empty — a rejected ?host= mark must not write a release mark", all)
-	}
-}
+// Cross-host image MUTATIONS (mark/unmark/delete/prune via ?host=) are
+// covered end-to-end in imageswritehost_test.go, now that they're forwarded
+// rather than rejected — see TestImagesMutationForwardsToPeer and friends.
