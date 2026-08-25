@@ -83,6 +83,32 @@ func canaryContainers() []dockerContainer {
 	}
 }
 
+// putOnboardedAppWithCanary is putOnboardedApp's counterpart for tests that
+// exercise promote/discard on the ONBOARDED path — those both error
+// immediately ("no canary to promote/discard for %q") unless CanaryImage is
+// already set, which putOnboardedApp deliberately leaves empty.
+func putOnboardedAppWithCanary(t *testing.T, onb *OnboardedStore) {
+	t.Helper()
+	if err := onb.Put(OnboardedService{
+		Name: "app", Host: "app.example", Image: "ghcr.io/org/app:v1", Replicas: 1,
+		OriginalRouted: true, CanaryImage: "ghcr.io/org/app:v2", CanaryReplicas: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// onboardedCanaryClones is the container fixture matching
+// putOnboardedAppWithCanary: a single goproxy-onb-<name>-c1 container —
+// promoteOnboarded/discardOnboarded locate it by that literal name prefix
+// (the "goproxy-onb-<name>-" filter passed to listAll is not actually
+// enforced server-side by replaceDockerStub below, so the fixture itself is
+// what makes the prefix match hold).
+func onboardedCanaryClones(name string) []dockerContainer {
+	return []dockerContainer{
+		{ID: "onb-c1", Names: []string{"/goproxy-onb-" + name + "-c1"}, State: "running", Image: "ghcr.io/org/app:v2"},
+	}
+}
+
 // servicesDockerStub is the shared docker-daemon stub shape for every test
 // below: GET /containers/json (listAll/listServices, any filter) returns
 // containers; POST .../stop, POST .../start, and DELETE /containers/<id>
@@ -116,6 +142,81 @@ func newPeerServicesServer(t *testing.T, containers []dockerContainer, writesEna
 	onb := newTestOnboardedStore(t)
 	proxy := noopProxyStub(t)
 	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), "", proxy, writesEnabled))
+	t.Cleanup(srv.Close)
+	return srv, calls
+}
+
+// replaceDockerStub extends servicesDockerStub with everything replace/
+// stage/promote/discard need beyond scale/stop/start: GET
+// /containers/{id}/json (inspectEnv/inspectCloneSpec/inspectHostConfigUnknowns
+// all hit this — answered with a body carrying zero HostConfig/Config fields
+// so inspectHostConfigUnknowns never refuses), POST /containers/create
+// (returns a fixed id — nothing here depends on distinct container ids), and
+// POST /images/create (pullImage — always 200). Every hit is recorded in
+// calls, matching autoUpdateDockerStub's convention (unlike
+// servicesDockerStub, which only records stop/start/remove).
+func replaceDockerStub(t *testing.T, calls *svcCallTracker, containers []dockerContainer) *dockerClient {
+	t.Helper()
+	return dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			calls.record("list " + r.URL.Path)
+			json.NewEncoder(w).Encode(containers)
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			calls.record("create " + r.URL.Path)
+			json.NewEncoder(w).Encode(map[string]any{"Id": "newid"})
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/start"):
+			calls.record("start " + r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/stop"):
+			calls.record("stop " + r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/containers/"):
+			calls.record("remove " + r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/images/create"):
+			calls.record("pull " + r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			calls.record("inspect " + r.URL.Path)
+			w.Write([]byte(`{"Image":"sha256:abc","Config":{"Env":[]},"HostConfig":{"Mounts":[]},"NetworkSettings":{"Networks":{"edge":{}}}}`))
+		default:
+			calls.record("other " + r.URL.Path)
+			w.Write([]byte("{}"))
+		}
+	}))
+}
+
+// newPeerServicesServerReplace is newPeerServicesServer's counterpart backed
+// by replaceDockerStub — needed by every replace/stage/promote/discard test
+// on the LABEL-MANAGED path, since servicesDockerStub's default branch
+// answers GET /containers/{id}/json with the container list (an array),
+// which inspectEnv/inspectCloneSpec/inspectHostConfigUnknowns can't decode.
+func newPeerServicesServerReplace(t *testing.T, containers []dockerContainer, writesEnabled bool) (*httptest.Server, *svcCallTracker) {
+	t.Helper()
+	calls := &svcCallTracker{}
+	dc := replaceDockerStub(t, calls, containers)
+	onb := newTestOnboardedStore(t)
+	proxy := noopProxyStub(t)
+	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), "", proxy, writesEnabled))
+	t.Cleanup(srv.Close)
+	return srv, calls
+}
+
+// newPeerServicesServerOnboarded is newPeerServicesServerReplace's
+// counterpart for the ONBOARDED path — replace/stage/promote/discard there
+// go through rebuildOnboardedRoute, which unconditionally writes
+// routesConfigPath, so (unlike every scale/stop/start test, which never
+// touches it) "" would fail os.WriteFile(""). Needs a real temp file. Caller
+// supplies the onboarded fixture (onb) since Put must happen before the
+// server can see it.
+func newPeerServicesServerOnboarded(t *testing.T, containers []dockerContainer, onb *OnboardedStore, writesEnabled bool) (*httptest.Server, *svcCallTracker) {
+	t.Helper()
+	calls := &svcCallTracker{}
+	dc := replaceDockerStub(t, calls, containers)
+	proxy := noopProxyStub(t)
+	routesPath := filepath.Join(t.TempDir(), "routes.json")
+	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), routesPath, proxy, writesEnabled))
 	t.Cleanup(srv.Close)
 	return srv, calls
 }
@@ -683,6 +784,561 @@ func TestServicesMutationForwardsActorAssertion(t *testing.T) {
 	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/services/app/scale?host=dashboard-b", strings.NewReader(`{"replicas":1}`))
+	req.Header.Set("Authorization", "Bearer "+raw)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	headerMu.Lock()
+	header := gotHeader
+	headerMu.Unlock()
+	if header == "" {
+		t.Fatal("peer never received an X-Pmgr-Actor header for a token-authenticated request")
+	}
+	claims, ok := sso.VerifyActor(header, testActorSecret)
+	if !ok || claims.Username != "alice" {
+		t.Fatalf("VerifyActor(header) = %+v, ok=%v, want Username=alice", claims, ok)
+	}
+
+	entries := readAudit()
+	if len(entries) != 1 {
+		t.Fatalf("wrote %d audit entries, want 1", len(entries))
+	}
+	if entries[0]["user"] != "alice (via peer-mesh)" {
+		t.Fatalf("peer audit user = %v, want %q (a double-wrapped fallback would produce \"alice (via alice (via peer-mesh))\")",
+			entries[0]["user"], "alice (via peer-mesh)")
+	}
+}
+
+// ---------------------------------------------------------------------
+// Write-Mesh Phase 4: replace / stage / promote / discard(canary)
+// ---------------------------------------------------------------------
+
+// TestServicesLifecycleMutationsForwardToPeer proves all four Phase 4
+// endpoints — replace, stage, promote, discard(canary) — reach the peer's
+// own docker client (never local) when called with ?host=<peer>, on BOTH the
+// label-managed path (docker.go's replaceService/stageCanary/promoteCanary/
+// discardCanary) and the onboarded path (onboarded.go's counterparts), since
+// peerServicesMutateHandler's onboarded-vs-label-managed dispatch is exactly
+// the thing this phase adds.
+func TestServicesLifecycleMutationsForwardToPeer(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+	t.Setenv("PROXY_URL", noopProxyStub(t))
+
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	var localHit atomic.Bool
+	newLocal := func(t *testing.T) *dockerClient {
+		return dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			localHit.Store(true)
+			json.NewEncoder(w).Encode([]dockerContainer{})
+		}))
+	}
+
+	t.Run("label-managed replace", func(t *testing.T) {
+		peerSrv, calls := newPeerServicesServerReplace(t, twoReplicaContainers("running", false), true)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, newLocal(t), reg)
+		req := httptest.NewRequest(http.MethodPost, "/api/services/app/replace?host=dashboard-b", strings.NewReader(`{"image":"ghcr.io/org/app:v2"}`))
+		req.Header.Set("Authorization", "Bearer "+internalToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if len(calls.all()) == 0 {
+			t.Error("peer docker stub was never hit — replace did not reach the peer")
+		}
+	})
+	t.Run("label-managed stage", func(t *testing.T) {
+		peerSrv, calls := newPeerServicesServerReplace(t, twoReplicaContainers("running", false), true)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, newLocal(t), reg)
+		req := httptest.NewRequest(http.MethodPost, "/api/services/app/stage?host=dashboard-b", strings.NewReader(`{"image":"ghcr.io/org/app:v2"}`))
+		req.Header.Set("Authorization", "Bearer "+internalToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if len(calls.all()) == 0 {
+			t.Error("peer docker stub was never hit — stage did not reach the peer")
+		}
+	})
+	t.Run("label-managed promote", func(t *testing.T) {
+		peerSrv, calls := newPeerServicesServerReplace(t, canaryContainers(), true)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, newLocal(t), reg)
+		rec := doReq(mux, http.MethodPost, "/api/services/app/promote?host=dashboard-b")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if len(calls.all()) == 0 {
+			t.Error("peer docker stub was never hit — promote did not reach the peer")
+		}
+	})
+	t.Run("label-managed discard", func(t *testing.T) {
+		peerSrv, calls := newPeerServicesServerReplace(t, canaryContainers(), true)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, newLocal(t), reg)
+		rec := doReq(mux, http.MethodDelete, "/api/services/app/canary?host=dashboard-b")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if len(calls.all()) == 0 {
+			t.Error("peer docker stub was never hit — discard did not reach the peer")
+		}
+	})
+
+	t.Run("onboarded replace", func(t *testing.T) {
+		onb := newTestOnboardedStore(t)
+		putOnboardedApp(t, onb, false)
+		peerSrv, calls := newPeerServicesServerOnboarded(t, []dockerContainer{}, onb, true)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, newLocal(t), reg)
+		req := httptest.NewRequest(http.MethodPost, "/api/services/app/replace?host=dashboard-b", strings.NewReader(`{"image":"ghcr.io/org/app:v2"}`))
+		req.Header.Set("Authorization", "Bearer "+internalToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if len(calls.all()) == 0 {
+			t.Error("peer docker stub was never hit — onboarded replace did not reach the peer")
+		}
+	})
+	t.Run("onboarded stage", func(t *testing.T) {
+		onb := newTestOnboardedStore(t)
+		putOnboardedApp(t, onb, false)
+		peerSrv, calls := newPeerServicesServerOnboarded(t, []dockerContainer{}, onb, true)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, newLocal(t), reg)
+		req := httptest.NewRequest(http.MethodPost, "/api/services/app/stage?host=dashboard-b", strings.NewReader(`{"image":"ghcr.io/org/app:v2"}`))
+		req.Header.Set("Authorization", "Bearer "+internalToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if len(calls.all()) == 0 {
+			t.Error("peer docker stub was never hit — onboarded stage did not reach the peer")
+		}
+	})
+	t.Run("onboarded promote", func(t *testing.T) {
+		onb := newTestOnboardedStore(t)
+		putOnboardedAppWithCanary(t, onb)
+		peerSrv, calls := newPeerServicesServerOnboarded(t, onboardedCanaryClones("app"), onb, true)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, newLocal(t), reg)
+		rec := doReq(mux, http.MethodPost, "/api/services/app/promote?host=dashboard-b")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if len(calls.all()) == 0 {
+			t.Error("peer docker stub was never hit — onboarded promote did not reach the peer")
+		}
+	})
+	t.Run("onboarded discard", func(t *testing.T) {
+		onb := newTestOnboardedStore(t)
+		putOnboardedAppWithCanary(t, onb)
+		peerSrv, calls := newPeerServicesServerOnboarded(t, onboardedCanaryClones("app"), onb, true)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, newLocal(t), reg)
+		rec := doReq(mux, http.MethodDelete, "/api/services/app/canary?host=dashboard-b")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if len(calls.all()) == 0 {
+			t.Error("peer docker stub was never hit — onboarded discard did not reach the peer")
+		}
+	})
+
+	if localHit.Load() {
+		t.Error("local docker stub was hit — ?host=<peer> requests must never touch the local daemon")
+	}
+}
+
+// mutationCalls filters a svcCallTracker's hits down to actual mutations
+// (create/start/stop/remove/pull) — needed because replaceDockerStub
+// (unlike servicesDockerStub) also records plain reads (list/inspect), and
+// the outer self-guard's own serviceContainsSelfByName check legitimately
+// issues a "list" read before it can reject — that read is not the bug a
+// self-guard-rejection test is trying to catch.
+func mutationCalls(all []string) []string {
+	var out []string
+	for _, c := range all {
+		if strings.HasPrefix(c, "list ") || strings.HasPrefix(c, "inspect ") {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// TestServicesLifecycleReplacePeerSelfGuardRejects proves the PEER's own
+// self-guard rejects (403) a replace targeting its own container, verified
+// both directly against peerServicesMutateHandler and through the full
+// ?host= forwarding path (502, per mapPeerMutationErr's never-relay-a-peer-
+// 401/403-verbatim rule) — same two-pronged shape as
+// TestServicesPeerSelfGuardRejects, for one representative Phase 4 action.
+func TestServicesLifecycleReplacePeerSelfGuardRejects(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+	withSelfHostname(t, func() (string, error) { return "abc123def456", nil })
+
+	calls := &svcCallTracker{}
+	peerDC := replaceDockerStub(t, calls, []dockerContainer{{
+		ID: "abc123def456", Names: []string{"/dashboard"}, State: "running",
+		Labels: map[string]string{labelEnable: "true", labelService: "dashboard", labelHost: "dashboard.example", labelPort: "8093"},
+	}})
+	peerOnb := newTestOnboardedStore(t)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+
+	directReq := httptest.NewRequest(http.MethodPost, "/peer/services/dashboard/replace", strings.NewReader(`{"image":"ghcr.io/org/dash:v2"}`))
+	directReq.Header.Set("Authorization", "Bearer s3cret")
+	directRec := httptest.NewRecorder()
+	inner.ServeHTTP(directRec, directReq)
+	if directRec.Code != http.StatusForbidden {
+		t.Fatalf("direct peer handler: status = %d, body %s, want 403", directRec.Code, directRec.Body.String())
+	}
+	if got := mutationCalls(calls.all()); len(got) != 0 {
+		t.Errorf("peer docker stub saw a mutation call during a self-guard rejection: %v", got)
+	}
+
+	peerSrv := httptest.NewServer(inner)
+	t.Cleanup(peerSrv.Close)
+	reg := newTestPeerRegistry(peerSrv.URL, true)
+
+	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{})
+	}))
+	mux := newLocalTestMux(t, localDC, reg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/services/dashboard/replace?host=dashboard-b", strings.NewReader(`{"image":"ghcr.io/org/dash:v2"}`))
+	req.Header.Set("Authorization", "Bearer "+internalToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("forwarded: status = %d, body %s, want 502 (mapPeerMutationErr never relays a peer 403 verbatim)", rec.Code, rec.Body.String())
+	}
+	if got := mutationCalls(calls.all()); len(got) != 0 {
+		t.Errorf("peer docker stub saw a mutation call during a self-guard rejection: %v", got)
+	}
+}
+
+// TestServicesReplaceEnvConflictRelayedByPeer is the concrete regression test
+// proving the peer-side replace/stage branches use writeServiceErr (not
+// plain http.Error): an unresolved env conflict must produce a 409 carrying
+// {error, conflicts}, and that body must survive mapPeerMutationErr's
+// verbatim-relay-on-409 path back to the local caller unchanged.
+func TestServicesReplaceEnvConflictRelayedByPeer(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	peerDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode(twoReplicaContainers("running", false))
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			w.Write([]byte(`{"Image":"sha256:abc","Config":{"Env":["FOO=current"]},"HostConfig":{"Mounts":[]},"NetworkSettings":{"Networks":{"edge":{}}}}`))
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+	peerOnb := newTestOnboardedStore(t)
+	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true))
+	t.Cleanup(peerSrv.Close)
+	reg := newTestPeerRegistry(peerSrv.URL, true)
+
+	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{})
+	}))
+	mux := newLocalTestMux(t, localDC, reg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/services/app/replace?host=dashboard-b", strings.NewReader(`{"image":"ghcr.io/org/app:v2","env":{"FOO":"newvalue"}}`))
+	req.Header.Set("Authorization", "Bearer "+internalToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body %s, want 409 (env conflict relayed verbatim via writeServiceErr + mapPeerMutationErr)", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error     string        `json:"error"`
+		Conflicts []EnvConflict `json:"conflicts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v, body=%s", err, rec.Body.String())
+	}
+	if len(body.Conflicts) != 1 || body.Conflicts[0].Key != "FOO" {
+		t.Fatalf("conflicts = %+v, want exactly one conflict on key FOO", body.Conflicts)
+	}
+}
+
+// TestServicesStageAlreadyStagedRejectedByPeer proves the PEER re-validates
+// "already has a canary" against its own live state for stage — distinct
+// from Phase 2's per-replica-stop canary 409 (a different code path: that one
+// is stageCanary's own guard, not the replicas/{member}/stop guard).
+func TestServicesStageAlreadyStagedRejectedByPeer(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	peerSrv, _ := newPeerServicesServerReplace(t, canaryContainers(), true)
+	reg := newTestPeerRegistry(peerSrv.URL, true)
+
+	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{})
+	}))
+	mux := newLocalTestMux(t, localDC, reg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/services/app/stage?host=dashboard-b", strings.NewReader(`{"image":"ghcr.io/org/app:v3"}`))
+	req.Header.Set("Authorization", "Bearer "+internalToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body %s, want 400 (peer must re-validate 'already has a canary', relayed verbatim)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "canary") {
+		t.Errorf("body = %q, want it to mention the existing canary", rec.Body.String())
+	}
+}
+
+// TestServicesLifecycleMutationPeerWritesDisabled proves a peer with
+// -peer-writes=false answers 404 to every one of the four Phase 4 mutation
+// endpoints.
+func TestServicesLifecycleMutationPeerWritesDisabled(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	peerSrv, _ := newPeerServicesServerReplace(t, twoReplicaContainers("running", false), false)
+	reg := newTestPeerRegistry(peerSrv.URL, false)
+
+	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{})
+	}))
+	mux := newLocalTestMux(t, localDC, reg)
+
+	for _, tc := range []struct{ name, method, path, body string }{
+		{"replace", http.MethodPost, "/api/services/app/replace?host=dashboard-b", `{"image":"x"}`},
+		{"stage", http.MethodPost, "/api/services/app/stage?host=dashboard-b", `{"image":"x"}`},
+		{"promote", http.MethodPost, "/api/services/app/promote?host=dashboard-b", ""},
+		{"discard", http.MethodDelete, "/api/services/app/canary?host=dashboard-b", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body *strings.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			} else {
+				body = strings.NewReader("")
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
+			req.Header.Set("Authorization", "Bearer "+internalToken)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, body %s, want %d", rec.Code, rec.Body.String(), http.StatusNotFound)
+			}
+		})
+	}
+}
+
+// TestServicesLifecycleMutationPeerReachabilityErrors covers unknown-host,
+// nil-registry, unreachable-peer, and peer-401 for a single representative
+// Phase 4 action (replace) — established Phase 2/3 precedent that these
+// generic peerMutate/forwarding failure paths don't need repeating per
+// endpoint.
+func TestServicesLifecycleMutationPeerReachabilityErrors(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	t.Run("unknown host", func(t *testing.T) {
+		localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode([]dockerContainer{})
+		}))
+		reg := newTestPeerRegistry("http://peer-b:8098", true)
+		mux := newLocalTestMux(t, localDC, reg)
+
+		rec := doReq(mux, http.MethodPost, "/api/services/app/replace?host=nonexistent-host")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, body %s, want %d", rec.Code, rec.Body.String(), http.StatusNotFound)
+		}
+	})
+	t.Run("nil registry", func(t *testing.T) {
+		localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode([]dockerContainer{})
+		}))
+		mux := newLocalTestMux(t, localDC, nil)
+
+		rec := doReq(mux, http.MethodPost, "/api/services/app/replace?host=anything")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, body %s, want %d", rec.Code, rec.Body.String(), http.StatusNotFound)
+		}
+	})
+	t.Run("unreachable peer", func(t *testing.T) {
+		localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode([]dockerContainer{})
+		}))
+		peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		url := peerSrv.URL
+		peerSrv.Close() // guarantees connection-refused without hardcoding a port
+		reg := newTestPeerRegistry(url, true)
+		mux := newLocalTestMux(t, localDC, reg)
+
+		rec := doReq(mux, http.MethodPost, "/api/services/app/replace?host=dashboard-b")
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, body %s, want %d", rec.Code, rec.Body.String(), http.StatusBadGateway)
+		}
+	})
+	t.Run("peer 401", func(t *testing.T) {
+		localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode([]dockerContainer{})
+		}))
+		peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "peer's own auth error body", http.StatusUnauthorized)
+		}))
+		t.Cleanup(peerSrv.Close)
+		reg := newTestPeerRegistry(peerSrv.URL, true)
+		mux := newLocalTestMux(t, localDC, reg)
+
+		rec := doReq(mux, http.MethodPost, "/api/services/app/replace?host=dashboard-b")
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, body %s, want %d", rec.Code, rec.Body.String(), http.StatusBadGateway)
+		}
+		if strings.Contains(rec.Body.String(), "peer's own auth error body") {
+			t.Errorf("body = %q, must not contain the peer's own auth-failure body", rec.Body.String())
+		}
+	})
+}
+
+// TestServicesLifecycleMutationsLocalStillWork is the no-?host= regression
+// test: all four Phase 4 actions must still work exactly as before the
+// forwarding branch was added.
+func TestServicesLifecycleMutationsLocalStillWork(t *testing.T) {
+	t.Setenv("PROXY_URL", noopProxyStub(t))
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	t.Run("replace", func(t *testing.T) {
+		calls := &svcCallTracker{}
+		dc := replaceDockerStub(t, calls, twoReplicaContainers("running", false))
+		mux := newLocalTestMux(t, dc, nil)
+		req := httptest.NewRequest(http.MethodPost, "/api/services/app/replace", strings.NewReader(`{"image":"ghcr.io/org/app:v2"}`))
+		req.Header.Set("Authorization", "Bearer "+internalToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("stage", func(t *testing.T) {
+		calls := &svcCallTracker{}
+		dc := replaceDockerStub(t, calls, twoReplicaContainers("running", false))
+		mux := newLocalTestMux(t, dc, nil)
+		req := httptest.NewRequest(http.MethodPost, "/api/services/app/stage", strings.NewReader(`{"image":"ghcr.io/org/app:v2"}`))
+		req.Header.Set("Authorization", "Bearer "+internalToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("promote", func(t *testing.T) {
+		calls := &svcCallTracker{}
+		dc := replaceDockerStub(t, calls, canaryContainers())
+		mux := newLocalTestMux(t, dc, nil)
+		rec := doReq(mux, http.MethodPost, "/api/services/app/promote")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("discard", func(t *testing.T) {
+		calls := &svcCallTracker{}
+		dc := replaceDockerStub(t, calls, canaryContainers())
+		mux := newLocalTestMux(t, dc, nil)
+		rec := doReq(mux, http.MethodDelete, "/api/services/app/canary")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestServicesLifecycleReplaceHostParamOwnIdentity proves
+// ?host=<this host's own identity> behaves identically to no host param at
+// all — processed locally, never forwarded — for one representative Phase 4
+// action (replace).
+func TestServicesLifecycleReplaceHostParamOwnIdentity(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+	t.Setenv("PROXY_URL", noopProxyStub(t))
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	calls := &svcCallTracker{}
+	localDC := replaceDockerStub(t, calls, twoReplicaContainers("running", false))
+
+	var peerHit atomic.Bool
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { peerHit.Store(true) }))
+	t.Cleanup(peerSrv.Close)
+	reg := newTestPeerRegistry(peerSrv.URL, true)
+
+	mux := newLocalTestMux(t, localDC, reg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/services/app/replace?host=dashboard-a", strings.NewReader(`{"image":"ghcr.io/org/app:v2"}`))
+	req.Header.Set("Authorization", "Bearer "+internalToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if len(calls.all()) == 0 {
+		t.Error("local docker stub was never hit — ?host=<own identity> should process locally")
+	}
+	if peerHit.Load() {
+		t.Error("peer was contacted for ?host=<own identity> — must be treated identically to no host param")
+	}
+}
+
+// TestServicesPromoteMutationForwardsActorAssertion is
+// TestServicesMutationForwardsActorAssertion's Phase 4 counterpart, for one
+// representative action (promote): a token-authenticated request must reach
+// the peer carrying a verifiable X-Pmgr-Actor assertion, and the peer's own
+// audit entry must read "alice (via peer-mesh)" — not the double-wrapped
+// "alice (via alice (via peer-mesh))" that auditUser(r, "peer-mesh") would
+// produce (the exact bug class this convention exists to catch).
+func TestServicesPromoteMutationForwardsActorAssertion(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+	withActorSecret(t, testActorSecret)
+	readAudit := withAuditFile(t)
+
+	calls := &svcCallTracker{}
+	peerDC := replaceDockerStub(t, calls, canaryContainers())
+	peerOnb := newTestOnboardedStore(t)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+
+	var headerMu sync.Mutex
+	var gotHeader string
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headerMu.Lock()
+		gotHeader = r.Header.Get(actorHeader)
+		headerMu.Unlock()
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(peerSrv.Close)
+
+	reg := newTestPeerRegistry(peerSrv.URL, true)
+
+	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]dockerContainer{})
+	}))
+	localOnb := newTestOnboardedStore(t)
+	auth, _ := newConfirmedStore(t, "alice", "correct horse")
+	raw, _, err := auth.CreateToken("alice", "ci")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/services/app/promote?host=dashboard-b", nil)
 	req.Header.Set("Authorization", "Bearer "+raw)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)

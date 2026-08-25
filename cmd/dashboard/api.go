@@ -1757,10 +1757,10 @@ func runServiceCheckImage(ctx context.Context, dc *dockerClient, ic *imageChecke
 // forwardServiceMutation relays one mutating /api/services/{name}/<sub>
 // request to the peer identified by host, translating (parts, method) onto
 // its /peer/services/{name}/<sub> counterpart — the write-mesh sibling of
-// forwardImageMutation above, established as the pattern later write-mesh
-// phases (4-5) should follow for their own subpaths. Scoped to exactly the
-// seven endpoints below — replace/stage/promote/discard/offboard/delete are
-// out of scope for this phase and fall through to the default 404.
+// forwardImageMutation above. Covers scale, stop, start, replicas/{member}/
+// {stop,start}, autoupdate, check, replace, stage, promote, and canary
+// (discard) — every mutating service endpoint except offboard and delete,
+// which stay genuinely local-only and fall through to the default 404.
 func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host string, registry *PeerRegistry, name string, parts []string, actor string) {
 	var method, peerPath string
 	switch {
@@ -1783,6 +1783,14 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/autoupdate"
 	case len(parts) == 2 && parts[1] == "check" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/check"
+	case len(parts) == 2 && parts[1] == "replace" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/replace"
+	case len(parts) == 2 && parts[1] == "stage" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/stage"
+	case len(parts) == 2 && parts[1] == "promote" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/promote"
+	case len(parts) == 2 && parts[1] == "canary" && req.Method == http.MethodDelete:
+		method, peerPath = http.MethodDelete, "/peer/services/"+url.PathEscape(name)+"/canary"
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 		return
