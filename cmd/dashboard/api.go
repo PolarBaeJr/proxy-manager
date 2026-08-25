@@ -937,6 +937,14 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			return
 		}
 		name := parts[0]
+		if host, isPeer := hostForReq(req, registry); isPeer {
+			actor := sessionUser(sessionFromReq(auth, req))
+			if actor == "" {
+				actor = principalFrom(req)
+			}
+			forwardOnboardMutation(w, req, host, registry, name, actor)
+			return
+		}
 		var body OnboardRequest
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			httpx.WriteErr(w, err)
@@ -1986,6 +1994,55 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	code, respBody, mutErr := peerMutate(req.Context(), client, peerURL, peerSecret, method, peerPath,
+		10*time.Second, bytes.NewReader(reqBody), nil, mintForwardedActor(req, actor))
+	if mutErr != nil {
+		mapPeerMutationErr(w, 0, []byte(mutErr.Error()))
+		return
+	}
+	if code < 200 || code >= 300 {
+		mapPeerMutationErr(w, code, respBody)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(respBody)
+}
+
+// forwardOnboardMutation relays one POST /api/discovery/{name}/onboard
+// request to the peer identified by host, onto its /peer/discovery/{name}/
+// onboard counterpart — onboard's own write-mesh forwarder, kept separate
+// from forwardServiceMutation since onboard lives under a different mux
+// prefix (see peers.go's peerDiscoveryMutateHandler doc comment for why).
+//
+// The request body (OnboardRequest: Host, Port, Path, Strip, Replicas — no
+// image, no container ID, no labels) is forwarded VERBATIM, unlike delete's
+// server-constructed confirm body. That's safe here because the peer
+// independently resolves the target BY NAME against its own live Docker
+// daemon and re-validates via checkOnboardTarget before mutating anything —
+// it never trusts the requester's view of state. Same principle every prior
+// phase's forwarding relies on.
+func forwardOnboardMutation(w http.ResponseWriter, req *http.Request, host string, registry *PeerRegistry, name string, actor string) {
+	if registry == nil {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	peerURL, ok := registry.URLForIdentity(host)
+	if !ok {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+	if peerSecret == "" {
+		http.Error(w, "unknown host", http.StatusNotFound)
+		return
+	}
+	reqBody, err := io.ReadAll(req.Body)
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	code, respBody, mutErr := peerMutate(req.Context(), client, peerURL, peerSecret, http.MethodPost, "/peer/discovery/"+url.PathEscape(name)+"/onboard",
 		10*time.Second, bytes.NewReader(reqBody), nil, mintForwardedActor(req, actor))
 	if mutErr != nil {
 		mapPeerMutationErr(w, 0, []byte(mutErr.Error()))

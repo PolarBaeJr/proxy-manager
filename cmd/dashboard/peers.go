@@ -788,6 +788,58 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 	})
 }
 
+// peerDiscoveryMutateHandler returns the HTTP handler for POST
+// /peer/discovery/{name}/onboard on the dedicated peer-handshake port — the
+// write-side onboard counterpart, kept out of peerServicesMutateHandler's
+// dispatch on purpose. Onboard targets are UNLABELED containers (they never
+// carry proxy.service/etc labels), so the label-based outer self-guard used
+// by peerServicesMutateHandler (dc.serviceContainsSelfByName) literally
+// cannot fire against them — it would always return false ("not self") for
+// any onboard target, giving zero protection. The actual guard is
+// checkOnboardTarget, IDENTITY-based (compares the container's Docker ID
+// against selfHostname()) plus infra-name-based, and it already lives inside
+// onboardContainer itself, called right after the target container is
+// resolved and before any mutation. It fails CLOSED on a selfHostname()
+// lookup error. So: no outer self-guard is added here — checkOnboardTarget is
+// the complete, correct, already-fail-closed guard for this handler.
+func peerDiscoveryMutateHandler(secret, identity string, dc *dockerClient, proxyURL string, writesEnabled bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" || !writesEnabled {
+			http.NotFound(w, r)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		sub := strings.TrimPrefix(r.URL.Path, "/peer/discovery/")
+		parts := strings.SplitN(sub, "/", 2)
+		if len(parts) != 2 || parts[1] != "onboard" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		name := parts[0]
+		if name == "" {
+			http.NotFound(w, r)
+			return
+		}
+		var body OnboardRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		if err := dc.onboardContainer(r.Context(), name, body); err != nil {
+			writeOnboardErr(w, err)
+			return
+		}
+		proxyRefresh(proxyURL)
+		audit(r, "peer-mesh", "service.onboard", name)
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "onboarded", "name": name})
+	})
+}
+
 // peerImagesResp is the wire shape for GET /peer/images — this peer's own
 // local per-service image inventory (buildImagesInfo) plus its identity.
 // Machine is left unset on Images — the peer never tags its own local data
