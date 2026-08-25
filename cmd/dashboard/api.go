@@ -88,7 +88,31 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	})
 
 	// Host CPU / memory / disk for the header widget.
-	mux.HandleFunc("/api/stats", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/stats", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
+		if host, isPeer := hostForReq(req, registry); isPeer {
+			if registry == nil {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			peerURL, ok := registry.URLForIdentity(host)
+			if !ok {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+			if peerSecret == "" {
+				http.Error(w, "unknown host", http.StatusNotFound)
+				return
+			}
+			client := &http.Client{Timeout: 2 * time.Second}
+			var resp peerStatsResp
+			if err := peerGET(req.Context(), client, peerURL, peerSecret, "/peer/stats", &resp); err != nil {
+				httpx.WriteJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, resp.Stats)
+			return
+		}
 		httpx.WriteJSON(w, http.StatusOK, GetStats())
 	}))
 

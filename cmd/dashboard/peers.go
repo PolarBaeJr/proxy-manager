@@ -1140,6 +1140,38 @@ func peerLogsHandler(secret, identity string, dc *dockerClient) http.Handler {
 	})
 }
 
+// peerStatsResp is the wire shape for GET /peer/stats — this peer's own
+// local SysStats (GetStats(), stats.go) plus its identity.
+type peerStatsResp struct {
+	Identity string   `json:"identity"`
+	Stats    SysStats `json:"stats"`
+}
+
+// peerStatsHandler returns the HTTP handler for GET /peer/stats on the
+// dedicated peer-handshake port — same bearer-auth shape as
+// peerServicesHandler/peerImagesHandler. No dockerClient dependency: GetStats
+// reads host /proc + statfs directly, independent of Docker.
+func peerStatsHandler(secret, identity string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		want := []byte("Bearer " + secret)
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(peerStatsResp{Identity: identity, Stats: GetStats()})
+	})
+}
+
 // peerGETTimeout is peerGET with a caller-chosen timeout instead of the
 // fixed 2s — for resources whose payload isn't small-and-fast like
 // service-status/services/images. Container logs can be up to 4MB of raw
