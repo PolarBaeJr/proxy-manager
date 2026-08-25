@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -68,6 +69,36 @@ func main() {
 	}
 
 	dc := newDockerClient()
+
+	// One-shot visibility check: confirm self-identification (isSelfContainer,
+	// selfidentity.go) actually matches this process's own container among
+	// what's running right now. If a future compose change adds a
+	// hostname: override to the dashboard service, os.Hostname() stops
+	// returning the container ID and this silently regresses — log it here
+	// instead of only discovering it the hard way in the UI. Run in a
+	// goroutine with its own bounded timeout — this is diagnostic logging
+	// only, so a hung Docker socket (the Pi has a history of exactly that
+	// during SSD dropouts) must never delay the HTTP server from binding.
+	go func() {
+		h, err := selfHostname()
+		if err != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		containers, listErr := dc.listAll(ctx, "")
+		switch {
+		case listErr != nil:
+			log.Printf("dashboard self-identification: hostname=%q — could not list containers to verify: %v", h, listErr)
+		default:
+			matched := slices.ContainsFunc(containers, isSelfContainer)
+			if matched {
+				log.Printf("dashboard self-identification: hostname=%q matched container=true", h)
+			} else {
+				log.Printf("⚠ dashboard self-identification: hostname=%q matched no running container — self-exclusion in /api/services will not work (compose hostname: override?)", h)
+			}
+		}
+	}()
 
 	secrets, secretsMsgs := newSecretsFromEnv(os.Getenv)
 	for _, m := range secretsMsgs {
