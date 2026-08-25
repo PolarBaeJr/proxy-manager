@@ -1462,12 +1462,12 @@ function svcLk(s) {
   return foreignSvc(s) ? '<span class="lock" title="managed on ' + esc(machineLabel(s.machine)) + '">' + I.lock + '</span>' : lk();
 }
 // svcWriteAttr/svcWriteLk are the narrow write-mesh counterparts of
-// svcLockedAttr/svcLk — used ONLY by the controls this phase actually
-// forwards (replica-count +/-/Apply, service Stop/Start, per-replica
-// Stop/Start), never by svcLockedAttr/svcLk's other callers (Add route,
-// Promote, Discard, Pull update, Stage, Replace, Check now, Add env,
-// Auto-update toggle, Rollback, Delete service, menu), which have no peer
-// endpoint and must keep firing against the LOCAL daemon guard.
+// svcLockedAttr/svcLk — used ONLY by the controls that actually forward
+// (replica-count +/-/Apply, service Stop/Start, per-replica Stop/Start, Check
+// now, Auto-update toggle), never by svcLockedAttr/svcLk's other callers (Add
+// route, Promote, Discard, Pull update, Stage, Replace, Add env, Rollback,
+// Delete service, menu), which have no peer endpoint and must keep firing
+// against the LOCAL daemon guard.
 function svcWriteAttr(s) {
   return (foreignSvc(s) && !peerWritable(s)) ? svcLockedAttr(s) : (isElevated() ? '' : lockedAttr());
 }
@@ -1558,7 +1558,7 @@ async function renderServices() {
               + '<button class="btn" ' + svcLockedAttr(s) + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.swap + 'Replace' + svcLk(s) + '</button>'
               // Force an immediate registry check instead of waiting on the
               // ~10min background poller — mirrors the MCP check_for_update tool.
-              + '<button class="btn ghost" ' + svcLockedAttr(s) + ' onclick="checkForUpdate(\'' + sn + '\', this)">' + I.refresh + 'Check now' + svcLk(s) + '</button>'
+              + '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="checkForUpdate(\'' + sn + '\', this, this.dataset.host)">' + I.refresh + 'Check now' + svcWriteLk(s) + '</button>'
               + (s.all_stopped
                   ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\', this.dataset.host)">' + I.bolt + 'Start service' + svcWriteLk(s) + '</button>'
                   : '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\', this.dataset.host)">' + I.lock + 'Stop service' + svcWriteLk(s) + '</button>')
@@ -1573,8 +1573,8 @@ async function renderServices() {
               // flips proxy.autoupdate via the same clone-and-recreate as
               // Add env, above — same image/env/mounts, just the label changes.
               + (s.auto_update
-                  ? '<button class="btn" ' + svcLockedAttr(s) + ' onclick="toggleAutoUpdate(\'' + sn + '\', false)">' + I.arrowup + 'Auto-update: on' + svcLk(s) + '</button>'
-                  : '<button class="btn ghost" ' + svcLockedAttr(s) + ' onclick="toggleAutoUpdate(\'' + sn + '\', true)">' + I.arrowup + 'Auto-update: off' + svcLk(s) + '</button>')
+                  ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', false, this.dataset.host)">' + I.arrowup + 'Auto-update: on' + svcWriteLk(s) + '</button>'
+                  : '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', true, this.dataset.host)">' + I.arrowup + 'Auto-update: off' + svcWriteLk(s) + '</button>')
               + (s.previous_image ? '<button class="linkbtn" ' + svcLockedAttr(s) + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\')">' + I.rewind + 'Rollback</button>' : '');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
@@ -2108,9 +2108,10 @@ async function oneClickUpdate(name, image) {
 }
 
 // toggleAutoUpdate — flip the per-onboarded-service unattended-update opt-in.
-async function toggleAutoUpdate(name, enabled) {
+async function toggleAutoUpdate(name, enabled, host) {
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
   try {
-    await api('/api/services/' + encodeURIComponent(name) + '/autoupdate', {
+    await api('/api/services/' + encodeURIComponent(name) + '/autoupdate' + hostParam, {
       method: 'POST', body: JSON.stringify({ enabled: enabled })
     });
     toast(enabled ? 'auto-update enabled for ' + name : 'auto-update disabled for ' + name, 'ok');
@@ -2147,10 +2148,11 @@ async function toggleMaintenance(host, enable) {
 // ~10min background checker — same endpoint the MCP check_for_update tool
 // calls. Response is either a single status object, or {live, canary} when
 // a canary is staged; either shape may carry update_available.
-async function checkForUpdate(name, btn) {
+async function checkForUpdate(name, btn, host) {
   if (btn) btn.disabled = true;
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
   try {
-    const r = await api('/api/services/' + encodeURIComponent(name) + '/check', { method:'POST' });
+    const r = await api('/api/services/' + encodeURIComponent(name) + '/check' + hostParam, { method:'POST' });
     const avail = r.update_available || (r.live && r.live.update_available) || (r.canary && r.canary.update_available);
     toast(avail ? 'update available for ' + name : name + ' is up to date', 'ok');
     _lastServicesHash = '';

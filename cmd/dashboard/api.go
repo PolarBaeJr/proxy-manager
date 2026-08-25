@@ -642,83 +642,34 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				httpx.WriteErr(w, err)
 				return
 			}
-			if o, ok := onb.Get(name); ok {
-				if o.Host == "" {
-					http.Error(w, "managed-only service (no route) — auto-update needs a routed onboarded service", http.StatusBadRequest)
-					return
-				}
-				if err := onb.SetAutoUpdate(name, body.Enabled); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-			} else {
-				// Label-managed service: flip proxy.autoupdate via a
-				// lightweight clone-and-recreate (same image/env/mounts,
-				// only the label value changes) rather than requiring a
-				// compose edit.
-				if err := dc.setAutoUpdateLabel(req.Context(), name, body.Enabled); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
+			if err := runServiceAutoUpdateSet(req.Context(), dc, onb, name, body.Enabled); err != nil {
+				writeAutoUpdateErr(w, err)
+				return
 			}
 			audit(req, sessionUser(info), "service.autoupdate_set", name+" => "+strconv.FormatBool(body.Enabled))
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
 			return
 		}
 		if len(parts) == 2 && parts[1] == "check" && req.Method == "POST" {
-			svc, ok, err := findService(req.Context(), dc, name)
+			payload, status, err := runServiceCheckImage(req.Context(), dc, ic, onb, name)
 			if err != nil {
 				httpx.WriteErr(w, err)
 				return
 			}
-			if !ok {
+			if status == http.StatusNotFound {
 				http.Error(w, "service not found", http.StatusNotFound)
 				return
 			}
-			// A staged canary can live in the labeled-container view
-			// (svc.CanaryImage, set by dc.listServices from the c-prefixed
-			// container's proxy.canary label) or, for onboarded services,
-			// only in the onboarded store — the canary clones onboardedBaseEnv
-			// creates carry no proxy.* labels, so dc.listServices never sees
-			// them. Fall back to the store so an onboarded canary isn't
-			// silently skipped.
-			canaryImage := svc.CanaryImage
-			if canaryImage == "" && onb != nil {
-				if o, ok := onb.Get(name); ok {
-					canaryImage = o.CanaryImage
-				}
-			}
-
-			ic.Check(req.Context(), svc.Image)
 			audit(req, sessionUser(info), "service.check_image", name)
-			live := ic.Get(svc.Image)
-
-			if canaryImage == "" {
-				if live.Err != "" {
-					http.Error(w, live.Err, http.StatusBadGateway)
-					return
+			if status != http.StatusOK {
+				msg, _ := payload.(string)
+				if msg == "" {
+					msg = "check failed"
 				}
-				httpx.WriteJSON(w, http.StatusOK, live)
+				http.Error(w, msg, status)
 				return
 			}
-
-			ic.Check(req.Context(), canaryImage)
-			canary := ic.Get(canaryImage)
-			if live.Err != "" || canary.Err != "" {
-				msg := ""
-				if live.Err != "" {
-					msg = "live " + svc.Image + ": " + live.Err
-				}
-				if canary.Err != "" {
-					if msg != "" {
-						msg += "; "
-					}
-					msg += "canary " + canaryImage + ": " + canary.Err
-				}
-				http.Error(w, msg, http.StatusBadGateway)
-				return
-			}
-			httpx.WriteJSON(w, http.StatusOK, map[string]any{"live": live, "canary": canary})
+			httpx.WriteJSON(w, status, payload)
 			return
 		}
 		if len(parts) == 2 && parts[1] == "stage" && req.Method == "POST" {
@@ -1685,14 +1636,131 @@ func runServiceLifecycle(ctx context.Context, dc *dockerClient, proxyURL string,
 	return acted, nil
 }
 
+// errAutoUpdateSelf is returned by runServiceAutoUpdateSet when enabling
+// autoupdate would let a future autoUpdater cycle replace the dashboard's own
+// container — either because the service demonstrably IS the dashboard, or
+// because a Docker error means that can't be ruled out. Both cases are
+// wrapped in this same sentinel (via %w) so writeAutoUpdateErr maps either to
+// 403, not 400: an identity check that failed is exactly as dangerous here as
+// one that succeeded and found self, since the write path (onb.SetAutoUpdate
+// / dc.setAutoUpdateLabel) has no independent live-state re-read of its own.
+var errAutoUpdateSelf = errors.New("refusing to enable auto-update for the dashboard's own service — could trigger unattended self-replacement")
+
+// runServiceAutoUpdateSet is the autoupdate-toggle logic shared by the local
+// /api/services/{name}/autoupdate handler and peers.go's peer branch.
+// onb.SetAutoUpdate is a pure store write with no live Docker re-read, so
+// unlike dc.setAutoUpdateLabel (which re-reads live state itself via
+// setAutoUpdateLabel's own container lookup), enabling it here must
+// independently fail CLOSED on a Docker error, not pass through the way the
+// outer per-request self-guard (dc.serviceContainsSelfByName, checked before
+// dispatch) does. Only checked when enabled=true — disabling is
+// de-escalating, so it skips the check entirely.
+func runServiceAutoUpdateSet(ctx context.Context, dc *dockerClient, onb *OnboardedStore, name string, enabled bool) error {
+	if o, ok := onb.Get(name); ok {
+		if o.Host == "" {
+			return fmt.Errorf("managed-only service (no route) — auto-update needs a routed onboarded service")
+		}
+		if enabled {
+			self, err := dc.serviceContainsSelfByName(ctx, name)
+			if err != nil {
+				return fmt.Errorf("could not verify service identity: %v: %w", err, errAutoUpdateSelf)
+			}
+			if self {
+				return errAutoUpdateSelf
+			}
+		}
+		return onb.SetAutoUpdate(name, enabled)
+	}
+	return dc.setAutoUpdateLabel(ctx, name, enabled)
+}
+
+// writeAutoUpdateErr maps runServiceAutoUpdateSet's error onto the response:
+// errAutoUpdateSelf (self=true OR the identity check itself errored, both
+// wrapped in this sentinel) -> 403, a real refusal; everything else -> 400
+// (preserves the existing plain-400 behavior for all other error cases, e.g.
+// managed-only or a downstream Docker failure unrelated to identity).
+func writeAutoUpdateErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAutoUpdateSelf) {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
+// runServiceCheckImage is the "check now" logic shared by the local
+// /api/services/{name}/check handler and peers.go's peer branch. Reproduces
+// the pre-extraction handler's three response shapes exactly:
+//   - service not found: (nil, http.StatusNotFound, nil)
+//   - found, no staged canary: (*imageStatus, http.StatusOK, nil), or
+//     (errMsg string, http.StatusBadGateway, nil) if the live check failed
+//   - found, staged canary: (map[string]any{"live":..,"canary":..},
+//     http.StatusOK, nil), or (errMsg string, http.StatusBadGateway, nil) if
+//     either check failed
+//
+// A non-nil err is reserved for findService itself failing (mirrors the
+// original handler's httpx.WriteErr branch) — callers should relay it the
+// same way. Auditing is NOT done here — it happens at the call sites, since
+// the original local handler audits unconditionally once the service is
+// found (even on the eventual 502 path), and the peer branch's audit
+// convention (success-only) differs; extracting it here would force one
+// behavior onto both.
+func runServiceCheckImage(ctx context.Context, dc *dockerClient, ic *imageChecker, onb *OnboardedStore, name string) (payload any, status int, err error) {
+	svc, ok, err := findService(ctx, dc, name)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !ok {
+		return nil, http.StatusNotFound, nil
+	}
+
+	// A staged canary can live in the labeled-container view (svc.CanaryImage,
+	// set by dc.listServices from the c-prefixed container's proxy.canary
+	// label) or, for onboarded services, only in the onboarded store — the
+	// canary clones onboardedBaseEnv creates carry no proxy.* labels, so
+	// dc.listServices never sees them. Fall back to the store so an onboarded
+	// canary isn't silently skipped.
+	canaryImage := svc.CanaryImage
+	if canaryImage == "" && onb != nil {
+		if o, ok := onb.Get(name); ok {
+			canaryImage = o.CanaryImage
+		}
+	}
+
+	ic.Check(ctx, svc.Image)
+	live := ic.Get(svc.Image)
+
+	if canaryImage == "" {
+		if live.Err != "" {
+			return live.Err, http.StatusBadGateway, nil
+		}
+		return live, http.StatusOK, nil
+	}
+
+	ic.Check(ctx, canaryImage)
+	canary := ic.Get(canaryImage)
+	if live.Err != "" || canary.Err != "" {
+		msg := ""
+		if live.Err != "" {
+			msg = "live " + svc.Image + ": " + live.Err
+		}
+		if canary.Err != "" {
+			if msg != "" {
+				msg += "; "
+			}
+			msg += "canary " + canaryImage + ": " + canary.Err
+		}
+		return msg, http.StatusBadGateway, nil
+	}
+	return map[string]any{"live": live, "canary": canary}, http.StatusOK, nil
+}
+
 // forwardServiceMutation relays one mutating /api/services/{name}/<sub>
 // request to the peer identified by host, translating (parts, method) onto
 // its /peer/services/{name}/<sub> counterpart — the write-mesh sibling of
 // forwardImageMutation above, established as the pattern later write-mesh
-// phases (3-5) should follow for their own subpaths. Scoped to exactly the
-// five endpoints below — replace/stage/promote/discard/autoupdate/check/
-// offboard/delete are out of scope for this phase and fall through to the
-// default 404.
+// phases (4-5) should follow for their own subpaths. Scoped to exactly the
+// seven endpoints below — replace/stage/promote/discard/offboard/delete are
+// out of scope for this phase and fall through to the default 404.
 func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host string, registry *PeerRegistry, name string, parts []string, actor string) {
 	var method, peerPath string
 	switch {
@@ -1711,6 +1779,10 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		}
 		method = http.MethodPost
 		peerPath = "/peer/services/" + url.PathEscape(name) + "/replicas/" + url.PathEscape(memberParts[0]) + "/" + memberParts[1]
+	case len(parts) == 2 && parts[1] == "autoupdate" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/autoupdate"
+	case len(parts) == 2 && parts[1] == "check" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/check"
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 		return

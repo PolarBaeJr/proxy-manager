@@ -485,14 +485,14 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 }
 
 // peerServicesMutateHandler returns the HTTP handler for POST
-// /peer/services/{name}/{scale,stop,start,replicas/{member}/{stop,start}}
-// on the dedicated peer-handshake port — the write-side counterpart of
-// peerServicesHandler. This establishes the copyable pattern later
-// write-mesh phases (3-5) should reuse: gate on secret+writesEnabled,
+// /peer/services/{name}/{scale,stop,start,replicas/{member}/{stop,start},
+// autoupdate,check} on the dedicated peer-handshake port — the write-side
+// counterpart of peerServicesHandler. This establishes the copyable pattern
+// later write-mesh phases (4-5) should reuse: gate on secret+writesEnabled,
 // constant-time bearer compare, parse the subpath, self-guard, then dispatch
 // against THIS host's own live Docker state (never the requester's claims),
 // auditing every branch as peer-mesh.
-func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, routesConfigPath, proxyURL string, writesEnabled bool) http.Handler {
+func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, ic *imageChecker, routesConfigPath, proxyURL string, writesEnabled bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if secret == "" || !writesEnabled {
 			http.NotFound(w, r)
@@ -518,6 +518,12 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 		// phase (3-5) adding a peer-write branch that can mutate WITHOUT
 		// first re-reading live state must fail CLOSED instead of copying
 		// this assumption blindly.
+		//
+		// The autoupdate branch (phase 3) is exactly that case: enabling
+		// auto-update writes straight to the onboarded store with no
+		// live-state read afterward, so it cannot rely on this outer check.
+		// runServiceAutoUpdateSet does its own independent self-check and
+		// fails CLOSED (403) on a Docker error there too, not just on self==true.
 		if self, err := dc.serviceContainsSelfByName(r.Context(), name); err == nil && self {
 			http.Error(w, "refusing to manage the dashboard's own service from within itself — use docker compose on the host", http.StatusForbidden)
 			return
@@ -606,6 +612,49 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 			proxyRefresh(proxyURL)
 			audit(r, "peer-mesh", "service.replica_"+act, name+"/"+member)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": act + "ped", "member": member})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "autoupdate" && r.Method == http.MethodPost {
+			var body struct {
+				Enabled bool `json:"enabled"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if err := runServiceAutoUpdateSet(r.Context(), dc, onb, name, body.Enabled); err != nil {
+				writeAutoUpdateErr(w, err)
+				return
+			}
+			audit(r, "peer-mesh", "service.autoupdate_set", name+" => "+strconv.FormatBool(body.Enabled))
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "check" && r.Method == http.MethodPost {
+			payload, status, err := runServiceCheckImage(r.Context(), dc, ic, onb, name)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if status != http.StatusOK {
+				if status == http.StatusNotFound {
+					http.Error(w, "service not found", http.StatusNotFound)
+					return
+				}
+				msg, _ := payload.(string)
+				if msg == "" {
+					msg = "check failed"
+				}
+				http.Error(w, msg, status)
+				return
+			}
+			// Unlike the local handler (which audits unconditionally once the
+			// service is found, including the eventual-502 path), this only
+			// audits on success — there's no operator watching this response
+			// synchronously the way the local UI is, so a failed check isn't
+			// an action worth recording in the peer-mesh audit trail.
+			audit(r, "peer-mesh", "service.check_image", name)
+			httpx.WriteJSON(w, status, payload)
 			return
 		}
 		http.NotFound(w, r)
