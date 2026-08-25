@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -90,13 +91,7 @@ func main() {
 		case listErr != nil:
 			log.Printf("dashboard self-identification: hostname=%q — could not list containers to verify: %v", h, listErr)
 		default:
-			matched := false
-			for _, ct := range containers {
-				if isSelfContainer(ct) {
-					matched = true
-					break
-				}
-			}
+			matched := slices.ContainsFunc(containers, isSelfContainer)
 			if matched {
 				log.Printf("dashboard self-identification: hostname=%q matched container=true", h)
 			} else {
