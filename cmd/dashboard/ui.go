@@ -7,7 +7,7 @@ const dashboardHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pi Dashboard</title>
+<title>Dashboard</title>
 <style>
 /* ============ TOKENS ============ */
 :root{
@@ -498,7 +498,7 @@ footer.app code{color:var(--muted)}
     <div class="brand">
       <div class="logo" id="auth-logo-slot"></div>
       <div>
-        <h1>Pi Dashboard</h1>
+        <h1>Dashboard</h1>
         <div class="sub">homelab edge &amp; service control</div>
       </div>
     </div>
@@ -514,7 +514,7 @@ footer.app code{color:var(--muted)}
         <div class="brand">
           <div class="logo" id="main-logo-slot"></div>
           <div>
-            <h1>Pi Dashboard</h1>
+            <h1>Dashboard</h1>
             <div class="sub">homelab edge &amp; service control</div>
           </div>
         </div>
@@ -572,7 +572,7 @@ footer.app code{color:var(--muted)}
     </div>
     <div class="wrap">
       <footer class="app">
-        <span>Pi Dashboard <code>v2.4.0</code></span><span class="dotsep"></span>
+        <span>Dashboard <code>v2.4.0</code></span><span class="dotsep"></span>
         <span id="footer-peers" hidden></span><span class="dotsep" id="footer-peers-sep" hidden></span>
         <span><a href="/api/health">/api/health</a></span>
       </footer>
@@ -593,7 +593,7 @@ footer.app code{color:var(--muted)}
 
 <script>
 /* ===================================================================
-   Pi Dashboard — client. Wire-compatible with the existing api.go.
+   Dashboard — client. Wire-compatible with the existing api.go.
    Visuals are the pitch-black / Vercel/Geist refresh; behavior, auth
    flow, polling, and contract are preserved from the prior ui.go.
    =================================================================== */
