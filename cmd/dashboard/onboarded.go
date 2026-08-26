@@ -162,15 +162,26 @@ type routesFile struct {
 	Routes []routesEntry `json:"routes"`
 }
 type routesEntry struct {
-	Name     string   `json:"name,omitempty"`
-	Host     string   `json:"host"`
-	Path     string   `json:"path,omitempty"`
-	Strip    bool     `json:"strip,omitempty"`
-	Backends []string `json:"backends"`
-	Health   string   `json:"health,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Host      string   `json:"host"`
+	Path      string   `json:"path,omitempty"`
+	Strip     bool     `json:"strip,omitempty"`
+	Backends  []string `json:"backends"`
+	Service   string   `json:"service,omitempty"`
+	Health    string   `json:"health,omitempty"`
+	Auth      bool     `json:"auth,omitempty"`
+	AuthUsers []string `json:"auth_users,omitempty"`
+	AuthMode  string   `json:"auth_mode,omitempty"`
+	RateLimit bool     `json:"ratelimit,omitempty"`
+	RateRPM   int      `json:"ratelimit_rpm,omitempty"`
 	// Marker: routes the dashboard wrote, so we can rewrite/delete them
 	// without touching user-curated entries.
 	Onboarded string `json:"onboarded,omitempty"` // matches OnboardedService.Name
+	// DuplicateOf marks an entry written by duplicate.go's
+	// upsertDuplicateRoute — a SEPARATE marker from Onboarded so
+	// rebuildOnboardedRoute/removeOnboardedRoute never touch these entries,
+	// and vice versa.
+	DuplicateOf string `json:"duplicate_of,omitempty"` // matches the duplicated service's name
 }
 
 func readRoutesFile(path string) (routesFile, error) {

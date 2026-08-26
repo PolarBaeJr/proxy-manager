@@ -167,10 +167,11 @@ func (c *dockerClient) listRunning(ctx context.Context, filter string) ([]docker
 // ---- Container lifecycle (for service management) ----
 
 type createBody struct {
-	Image            string            `json:"Image"`
-	Labels           map[string]string `json:"Labels,omitempty"`
-	Env              []string          `json:"Env,omitempty"`
-	HostConfig       hostConfig        `json:"HostConfig"`
+	Image            string              `json:"Image"`
+	Labels           map[string]string   `json:"Labels,omitempty"`
+	Env              []string            `json:"Env,omitempty"`
+	ExposedPorts     map[string]struct{} `json:"ExposedPorts,omitempty"`
+	HostConfig       hostConfig          `json:"HostConfig"`
 	NetworkingConfig struct {
 		EndpointsConfig map[string]struct{} `json:"EndpointsConfig"`
 	} `json:"NetworkingConfig"`
@@ -180,7 +181,15 @@ type hostConfig struct {
 	RestartPolicy struct {
 		Name string `json:"Name"`
 	} `json:"RestartPolicy"`
-	Mounts []mountSpec `json:"Mounts,omitempty"`
+	Mounts       []mountSpec              `json:"Mounts,omitempty"`
+	PortBindings map[string][]portBinding `json:"PortBindings,omitempty"`
+}
+
+// portBinding mirrors Docker Engine API's HostConfig.PortBindings entry
+// shape — one host-side binding for a published container port.
+type portBinding struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
 }
 
 // mountSpec mirrors Docker Engine API's HostConfig.Mounts entry shape —
@@ -216,6 +225,18 @@ func (c *dockerClient) pullImage(ctx context.Context, image string) {
 	}
 	defer body.Close()
 	_, _ = io.Copy(io.Discard, body)
+}
+
+// createVolume creates a named volume, POSTing to Docker's /volumes/create.
+// Naturally idempotent: Docker returns 201 even if the volume already
+// exists, so there's no existence pre-check.
+func (c *dockerClient) createVolume(ctx context.Context, name string) error {
+	resp, err := c.do(ctx, "POST", "/volumes/create", map[string]string{"Name": name})
+	if err != nil {
+		return err
+	}
+	resp.Close()
+	return nil
 }
 
 func (c *dockerClient) createContainer(ctx context.Context, name string, body createBody) (string, error) {
