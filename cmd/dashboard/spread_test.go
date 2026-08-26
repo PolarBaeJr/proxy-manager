@@ -183,6 +183,42 @@ func TestServicesSpreadCreatesSameLabelReplicaOnPeer(t *testing.T) {
 	}
 }
 
+// TestServicesSpreadForwardsGroupLabel is the regression for the bug where a
+// spread replica silently landed in its own default-to-service-name group
+// instead of the origin's real proxy.group — which fragmented a spread
+// service's Status-tab/statusbot entry across two differently-named groups
+// on two hosts (see mergeServiceStatusGroups in servicestatus.go, which
+// depends on both hosts agreeing on the group name to combine them at all).
+func TestServicesSpreadForwardsGroupLabel(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	target, cap := newSpreadTargetServer(t)
+	calls := &svcCallTracker{}
+	containers := []dockerContainer{{
+		ID: "tpl1", Names: []string{"/app"}, State: "running", Image: "ghcr.io/org/app:v1",
+		Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "8080", labelGroup: "badminton"},
+	}}
+	dc := spreadDockerStub(t, calls, containers, nil, nil)
+
+	rec := postSpread(t, dc, target, `{"target":"dashboard-b"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	_, body := cap.first(t)
+	if got := body.Labels[labelGroup]; got != "badminton" {
+		t.Errorf("%s = %q, want badminton — the replica must join the origin's Status-view group, not default to its own service name", labelGroup, got)
+	}
+}
+
+// Unlike proxy.name (free text, never validated on ingest), an invalid
+// proxy.group is rejected by docker.go at container-listing time — the
+// container is dropped before it ever becomes part of a Service, so
+// findService can't find it and spread.go's own group sanitization (mirrored
+// after Display's, for defense in depth) has no reachable path to exercise
+// via this handler. No test for that branch; the guarantee comes from
+// docker.go's ingest-time validation instead.
+
 // TestServicesSpreadWritesNoRoutesEntry is the direct regression against the
 // incident shape: duplicate.go appends a SECOND, competing routes.json entry
 // for the same host+path. Spread must add none at all — the peer's own proxy

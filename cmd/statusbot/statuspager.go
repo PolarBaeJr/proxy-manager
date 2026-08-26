@@ -232,9 +232,23 @@ func serviceDetail(s serviceStatusEntry) string {
 			rate += "+"
 		}
 	}
-	return fmt.Sprintf("%d/%d replicas · %s req/5m\n%.1f%% cpu · %s/%s mem",
+	detail := fmt.Sprintf("%d/%d replicas · %s req/5m\n%.1f%% cpu · %s/%s mem",
 		s.HealthyReplicas, s.TotalReplicas, rate, s.CPUPercent,
 		humanBytes(s.MemUsedBytes), humanBytes(s.MemLimitBytes))
+	if len(s.Machines) > 1 {
+		detail += "\n" + machinesLabel(s.Machines)
+	}
+	return detail
+}
+
+// machinesLabel renders a spread service's contributing hosts, trimmed the
+// same way machineSuffix trims a group's — e.g. "mac + pi".
+func machinesLabel(machines []string) string {
+	trimmed := make([]string, len(machines))
+	for i, m := range machines {
+		trimmed[i] = trimMachineLabel(m)
+	}
+	return strings.Join(trimmed, " + ")
 }
 
 // statusPageComponents returns the Back/Next button row for the given

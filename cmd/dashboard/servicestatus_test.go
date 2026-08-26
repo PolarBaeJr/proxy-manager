@@ -328,3 +328,78 @@ func TestServiceStatusEndpointReportsUnreachablePeer(t *testing.T) {
 		t.Errorf("peerHost = %+v, want an unreachable entry labeled %q", peerHost, peerURL)
 	}
 }
+
+// TestMergeServiceStatusGroupsCombinesSpreadService proves a service spread
+// across two hosts — same group, same Name+Host, arriving as two separate
+// per-machine groups the way api.go builds them before merging — folds into
+// one group with one entry summing both hosts' replicas, instead of showing
+// up as two disconnected fragments.
+func TestMergeServiceStatusGroupsCombinesSpreadService(t *testing.T) {
+	n := 12
+	groups := []ServiceStatusGroup{
+		{
+			Group:   "badminton",
+			Machine: "pi",
+			Services: []ServiceStatusEntry{
+				{Name: "badminton-player", Host: "sfubadminton.com", HealthyReplicas: 2, TotalReplicas: 2, State: "up", Requests5m: &n, CPUPercent: 4.5, MemUsedBytes: 100},
+				{Name: "badminton-admin", Host: "sfubadminton.com", HealthyReplicas: 1, TotalReplicas: 1, State: "up"},
+			},
+		},
+		{
+			Group:   "badminton",
+			Machine: "mac",
+			Services: []ServiceStatusEntry{
+				{Name: "badminton-player", Host: "sfubadminton.com", HealthyReplicas: 2, TotalReplicas: 3, State: "degraded", Requests5m: intPtr(8), CPUPercent: 6.0, MemUsedBytes: 200},
+			},
+		},
+	}
+
+	out := mergeServiceStatusGroups(groups)
+	if len(out) != 1 {
+		t.Fatalf("groups = %+v, want 1 combined badminton group", out)
+	}
+	g := out[0]
+	if g.Group != "badminton" {
+		t.Fatalf("Group = %q, want badminton", g.Group)
+	}
+	if g.Machine != "" {
+		t.Errorf("Machine = %q, want \"\" — group spans pi+mac, ambiguous", g.Machine)
+	}
+	if len(g.Services) != 2 {
+		t.Fatalf("Services = %+v, want 2 (badminton-player merged, badminton-admin untouched)", g.Services)
+	}
+
+	var player, admin *ServiceStatusEntry
+	for i := range g.Services {
+		switch g.Services[i].Name {
+		case "badminton-player":
+			player = &g.Services[i]
+		case "badminton-admin":
+			admin = &g.Services[i]
+		}
+	}
+	if player == nil {
+		t.Fatalf("no badminton-player entry in %+v", g.Services)
+	}
+	if player.TotalReplicas != 5 || player.HealthyReplicas != 4 {
+		t.Errorf("player replicas = %d/%d, want 4/5", player.HealthyReplicas, player.TotalReplicas)
+	}
+	if player.State != "degraded" {
+		t.Errorf("player.State = %q, want degraded (pi up, mac degraded)", player.State)
+	}
+	if player.Requests5m == nil || *player.Requests5m != 20 {
+		t.Errorf("player.Requests5m = %v, want 20 (12+8 summed)", player.Requests5m)
+	}
+	if got := len(player.Machines); got != 2 {
+		t.Errorf("player.Machines = %v, want [mac pi]", player.Machines)
+	}
+
+	if admin == nil {
+		t.Fatalf("no badminton-admin entry in %+v", g.Services)
+	}
+	if admin.TotalReplicas != 1 || len(admin.Machines) != 1 || admin.Machines[0] != "pi" {
+		t.Errorf("admin = %+v, want untouched pi-only entry", admin)
+	}
+}
+
+func intPtr(n int) *int { return &n }

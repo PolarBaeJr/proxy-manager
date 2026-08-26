@@ -121,6 +121,12 @@ type ServiceStatusEntry struct {
 	CPUPercent      float64 `json:"cpu_pct"`
 	MemUsedBytes    uint64  `json:"mem_used_bytes"`
 	MemLimitBytes   uint64  `json:"mem_limit_bytes"`
+	// Machines lists every peer identity this entry's replicas were counted
+	// on, sorted/deduplicated — populated by mergeServiceStatusGroups when
+	// this host's own entry and a peer's matching entry (same Name+Host,
+	// i.e. a Spread service — see spread.go) get folded into one. A single
+	// element (or none, before any peer is configured) is the common case.
+	Machines []string `json:"machines,omitempty"`
 }
 
 type ServiceStatusGroup struct {
@@ -132,6 +138,11 @@ type ServiceStatusGroup struct {
 	// configured), set only on groups merged in from a peer's
 	// /peer/service-status. Lets a multi-host caller (statusbot) label which
 	// host each group belongs to without a second lookup.
+	//
+	// mergeServiceStatusGroups combines every group sharing the same Group
+	// name (regardless of Machine) into one, so this ends up "" whenever
+	// that group's services actually came from more than one machine —
+	// which entry.Machines then says explicitly, entry by entry.
 	Machine string `json:"machine,omitempty"`
 }
 
@@ -255,4 +266,119 @@ func buildServiceStatus(ctx context.Context, dc *dockerClient, proxyURL string) 
 		out.Groups = append(out.Groups, ServiceStatusGroup{Group: g, Services: entries})
 	}
 	return out, nil
+}
+
+// mergeServiceStatusGroups combines groups that share a Group name —
+// which happens once a peer's groups are merged in (api.go) and, for a
+// spread service, once spread.go forwards proxy.group so the origin and its
+// peer replicas agree on the same group name — into one group. Within that
+// combined group, entries that are really the same routed service running on
+// multiple hosts (matched on Name+Host, Host required non-empty: an unrouted
+// "DB"-style entry describes containers this host runs, never a shared
+// identity a peer could also be running) are folded into one, summing
+// replica/usage counts and recording every contributing machine so a caller
+// can render e.g. "5/5 replicas (pi + mac)" instead of two disconnected
+// entries.
+//
+// Safe to call unconditionally, including a single-host response with no
+// peers configured: every group name is already unique in that case, so
+// nothing merges and the input comes back unchanged (aside from sort order).
+func mergeServiceStatusGroups(groups []ServiceStatusGroup) []ServiceStatusGroup {
+	order := make([]string, 0, len(groups))
+	byName := map[string]*ServiceStatusGroup{}
+	machinesOf := map[string]map[string]bool{}
+
+	for _, g := range groups {
+		mg, ok := byName[g.Group]
+		if !ok {
+			gc := ServiceStatusGroup{Group: g.Group}
+			byName[g.Group] = &gc
+			machinesOf[g.Group] = map[string]bool{}
+			order = append(order, g.Group)
+			mg = &gc
+		}
+		if g.Machine != "" {
+			machinesOf[g.Group][g.Machine] = true
+		}
+		for _, e := range g.Services {
+			if g.Machine != "" {
+				e.Machines = appendUniqueSorted(e.Machines, g.Machine)
+			}
+			if e.Host == "" {
+				mg.Services = append(mg.Services, e)
+				continue
+			}
+			idx := -1
+			for i := range mg.Services {
+				if mg.Services[i].Name == e.Name && mg.Services[i].Host == e.Host {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				mg.Services = append(mg.Services, e)
+				continue
+			}
+			mg.Services[idx] = combineServiceStatusEntries(mg.Services[idx], e)
+		}
+	}
+
+	sort.Strings(order)
+	out := make([]ServiceStatusGroup, 0, len(order))
+	for _, name := range order {
+		g := byName[name]
+		if ms := machinesOf[name]; len(ms) == 1 {
+			for m := range ms {
+				g.Machine = m
+			}
+		}
+		sort.Slice(g.Services, func(i, j int) bool { return g.Services[i].Name < g.Services[j].Name })
+		out = append(out, *g)
+	}
+	return out
+}
+
+// combineServiceStatusEntries folds b (a same-identity entry counted on
+// another machine) into a.
+func combineServiceStatusEntries(a, b ServiceStatusEntry) ServiceStatusEntry {
+	a.HealthyReplicas += b.HealthyReplicas
+	a.TotalReplicas += b.TotalReplicas
+	a.CPUPercent += b.CPUPercent
+	a.MemUsedBytes += b.MemUsedBytes
+	if b.MemLimitBytes > a.MemLimitBytes {
+		a.MemLimitBytes = b.MemLimitBytes
+	}
+	// down only when every contributing host agrees it's down — one host
+	// still serving traffic is a real degradation, not a full outage.
+	switch {
+	case a.State == "up" && b.State == "up":
+		a.State = "up"
+	case a.State == "down" && b.State == "down":
+		a.State = "down"
+	default:
+		a.State = "degraded"
+	}
+	switch {
+	case a.Requests5m == nil:
+		a.Requests5m = b.Requests5m
+	case b.Requests5m != nil:
+		sum := *a.Requests5m + *b.Requests5m
+		a.Requests5m = &sum
+	}
+	a.RateTruncated = a.RateTruncated || b.RateTruncated
+	for _, m := range b.Machines {
+		a.Machines = appendUniqueSorted(a.Machines, m)
+	}
+	return a
+}
+
+func appendUniqueSorted(machines []string, m string) []string {
+	for _, existing := range machines {
+		if existing == m {
+			return machines
+		}
+	}
+	machines = append(machines, m)
+	sort.Strings(machines)
+	return machines
 }
