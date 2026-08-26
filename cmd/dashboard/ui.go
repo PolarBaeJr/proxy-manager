@@ -1620,11 +1620,19 @@ async function renderServices() {
   for (const s of ordered) {
     const k = mergeKeyOf(s);
     mergeCounts[k] = (mergeCounts[k] || 0) + 1;
-    const a = unitAgg[k] || (unitAgg[k] = { totalReplicas: 0, allStopped: true, backends: [], hasLocal: false, machines: [] });
+    const a = unitAgg[k] || (unitAgg[k] = { totalReplicas: 0, allStopped: true, backends: [], hasLocal: false, machines: [], backendsByMachine: {} });
     a.totalReplicas += s.replicas || 0;
     if (!s.all_stopped) a.allStopped = false;
     for (const b of (s.backends || [])) if (a.backends.indexOf(b) === -1) a.backends.push(b);
     if (!foreignSvc(s)) a.hasLocal = true;
+    // Backends are docker-network-internal IPs, private to whichever host
+    // issued them — pi and mac both hand out 172.18.0.x, so a bare IP can
+    // collide across hosts. Bucketing per machine (''  = local) lets the
+    // Recent-requests panel below match each backend only against that same
+    // machine's own access log, never a peer's.
+    const mid = foreignSvc(s) ? s.machine : '';
+    const bucket = (a.backendsByMachine[mid] = a.backendsByMachine[mid] || []);
+    for (const b of (s.backends || [])) if (bucket.indexOf(b) === -1) bucket.push(b);
     a.machines.push(s.machine ? machineLabel(s.machine) : (_selfIdentity ? machineLabel(_selfIdentity) : 'this host'));
   }
   // Distinct merge units per group, so the folder header's "N services"
@@ -1892,9 +1900,21 @@ async function renderServices() {
 
     if (isLastOfUnit) {
       const agg = unitAgg[mKey];
-      const backends = merged ? agg.backends : (s.backends || []);
+      const localBackends = merged ? (agg.backendsByMachine[''] || []) : (s.backends || []);
       const skipStats = managed || !agg.hasLocal;
-      html += (skipStats ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-service="' + sn + '" data-backends="' + esc(backends.join(' ')) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
+      // Peer backends (any machine key other than '') let the panel also
+      // pull that peer's own access log and merge its traffic in — see
+      // recentForPanelMulti. Only emitted for a merged unit; a lone local
+      // instance has none.
+      let peerBackendsAttr = '';
+      if (merged) {
+        const peerMap = {};
+        for (const [mid, backends] of Object.entries(agg.backendsByMachine)) {
+          if (mid && backends.length) peerMap[mid] = backends;
+        }
+        if (Object.keys(peerMap).length) peerBackendsAttr = ' data-peer-backends="' + esc(JSON.stringify(peerMap)) + '"';
+      }
+      html += (skipStats ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-service="' + sn + '" data-backends="' + esc(localBackends.join(' ')) + '"' + peerBackendsAttr + '><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
            +  '</div>'
            +  '</div>';
     }
@@ -1907,7 +1927,7 @@ async function renderServices() {
 // Cache last per-host stats so re-render uses prior data instantly — kills
 // the height-jump on every 5s auto-refresh tick where the panel would
 // otherwise flash "Loading…" → full content.
-let _svcStatsCache = { byHost: {}, recentByHost: {}, byService: {}, fetchedAt: 0 };
+let _svcStatsCache = { byHost: {}, recentByMachine: {}, byService: {}, fetchedAt: 0 };
 // Per-panel hash of last-painted content, so we only touch innerHTML when
 // the rendered HTML would actually differ. Without this, the table inside
 // each panel was being re-parsed every 5s — that's what was "moving around".
@@ -1919,26 +1939,41 @@ function paintServicePanelIfChanged(panel, html) {
   panel.innerHTML = html;
 }
 
-// recentForPanel narrows host-wide access entries to the ones this service
-// actually served, by matching the upstream the proxy picked.
+// recentForPanelMulti narrows each machine's access entries to the ones this
+// service actually served on THAT machine, by matching the upstream its own
+// proxy picked, then merges every machine's matches into one chronological
+// feed. A merged (pi + mac) service otherwise only ever showed the traffic of
+// whichever machine's dashboard you happened to be looking at.
+//
+// Matching stays per-machine rather than against one flattened backend set:
+// backends are docker-network-internal IPs, private to whichever host issued
+// them, and two hosts' default bridge networks commonly hand out the same
+// 172.18.0.x addresses — a flattened set could match a request against the
+// wrong host's backend.
 //
 // A host can fan out to several services (badminton.polardev.org routes to
 // four), so grouping by host alone put every neighbour's requests — including
-// static routes to entirely different backends — on every card.
-//
-// With no known backends (every replica stopped) nothing is claimed: showing
-// the host's traffic would be attributing other services' requests to one that
-// is serving none.
-function recentForPanel(panel, hostEntries) {
-  const raw = (panel.dataset.backends || '').trim();
-  if (!raw) return [];
-  const mine = new Set(raw.split(/\s+/));
+// static routes to entirely different backends — on every card. With no known
+// backends on a machine (every replica there stopped) nothing from it is
+// claimed.
+function recentForPanelMulti(panel, cache) {
   const out = [];
-  for (const e of hostEntries) {
-    if (mine.has(e.backend)) out.push(e);
-    if (out.length >= 12) break;
+  const byMachine = cache.recentByMachine || {};
+  const localRaw = (panel.dataset.backends || '').trim();
+  if (localRaw) {
+    const mine = new Set(localRaw.split(/\s+/));
+    for (const e of (byMachine[''] || [])) if (mine.has(e.backend)) out.push(Object.assign({ _machine: '' }, e));
   }
-  return out;
+  if (panel.dataset.peerBackends) {
+    let peerMap = {};
+    try { peerMap = JSON.parse(panel.dataset.peerBackends); } catch {}
+    for (const [machine, backends] of Object.entries(peerMap)) {
+      const mine = new Set(backends);
+      for (const e of (byMachine[machine] || [])) if (mine.has(e.backend)) out.push(Object.assign({ _machine: machine }, e));
+    }
+  }
+  out.sort((a, b) => new Date(b.t) - new Date(a.t));
+  return out.slice(0, 14);
 }
 
 // flattenStatusByService turns /api/service-status's grouped shape into a
@@ -1957,38 +1992,42 @@ async function fillServiceStatsPanels() {
   if (!panels.length) return;
   // Paint from cache first (no flicker on the tick that triggered this render).
   for (const panel of panels) {
-    const host = panel.dataset.host;
-    const recent = recentForPanel(panel, _svcStatsCache.recentByHost[host] || []);
+    const recent = recentForPanelMulti(panel, _svcStatsCache);
     const svcStatus = _svcStatsCache.byService[panel.dataset.service];
-    if (_svcStatsCache.byHost[host] || recent.length || svcStatus) {
-      paintServicePanelIfChanged(panel, renderServiceStatsPanel(_svcStatsCache.byHost[host], recent, panel, svcStatus));
+    if (_svcStatsCache.byHost[panel.dataset.host] || recent.length || svcStatus) {
+      paintServicePanelIfChanged(panel, renderServiceStatsPanel(_svcStatsCache.byHost[panel.dataset.host], recent, panel, svcStatus));
     }
   }
+  // A merged service's peer machines (from data-peer-backends) each need their
+  // OWN access log fetched — /api/access?host=<identity> hops to that peer's
+  // dashboard (accesshost.go) exactly like the full Access Log tab's host
+  // switcher does, just fetched for every needed peer at once instead of one
+  // at a time.
+  const neededPeers = new Set();
+  for (const panel of panels) {
+    if (!panel.dataset.peerBackends) continue;
+    try { Object.keys(JSON.parse(panel.dataset.peerBackends)).forEach(id => neededPeers.add(id)); } catch {}
+  }
+  const peerIdentities = Array.from(neededPeers);
   // Then fetch fresh in the background and update the cache + panels.
   try {
-    const [hosts, access, status] = await Promise.all([
+    const [hosts, access, status, ...peerAccess] = await Promise.all([
       api('/api/monitor/target/proxy/hosts').catch(() => []),
       api('/api/access?limit=400').catch(() => ({ entries: [] })),
       api('/api/service-status').catch(() => null),
+      ...peerIdentities.map(id => api('/api/access?limit=400&host=' + encodeURIComponent(id)).catch(() => ({ entries: [] }))),
     ]);
     const byHost = {};
     for (const h of (Array.isArray(hosts) ? hosts : [])) byHost[h.host] = h;
-    // Keep more per host than a single card shows: entries are filtered down
-    // to one service's backends afterwards, so a busy neighbour must not crowd
-    // this service's requests out of the window before filtering happens.
-    const recentByHost = {};
-    for (const e of (access.entries || [])) {
-      if (!recentByHost[e.host]) recentByHost[e.host] = [];
-      if (recentByHost[e.host].length < 200) recentByHost[e.host].push(e);
-    }
+    const recentByMachine = { '': access.entries || [] };
+    peerIdentities.forEach((id, i) => { recentByMachine[id] = peerAccess[i].entries || []; });
     const byService = flattenStatusByService(status);
-    _svcStatsCache = { byHost, recentByHost, byService, fetchedAt: Date.now() };
+    _svcStatsCache = { byHost, recentByMachine, byService, fetchedAt: Date.now() };
     // Repaint only the panels that are still in the DOM and expanded AND
     // whose rendered HTML would actually differ from what they show now.
     document.querySelectorAll('.svc-card:not(.collapsed) .svc-stats').forEach(panel => {
-      const host = panel.dataset.host;
-      const recent = recentForPanel(panel, recentByHost[host] || []);
-      paintServicePanelIfChanged(panel, renderServiceStatsPanel(byHost[host], recent, panel, byService[panel.dataset.service]));
+      const recent = recentForPanelMulti(panel, _svcStatsCache);
+      paintServicePanelIfChanged(panel, renderServiceStatsPanel(byHost[panel.dataset.host], recent, panel, byService[panel.dataset.service]));
     });
   } catch {}
 }
@@ -2034,22 +2073,44 @@ function renderServiceStatsPanel(stats, recent, panel, svcStatus) {
     if (Object.keys(by).length) html += statusBarFromCodes(by);
   }
   if (recent.length) {
-    html += '<div class="kpi-label" style="margin:14px 0 6px">Recent requests <span style="text-transform:none;letter-spacing:0;font-weight:400;opacity:.75">— this service only</span></div>';
-    // Fixed-height scroll container so new rows don't push the rest of the
-    // card down on every auto-refresh tick.
-    html += '<div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm)">';
-    html += '<table class="acc-table" style="margin:0"><thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>ms</th><th>Backend</th></tr></thead><tbody>';
+    // "both devices" (this card can hold backends from more than one
+    // machine when the service is merged) is only worth calling out once
+    // there's actually more than one distinct machine present in the feed.
+    const machines = new Set(recent.map(r => r._machine || ''));
+    const scopeNote = machines.size > 1
+      ? '— merged from ' + machines.size + ' devices'
+      : '— this service only';
+    html += '<div class="kpi-label" style="margin:14px 0 6px">Recent requests <span style="text-transform:none;letter-spacing:0;font-weight:400;opacity:.75">' + scopeNote + '</span></div>';
+    // overflow-x:auto guards against the card squeezing the table below a
+    // usable width now that Device is a column too — the fixed max-height
+    // only ever handled vertical growth.
+    html += '<div style="max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm)">';
+    html += '<table class="acc-table" style="margin:0"><thead><tr><th>Time</th>'
+          + (machines.size > 1 ? '<th>Device</th>' : '')
+          + '<th>Method</th><th>Path</th><th>Status</th><th>ms</th><th>Backend</th></tr></thead><tbody>';
     for (const r of recent) {
-      const t = new Date(r.t).toLocaleTimeString();
+      const when = new Date(r.t);
       const ms = r.ms || 0;
       const msCls = ms > 1000 ? ' veryslow' : ms > 250 ? ' slow' : '';
+      let deviceCell = '';
+      if (machines.size > 1) {
+        const isLocal = !r._machine;
+        const label = isLocal ? (machineLabel(_selfIdentity) || 'local') : machineLabel(r._machine);
+        const dot = isLocal ? 'var(--green)' : '#5eb4ff';
+        deviceCell = '<td class="meta" style="font-size:11px;white-space:nowrap">'
+          + '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;background:' + dot + '"></span>'
+          + esc(label) + '</td>';
+      }
       html += '<tr>'
-        + '<td class="meta" style="font-size:11.5px">' + t + '</td>'
+        // Full date+time on hover — the bare clock time reads ambiguous once
+        // you're actually trying to read back through what happened.
+        + '<td class="meta" style="font-size:11.5px" title="' + esc(when.toLocaleString()) + '">' + when.toLocaleTimeString() + '</td>'
+        + deviceCell
         + '<td><b>' + esc(r.method) + '</b></td>'
-        + '<td class="path" title="' + esc(r.path) + '">' + esc(r.path) + '</td>'
+        + '<td class="path" style="max-width:180px" title="' + esc(r.path) + '">' + esc(r.path) + '</td>'
         + '<td><span class="sc ' + statusClass(r.status) + '">' + r.status + '</span></td>'
         + '<td class="ms' + msCls + '">' + ms + '</td>'
-        + '<td class="meta" title="' + esc(r.backend || '') + '">' + esc((r.backend || '').replace(/^https?:\/\//, '').slice(0, 28)) + '</td>'
+        + '<td class="meta" title="' + esc(r.backend || '') + '">' + esc((r.backend || '').replace(/^https?:\/\//, '').slice(0, 20)) + '</td>'
         + '</tr>';
     }
     html += '</tbody></table></div>';
