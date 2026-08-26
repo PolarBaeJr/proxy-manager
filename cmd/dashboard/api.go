@@ -1633,6 +1633,7 @@ func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedS
 				svcs[i].CanaryImage = o.CanaryImage
 				svcs[i].CanaryReplicas = o.CanaryReplicas
 			}
+			dc.mergeOnboardedLiveState(ctx, &svcs[i])
 			continue
 		}
 		svcs = append(svcs, Service{

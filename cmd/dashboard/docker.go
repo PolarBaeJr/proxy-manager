@@ -768,6 +768,42 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 	return out, nil
 }
 
+// mergeOnboardedLiveState folds a dual-tracked service's onboarded clone
+// containers (goproxy-onb-<name>-*, which deliberately carry no proxy.*
+// labels — that's what makes them "onboarded" rather than label-managed)
+// into its Members/AllStopped. Without this, a dual-tracked Service's status
+// reflects ONLY whatever label-carrying container listServices found under
+// the same name — including a stale, long-exited leftover from a prior
+// relabel/adopt operation — so a fully-live onboarded replica can report
+// AllStopped=true because listServices never saw it at all (2026-08-26:
+// badminton-staging-player/-admin showed "down" for a week off a dead
+// "-relabel" container while the real replica ran fine).
+func (c *dockerClient) mergeOnboardedLiveState(ctx context.Context, s *Service) {
+	clones, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, s.Name))
+	if err != nil || len(clones) == 0 {
+		return
+	}
+	seen := make(map[string]bool, len(s.Members))
+	for _, m := range s.Members {
+		seen[m.ID] = true
+	}
+	anyRunning := !s.AllStopped
+	for _, cl := range clones {
+		if seen[cl.ID] {
+			continue
+		}
+		s.Members = append(s.Members, cl)
+		s.MemberSummaries = append(s.MemberSummaries, ServiceMember{
+			Name: cl.name(), ID: cl.ID, State: cl.State, Health: parseHealth(cl.Status),
+		})
+		if cl.State == "running" {
+			anyRunning = true
+		}
+	}
+	s.AllStopped = !anyRunning
+	sort.Slice(s.MemberSummaries, func(i, j int) bool { return s.MemberSummaries[i].Name < s.MemberSummaries[j].Name })
+}
+
 type CreateServiceRequest struct {
 	Name       string            `json:"name"`
 	Image      string            `json:"image"`
