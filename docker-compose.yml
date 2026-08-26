@@ -207,6 +207,7 @@ services:
       -peers=${DASHBOARD_PEERS:-}
       -peer-sync-interval=${DASHBOARD_PEER_SYNC_INTERVAL:-5s}
       -peer-addr=:8098
+      -peer-writes=${DASHBOARD_PEER_WRITES:-false}
 
   monitor:
     build:
