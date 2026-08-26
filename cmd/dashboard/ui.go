@@ -239,6 +239,7 @@ main{padding:24px 0 64px}
 .btn.ghost:hover{background:var(--surface-2);color:var(--text)}
 .btn.sm{padding:5px 9px;font-size:12px}
 .btn.icon{padding:7px;border-radius:var(--radius-sm)}
+.btn.icon.pinned{color:var(--yellow)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .btn:disabled .lock{display:inline-flex}
 .btn .lock{display:none;width:12px;height:12px;opacity:.8}
@@ -668,6 +669,7 @@ const I = {
   bookmark:svg('<path d="M6 3h12v18l-6-4-6 4z"/>'),
   terminal:svg('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/>'),
   refresh: svg('<path d="M20 11A8 8 0 0 0 6.3 6.3L4 8.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 13.7 4.7L20 15.4"/><path d="M20 20v-5h-5"/>'),
+  pin:     svg('<path d="M12 2v6"/><path d="M8 8h8l1 4H7z"/><path d="M12 12v10"/>'),
 };
 const NAVMETA = { routing:'Routing', dns:'DNS', observability:'Observability', users:'Users' };
 const NAVICON = { routing:I.services, dns:I.dns, observability:I.activity, users:I.users };
@@ -1581,7 +1583,8 @@ async function renderServices() {
   // Bail out of the full rebuild on the 5s tick if nothing about the services
   // changed — preserves scroll, hover, expanded-card state. We still refresh
   // the per-service stats panels (which DO change) without touching the rest.
-  const hash = JSON.stringify(svcs) + '|' + _selfIdentity + '|' + JSON.stringify(_peerWrites) + '|' + authState.elevated_until;
+  const pinnedName = loadPref('pmgr-svc-pinned', '');
+  const hash = JSON.stringify(svcs) + '|' + _selfIdentity + '|' + JSON.stringify(_peerWrites) + '|' + authState.elevated_until + '|' + pinnedName;
   if (hash === _lastServicesHash && el.children.length) {
     fillServiceStatsPanels().catch(() => {});
     return;
@@ -1599,7 +1602,16 @@ async function renderServices() {
   // run of DOM siblings up to the next .subhead) — sorting by group then
   // name keeps a singleton service (the common case) at the same
   // alphabetical spot it holds today, since its group equals its name.
+  // Hoist the pinned service's whole GROUP, not just that one card — a
+  // group's members must stay adjacent (see sort rationale above) or
+  // wireCollapsibleSections would fold a group split across two spots.
+  let pinnedGroup = null;
+  if (pinnedName) { const m = svcs.find(s => s.name === pinnedName); if (m) pinnedGroup = m.group; }
   const ordered = svcs.slice().sort((a, b) => {
+    if (pinnedGroup !== null) {
+      const ap = a.group === pinnedGroup, bp = b.group === pinnedGroup;
+      if (ap !== bp) return ap ? -1 : 1;
+    }
     if (a.group !== b.group) return a.group < b.group ? -1 : 1;
     return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
   });
@@ -1866,6 +1878,7 @@ async function renderServices() {
              +    '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
              +      (s.host ? '<span class="ident dim">' + esc(s.host) + '</span>' : '')
              +      '<span>' + agg.totalReplicas + ' replica' + (agg.totalReplicas === 1 ? '' : 's') + ' total</span>'
+             +      '<button class="btn icon' + (s.name === pinnedName ? ' pinned' : '') + '" onclick="togglePin(event, \'' + sn + '\')" title="Pin to top">' + I.pin + '</button>'
              +      '<span class="collapse-chev">' + I.chevron + '</span></span>'
              +  '</div>'
              +  '<div class="svc-body">';
@@ -1873,6 +1886,7 @@ async function renderServices() {
         const replicaSummary = '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
           + '<span class="ident dim">' + esc(s.host) + '</span>'
           + '<span>' + s.replicas + ' replica' + (s.replicas === 1 ? '' : 's') + '</span>'
+          + '<button class="btn icon' + (s.name === pinnedName ? ' pinned' : '') + '" onclick="togglePin(event, \'' + sn + '\')" title="Pin to top">' + I.pin + '</button>'
           + '<span class="collapse-chev">' + I.chevron + '</span></span>';
         html += '<div class="card svc-card' + (isCollapsed ? ' collapsed' : '') + '" data-svc="' + sn + '">'
              +  '<div class="svc-head" onclick="toggleServiceCard(\'' + sn + '\')">'
@@ -2200,6 +2214,14 @@ function toggleServiceCard(name) {
   savePref('pmgr-svc-collapsed', JSON.stringify(s));
   // Just expanded — refresh its stats panel without waiting for the 5s tick.
   if (!willCollapse) fillServiceStatsPanels().catch(() => {});
+}
+
+function togglePin(e, name) {
+  e.stopPropagation();
+  const current = loadPref('pmgr-svc-pinned', '');
+  savePref('pmgr-svc-pinned', current === name ? '' : name);
+  _lastServicesHash = '';
+  renderActive();
 }
 
 function toggleDiscoveryGroup(rowEl) {
