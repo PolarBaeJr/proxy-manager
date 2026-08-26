@@ -596,6 +596,7 @@ footer.app code{color:var(--muted)}
 <dialog id="dlg-token-reveal"></dialog>
 <dialog id="dlg-prompt"></dialog>
 <dialog id="dlg-duplicate-service"></dialog>
+<dialog id="dlg-spread-service"></dialog>
 
 <div id="toasts"></div>
 
@@ -1429,6 +1430,10 @@ async function renderRoutes() {
 // is only so the input's max and the client-side message match what the API
 // will accept. TestUIWeightCapMatchesServer fails if the two ever drift.
 const MAX_SVC_WEIGHT = 100;
+// Mirrors maxSpreadReplicas in spread.go — blast-radius bound on a typo in
+// the dialog, not a correctness gate (the server refuses out-of-range
+// regardless).
+const MAX_SPREAD_REPLICAS = 10;
 let _lastServicesHash = '';
 // This host's own peer identity (DASHBOARD_HOST, see peers.go), lazily
 // fetched once from /api/peers. null means "not known yet" — foreignSvc()
@@ -1518,6 +1523,30 @@ function dupAttr(s) {
 }
 function dupLk(s) {
   if (s.unscalable) return '<span class="lock" title="singleton services can\'t be duplicated">' + I.lock + '</span>';
+  if (foreignSvc(s) && !peerWritable(s)) return svcLk(s);
+  if (!isElevated()) return lk();
+  if (foreignSvc(s)) return lk();
+  if (!anyPeerWritable()) return '<span class="lock" title="no peer host currently accepts writes">' + I.lock + '</span>';
+  return lk();
+}
+// spreadAttr/spreadLk gate the "Spread to host…" button — same shape as
+// dupAttr/dupLk above, since spread forwards through the exact same
+// write-mesh paths as duplicate (a local row needs a write-accepting peer to
+// target; a foreign row needs its owning peer to accept writes at all).
+// Unscalable is checked first and independently of the server-side refusal
+// in runServiceSpread — a singleton service (e.g. one holding in-memory
+// state a second instance can't share) must never render this as clickable,
+// not just error when clicked.
+function spreadAttr(s) {
+  if (s.unscalable) return 'disabled title="singleton services can\'t be spread across hosts"';
+  if (foreignSvc(s) && !peerWritable(s)) return svcLockedAttr(s);
+  if (!isElevated()) return lockedAttr();
+  if (foreignSvc(s)) return '';
+  if (!anyPeerWritable()) return 'disabled title="no peer host currently accepts writes"';
+  return '';
+}
+function spreadLk(s) {
+  if (s.unscalable) return '<span class="lock" title="singleton services can\'t be spread across hosts">' + I.lock + '</span>';
   if (foreignSvc(s) && !peerWritable(s)) return svcLk(s);
   if (!isElevated()) return lk();
   if (foreignSvc(s)) return lk();
@@ -1643,7 +1672,13 @@ async function renderServices() {
               // supports label-managed sources). hostAttr forwards a
               // foreign-but-writable row to its owning peer, same as every
               // other svcWriteAttr-gated action.
-              + (s.onboarded ? '' : '<button class="btn" ' + dupAttr(s) + hostAttr + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ', this.dataset.host)">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>');
+              + (s.onboarded ? '' : '<button class="btn" ' + dupAttr(s) + hostAttr + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ', this.dataset.host)">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>')
+              // Spread reads the OWNING host's own live env/mounts server-side
+              // (runServiceSpread in spread.go) and joins a peer replica into
+              // ONE load-balanced service via the proxy-level peer mesh —
+              // distinct from Duplicate, which creates an independent second
+              // service. Same onboarded/unscalable gates as Duplicate.
+              + (s.onboarded ? '' : '<button class="btn" ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
     // replica AND no stopped members (saves card height for the common case).
@@ -2469,6 +2504,52 @@ function openDuplicate(name, defaultPort, host) {
   }
   if (!sel.options.length) { toast('no peer host currently accepts writes', 'err'); return; }
   $('#dlg-duplicate-service').showModal();
+}
+// openSpread mirrors openDuplicate exactly (same target-host population
+// rules) but has no publish_port field — a spread replica joins the pool as
+// a peer-routed backend, it never gets its own published port.
+function openSpread(name, host) {
+  const f = $('#form-spread-service');
+  f.serviceName.value = name;
+  f.replicas.value = 1;
+  f.dataset.host = host || '';
+  const sel = f.target;
+  sel.innerHTML = '';
+  if (host) {
+    // Foreign row: forwards to host (the owning peer), which resolves the
+    // target against ITS OWN peer registry — see openDuplicate for why that
+    // means _selfIdentity is the only sensible option to offer here.
+    if (_selfIdentity) {
+      const opt = document.createElement('option');
+      opt.value = _selfIdentity;
+      opt.textContent = machineLabel(_selfIdentity);
+      sel.appendChild(opt);
+    }
+  } else {
+    for (const identity in _peerWrites) {
+      if (!_peerWrites[identity]) continue;
+      const opt = document.createElement('option');
+      opt.value = identity;
+      opt.textContent = machineLabel(identity);
+      sel.appendChild(opt);
+    }
+  }
+  if (!sel.options.length) { toast('no peer host currently accepts writes', 'err'); return; }
+  $('#dlg-spread-service').showModal();
+}
+// showSpreadWarnings reuses the token-reveal dialog like showDuplicateHint —
+// same "read this before you go" shape, for runServiceSpread's warnings
+// about env that looks host-local or credential-shaped when duplicated
+// verbatim to a second live instance.
+function showSpreadWarnings(warnings) {
+  const d = document.getElementById('dlg-token-reveal');
+  d.innerHTML = '<div class="dlg"><div class="dlg-head"><div class="di">' + I.alert + '</div>'
+    + '<div><h3>Spread succeeded — please read</h3><div class="dsub">The target replica may need attention</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.x + '</button></div>'
+    + '<div class="dlg-body">'
+    + '<div class="token-block" id="tr-raw" style="margin-top:14px;white-space:pre-wrap">' + esc(warnings.join('\n\n')) + '</div>'
+    + '</div><div class="dialog-actions"><button class="btn primary" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.check + 'Done</button></div></div>';
+  d.showModal();
 }
 // showDuplicateHint reuses the existing token-reveal dialog (tokenReveal,
 // #dlg-token-reveal) rather than a new modal — same copy-to-clipboard shape,
@@ -3831,6 +3912,20 @@ function buildDialogs() {
     +   '<button type="submit" class="btn primary">' + I.check + 'Duplicate</button>'
     + '</div></form></div>';
 
+  // Spread to host
+  $('#dlg-spread-service').innerHTML =
+    '<div class="dlg"><div class="dlg-head"><div class="di">' + I.globe + '</div>'
+    + '<div><h3>Spread to host…</h3><div class="dsub">Join a replica on a peer host into this ONE load-balanced service, over the proxy-level peer mesh</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-spread-service\').close()">' + I.x + '</button></div>'
+    + '<form id="form-spread-service"><div class="dlg-body">'
+    + '<input type="hidden" name="serviceName">'
+    + '<div class="field"><label>Target host</label><select name="target" required></select></div>'
+    + '<div class="field"><label>Replicas on target</label><input name="replicas" type="number" min="1" max="' + MAX_SPREAD_REPLICAS + '" value="1" required><div class="hint">How many replicas to start on the target host — traffic is then load-balanced across both hosts by weight.</div></div>'
+    + '</div><div class="dialog-actions">'
+    +   '<button type="button" class="btn" onclick="document.getElementById(\'dlg-spread-service\').close()">Cancel</button>'
+    +   '<button type="submit" class="btn primary">' + I.check + 'Spread</button>'
+    + '</div></form></div>';
+
   // New DNS — type-aware. The content field swaps shape per type:
   //   A    → IPv4 input
   //   AAAA → IPv6 input
@@ -4036,6 +4131,41 @@ function wireDialogForms() {
       $('#dlg-duplicate-service').close();
       toast('duplicated ' + f.serviceName.value + ' to ' + resp.target);
       if (resp.nginx_stream_hint) showDuplicateHint(resp.nginx_stream_hint);
+      renderActive();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; } }
+  };
+
+  $('#form-spread-service').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const submitBtn = f.querySelector('button[type="submit"]');
+    const original = submitBtn ? submitBtn.innerHTML : '';
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Working…'; }
+    const hostParam = f.dataset.host ? '?host=' + encodeURIComponent(f.dataset.host) : '';
+    const doSpread = (allowUnreachableEnv) => api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/spread' + hostParam, {
+      method: 'POST',
+      body: JSON.stringify({ target: f.target.value, replicas: +f.replicas.value, allow_unreachable_env: allowUnreachableEnv }),
+    });
+    try {
+      let resp;
+      try {
+        resp = await doSpread(false);
+      } catch (e) {
+        // runServiceSpread refuses host-local-looking env unless explicitly
+        // overridden — the flag name itself (not the surrounding wording,
+        // which can drift) is what we key the retry prompt on. The error
+        // text already names the specific env keys, so show it verbatim
+        // rather than a generic "proceed anyway?".
+        if (e.message && e.message.includes('allow_unreachable_env') && await confirmDialog(e.message, {title: 'Env may not reach the target host'})) {
+          resp = await doSpread(true);
+        } else {
+          throw e;
+        }
+      }
+      $('#dlg-spread-service').close();
+      toast('spread ' + f.serviceName.value + ' to ' + resp.target + ' (' + resp.replicas + ' replica' + (resp.replicas === 1 ? '' : 's') + ')');
+      if (resp.warnings && resp.warnings.length) showSpreadWarnings(resp.warnings);
       renderActive();
     } catch (e) { toast(e.message, 'err'); }
     finally { if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; } }
