@@ -319,6 +319,60 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		},
 	})
 
+	// Deliberately a separate tool rather than a flag on scale_service: there,
+	// "host" means "the copy that already lives on that host", and overloading
+	// it to also mean "put a copy there" is exactly the ambiguity an
+	// LLM-driven caller resolves wrongly. Once spread_service has seeded a
+	// peer, scale_service's existing host parameter adjusts the peer's replica
+	// count through the unchanged path.
+	s.Register(Tool{
+		Name:        "spread_service",
+		Title:       "Scale a service onto another host",
+		Description: "Place replicas of a service on a DIFFERENT host as members of the SAME logical service — same proxy.service identity, same route, load-balanced across both hosts. Refused for singleton services, services with volumes or bind mounts, and services whose env names a host-local database address. Requires MCP_ALLOW_PEER_WRITES.",
+		Mutating:    true,
+		InputSchema: schema(map[string]any{
+			"service":               prop("string", "Service name from list_services, as it exists on THIS host."),
+			"target":                prop("string", "Peer hostname/identity (see the \"machine\" field returned by list_services) to place replicas on."),
+			"replicas":              prop("number", "How many replicas to run on the target host (1-10, default 1)."),
+			"allow_unreachable_env": prop("boolean", "Override the refusal when the service's env names a host-local address the replica could not reach. Only set this after confirming the address is routable from the target host."),
+		}, "service", "target"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			// Routed through hostArg purely for its MCP_ALLOW_PEER_WRITES
+			// gate — spreading always writes to another host.
+			target, err := hostArg(args, "target", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			if target == "" {
+				return "", fmt.Errorf("target is required")
+			}
+			body := map[string]any{"target": target}
+			if _, ok := args["replicas"]; ok {
+				n, err := argInt(args, "replicas")
+				if err != nil {
+					return "", err
+				}
+				body["replicas"] = n
+			}
+			if _, ok := args["allow_unreachable_env"]; ok {
+				allow, err := argBool(args, "allow_unreachable_env")
+				if err != nil {
+					return "", err
+				}
+				body["allow_unreachable_env"] = allow
+			}
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/spread", body)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
 	s.Register(Tool{
 		Name:        "lifecycle_service",
 		Title:       "Start or stop a service",

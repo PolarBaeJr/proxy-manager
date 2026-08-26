@@ -40,6 +40,12 @@ type peerRouteInfo struct {
 	Backends    int    `json:"backends"`
 	RateLimit   bool   `json:"ratelimit,omitempty"`
 	RateRPM     int    `json:"ratelimit_rpm,omitempty"`
+	// Spread carries RouteGroup.Spread across the wire so the receiving
+	// side load-balances into this peer instead of holding it in reserve as
+	// a failover tier. Advertised whether this host set it from its own
+	// proxy.spread label or adopted it from another peer — that's what makes
+	// the pool symmetric once either side of a cross-host scale opts in.
+	Spread bool `json:"spread,omitempty"`
 }
 
 // peerRoutePayload is the body POSTed to a peer's /peer/routes endpoint.
@@ -112,7 +118,7 @@ func (p *PeerSync) tick(ctx context.Context) {
 		routes = append(routes, peerRouteInfo{
 			Host: g.Host, PathPrefix: g.PathPrefix, StripPrefix: g.StripPrefix,
 			Name: g.Name, Backends: localCount,
-			RateLimit: g.RateLimit, RateRPM: g.RateRPM,
+			RateLimit: g.RateLimit, RateRPM: g.RateRPM, Spread: g.Spread,
 		})
 	}
 	if len(routes) == 0 {

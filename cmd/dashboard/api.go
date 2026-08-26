@@ -797,6 +797,37 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteJSON(w, http.StatusOK, resp)
 			return
 		}
+		// Same locality rule as duplicate above: runServiceSpread reads the
+		// real service's live env server-side, so it must run where the
+		// service actually lives. A foreign service takes the isPeer branch
+		// and reaches its owner's /peer/services/{name}/spread instead.
+		if len(parts) == 2 && parts[1] == "spread" && req.Method == "POST" {
+			var body SpreadServiceRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			actor := sessionUser(info)
+			if actor == "" {
+				actor = principalFrom(req)
+			}
+			resp, err := runServiceSpread(req.Context(), dc, registry, onb, name, body, mintForwardedActor(req, actor))
+			if err != nil {
+				var pe *peerSpreadError
+				switch {
+				case errors.As(err, &pe):
+					mapPeerMutationErr(w, pe.statusCode, pe.body)
+				case errors.Is(err, errSpreadNotFound):
+					http.Error(w, "service not found", http.StatusNotFound)
+				default:
+					http.Error(w, err.Error(), http.StatusBadRequest)
+				}
+				return
+			}
+			audit(req, sessionUser(info), "service.spread", name+" => "+body.Target)
+			httpx.WriteJSON(w, http.StatusOK, resp)
+			return
+		}
 		if len(parts) == 2 && parts[1] == "stage" && req.Method == "POST" {
 			var body ReplaceServiceRequest
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
@@ -2134,6 +2165,8 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/offboard"
 	case len(parts) == 2 && parts[1] == "duplicate" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/duplicate"
+	case len(parts) == 2 && parts[1] == "spread" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/spread"
 	case len(parts) == 1 && req.Method == http.MethodDelete:
 		method, peerPath = http.MethodDelete, "/peer/services/"+url.PathEscape(name)
 	default:

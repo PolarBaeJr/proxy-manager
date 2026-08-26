@@ -607,7 +607,7 @@ func TestServeHTTPStripPrefix(t *testing.T) {
 // forwarded to yet another peer), even when it's the only eligible backend
 // in the group (i.e. the local tier is empty).
 func TestPickHealthySkipsLearnedUnlessAllowed(t *testing.T) {
-	learned := makePeerBackend("http://127.0.0.1:2", "h.example.org", "", false, "peer-b")
+	learned := makePeerBackend("http://127.0.0.1:2", "h.example.org", "", false, "peer-b", 1)
 	learned.markHealthy(true)
 	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{learned}}
 
@@ -635,7 +635,7 @@ func TestPickHealthyPrefersLocalOverLearned(t *testing.T) {
 	}
 	local := makeBackend("http://127.0.0.1:1", 1, "c", "", u, "h.example.org")
 	local.markHealthy(true)
-	learned := makePeerBackend("http://127.0.0.1:2", "h.example.org", "", false, "peer-b")
+	learned := makePeerBackend("http://127.0.0.1:2", "h.example.org", "", false, "peer-b", 1)
 	learned.markHealthy(true)
 	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{local, learned}}
 
@@ -668,7 +668,7 @@ func TestPeerBackendRestoresStrippedPrefix(t *testing.T) {
 	}))
 	defer peerBackend.Close()
 
-	b := makePeerBackend(peerBackend.URL, "mcp.example.org", "/mcp/foo", true, "peer-b")
+	b := makePeerBackend(peerBackend.URL, "mcp.example.org", "/mcp/foo", true, "peer-b", 1)
 	g := &RouteGroup{Host: "mcp.example.org", PathPrefix: "/mcp/foo", StripPrefix: true, Backends: []*Backend{b}}
 
 	r := &Router{}
@@ -801,10 +801,10 @@ func TestPeerMeshLoopPreventionTwoInstances(t *testing.T) {
 	}))
 	defer srvB.Close()
 
-	bA := makePeerBackend(srvB.URL, host, "", false, "b")
+	bA := makePeerBackend(srvB.URL, host, "", false, "b", 1)
 	rA.Set([]*RouteGroup{{Host: host, Backends: []*Backend{bA}}})
 
-	bB := makePeerBackend(srvA.URL, host, "", false, "a")
+	bB := makePeerBackend(srvA.URL, host, "", false, "a", 1)
 	rB.Set([]*RouteGroup{{Host: host, Backends: []*Backend{bB}}})
 
 	req, err := http.NewRequest("GET", srvA.URL+"/", nil)

@@ -23,6 +23,8 @@ type learnedRoute struct {
 	stripPrefix bool
 	rateLimit   bool
 	rateRPM     int
+	spread      bool
+	backends    int
 	lastSeen    time.Time
 }
 
@@ -92,6 +94,8 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 			stripPrefix: r.StripPrefix,
 			rateLimit:   r.RateLimit,
 			rateRPM:     r.RateRPM,
+			spread:      r.Spread,
+			backends:    r.Backends,
 			lastSeen:    now(),
 		}
 	}
@@ -129,7 +133,7 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup) []*RouteGroup {
 				delete(peersForKey, peerID)
 				continue
 			}
-			b := makePeerBackend(lr.advertise, host, path, lr.stripPrefix, peerID)
+			b := makePeerBackend(lr.advertise, host, path, lr.stripPrefix, peerID, lr.backends)
 			if b == nil {
 				continue
 			}
@@ -149,6 +153,16 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup) []*RouteGroup {
 				}
 				byKey[key] = g
 				groups = append(groups, g)
+			}
+			// Spread is the one advertised field adopted onto an EXISTING
+			// local group, unlike RateLimit/RateRPM above — it has to be, or
+			// the cross-host scale that set proxy.spread on the peer's
+			// replicas could never reach the origin, whose own containers
+			// deliberately keep their labels untouched. It only ever turns
+			// spreading ON; a peer that stops advertising it drops out with
+			// the rest of its entry at TTL expiry.
+			if lr.spread {
+				g.Spread = true
 			}
 			g.Backends = append(g.Backends, b)
 		}

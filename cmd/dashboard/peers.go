@@ -821,6 +821,31 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 			httpx.WriteJSON(w, http.StatusOK, resp)
 			return
 		}
+		if len(parts) == 2 && parts[1] == "spread" && r.Method == http.MethodPost {
+			var body SpreadServiceRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			// Inbound assertion relayed as-is to the second hop, same
+			// reasoning as the duplicate branch above.
+			resp, err := runServiceSpread(r.Context(), dc, registry, onb, name, body, r.Header.Get(actorHeader))
+			if err != nil {
+				var pe *peerSpreadError
+				switch {
+				case errors.As(err, &pe):
+					mapPeerMutationErr(w, pe.statusCode, pe.body)
+				case errors.Is(err, errSpreadNotFound):
+					http.Error(w, "service not found", http.StatusNotFound)
+				default:
+					http.Error(w, err.Error(), http.StatusBadRequest)
+				}
+				return
+			}
+			audit(r, "peer-mesh", "service.spread", name+" => "+body.Target)
+			httpx.WriteJSON(w, http.StatusOK, resp)
+			return
+		}
 		if len(parts) == 1 && r.Method == http.MethodDelete {
 			// Unlike the local handler, confirmation is REQUIRED here, not
 			// optional — this branch is only ever reached via
