@@ -960,10 +960,70 @@ func TestTryProxyClientDisconnectDoesNotMarkUnhealthy(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
 	rec := httptest.NewRecorder()
 
-	tryProxy(rec, req, b)
-
+	if ok := tryProxy(rec, req, b); !ok {
+		t.Error("tryProxy on a client disconnect returned false (retry another backend); want true (stop) — see TestServeHTTPClientDisconnectDoesNotRedispatch for why a retry is unsafe here")
+	}
 	if !b.healthy() {
 		t.Error("tryProxy marked the backend unhealthy on a client-side context cancellation — it should not")
+	}
+}
+
+// alwaysCanceledTransport simulates a backend whose in-flight request the
+// client walks away from: every RoundTrip call returns context.Canceled,
+// regardless of the request's own context state. A REAL client-canceled
+// context makes Go's default Transport fail before ever dialing out (it
+// checks ctx.Err() up front), which would make hit-counting on real
+// httptest backends pass trivially whether or not the retry loop redispatches
+// — this fake makes each attempt at the RoundTrip layer observable instead.
+type alwaysCanceledTransport struct {
+	calls int32
+}
+
+func (t *alwaysCanceledTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	atomic.AddInt32(&t.calls, 1)
+	return nil, context.Canceled
+}
+
+// TestServeHTTPClientDisconnectDoesNotRedispatch is the regression for the
+// second-order bug a peer session found in the fix above: returning false
+// from tryProxy on a client disconnect (nothing written, so the old
+// failed-and-!wroteHeader check said "retry") sent ServeHTTP's retry loop to
+// a DIFFERENT backend in the same group. For a non-idempotent handler that
+// claims work before finishing it (e.g. a cron job marking rows reminded
+// before sending them), that redispatch can duplicate — or worse, silently
+// drop — whatever the first backend was mid-way through. With two backends
+// in the group and a canceled request context, only ONE backend's transport
+// may ever be invoked.
+func TestServeHTTPClientDisconnectDoesNotRedispatch(t *testing.T) {
+	u, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	b1 := makeBackend("http://127.0.0.1:1", 1, "b1", "", u, "h.example.org")
+	b2 := makeBackend("http://127.0.0.1:2", 1, "b2", "", u, "h.example.org")
+	t1 := &alwaysCanceledTransport{}
+	t2 := &alwaysCanceledTransport{}
+	b1.proxy.Transport = t1
+	b2.proxy.Transport = t2
+	b1.markHealthy(true)
+	b2.markHealthy(true)
+	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{b1, b2}}
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // client already gone before the proxy ever dispatches
+	req := httptest.NewRequest(http.MethodGet, "http://h.example.org/", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	r.ServeHTTP(rec, req)
+
+	if total := atomic.LoadInt32(&t1.calls) + atomic.LoadInt32(&t2.calls); total > 1 {
+		t.Errorf("backend transports invoked %d times total (b1=%d b2=%d) on a client disconnect, want at most 1 — the retry loop redispatched to a second backend", total, t1.calls, t2.calls)
+	}
+	if !b1.healthy() || !b2.healthy() {
+		t.Error("a client disconnect must not mark any backend unhealthy")
 	}
 }
 
