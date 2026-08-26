@@ -4,8 +4,13 @@
 // a fixed ticker and keeps a single persistent "service status" message —
 // an overview page plus one page per service group, paged through with
 // Back/Next buttons (see statuspager.go) — edited in place on every tick
-// rather than a new message every time, falling back to a new message if
-// the edit fails (e.g. the message was deleted). Whichever page a user last
+// rather than a new message every time, falling back to a new message only
+// when Discord confirms the old one is actually gone (404 Unknown Message);
+// any other edit failure (a network blip, a timeout) just waits for the next
+// tick to retry the same message, since otherwise it can't tell "gone" from
+// "transient" and treating them the same turns a few seconds of network
+// flakiness into an unbounded pile of duplicate messages. Whichever page a
+// user last
 // navigated to stays selected across ticks; a button click updates that
 // page instantly from the last successful poll rather than fetching fresh.
 // The "/set-alert-channel" slash command (Manage Server permission
@@ -27,6 +32,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -128,6 +134,7 @@ func main() {
 
 		newMsgID := msgID
 		edited := false
+		messageGone := msgID == ""
 		if msgID != "" {
 			edit := &discordgo.MessageEdit{
 				Channel:    target,
@@ -136,12 +143,27 @@ func main() {
 				Components: &components,
 			}
 			if _, editErr := sess.ChannelMessageEditComplex(edit); editErr != nil {
-				log.Printf("failed to edit service-status message %s in %s, sending a new one: %v", msgID, target, editErr)
+				messageGone = isUnknownMessageErr(editErr)
+				if messageGone {
+					log.Printf("failed to edit service-status message %s in %s, sending a new one: %v", msgID, target, editErr)
+				} else {
+					// Anything other than Discord confirming the message is
+					// actually gone (e.g. a transient network reset) is not
+					// evidence the message needs replacing — the next tick
+					// retries this same edit in statusInterval. Escalating to
+					// a new message here on every transient error is what
+					// caused a runaway spam loop: each new message becomes
+					// its own single point of failure for the very next
+					// tick, so a few seconds of network flakiness turned
+					// into a growing pile of duplicate messages instead of
+					// self-healing in place.
+					log.Printf("failed to edit service-status message %s in %s, will retry same message next tick: %v", msgID, target, editErr)
+				}
 			} else {
 				edited = true
 			}
 		}
-		if !edited {
+		if !edited && messageGone {
 			sent, sendErr := sess.ChannelMessageSendComplex(target, &discordgo.MessageSend{
 				Embeds:     []*discordgo.MessageEmbed{embed},
 				Components: components,
@@ -385,6 +407,18 @@ func main() {
 			pollStatus()
 		}
 	}
+}
+
+// isUnknownMessageErr reports whether err is Discord confirming the message
+// no longer exists (HTTP 404, API error code 10008) — the one case where
+// falling back to a brand-new message is actually correct. Any other error
+// (a network reset, a timeout, a 5xx) is not evidence the message is gone,
+// only that this one request failed, and must not be treated the same way:
+// see the pollStatus call site for why conflating the two caused a runaway
+// spam loop.
+func isUnknownMessageErr(err error) bool {
+	var restErr *discordgo.RESTError
+	return errors.As(err, &restErr) && restErr.Message != nil && restErr.Message.Code == discordgo.ErrCodeUnknownMessage
 }
 
 // resolveDashboardToken prefers an explicit env override; otherwise it reads
