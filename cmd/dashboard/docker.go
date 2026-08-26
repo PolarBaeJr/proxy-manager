@@ -619,14 +619,21 @@ type Service struct {
 	// Group is the product-level grouping (proxy.group label) the Status
 	// view/statusbot bucket services by — defaults to Name when the label is
 	// absent, so an ungrouped service is its own group of one.
-	Group           string `json:"group"`
-	Image           string `json:"image"`
-	ImageID         string `json:"image_id,omitempty"`
-	Host            string `json:"host"`
-	Port            int    `json:"port"`
-	Path            string `json:"path,omitempty"`
-	Replicas        int    `json:"replicas"`
-	Unscalable      bool   `json:"unscalable,omitempty"`
+	Group      string `json:"group"`
+	Image      string `json:"image"`
+	ImageID    string `json:"image_id,omitempty"`
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	Path       string `json:"path,omitempty"`
+	Replicas   int    `json:"replicas"`
+	Unscalable bool   `json:"unscalable,omitempty"`
+	// Weight is proxy.weight, the per-replica routing weight within the
+	// proxy's pool for this route — and, since the peer mesh advertises the
+	// sum of them, this service's share of cross-host spread traffic too.
+	// Always populated (1 when the label is absent or unparseable, matching
+	// cmd/proxy/router.go's own default) so the UI can render a real number
+	// rather than an empty box.
+	Weight          int    `json:"weight,omitempty"`
 	PreviousImage   string `json:"previous_image,omitempty"`   // for one-click rollback
 	UpdateAvailable bool   `json:"update_available,omitempty"` // set by image checker
 	// ImageCheckError mirrors the image-checker's last error for this
@@ -737,6 +744,7 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 			s.Port = port
 			s.Path = ct.Labels[labelPath]
 			s.Unscalable = ct.Labels[labelUnscalable] == "true"
+			s.Weight = parseWeightLabel(ct.Labels[labelWeight])
 			s.PreviousImage = ct.Labels[labelPrevImage]
 			s.AutoUpdate = ct.Labels[labelAutoUpdate] == "true"
 			s.Replicas++
@@ -1355,6 +1363,106 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 		_ = c.stopContainer(ctx, ct.ID)
 		if err := c.removeContainer(ctx, ct.ID); err != nil {
 			log.Printf("unscalable label flip %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
+		}
+	}
+	return nil
+}
+
+// parseWeightLabel reads a proxy.weight label the same way cmd/proxy's
+// assembleGroups does — anything absent, unparseable, or non-positive means
+// the default of 1. Kept deliberately identical so the number the dashboard
+// shows is the number the proxy is actually routing on.
+func parseWeightLabel(v string) int {
+	if w, err := strconv.Atoi(v); err == nil && w > 0 {
+		return w
+	}
+	return 1
+}
+
+// setWeightLabel sets proxy.weight on every replica of a label-managed
+// service, via the same clone-and-recreate shape as setUnscalableLabel.
+//
+// Recreating is the whole cost here: Docker has no API to edit a label on a
+// running container, so retuning a weight restarts the service's replicas.
+// That is why the UI exposes this behind an explicit Apply rather than a
+// stepper — see replicaCtrl's neighbour in ui.go.
+func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight int) error {
+	if weight < 1 {
+		return fmt.Errorf("weight must be at least 1")
+	}
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+	if err != nil {
+		return err
+	}
+	existing := liveOnly(all)
+	if len(existing) == 0 {
+		return fmt.Errorf("service %q not found (no live replicas)", name)
+	}
+	// See replaceService's identical tplSet comment: prefer a running
+	// container as the template and as the recreate count, so a stale
+	// exited leftover doesn't donate stale env/mounts or inflate the count.
+	tplSet := preferRunning(existing)
+	tpl := tplSet[0]
+
+	env, err := c.inspectEnv(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template env: %w", err)
+	}
+	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template clone spec: %w", err)
+	}
+
+	newLabels := map[string]string{}
+	for k, v := range tpl.Labels {
+		if strings.HasPrefix(k, ociImageLabelPrefix) {
+			continue
+		}
+		newLabels[k] = v
+	}
+	// Weight 1 is the proxy's default, so drop the label entirely rather than
+	// writing it out — that keeps a reset-to-default indistinguishable from a
+	// service that never had a weight set.
+	if weight == 1 {
+		delete(newLabels, labelWeight)
+	} else {
+		newLabels[labelWeight] = strconv.Itoa(weight)
+	}
+
+	// startIdx still scans the full existing set — see replaceService's
+	// identical comment on why naming must consider stale containers too.
+	startIdx := nextReplicaIndex(existing, name)
+	var newIDs []string
+	for i := 0; i < len(tplSet); i++ {
+		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
+		id, err := c.createContainer(ctx, cname, createBody{
+			Image:      tpl.Image,
+			Labels:     newLabels,
+			Env:        env,
+			HostConfig: hostConfig{Mounts: clone.Mounts},
+		})
+		if err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			return fmt.Errorf("create %s: %w", cname, err)
+		}
+		if err := c.startContainer(ctx, id); err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			_ = c.removeContainer(ctx, id)
+			return fmt.Errorf("start %s: %w", cname, err)
+		}
+		newIDs = append(newIDs, id)
+	}
+
+	time.Sleep(replaceSettleDelay)
+
+	for _, ct := range existing {
+		_ = c.stopContainer(ctx, ct.ID)
+		if err := c.removeContainer(ctx, ct.ID); err != nil {
+			log.Printf("weight label set %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
 		}
 	}
 	return nil

@@ -118,8 +118,22 @@ The residual risk is health granularity. A synthetic peer backend has no
 `HealthPath` (see `checkBackend`) — a bare TCP dial of the peer PROXY. Under
 failover that was harmless; under spread, a peer whose container dies keeps
 receiving its share until the route ages out of `PeerRouteStore`, which is
-`3 x peerSyncInterval` (15s at the 5s default). Shortening the interval
-shortens that window.
+`3 x peerSyncInterval`. The compose default was lowered from 5s to 2s for
+exactly this reason, putting the window at ~6s rather than ~15s. It applies to
+plain failover detection too, not only spread.
+
+### Weight
+
+A peer's synthetic backend is weighted by the SUM of the `proxy.weight` labels
+on the peer's own replicas (each defaulting to 1), advertised as
+`peerRouteInfo.Weight`. So the same label that already sets a backend's share
+within one host's pool now also sets a host's share of a cross-host spread —
+one weight concept, not two. `Backends` stays a plain count and remains the
+validity gate; a peer that advertises no weight at all (an older binary) falls
+back to it, so a rolling deploy doesn't transiently collapse a multi-replica
+peer to weight 1. The dashboard edits the label via
+`POST /api/services/{name}/weight`, which recreates the service's replicas —
+Docker has no in-place label edit.
 
 ## Relationship to `PEERS_PLAN.md`
 

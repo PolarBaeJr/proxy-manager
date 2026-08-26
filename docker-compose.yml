@@ -91,7 +91,7 @@ services:
       -auth-trusted-cidrs=${AUTH_TRUSTED_CIDRS:-}
       -redis-addr=${REDIS_ADDR:-}
       -peers=${PMGR_PEERS:-}
-      -peer-sync-interval=${PMGR_PEER_SYNC_INTERVAL:-5s}
+      -peer-sync-interval=${PMGR_PEER_SYNC_INTERVAL:-2s}
       -peer-advertise-url=${PMGR_PEER_ADVERTISE_URL:-}
 
   dashboard:

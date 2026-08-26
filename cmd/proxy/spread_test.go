@@ -292,3 +292,91 @@ func TestPeerRouteStoreClearsAdoptedSpread(t *testing.T) {
 		t.Error("Spread still on after the peer stopped advertising it — the flag has no off-switch")
 	}
 }
+
+// TestPeerSyncAdvertisesSummedWeight proves the wire carries the SUM of the
+// local backends' proxy.weight, not a replica count — that sum is what gives
+// the receiving side's single synthetic backend the right share. Backends
+// stays a plain count alongside it, and the two are meant to diverge as soon
+// as an operator edits the label.
+func TestPeerSyncAdvertisesSummedWeight(t *testing.T) {
+	heavy := makeBackendForTest("http://172.26.0.5:8080")
+	heavy.Weight = 3
+	light := makeBackendForTest("http://172.26.0.6:8080")
+	light.Weight = 1
+	// A learned backend must contribute to neither number: it is another
+	// host's capacity, and counting it would inflate our own advertisement.
+	learned := makePeerBackend("http://100.1.1.1:8092", "app.example.org", "", false, "peer-c", 9)
+
+	routes := advertisedRoutes(t, &RouteGroup{
+		Host:     "app.example.org",
+		Backends: []*Backend{heavy, light, learned},
+	})
+	if routes[0].Weight != 4 {
+		t.Errorf("Weight = %d, want 4 (3+1 local, learned excluded)", routes[0].Weight)
+	}
+	if routes[0].Backends != 2 {
+		t.Errorf("Backends = %d, want 2 — the count must stay a count", routes[0].Backends)
+	}
+}
+
+// TestOverlayWeightsPeerByAdvertisedWeight is the end of the same path: an
+// advertised weight of 4 against one local backend of weight 1 must actually
+// come out of pickHealthy as a 4:1 split, which is the whole point of letting
+// an operator edit proxy.weight from the dashboard.
+func TestOverlayWeightsPeerByAdvertisedWeight(t *testing.T) {
+	s := newPeerRouteStore(time.Minute)
+	s.merge(peerRoutePayload{
+		Peer:      "peer-b",
+		Advertise: "http://100.83.62.68:8092",
+		Routes:    []peerRouteInfo{{Host: "app.example.org", Backends: 2, Weight: 4, Spread: true}},
+	})
+
+	local := makeBackendForTest("http://172.26.0.5:8080")
+	g := s.overlay([]*RouteGroup{{Host: "app.example.org", Backends: []*Backend{local}}})[0]
+	for _, b := range g.Backends {
+		b.markHealthy(true)
+	}
+	counts := pickCounts(g, 100, true)
+	if counts["peer:peer-b"] != 80 || counts["app"] != 20 {
+		t.Errorf("counts = %v, want a 4:1 split from the advertised weight (not 2:1 from the count)", counts)
+	}
+}
+
+// TestPeerWeightFallsBackToCount is the rolling-deploy case. A peer still
+// running a binary from before proxy.weight was advertised sends no weight at
+// all; without the fallback makePeerBackend's floor would collapse it to
+// weight 1, quietly starving a multi-replica peer of its share for as long as
+// the two hosts run different builds.
+func TestPeerWeightFallsBackToCount(t *testing.T) {
+	if got := peerWeight(peerRouteInfo{Backends: 3}); got != 3 {
+		t.Errorf("weight for a peer advertising none = %d, want its backend count 3", got)
+	}
+	if got := peerWeight(peerRouteInfo{Backends: 3, Weight: 7}); got != 7 {
+		t.Errorf("weight = %d, want the advertised 7 to win over the count", got)
+	}
+}
+
+// TestPeerRouteStoreAppliesRetunedWeight: an edited weight has to reach the
+// router, and merge() is the only thing that can say so — peerRoutesHandler
+// refreshes only on a changed merge, and the periodic tick only on TTL expiry.
+// Without this the new split would sit unapplied until an unrelated Docker
+// event rebuilt the groups.
+func TestPeerRouteStoreAppliesRetunedWeight(t *testing.T) {
+	s := newPeerRouteStore(time.Minute)
+	adv := func(w int) peerRoutePayload {
+		return peerRoutePayload{
+			Peer:      "peer-b",
+			Advertise: "http://100.83.62.68:8092",
+			Routes:    []peerRouteInfo{{Host: "app.example.org", Backends: 2, Weight: w}},
+		}
+	}
+	s.merge(adv(2))
+	if !s.merge(adv(5)) {
+		t.Error("merge reported no change on a retuned weight — refresh() would not run")
+	}
+	// The other half: a re-push of the SAME weight is just a keepalive and
+	// must not churn a Docker-listing refresh every sync interval.
+	if s.merge(adv(5)) {
+		t.Error("merge reported a change on an unchanged re-advertisement")
+	}
+}

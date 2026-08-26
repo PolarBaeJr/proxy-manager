@@ -25,7 +25,18 @@ type learnedRoute struct {
 	rateRPM     int
 	spread      bool
 	backends    int
+	weight      int
 	lastSeen    time.Time
+}
+
+// peerWeight resolves the weight to give a peer's synthetic backend: the
+// summed proxy.weight the peer advertised, or its plain backend count when
+// it advertised no weight at all (a binary predating the field).
+func peerWeight(r peerRouteInfo) int {
+	if r.Weight > 0 {
+		return r.Weight
+	}
+	return r.Backends
 }
 
 // PeerRouteStore is the durable, receiving-side record of routes pushed by
@@ -61,9 +72,9 @@ func splitRouteKey(key string) (host, path string) {
 // merge upserts every advertised route (with Backends > 0) into the store,
 // keyed by payload.Peer under its host|path. Returns true only when this
 // merge introduced a new host|path key, a new peer under an existing key, or
-// a flipped spread flag — a bare lastSeen refresh for an already-known
-// peer/route returns
-// false, so the caller (peerRoutesHandler) can skip an unnecessary refresh()
+// a changed spread/weight — a bare lastSeen refresh for an already-known
+// peer/route returns false, so the caller (peerRoutesHandler) can skip an
+// unnecessary refresh()
 // on steady-state pushes and rely on the periodic resync ticker for TTL
 // eviction instead.
 func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
@@ -85,14 +96,14 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 			s.routes[key] = peersForKey
 			changed = true
 		}
-		// A flipped spread flag counts as a change even though the peer and
-		// route are both already known: unlike the other advertised fields it
-		// decides whether this route load-balances into the peer or holds it
-		// in reserve, and the periodic tick below only calls refresh() when
-		// something has EXPIRED. Without this, turning spread off on the peer
-		// would leave the flag live here until some unrelated Docker event
-		// happened to trigger a rebuild.
-		if prev, ok := peersForKey[payload.Peer]; !ok || prev.spread != r.Spread {
+		// A flipped spread flag or an edited weight counts as a change even
+		// though the peer and route are both already known: unlike the other
+		// advertised fields these two decide how traffic is split, and the
+		// periodic tick below only calls refresh() when something has
+		// EXPIRED. Without this, turning spread off (or retuning the weight)
+		// on the peer would sit unapplied here until some unrelated Docker
+		// event happened to trigger a rebuild.
+		if prev, ok := peersForKey[payload.Peer]; !ok || prev.spread != r.Spread || prev.weight != peerWeight(r) {
 			changed = true
 		}
 		peersForKey[payload.Peer] = learnedRoute{
@@ -104,7 +115,13 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 			rateRPM:     r.RateRPM,
 			spread:      r.Spread,
 			backends:    r.Backends,
-			lastSeen:    now(),
+			// A peer running a binary from before proxy.weight was advertised
+			// sends no weight at all. Falling back to the count keeps its
+			// share of the pool exactly what it was, instead of letting
+			// makePeerBackend's floor collapse a 3-replica peer to weight 1
+			// for the length of a rolling deploy.
+			weight:   peerWeight(r),
+			lastSeen: now(),
 		}
 	}
 	return changed
@@ -141,7 +158,7 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup) []*RouteGroup {
 				delete(peersForKey, peerID)
 				continue
 			}
-			b := makePeerBackend(lr.advertise, host, path, lr.stripPrefix, peerID, lr.backends)
+			b := makePeerBackend(lr.advertise, host, path, lr.stripPrefix, peerID, lr.weight)
 			if b == nil {
 				continue
 			}
