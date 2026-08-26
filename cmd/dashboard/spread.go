@@ -74,22 +74,24 @@ type SpreadServiceResponse struct {
 // POST /peer/spread. Built entirely server-side from the origin's own live
 // Docker state — never a passthrough of the caller's body.
 type peerSpreadRequest struct {
-	Service   string   `json:"service"` // proxy.service identity, also the replica-name stem
-	Display   string   `json:"display,omitempty"`
-	Group     string   `json:"group,omitempty"`
-	Image     string   `json:"image"`
-	Env       []string `json:"env,omitempty"`
-	Host      string   `json:"host,omitempty"`
-	Port      int      `json:"port"`
-	Path      string   `json:"path,omitempty"`
-	Strip     bool     `json:"strip,omitempty"`
-	Health    string   `json:"health,omitempty"`
-	Auth      bool     `json:"auth,omitempty"`
-	AuthUsers []string `json:"auth_users,omitempty"`
-	AuthMode  string   `json:"auth_mode,omitempty"`
-	RateLimit bool     `json:"ratelimit,omitempty"`
-	RateRPM   int      `json:"ratelimit_rpm,omitempty"`
-	Replicas  int      `json:"replicas"`
+	Service    string   `json:"service"` // proxy.service identity, also the replica-name stem
+	Display    string   `json:"display,omitempty"`
+	Group      string   `json:"group,omitempty"`
+	Image      string   `json:"image"`
+	Env        []string `json:"env,omitempty"`
+	Host       string   `json:"host,omitempty"`
+	Port       int      `json:"port"`
+	Path       string   `json:"path,omitempty"`
+	Strip      bool     `json:"strip,omitempty"`
+	Health     string   `json:"health,omitempty"`
+	Auth       bool     `json:"auth,omitempty"`
+	AuthUsers  []string `json:"auth_users,omitempty"`
+	AuthMode   string   `json:"auth_mode,omitempty"`
+	RateLimit  bool     `json:"ratelimit,omitempty"`
+	RateRPM    int      `json:"ratelimit_rpm,omitempty"`
+	AutoUpdate bool     `json:"autoupdate,omitempty"`
+	Weight     int      `json:"weight,omitempty"`
+	Replicas   int      `json:"replicas"`
 }
 
 type peerSpreadResponse struct {
@@ -341,6 +343,8 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 		}
 	}
 	rateRPM, _ := strconv.Atoi(tpl.Labels[labelRateRPM])
+	autoUpdate := tpl.Labels[labelAutoUpdate] == "true"
+	weight := parseWeightLabel(tpl.Labels[labelWeight])
 
 	// proxy.name is a free-text display label everywhere else in this
 	// codebase (set once at creation, shown escaped in the UI, never itself
@@ -370,23 +374,37 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 		group = ""
 	}
 
+	// proxy.weight has no upper bound at the label level (parseWeightLabel
+	// accepts any positive int, e.g. a hand-authored compose file), but the
+	// peer's receiving handler validates it against validWeight/
+	// maxServiceWeight like every other weight-setting path in this
+	// codebase. Sending a value outside that range would make the peer
+	// hard-refuse the ENTIRE spread over a number that only affects routing
+	// share — drop to the default instead, same reasoning as Display/Group.
+	if weight > maxServiceWeight {
+		warnings = append(warnings, fmt.Sprintf("proxy.weight %d exceeds the maximum of %d — the replica on %s will use the default weight instead", weight, maxServiceWeight, req.Target))
+		weight = 1
+	}
+
 	peerReq := peerSpreadRequest{
-		Service:   svc.Name,
-		Display:   display,
-		Group:     group,
-		Image:     tpl.Image,
-		Env:       env,
-		Host:      svc.Host,
-		Port:      svc.Port,
-		Path:      svc.Path,
-		Strip:     tpl.Labels[labelStrip] == "true",
-		Health:    tpl.Labels[labelHealth],
-		Auth:      tpl.Labels[labelAuth] == "true",
-		AuthUsers: authUsers,
-		AuthMode:  tpl.Labels[labelAuthMode],
-		RateLimit: tpl.Labels[labelRateLimit] == "true",
-		RateRPM:   rateRPM,
-		Replicas:  replicas,
+		Service:    svc.Name,
+		Display:    display,
+		Group:      group,
+		Image:      tpl.Image,
+		Env:        env,
+		Host:       svc.Host,
+		Port:       svc.Port,
+		Path:       svc.Path,
+		Strip:      tpl.Labels[labelStrip] == "true",
+		Health:     tpl.Labels[labelHealth],
+		Auth:       tpl.Labels[labelAuth] == "true",
+		AuthUsers:  authUsers,
+		AuthMode:   tpl.Labels[labelAuthMode],
+		RateLimit:  tpl.Labels[labelRateLimit] == "true",
+		RateRPM:    rateRPM,
+		AutoUpdate: autoUpdate,
+		Weight:     weight,
+		Replicas:   replicas,
 	}
 	reqBody, err := json.Marshal(peerReq)
 	if err != nil {
@@ -482,6 +500,14 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 			http.Error(w, fmt.Sprintf("replicas must be between 1 and %d", maxSpreadReplicas), http.StatusBadRequest)
 			return
 		}
+		// 0 means the origin never had a weight label (parseWeightLabel's own
+		// default) rather than an explicit request — only a non-zero value is
+		// validated, matching how the /api/services/{name}/weight handler
+		// treats the same range.
+		if req.Weight != 0 && !validWeight(req.Weight) {
+			http.Error(w, fmt.Sprintf("weight must be between 1 and %d", maxServiceWeight), http.StatusBadRequest)
+			return
+		}
 
 		all, err := dc.listAll(r.Context(), fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, req.Service))
 		if err != nil {
@@ -569,6 +595,16 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 			}
 			if req.RateRPM > 0 {
 				labels[labelRateRPM] = strconv.Itoa(req.RateRPM)
+			}
+			if req.AutoUpdate {
+				labels[labelAutoUpdate] = "true"
+			}
+			// Weight 1 (or unset) is the proxy's own default — dropping the
+			// label rather than writing it out keeps a reset-to-default
+			// indistinguishable from a service that never had a weight set,
+			// same convention as setWeightLabel.
+			if req.Weight > 1 {
+				labels[labelWeight] = strconv.Itoa(req.Weight)
 			}
 
 			// No PortBindings and no Mounts, unlike peerDuplicateHandler:
