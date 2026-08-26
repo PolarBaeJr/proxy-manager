@@ -1494,8 +1494,13 @@ function foreignSvc(s) { return !!s.machine && s.machine !== _selfIdentity; }
 // peer mesh's frontend gating (Phase 0 left this hardcoded false).
 function peerWritable(s) { return !!(s && s.machine && _peerWrites[s.machine]); }
 // machineLabel trims the shared ".polardev.org" suffix so the badge stays
-// short — same convention as cmd/statusbot/statuspager.go's machineSuffix.
-function machineLabel(m) { return String(m || '').replace(/\.polardev\.org$/, ''); }
+// short — same convention as cmd/statusbot/statuspager.go's machineSuffix —
+// then maps the two known DASHBOARD_HOST identities to friendly names.
+const MACHINE_FRIENDLY_NAMES = { dashboard: 'Pi', 'dashboard-mac': 'Mac' };
+function machineLabel(m) {
+  const s = String(m || '').replace(/\.polardev\.org$/, '');
+  return MACHINE_FRIENDLY_NAMES[s] || s;
+}
 // svcLockedAttr/svcLk extend lockedAttr()/lk() with a per-card foreign-host
 // guard: a peer-owned row is disabled here regardless of this host's own
 // elevation state, since mutating actions never forward to peers.

@@ -163,14 +163,14 @@ func TestBuildStatusPagesShowsMachineLabel(t *testing.T) {
 	if pages[0].Fields[0].Name != "✅ core" {
 		t.Errorf("overview Fields[0].Name = %q, want no machine suffix for an unset Machine", pages[0].Fields[0].Name)
 	}
-	if pages[0].Fields[1].Name != "✅ badminton-mac-player · dashboard-mac" {
-		t.Errorf("overview Fields[1].Name = %q, want a trimmed machine suffix", pages[0].Fields[1].Name)
+	if pages[0].Fields[1].Name != "✅ badminton-mac-player · Mac" {
+		t.Errorf("overview Fields[1].Name = %q, want a friendly machine suffix", pages[0].Fields[1].Name)
 	}
 	if pages[1].Title != "📁 core: ✅ Up" {
 		t.Errorf("pages[1].Title = %q, want no machine suffix", pages[1].Title)
 	}
-	if pages[2].Title != "📁 badminton-mac-player · dashboard-mac: ✅ Up" {
-		t.Errorf("pages[2].Title = %q, want a trimmed machine suffix", pages[2].Title)
+	if pages[2].Title != "📁 badminton-mac-player · Mac: ✅ Up" {
+		t.Errorf("pages[2].Title = %q, want a friendly machine suffix", pages[2].Title)
 	}
 }
 
@@ -192,12 +192,12 @@ func TestOverviewPageHostRoster(t *testing.T) {
 	}
 
 	up := overview.Fields[0]
-	if up.Name != "✅ dashboard" || up.Value != "up" {
-		t.Errorf("up host field = %+v, want name %q value %q", up, "✅ dashboard", "up")
+	if up.Name != "✅ Pi" || up.Value != "up" {
+		t.Errorf("up host field = %+v, want name %q value %q", up, "✅ Pi", "up")
 	}
 	degraded := overview.Fields[1]
-	if degraded.Name != "⚠️ dashboard-mac" {
-		t.Errorf("degraded host field name = %q, want %q", degraded.Name, "⚠️ dashboard-mac")
+	if degraded.Name != "⚠️ Mac" {
+		t.Errorf("degraded host field name = %q, want %q", degraded.Name, "⚠️ Mac")
 	}
 	if !strings.Contains(degraded.Value, "degraded") || !strings.Contains(degraded.Value, "proxy") {
 		t.Errorf("degraded host field value = %q, want it to mention degraded and proxy", degraded.Value)
