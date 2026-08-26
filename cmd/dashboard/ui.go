@@ -1602,10 +1602,13 @@ async function renderServices() {
         const canaryPill = m.is_canary ? ' <span class="pill info">canary</span>' : '';
         const btn = m.is_canary ? ''
           : (live
-              // Restart stays local-only (svcLockedAttr/svcLk, no hostArg) —
-              // it's two sequential mutations with a definite-outcome
-              // success message that doesn't survive a network hop cleanly.
-              ? '<button class="btn sm ghost" ' + svcLockedAttr(s) + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'restart\')" title="Stop then start this replica">' + I.refresh + 'Restart' + svcLk(s) + '</button>'
+              // Restart uses the same write-mesh gating as Stop/Start — it's
+              // just a client-side stop-then-start against the same
+              // peer-aware endpoints those buttons already call. The
+              // partial-failure case (stop succeeds, start fails) is
+              // reported explicitly by lifecycleReplica's catch block below
+              // regardless of whether the hop was local or cross-host.
+              ? '<button class="btn sm ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'restart\', this.dataset.host)" title="Stop then start this replica">' + I.refresh + 'Restart' + svcWriteLk(s) + '</button>'
               + '<button class="btn sm ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'stop\', this.dataset.host)">' + I.lock + 'Stop' + svcWriteLk(s) + '</button>'
               : '<button class="btn sm" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleReplica(\'' + sn + '\', \'' + esc(m.name) + '\', \'start\', this.dataset.host)">' + I.bolt + 'Start' + svcWriteLk(s) + '</button>');
         memberList += '<div class="member-row"><span class="ident dim">' + esc(m.name) + '</span> ' + pill + canaryPill + '<span class="spacer"></span>' + btn + '</div>';
@@ -2182,13 +2185,14 @@ async function checkForUpdate(name, btn, host) {
 }
 
 async function lifecycleReplica(svc, member, act, host) {
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
   try {
     if (act === 'restart') {
-      // Local-only, deliberately: no host param even if the caller passed
-      // one — see the "Restart stays local-only" comment at its call site.
-      await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/stop', { method:'POST' });
+      // Forwards host to both legs — stop/start already forward correctly
+      // through the peer-write mesh, restart is just two calls to them.
+      await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/stop' + hostParam, { method:'POST' });
       try {
-        await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/start', { method:'POST' });
+        await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/start' + hostParam, { method:'POST' });
         toast('restarted ' + member, 'ok');
       } catch (e) {
         // Stop already succeeded — the replica is now down, not still running
@@ -2202,7 +2206,6 @@ async function lifecycleReplica(svc, member, act, host) {
       renderActive();
       return;
     }
-    const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
     await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/' + act + hostParam, { method:'POST' });
     toast(act === 'stop' ? 'stopped ' + member : 'started ' + member, 'ok');
     _lastServicesHash = '';
