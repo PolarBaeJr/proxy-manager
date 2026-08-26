@@ -1570,7 +1570,38 @@ async function renderServices() {
     + '<button class="btn primary" ' + lockedAttr() + ' onclick="document.getElementById(\'dlg-new-service\').showModal()">' + I.plus + 'New service' + lk() + '</button>'
     + '<span class="meta">' + svcs.length + ' managed service' + (svcs.length === 1 ? '' : 's') + '</span></div>';
   if (!svcs.length) { el.innerHTML = html + emptyState(I.services, 'No managed services', 'Deploy a container and the proxy will scale, canary, and roll it back from here.'); return; }
-  for (const s of svcs) {
+  // Group by proxy.group (defaults to the service's own name — see
+  // docker.go's Service.Group) so a multi-service product collapses under
+  // one folder-style header, mirroring the Status tab/Discord bot's own
+  // per-group view. Reordering to put a group's members next to each other
+  // is required for wireCollapsibleSections() to fold them (it collapses a
+  // run of DOM siblings up to the next .subhead) — sorting by group then
+  // name keeps a singleton service (the common case) at the same
+  // alphabetical spot it holds today, since its group equals its name.
+  const groupCounts = {};
+  for (const s of svcs) groupCounts[s.group] = (groupCounts[s.group] || 0) + 1;
+  const ordered = svcs.slice().sort((a, b) => {
+    if (a.group !== b.group) return a.group < b.group ? -1 : 1;
+    return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
+  });
+  let lastGroup = null;
+  for (const s of ordered) {
+    // Only a real group (2+ members) earns a header — Group defaults to
+    // Name, so most services would otherwise get a one-item folder, which
+    // is more clutter than today's flat list, not less.
+    if (s.group !== lastGroup) {
+      lastGroup = s.group;
+      if (groupCounts[s.group] > 1) {
+        const members = ordered.filter(x => x.group === s.group);
+        let replicas = 0, down = 0;
+        for (const m of members) { replicas += m.replicas || 0; if (m.all_stopped) down++; }
+        html += '<div class="subhead">' + I.services + esc(s.group)
+          + '<span class="meta" style="margin-left:8px;text-transform:none;letter-spacing:0;font-weight:500">'
+          + members.length + ' services · ' + replicas + ' replica' + (replicas === 1 ? '' : 's')
+          + (down ? ' · <span class="pill bad" style="margin-left:4px">' + down + ' down</span>' : '')
+          + '</span></div>';
+      }
+    }
     const sn = esc(s.name);
     // hostAttr renders a data-host attribute on the write-mesh call sites
     // (scaleSvc, lifecycleSvc, lifecycleReplica stop/start) so a
