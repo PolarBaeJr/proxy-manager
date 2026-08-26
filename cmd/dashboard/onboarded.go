@@ -1101,10 +1101,18 @@ func proxyRefresh(proxyURL string) {
 // env is merged rather than replaced: a conflict dialog built on the snapshot
 // would ask the user to choose against a "current" value nothing is running.
 //
-// Prefers a live non-canary clone, then the original container (named for the
-// service itself), and only falls back to the stored snapshot when neither can
-// be read — better a stale base than no base, since the caller would otherwise
-// create replicas with an empty environment.
+// Prefers a RUNNING live non-canary clone, then any non-canary clone
+// regardless of state, then the original container (named for the service
+// itself), and only falls back to the stored snapshot when none of those can
+// be read — better a stale base than no base, since the caller would
+// otherwise create replicas with an empty environment.
+//
+// listAll queries Docker with all=true, so its result can include a STOPPED/
+// EXITED clone left over from a prior operation (e.g. a removal that silently
+// failed). Without a running-first pass, such a leftover could sort before
+// the real live clone and donate its stale env as the base for a merge,
+// silently dropping whatever was added since — the same class of bug fixed
+// in replaceService/scaleService et al. via preferRunning.
 //
 // A c-prefixed container is only skipped while svc.CanaryImage is set (an
 // actively-staged canary, not yet the live config) — matching the same
@@ -1116,12 +1124,20 @@ func (c *dockerClient) onboardedBaseEnv(ctx context.Context, name string, svc On
 	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
 	if err == nil {
 		cPrefix := fmt.Sprintf("goproxy-onb-%s-c", name)
+		var candidates []dockerContainer
 		for _, ct := range all {
 			if svc.CanaryImage != "" && strings.HasPrefix(ct.name(), cPrefix) {
 				continue // actively-staged canary replica — not the live config
 			}
-			if env, err := c.inspectEnv(ctx, ct.ID); err == nil && len(env) > 0 {
-				return env
+			candidates = append(candidates, ct)
+		}
+		// Running pass first, then fall back to the full candidate set (which
+		// may include stopped clones) if no running one yields a usable env.
+		for _, pass := range [][]dockerContainer{runningOnly(candidates), candidates} {
+			for _, ct := range pass {
+				if env, err := c.inspectEnv(ctx, ct.ID); err == nil && len(env) > 0 {
+					return env
+				}
 			}
 		}
 	}

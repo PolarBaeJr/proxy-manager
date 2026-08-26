@@ -803,8 +803,17 @@ type ReplaceServiceRequest struct {
 // guardUnscalable refuses to scale a service that has any container labeled
 // proxy.unscalable=true above 1 replica. Returns nil if scaling is allowed.
 func (c *dockerClient) guardUnscalable(ctx context.Context, name string, desired int) error {
-	existing, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
-	if err != nil || len(existing) == 0 {
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+	if err != nil {
+		return nil
+	}
+	// Strip canaries and prefer a running member — same reasoning as
+	// preferRunning's other call sites: a stale exited leftover (e.g. one
+	// predating the addition of proxy.unscalable to the compose file) could
+	// otherwise sort first and silently lack the label, letting an
+	// unscalable service get scaled past 1 with no error.
+	existing := preferRunning(liveOnly(all))
+	if len(existing) == 0 {
 		return nil
 	}
 	if existing[0].Labels[labelUnscalable] == "true" && desired != 1 {
@@ -828,7 +837,13 @@ func (c *dockerClient) scaleService(ctx context.Context, name string, desired in
 	if len(existing) == 0 {
 		return fmt.Errorf("service %q not found (no live replicas)", name)
 	}
-	tpl := existing[0]
+	// Prefer a RUNNING container as the template so a stale exited leftover
+	// doesn't donate its (possibly stale) env/mounts to newly-scaled-up
+	// replicas. current/desired arithmetic below still counts the full
+	// existing set — it drives scale-down's removal-count guard, which
+	// operates over the same full set, and scale-up's index generation
+	// still needs to see stale names to avoid a create-time 409.
+	tpl := preferRunning(existing)[0]
 	current := len(existing)
 	switch {
 	case current == desired:
@@ -977,6 +992,36 @@ func canaryOnly(in []dockerContainer) []dockerContainer {
 	return out
 }
 
+// runningOnly returns containers whose State == "running". listAll always
+// queries Docker with all=true (so a fully-scaled-to-zero service can still
+// be found), and liveOnly only strips canary-labeled containers — neither
+// filters on State. Without this, a STOPPED/EXITED leftover (e.g. one whose
+// removal silently failed during a prior replace) can sit in the label-
+// filtered result indefinitely and get treated as equivalent to a live one.
+func runningOnly(in []dockerContainer) []dockerContainer {
+	out := in[:0:0]
+	for _, ct := range in {
+		if ct.State == "running" {
+			out = append(out, ct)
+		}
+	}
+	return out
+}
+
+// preferRunning returns the RUNNING subset of in when it's non-empty, so
+// template selection (env/mounts/labels) and replica-count preservation pick
+// a live container instead of a stale exited one that happens to sort first.
+// Falls back to the full set when every member is stopped, preserving the
+// existing (intentional) ability to act on a fully-stopped service — see
+// Service.AllStopped and onboardedBaseEnv's "better a stale base than no
+// base" doc comment for the same philosophy.
+func preferRunning(in []dockerContainer) []dockerContainer {
+	if running := runningOnly(in); len(running) > 0 {
+		return running
+	}
+	return in
+}
+
 // replaceService creates fresh containers with a new image (and optionally new
 // env), starts them, waits briefly, then removes the old containers. Replica
 // count is preserved. Labels are inherited from the existing template.
@@ -992,7 +1037,15 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	if len(existing) == 0 {
 		return fmt.Errorf("service %q not found (no live replicas)", name)
 	}
-	tpl := existing[0]
+	// tplSet prefers RUNNING containers for both template selection and the
+	// recreate count below — a stale exited leftover (e.g. one whose removal
+	// silently failed on a prior replace, see the teardown loop's log-only
+	// error handling near the bottom of this function) must not donate its
+	// possibly-stale env as the template, nor inflate the replica count of
+	// the replacement set. Falls back to the full existing set when every
+	// member is stopped, so replacing an all-stopped service still works.
+	tplSet := preferRunning(existing)
+	tpl := tplSet[0]
 
 	// Refuse rather than silently strip host config a recreate can't
 	// reproduce — see hostConfigRefuseFields's doc comment. This is the
@@ -1049,10 +1102,16 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 		newLabels[labelPrevImage] = tpl.Image
 	}
 
-	// Create N replacements (same count as current).
+	// Create N replacements. N intentionally reflects tplSet (running-
+	// preferred), not the raw existing count — so a stale exited leftover
+	// doesn't get "replaced" too and inflate the live replica count.
+	// startIdx still scans the full existing set (not tplSet): it must see
+	// every name Docker currently holds, running or not, or it could hand
+	// out an index still occupied by a not-yet-removed stale container and
+	// 409 on create.
 	startIdx := nextReplicaIndex(existing, name)
 	var newIDs []string
-	for i := 0; i < len(existing); i++ {
+	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
 			Image:      req.Image,
@@ -1104,7 +1163,11 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	if len(existing) == 0 {
 		return fmt.Errorf("service %q not found (no live replicas)", name)
 	}
-	tpl := existing[0]
+	// See replaceService's identical tplSet comment: prefer a running
+	// container as the template and as the recreate count, so a stale
+	// exited leftover doesn't donate stale env/mounts or inflate the count.
+	tplSet := preferRunning(existing)
+	tpl := tplSet[0]
 
 	env, err := c.inspectEnv(ctx, tpl.ID)
 	if err != nil {
@@ -1128,9 +1191,11 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 		delete(newLabels, labelAutoUpdate)
 	}
 
+	// startIdx still scans the full existing set — see replaceService's
+	// identical comment on why naming must consider stale containers too.
 	startIdx := nextReplicaIndex(existing, name)
 	var newIDs []string
-	for i := 0; i < len(existing); i++ {
+	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
 			Image:      tpl.Image,
@@ -1185,7 +1250,9 @@ func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, re
 	if len(live) == 0 {
 		return fmt.Errorf("service %q has no live replicas", name)
 	}
-	tpl := live[0]
+	// Prefer a running live container as the canary template — see
+	// replaceService's identical tplSet comment.
+	tpl := preferRunning(live)[0]
 
 	base, err := c.inspectEnv(ctx, tpl.ID)
 	if err != nil {
@@ -1236,7 +1303,10 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 	if err != nil {
 		return err
 	}
-	return c.createCanaryReplicas(ctx, name, req, len(liveOnly(all)))
+	// count prefers running live replicas — see replaceService's identical
+	// tplSet comment — so a stale exited "live" leftover doesn't inflate the
+	// canary pool created for the 50/50 split.
+	return c.createCanaryReplicas(ctx, name, req, len(preferRunning(liveOnly(all))))
 }
 
 // nextCanaryReplicaIndex mirrors nextReplicaIndex but keys off the
@@ -1273,7 +1343,11 @@ func (c *dockerClient) scaleCanary(ctx context.Context, name string, target int)
 	if len(existing) == 0 {
 		return fmt.Errorf("service %q has no canary replicas", name)
 	}
-	tpl := existing[0]
+	// Prefer a running canary as the template — see replaceService's
+	// identical tplSet comment. current/target arithmetic below still counts
+	// the full existing set: it drives the scale-down removal-count guard,
+	// which operates over the same full set (mirrors scaleService).
+	tpl := preferRunning(existing)[0]
 	current := len(existing)
 	switch {
 	case current == target:
