@@ -1609,6 +1609,12 @@ async function renderServices() {
               + (s.auto_update
                   ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', false, this.dataset.host)">' + I.arrowup + 'Auto-update: on' + svcWriteLk(s) + '</button>'
                   : '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', true, this.dataset.host)">' + I.arrowup + 'Auto-update: off' + svcWriteLk(s) + '</button>')
+              // Singleton toggle: label-managed services only (proxy.unscalable
+              // has no onboarded-service equivalent) — flips the label via the
+              // same clone-and-recreate as Auto-update, above.
+              + (s.onboarded ? '' : (s.unscalable
+                  ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', false, this.dataset.host)">' + I.lock + 'Singleton: on' + svcWriteLk(s) + '</button>'
+                  : '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', true, this.dataset.host)">' + I.unlock + 'Singleton: off' + svcWriteLk(s) + '</button>'))
               + (s.previous_image ? '<button class="linkbtn" ' + svcWriteAttr(s) + hostAttr + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\', this.dataset.host)">' + I.rewind + 'Rollback' + svcWriteLk(s) + '</button>' : '')
               // Duplicate reads this host's own live env/mounts server-side
               // and ships them to a peer — never available for an onboarded
@@ -2097,11 +2103,19 @@ function replicaCtrl(s) {
   // into the onclick string directly, because s.machine is unvalidated
   // operator-set text.
   const hostAttr = (foreignSvc(s) && peerWritable(s)) ? ' data-host="' + esc(s.machine) + '"' : '';
+  // A stopped member still counts toward s.replicas (the API's total, which
+  // servicestatus.go's degraded check needs) but shouldn't read as "alive" in
+  // this stepper — show the running count instead, and translate Apply's
+  // input value back to a total (+stopped) so submitting it unedited is a
+  // no-op rather than silently scaling down to the displayed number.
+  const stopped = (s.member_summaries || []).filter(m => !m.is_canary && m.state !== 'running').length;
+  const running = s.replicas - stopped;
+  const stoppedNote = stopped ? ' title="' + running + ' running (' + stopped + ' stopped, not counted)"' : '';
   return '<span class="replica-ctrl">'
-       + '<button ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas - 1) + ', this.dataset.host)">−</button>'
-       + '<input type="number" min="0" value="' + s.replicas + '" id="rep-' + sn + '"' + ((isElevated() && (!foreignSvc(s) || peerWritable(s))) ? '' : ' disabled') + '>'
-       + '<button ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas + 1) + ', this.dataset.host)">+</button>'
-       + '<button class="apply" ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', +document.getElementById(\'rep-' + sn + '\').value, this.dataset.host)">Apply</button>'
+       + '<button ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas - 1) + ', this.dataset.host, this)">−</button>'
+       + '<input type="number" min="0" value="' + running + '" id="rep-' + sn + '"' + stoppedNote + ((isElevated() && (!foreignSvc(s) || peerWritable(s))) ? '' : ' disabled') + '>'
+       + '<button ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas + 1) + ', this.dataset.host, this)">+</button>'
+       + '<button class="apply" ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', (+document.getElementById(\'rep-' + sn + '\').value) + ' + stopped + ', this.dataset.host, this)">Apply</button>'
        + '</span>';
 }
 
@@ -2114,14 +2128,33 @@ function toggleMenu(e, id) {
 }
 document.addEventListener('click', () => { document.querySelectorAll('.menu-pop.open').forEach(x => x.classList.remove('open')); });
 
-async function scaleSvc(name, n, host) {
+async function scaleSvc(name, n, host, btn) {
   if (n < 0) return;
   const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
+  // Visible confirmation the click registered: dim the whole stepper and
+  // swap Apply's label while the request is in flight, since create+start
+  // (or stop+remove) over the Docker API isn't instant and the buttons gave
+  // no feedback otherwise. renderActive() rebuilds the row from scratch on
+  // success, so only the catch path needs to restore it.
+  const wrap = btn && btn.closest('.replica-ctrl');
+  const applyBtn = wrap && wrap.querySelector('.apply');
+  const applyLabel = applyBtn ? applyBtn.textContent : '';
+  if (wrap) {
+    wrap.querySelectorAll('button').forEach(b => b.disabled = true);
+    if (applyBtn) applyBtn.textContent = '…';
+  }
   try {
     await api('/api/services/' + encodeURIComponent(name) + '/scale' + hostParam, { method:'POST', body: JSON.stringify({replicas: n}) });
     toast('scaled ' + name + ' → ' + n);
+    _lastServicesHash = '';
     renderActive();
-  } catch (e) { toast(e.message, 'err'); }
+  } catch (e) {
+    toast(e.message, 'err');
+    if (wrap) {
+      wrap.querySelectorAll('button').forEach(b => b.disabled = false);
+      if (applyBtn) applyBtn.textContent = applyLabel;
+    }
+  }
 }
 
 // lifecycleSvc / lifecycleReplica — stop/start all-of-service or a single
@@ -2166,6 +2199,19 @@ async function toggleAutoUpdate(name, enabled, host) {
       method: 'POST', body: JSON.stringify({ enabled: enabled })
     });
     toast(enabled ? 'auto-update enabled for ' + name : 'auto-update disabled for ' + name, 'ok');
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// toggleSingleton — flip proxy.unscalable for a label-managed service.
+async function toggleSingleton(name, enabled, host) {
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
+  try {
+    await api('/api/services/' + encodeURIComponent(name) + '/singleton' + hostParam, {
+      method: 'POST', body: JSON.stringify({ enabled: enabled })
+    });
+    toast(enabled ? 'singleton enabled for ' + name : 'singleton disabled for ' + name, 'ok');
     _lastServicesHash = '';
     renderActive();
   } catch (e) { toast(e.message, 'err'); }

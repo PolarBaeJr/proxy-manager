@@ -718,6 +718,26 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
 			return
 		}
+		if len(parts) == 2 && parts[1] == "singleton" && req.Method == "POST" {
+			var body struct {
+				Enabled bool `json:"enabled"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if _, ok := onb.Get(name); ok {
+				http.Error(w, "singleton toggle is only supported for label-managed services", http.StatusBadRequest)
+				return
+			}
+			if err := dc.setUnscalableLabel(req.Context(), name, body.Enabled); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			audit(req, sessionUser(info), "service.singleton_set", name+" => "+strconv.FormatBool(body.Enabled))
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
+			return
+		}
 		if len(parts) == 2 && parts[1] == "check" && req.Method == "POST" {
 			payload, status, err := runServiceCheckImage(req.Context(), dc, ic, onb, name)
 			if err != nil {
@@ -2094,6 +2114,8 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		peerPath = "/peer/services/" + url.PathEscape(name) + "/replicas/" + url.PathEscape(memberParts[0]) + "/" + memberParts[1]
 	case len(parts) == 2 && parts[1] == "autoupdate" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/autoupdate"
+	case len(parts) == 2 && parts[1] == "singleton" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/singleton"
 	case len(parts) == 2 && parts[1] == "check" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/check"
 	case len(parts) == 2 && parts[1] == "replace" && req.Method == http.MethodPost:
