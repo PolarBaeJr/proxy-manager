@@ -301,3 +301,70 @@ func TestSetAutoUpdateLabelCountMatchesRunningReplicas(t *testing.T) {
 		t.Errorf("createCount = %d, want 1 (the exited leftover must not inflate the recreated replica count)", createCount)
 	}
 }
+
+// TestScaleServiceRemovesStoppedReplicaBeforeRunningOne reproduces the
+// stepper's companion bug: the UI displays the RUNNING count (a stopped
+// member already reads as "not there" — see replicaCtrl in ui.go), so
+// scaling down by one must reclaim the already-stopped member rather than
+// stopping a live one and leaving the stale stopped one behind. Before the
+// fix, scaleService's removal order only looked at name (highest index
+// first), so a stopped LOW-index replica sitting next to a running
+// HIGH-index one would survive while the running one got killed.
+func TestScaleServiceRemovesStoppedReplicaBeforeRunningOne(t *testing.T) {
+	var removedIDs []string
+
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{
+				{
+					ID: "orig", Names: []string{"/app"}, State: "running",
+					Image:  "ghcr.io/org/app:v1",
+					Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example"},
+				},
+				{
+					// Lower index, but STOPPED — this is the one that must go.
+					ID: "stopped2", Names: []string{"/goproxy-app-2"}, State: "exited",
+					Image:  "ghcr.io/org/app:v1",
+					Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example"},
+				},
+				{
+					// Higher index, RUNNING — must survive the scale-down.
+					ID: "running3", Names: []string{"/goproxy-app-3"}, State: "running",
+					Image:  "ghcr.io/org/app:v1",
+					Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example"},
+				},
+			})
+		case strings.Contains(r.URL.Path, "/stop"):
+			removedIDs = append(removedIDs, "stop:"+strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/containers/"), "/stop"))
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete:
+			id := strings.TrimPrefix(r.URL.Path, "/containers/")
+			removedIDs = append(removedIDs, "rm:"+id)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	// 3 total (1 original + 2 goproxy-managed) -> 2: exactly one goproxy-
+	// managed replica must be removed, and it must be the stopped one.
+	if err := dc.scaleService(context.Background(), "app", 2); err != nil {
+		t.Fatalf("scaleService: %v", err)
+	}
+	var sawStoppedRemoved, sawRunningRemoved bool
+	for _, id := range removedIDs {
+		if strings.Contains(id, "stopped2") {
+			sawStoppedRemoved = true
+		}
+		if strings.Contains(id, "running3") {
+			sawRunningRemoved = true
+		}
+	}
+	if !sawStoppedRemoved {
+		t.Errorf("expected the already-stopped replica (stopped2) to be removed, removedIDs=%v", removedIDs)
+	}
+	if sawRunningRemoved {
+		t.Errorf("running replica (running3) must not be removed while a stopped one remains, removedIDs=%v", removedIDs)
+	}
+}

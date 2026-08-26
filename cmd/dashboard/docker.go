@@ -881,8 +881,19 @@ func (c *dockerClient) scaleService(ctx context.Context, name string, desired in
 				ours = append(ours, ct)
 			}
 		}
-		// Remove highest-indexed first (e.g. goproxy-foo-5 before goproxy-foo-2).
-		sort.Slice(ours, func(i, j int) bool { return ours[i].name() > ours[j].name() })
+		// Reclaim a stopped replica before touching a running one — the UI's
+		// stepper displays the running count (a stopped member already reads
+		// as "not there"), so scaling down must actually remove the member
+		// that's already down first rather than killing a live one and
+		// leaving the stale stopped one behind. Ties (same state) still
+		// remove highest-indexed first (e.g. goproxy-foo-5 before goproxy-foo-2).
+		sort.Slice(ours, func(i, j int) bool {
+			iRunning, jRunning := ours[i].State == "running", ours[j].State == "running"
+			if iRunning != jRunning {
+				return !iRunning
+			}
+			return ours[i].name() > ours[j].name()
+		})
 		if len(ours) < toRemove {
 			return fmt.Errorf("can only scale down to %d (the original is not removable)", current-len(ours))
 		}
@@ -1225,6 +1236,89 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 		_ = c.stopContainer(ctx, ct.ID)
 		if err := c.removeContainer(ctx, ct.ID); err != nil {
 			log.Printf("autoupdate label flip %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
+		}
+	}
+	return nil
+}
+
+// setUnscalableLabel flips proxy.unscalable for a label-managed service via
+// the same clone-and-recreate shape as setAutoUpdateLabel, but WITHOUT an
+// image swap: same image, same env, same mounts, only the label value
+// changes. Lets the dashboard/MCP toggle the singleton flag for any
+// label-managed service without requiring a compose edit + `docker compose
+// up -d`. guardUnscalable is what enforces the "can't scale a singleton"
+// constraint at scale-time; this setter's only job is to flip the label.
+func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enabled bool) error {
+	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+	if err != nil {
+		return err
+	}
+	existing := liveOnly(all)
+	if len(existing) == 0 {
+		return fmt.Errorf("service %q not found (no live replicas)", name)
+	}
+	// See replaceService's identical tplSet comment: prefer a running
+	// container as the template and as the recreate count, so a stale
+	// exited leftover doesn't donate stale env/mounts or inflate the count.
+	tplSet := preferRunning(existing)
+	tpl := tplSet[0]
+
+	env, err := c.inspectEnv(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template env: %w", err)
+	}
+	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("inspect template clone spec: %w", err)
+	}
+
+	newLabels := map[string]string{}
+	for k, v := range tpl.Labels {
+		if strings.HasPrefix(k, ociImageLabelPrefix) {
+			continue
+		}
+		newLabels[k] = v
+	}
+	if enabled {
+		newLabels[labelUnscalable] = "true"
+	} else {
+		delete(newLabels, labelUnscalable)
+	}
+
+	// startIdx still scans the full existing set — see replaceService's
+	// identical comment on why naming must consider stale containers too.
+	startIdx := nextReplicaIndex(existing, name)
+	var newIDs []string
+	for i := 0; i < len(tplSet); i++ {
+		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
+		id, err := c.createContainer(ctx, cname, createBody{
+			Image:      tpl.Image,
+			Labels:     newLabels,
+			Env:        env,
+			HostConfig: hostConfig{Mounts: clone.Mounts},
+		})
+		if err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			return fmt.Errorf("create %s: %w", cname, err)
+		}
+		if err := c.startContainer(ctx, id); err != nil {
+			for _, oid := range newIDs {
+				_ = c.removeContainer(ctx, oid)
+			}
+			_ = c.removeContainer(ctx, id)
+			return fmt.Errorf("start %s: %w", cname, err)
+		}
+		newIDs = append(newIDs, id)
+	}
+
+	time.Sleep(replaceSettleDelay)
+
+	for _, ct := range existing {
+		_ = c.stopContainer(ctx, ct.ID)
+		if err := c.removeContainer(ctx, ct.ID); err != nil {
+			log.Printf("unscalable label flip %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
 		}
 	}
 	return nil

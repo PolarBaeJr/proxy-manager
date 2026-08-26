@@ -513,7 +513,7 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 
 // peerServicesMutateHandler returns the HTTP handler for POST
 // /peer/services/{name}/{scale,stop,start,replicas/{member}/{stop,start},
-// autoupdate,check} on the dedicated peer-handshake port — the write-side
+// autoupdate,singleton,check} on the dedicated peer-handshake port — the write-side
 // counterpart of peerServicesHandler. This establishes the copyable pattern
 // later write-mesh phases (4-5) should reuse: gate on secret+writesEnabled,
 // constant-time bearer compare, parse the subpath, self-guard, then dispatch
@@ -654,6 +654,26 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 				return
 			}
 			audit(r, "peer-mesh", "service.autoupdate_set", name+" => "+strconv.FormatBool(body.Enabled))
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "singleton" && r.Method == http.MethodPost {
+			var body struct {
+				Enabled bool `json:"enabled"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if _, ok := onb.Get(name); ok {
+				http.Error(w, "singleton toggle is only supported for label-managed services", http.StatusBadRequest)
+				return
+			}
+			if err := dc.setUnscalableLabel(r.Context(), name, body.Enabled); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			audit(r, "peer-mesh", "service.singleton_set", name+" => "+strconv.FormatBool(body.Enabled))
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
 			return
 		}
