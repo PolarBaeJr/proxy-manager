@@ -199,6 +199,11 @@ main{padding:24px 0 64px}
 .kpi-foot svg{width:13px;height:13px;flex:none}
 .kpi-foot .up{color:var(--green);display:inline-flex;align-items:center;gap:5px} .kpi-foot .down{color:var(--red);display:inline-flex;align-items:center;gap:5px}
 .kpi-foot .up svg,.kpi-foot .down svg,.kpi-foot span svg{width:13px;height:13px}
+.kpi-sm{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 12px}
+.kpi-sm .kpi-label{margin-bottom:5px}
+.kpi-sm-val{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.kpi-sm-val.warn{color:var(--yellow)}
+.kpi-sm-val.bad{color:var(--red)}
 
 /* ============ PILLS ============ */
 .pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:650;line-height:1;
@@ -263,11 +268,13 @@ details.errd[open] summary{color:#ff7173}
 
 /* ============ CHARTS ============ */
 .spark{display:block;width:100%;height:46px}
-.statusbar{display:flex;height:9px;border-radius:var(--radius-pill);overflow:hidden;background:var(--surface-3);margin:4px 0}
+.statusbar{display:flex;height:10px;border-radius:var(--radius-pill);overflow:hidden;background:var(--surface-3);margin:4px 0;border:1px solid var(--border)}
 .statusbar i{display:block;height:100%}
+.statusbar i+i{border-left:1px solid rgba(0,0,0,.18)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:9px;font-size:11.5px;color:var(--muted)}
 .legend span{display:inline-flex;align-items:center;gap:5px;font-variant-numeric:tabular-nums}
-.legend .sw{width:9px;height:9px;border-radius:2px;flex:none}
+.legend .sw{width:8px;height:8px;border-radius:50%;flex:none}
+.legend b{color:var(--text);font-weight:700}
 .hostbar{display:grid;grid-template-columns:1fr;gap:9px}
 .hostrow{display:grid;grid-template-columns:160px 1fr 64px 56px;gap:12px;align-items:center;font-size:12.5px}
 .hostrow .nm{font-family:var(--font-mono);font-size:12px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -296,13 +303,15 @@ details.errd[open] summary{color:#ff7173}
 .th.active{color:var(--text)}
 
 /* replica control */
-.replica-ctrl{display:inline-flex;align-items:center;gap:0;border:1px solid var(--border-2);border-radius:var(--radius-sm);overflow:hidden;background:var(--surface-2)}
-.replica-ctrl button{appearance:none;border:0;background:transparent;color:var(--text);font:inherit;font-size:15px;width:30px;height:30px;cursor:pointer;transition:background var(--transition-fast)}
+.replica-ctrl{display:inline-flex;align-items:center;gap:0;border:1px solid var(--border-2);border-radius:var(--radius-md);overflow:hidden;background:var(--surface-2);transition:border-color var(--transition-fast),box-shadow var(--transition-fast)}
+.replica-ctrl:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,212,255,.15)}
+.replica-ctrl button{appearance:none;border:0;background:transparent;color:var(--text);font:inherit;font-size:16px;font-weight:600;width:30px;height:32px;cursor:pointer;transition:background var(--transition-fast)}
 .replica-ctrl button:hover:not(:disabled){background:var(--surface-3)}
 .replica-ctrl button:disabled{opacity:.4;cursor:not-allowed}
-.replica-ctrl input{width:44px;height:30px;text-align:center;background:var(--bg);border:0;border-left:1px solid var(--border);border-right:1px solid var(--border);color:var(--text);font:inherit;font-variant-numeric:tabular-nums}
+.replica-ctrl input{width:44px;height:32px;text-align:center;background:var(--bg);border:0;border-left:1px solid var(--border);border-right:1px solid var(--border);color:var(--text);font:inherit;font-weight:600;font-variant-numeric:tabular-nums}
 .replica-ctrl input:focus{outline:none}
-.replica-ctrl .apply{width:auto;padding:0 11px;font-size:12px;font-weight:600;color:var(--accent);border-left:1px solid var(--border)}
+.replica-ctrl .apply{width:auto;padding:0 12px;font-size:12px;font-weight:700;letter-spacing:.02em;color:var(--accent);background:rgba(0,212,255,.1);border-left:1px solid var(--border);transition:background var(--transition-fast)}
+.replica-ctrl .apply:hover:not(:disabled){background:rgba(0,212,255,.18)}
 .singleton-lock{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
 .singleton-lock svg{width:13px;height:13px}
 
@@ -1165,9 +1174,15 @@ function kpi(icon, label, val, foot, accent) {
        + '<div class="kpi-num' + (accent ? ' accent' : '') + '">' + val + '</div>'
        + (foot ? '<div class="kpi-foot">' + foot + '</div>' : '') + '</div>';
 }
-function kpiSm(label, val) {
-  return '<div><div class="kpi-label" style="margin-bottom:4px">' + label + '</div>'
-       + '<div style="font-size:19px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em">' + val + '</div></div>';
+function kpiSm(label, val, accent) {
+  return '<div class="kpi-sm"><div class="kpi-label">' + label + '</div>'
+       + '<div class="kpi-sm-val' + (accent ? ' ' + accent : '') + '">' + val + '</div></div>';
+}
+// errAccent maps an error percentage to the kpiSm accent class an Errors
+// tile should render with — 'bad' loud enough to catch the eye scanning a
+// row of otherwise-neutral stats, 'warn' for anything nonzero but low.
+function errAccent(errPct) {
+  return errPct >= 5 ? 'bad' : errPct > 0 ? 'warn' : '';
 }
 function emptyState(icon, title, body) {
   return '<div class="card"><div class="empty-state"><div class="es-ic">' + icon + '</div>'
@@ -1201,7 +1216,7 @@ function statusBarFromCodes(byCode) {
   const keys = ['2xx','3xx','4xx','5xx'];
   const total = keys.reduce((a,k) => a + buckets[k], 0) || 1;
   const bar = keys.map(k => { const p = buckets[k] / total * 100; return p <= 0 ? '' : '<i style="width:' + p + '%;background:' + STC[k] + '"></i>'; }).join('');
-  const leg = keys.map(k => '<span><i class="sw" style="background:' + STC[k] + '"></i>' + k + ' ' + fmt(buckets[k]) + '</span>').join('');
+  const leg = keys.map(k => '<span><i class="sw" style="background:' + STC[k] + '"></i>' + k + ' <b>' + fmt(buckets[k]) + '</b></span>').join('');
   return '<div class="statusbar">' + bar + '</div><div class="legend">' + leg + '</div>';
 }
 // normalizeImageRef cleans what people actually paste into an image field.
@@ -1624,6 +1639,14 @@ async function renderServices() {
     facts += '</table>';
 
     let actions;
+    // menuExtra holds the secondary/administrative actions that move into
+    // the "..." overflow (see the menu-pop below) instead of sitting flat
+    // in the action row — a routed, non-canary service used to put up to
+    // 8 buttons there, most of them settings toggles or setup-time actions
+    // rather than things an operator reaches for during day-to-day use or
+    // an incident. Start/Stop, Stage, Replace, and one-click Update stay
+    // flat — those are the ones worth one click, not two.
+    let menuExtra = '';
     if (managed) {
       actions = '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="onboardDialog(\'' + sn + '\', ' + (s.port || 0) + ', \'' + esc(s.path || '') + '\')">' + I.rocket + 'Add route…' + svcLk(s) + '</button>';
     } else if (canary) {
@@ -1640,45 +1663,46 @@ async function renderServices() {
                   ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.rocket + 'Stage new version' + svcWriteLk(s) + '</button>'
                   : '<button class="btn primary" ' + svcWriteAttr(s) + hostAttr + ' onclick="openStage(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.rocket + 'Stage new version' + svcWriteLk(s) + '</button>')
               + '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="openReplace(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.swap + 'Replace' + svcWriteLk(s) + '</button>'
-              // Force an immediate registry check instead of waiting on the
-              // ~10min background poller — mirrors the MCP check_for_update tool.
-              + '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="checkForUpdate(\'' + sn + '\', this, this.dataset.host)">' + I.refresh + 'Check now' + svcWriteLk(s) + '</button>'
               + (s.all_stopped
                   ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\', this.dataset.host)">' + I.bolt + 'Start service' + svcWriteLk(s) + '</button>'
                   : '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\', this.dataset.host)">' + I.lock + 'Stop service' + svcWriteLk(s) + '</button>')
+              + (s.previous_image ? '<button class="linkbtn" ' + svcWriteAttr(s) + hostAttr + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\', this.dataset.host)">' + I.rewind + 'Rollback' + svcWriteLk(s) + '</button>' : '');
+      menuExtra =
+                // Force an immediate registry check instead of waiting on the
+                // ~10min background poller — mirrors the MCP check_for_update tool.
+                '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="checkForUpdate(\'' + sn + '\', this, this.dataset.host)">' + I.refresh + 'Check now' + svcWriteLk(s) + '</button>'
               // Add env: recreates the replicas on the SAME image with the new
               // variables merged in. Disabled while stopped — the recreate
               // clones a live replica's config, so there has to be one.
               + (s.all_stopped
-                  ? '<button class="btn" disabled title="Start the service first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
-                  : '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="openAddEnv(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.plus + 'Add env…' + svcWriteLk(s) + '</button>')
+                  ? '<button disabled title="Start the service first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
+                  : '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="openAddEnv(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.plus + 'Add env…' + svcWriteLk(s) + '</button>')
               // Auto-update toggle: available for any routed service, label-
               // managed or onboarded. For a label-managed service this
               // flips proxy.autoupdate via the same clone-and-recreate as
               // Add env, above — same image/env/mounts, just the label changes.
               + (s.auto_update
-                  ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', false, this.dataset.host)">' + I.arrowup + 'Auto-update: on' + svcWriteLk(s) + '</button>'
-                  : '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', true, this.dataset.host)">' + I.arrowup + 'Auto-update: off' + svcWriteLk(s) + '</button>')
+                  ? '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', false, this.dataset.host)">' + I.arrowup + 'Auto-update: on' + svcWriteLk(s) + '</button>'
+                  : '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', true, this.dataset.host)">' + I.arrowup + 'Auto-update: off' + svcWriteLk(s) + '</button>')
               // Singleton toggle: label-managed services only (proxy.unscalable
               // has no onboarded-service equivalent) — flips the label via the
               // same clone-and-recreate as Auto-update, above.
               + (s.onboarded ? '' : (s.unscalable
-                  ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', false, this.dataset.host)">' + I.lock + 'Singleton: on' + svcWriteLk(s) + '</button>'
-                  : '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', true, this.dataset.host)">' + I.unlock + 'Singleton: off' + svcWriteLk(s) + '</button>'))
-              + (s.previous_image ? '<button class="linkbtn" ' + svcWriteAttr(s) + hostAttr + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\', this.dataset.host)">' + I.rewind + 'Rollback' + svcWriteLk(s) + '</button>' : '')
+                  ? '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', false, this.dataset.host)">' + I.lock + 'Singleton: on' + svcWriteLk(s) + '</button>'
+                  : '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', true, this.dataset.host)">' + I.unlock + 'Singleton: off' + svcWriteLk(s) + '</button>'))
               // Duplicate reads the OWNING host's own live env/mounts
               // server-side and ships them to a target peer — never
               // available for an onboarded service (duplicate.go only
               // supports label-managed sources). hostAttr forwards a
               // foreign-but-writable row to its owning peer, same as every
               // other svcWriteAttr-gated action.
-              + (s.onboarded ? '' : '<button class="btn" ' + dupAttr(s) + hostAttr + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ', this.dataset.host)">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>')
+              + (s.onboarded ? '' : '<button ' + dupAttr(s) + hostAttr + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ', this.dataset.host)">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>')
               // Spread reads the OWNING host's own live env/mounts server-side
               // (runServiceSpread in spread.go) and joins a peer replica into
               // ONE load-balanced service via the proxy-level peer mesh —
               // distinct from Duplicate, which creates an independent second
               // service. Same onboarded/unscalable gates as Duplicate.
-              + (s.onboarded ? '' : '<button class="btn" ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>');
+              + (s.onboarded ? '' : '<button ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
     // replica AND no stopped members (saves card height for the common case).
@@ -1726,8 +1750,16 @@ async function renderServices() {
     // string literal, since attribute-value entity-decoding happens BEFORE
     // the onclick body is parsed as JS.
     const menuId = 'm-' + esc(s.machine || 'local') + '-' + sn;
-    const menu = (foreignSvc(s) && !peerWritable(s)) ? '' : '<div class="menu"><button class="btn icon" data-menu="' + menuId + '" onclick="toggleMenu(event, this.dataset.menu)">' + I.dots + '</button>'
-               + '<div class="menu-pop" id="' + menuId + '"><button class="danger" ' + svcWriteAttr(s) + hostAttr + ' onclick="deleteSvc(\'' + sn + '\', this.dataset.host)">' + I.trash + 'Delete service</button></div></div>';
+    // Delete stays gated exactly as before (hidden, not just disabled, on a
+    // foreign row its owning peer won't accept writes for) — but menuExtra's
+    // settings/setup items are still worth showing (locked via svcWriteAttr)
+    // on such a row, same as they used to render locked in the flat action
+    // row before this menu existed, so the whole popover is only suppressed
+    // when it would end up with nothing in it.
+    const canDeleteSvc = !(foreignSvc(s) && !peerWritable(s));
+    const menuBody = menuExtra + (canDeleteSvc ? '<button class="danger" ' + svcWriteAttr(s) + hostAttr + ' onclick="deleteSvc(\'' + sn + '\', this.dataset.host)">' + I.trash + 'Delete service</button>' : '');
+    const menu = !menuBody ? '' : '<div class="menu"><button class="btn icon" data-menu="' + menuId + '" onclick="toggleMenu(event, this.dataset.menu)">' + I.dots + '</button>'
+               + '<div class="menu-pop" id="' + menuId + '">' + menuBody + '</div></div>';
 
     // Per-card collapse: clicking the svc-head folds facts + actionzone to a
     // one-line summary. Persisted in localStorage keyed by service name.
@@ -1879,7 +1911,7 @@ function renderServiceStatsPanel(stats, recent, panel, svcStatus) {
           + kpiSm(reqsLabel, reqsVal)
           + kpiSm('In flight', String(inflight))
           + kpiSm('p95', p95 + ' <small>ms</small>')
-          + kpiSm('Errors', pct(errPct))
+          + kpiSm('Errors', pct(errPct), errAccent(errPct))
           + '</div>';
     // In flight / p95 / errors still come from per-HOST metrics — a host can
     // front several services, so only THOSE three numbers are host-wide.
@@ -1888,7 +1920,7 @@ function renderServiceStatsPanel(stats, recent, panel, svcStatus) {
     if (Object.keys(by).length) html += statusBarFromCodes(by);
   }
   if (recent.length) {
-    html += '<div class="meta" style="margin:14px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:600">Recent requests <span style="text-transform:none;letter-spacing:0;font-weight:400;opacity:.75">— this service only</span></div>';
+    html += '<div class="kpi-label" style="margin:14px 0 6px">Recent requests <span style="text-transform:none;letter-spacing:0;font-weight:400;opacity:.75">— this service only</span></div>';
     // Fixed-height scroll container so new rows don't push the rest of the
     // card down on every auto-refresh tick.
     html += '<div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm)">';
@@ -3571,7 +3603,7 @@ async function renderStats() {
         + (tWin1h != null ? kpiSm('Requests (1h)', fmt(tWin1h)) : kpiSm('Requests', fmt(total)))
         + kpiSm('In flight', String(t.in_flight || 0))
         + kpiSm('p95',     p95 + ' <small>ms</small>')
-        + kpiSm('Errors',  pct(tErrPct))
+        + kpiSm('Errors',  pct(tErrPct), errAccent(tErrPct))
         + '</div>';
     const detail = isAbsent
       ? '<div class="meta" style="padding:10px 0 0">Not deployed — no metrics.</div>'
