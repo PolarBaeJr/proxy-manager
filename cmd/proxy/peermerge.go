@@ -24,9 +24,12 @@ type learnedRoute struct {
 	rateLimit   bool
 	rateRPM     int
 	spread      bool
-	backends    int
-	weight      int
-	lastSeen    time.Time
+	// service is the advertising peer's RouteGroup.Service — see overlay's
+	// localBackendsByService parameter for what it's used for.
+	service  string
+	backends int
+	weight   int
+	lastSeen time.Time
 }
 
 // peerWeight resolves the weight to give a peer's synthetic backend: the
@@ -114,6 +117,7 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 			rateLimit:   r.RateLimit,
 			rateRPM:     r.RateRPM,
 			spread:      r.Spread,
+			service:     r.Service,
 			backends:    r.Backends,
 			// A peer running a binary from before proxy.weight was advertised
 			// sends no weight at all. Falling back to the count keeps its
@@ -133,12 +137,33 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 // to the slice if no local group exists for that route. Expired entries are
 // dropped lazily while iterating; there is no background sweep goroutine.
 //
+// localBackendsByService is this host's OWN backendsByService map, as
+// returned by assembleGroups() in the same refresh() cycle — used to backfill
+// a brand-new synthesized group from this host's own Service-labeled
+// containers, exactly the way assembleGroups' own static-route backfill
+// (router.go: `if g.static && g.Service != ""`) does for a route this host
+// already knows about via routes.json. Without this, a `service:`-resolved
+// routes.json entry that exists on only ONE host is invisible everywhere
+// else: a peer running the same proxy.service-labeled containers has no
+// local group for the route at all (no routes.json entry, no proxy.host/path
+// label on those containers), so its own healthy replicas sit unused while
+// every request routes back over the network to the advertising peer — and,
+// since a group with zero local backends is never re-advertised outward
+// (see peersync.go's tick() anti-recycling filter), the origin can't fail
+// over to THIS peer either. Deliberately scoped to the brand-new-group
+// branch only (never an already-existing local group): a directly-labeled
+// local container is already in that group's Backends by the time overlay
+// runs, and is also already counted in localBackendsByService under the
+// same service name — backfilling onto an existing group would append the
+// same *Backend twice. See project memory
+// project_routes_json_service_backend_gap.md for how this was found.
+//
 // Because assembleGroups() runs fresh every refresh(), the groups slice
 // passed in always starts with zero pre-existing learned backends — so two
 // independent calls with two freshly-built slices produce the same
 // learned-backend count, rather than accumulating duplicates the way
 // repeated calls against the same slice would.
-func (s *PeerRouteStore) overlay(groups []*RouteGroup) []*RouteGroup {
+func (s *PeerRouteStore) overlay(groups []*RouteGroup, localBackendsByService map[string][]*Backend) []*RouteGroup {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now
@@ -174,7 +199,16 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup) []*RouteGroup {
 				// into it.
 				g = &RouteGroup{
 					Host: host, PathPrefix: path, StripPrefix: lr.stripPrefix, Name: lr.name,
-					RateLimit: lr.rateLimit, RateRPM: lr.rateRPM,
+					RateLimit: lr.rateLimit, RateRPM: lr.rateRPM, Service: lr.service,
+				}
+				// Real, local, non-Learned backends -- pickHealthy already prefers
+				// these over the synthetic peer backend added unconditionally
+				// below, without any change needed there: it's the same
+				// local-tier preference every other local backend already gets.
+				if lr.service != "" {
+					if bs, ok := localBackendsByService[lr.service]; ok {
+						g.Backends = append(g.Backends, bs...)
+					}
 				}
 				byKey[key] = g
 				groups = append(groups, g)

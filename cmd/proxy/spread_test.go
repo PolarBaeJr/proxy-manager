@@ -128,7 +128,7 @@ func TestAssembleGroupsSpreadLabel(t *testing.T) {
 			map[string]string{managedNetwork: "172.20.0.7"}),
 	))
 
-	groups, err := assembleGroups(context.Background(), dc, "")
+	groups, _, err := assembleGroups(context.Background(), dc, "")
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestPeerRouteStoreAdoptsSpreadOntoExistingGroup(t *testing.T) {
 
 	local := makeBackendForTest("http://172.26.0.5:8080")
 	g := &RouteGroup{Host: "app.example.org", Backends: []*Backend{local}}
-	groups := s.overlay([]*RouteGroup{g})
+	groups := s.overlay([]*RouteGroup{g}, nil)
 
 	if len(groups) != 1 {
 		t.Fatalf("groups = %d, want the learned route merged into the existing one", len(groups))
@@ -187,7 +187,7 @@ func TestPeerRouteStoreLeavesSpreadOffWhenNotAdvertised(t *testing.T) {
 		Routes:    []peerRouteInfo{{Host: "app.example.org", Backends: 1}},
 	})
 	g := &RouteGroup{Host: "app.example.org", Backends: []*Backend{makeBackendForTest("http://172.26.0.5:8080")}}
-	groups := s.overlay([]*RouteGroup{g})
+	groups := s.overlay([]*RouteGroup{g}, nil)
 	if groups[0].Spread {
 		t.Error("Spread turned on by an advertisement that never claimed it")
 	}
@@ -281,14 +281,14 @@ func TestPeerRouteStoreClearsAdoptedSpread(t *testing.T) {
 	}
 
 	s.merge(adv(true))
-	if !s.overlay([]*RouteGroup{fresh()})[0].Spread {
+	if !s.overlay([]*RouteGroup{fresh()}, nil)[0].Spread {
 		t.Fatal("Spread not adopted on the first advertisement")
 	}
 
 	if !s.merge(adv(false)) {
 		t.Error("merge reported no change on a flipped spread flag — refresh() would not run, leaving the stale flag live")
 	}
-	if s.overlay([]*RouteGroup{fresh()})[0].Spread {
+	if s.overlay([]*RouteGroup{fresh()}, nil)[0].Spread {
 		t.Error("Spread still on after the peer stopped advertising it — the flag has no off-switch")
 	}
 }
@@ -332,7 +332,7 @@ func TestOverlayWeightsPeerByAdvertisedWeight(t *testing.T) {
 	})
 
 	local := makeBackendForTest("http://172.26.0.5:8080")
-	g := s.overlay([]*RouteGroup{{Host: "app.example.org", Backends: []*Backend{local}}})[0]
+	g := s.overlay([]*RouteGroup{{Host: "app.example.org", Backends: []*Backend{local}}}, nil)[0]
 	for _, b := range g.Backends {
 		b.markHealthy(true)
 	}

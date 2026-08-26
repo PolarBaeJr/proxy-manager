@@ -96,12 +96,12 @@ func main() {
 	routeStore := newPeerRouteStore(3 * *peerSyncInterval)
 
 	refresh := func() {
-		groups, err := assembleGroups(ctx, dc, *staticConfig)
+		groups, backendsByService, err := assembleGroups(ctx, dc, *staticConfig)
 		if err != nil {
 			log.Printf("refresh: %v", err)
 			return
 		}
-		groups = routeStore.overlay(groups)
+		groups = routeStore.overlay(groups, backendsByService)
 		router.Set(groups)
 		total := 0
 		for _, g := range groups {

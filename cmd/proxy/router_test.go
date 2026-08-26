@@ -92,7 +92,7 @@ func TestAssembleGroupsLabelParsing(t *testing.T) {
 			map[string]string{labelHost: "d.example.org", labelPort: "9090"}, nil),
 	))
 
-	groups, err := assembleGroups(context.Background(), dc, "")
+	groups, _, err := assembleGroups(context.Background(), dc, "")
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestAssembleAuthMergeRule(t *testing.T) {
 			map[string]string{managedNetwork: "172.20.0.12"}),
 	))
 
-	groups, err := assembleGroups(context.Background(), dc, "")
+	groups, _, err := assembleGroups(context.Background(), dc, "")
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestAssembleGroupsStaticOwnsHost(t *testing.T) {
 			map[string]string{managedNetwork: "172.20.0.5"}),
 	))
 
-	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	groups, _, err := assembleGroups(context.Background(), dc, cfgPath)
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestAssembleGroupsStaticOwnsHost(t *testing.T) {
 			map[string]string{labelHost: "unowned.example.com", labelPort: "9090"},
 			map[string]string{managedNetwork: "172.20.0.6"}),
 	))
-	groups2, err := assembleGroups(context.Background(), dc2, cfgPath)
+	groups2, _, err := assembleGroups(context.Background(), dc2, cfgPath)
 	if err != nil {
 		t.Fatalf("assembleGroups (unowned): %v", err)
 	}
@@ -229,7 +229,7 @@ func TestAssembleGroupsServiceFieldLiteralOnly(t *testing.T) {
 	cfgPath := writeStaticConfig(t, staticRoute{Host: "literal.example.com", Backends: []string{"http://10.0.0.9:8080"}})
 	dc := fakeDocker(t, dockerJSON())
 
-	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	groups, _, err := assembleGroups(context.Background(), dc, cfgPath)
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestAssembleGroupsServiceFieldResolvesBackends(t *testing.T) {
 			map[string]string{managedNetwork: "172.20.0.12"}),
 	))
 
-	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	groups, _, err := assembleGroups(context.Background(), dc, cfgPath)
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestAssembleGroupsServiceFieldCombinedWithLiteral(t *testing.T) {
 			map[string]string{managedNetwork: "172.20.0.11"}),
 	))
 
-	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	groups, _, err := assembleGroups(context.Background(), dc, cfgPath)
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestAssembleGroupsServiceFieldZeroMatch(t *testing.T) {
 	cfgPath := writeStaticConfig(t, staticRoute{Host: "nomatch.example.com", Service: "nobody-labels-this"})
 	dc := fakeDocker(t, dockerJSON())
 
-	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	groups, _, err := assembleGroups(context.Background(), dc, cfgPath)
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -343,7 +343,7 @@ func TestAssembleGroupsServiceFieldExcludesCanary(t *testing.T) {
 			map[string]string{managedNetwork: "172.20.0.12"}),
 	))
 
-	groups, err := assembleGroups(context.Background(), dc, cfgPath)
+	groups, _, err := assembleGroups(context.Background(), dc, cfgPath)
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -754,7 +754,7 @@ func TestPeerRouteStoreOverlayRateLimitReachesRouterSet(t *testing.T) {
 	})
 
 	r := &Router{}
-	r.Set(store.overlay(nil))
+	r.Set(store.overlay(nil, nil))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "http://rl.example.org/", nil)
@@ -837,7 +837,7 @@ func TestDockerHealthFloorIndependentOfProbe(t *testing.T) {
 			map[string]string{managedNetwork: "172.20.0.9"}),
 	))
 
-	groups, err := assembleGroups(context.Background(), dc, "")
+	groups, _, err := assembleGroups(context.Background(), dc, "")
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
@@ -871,7 +871,7 @@ func TestDockerHealthFloorRecoversAcrossRefresh(t *testing.T) {
 			map[string]string{labelHost: "f.example.org", labelPort: "8080"},
 			map[string]string{managedNetwork: "172.20.0.9"}),
 	))
-	groups1, err := assembleGroups(context.Background(), dcUnhealthy, "")
+	groups1, _, err := assembleGroups(context.Background(), dcUnhealthy, "")
 	if err != nil {
 		t.Fatalf("assembleGroups (unhealthy): %v", err)
 	}
@@ -887,7 +887,7 @@ func TestDockerHealthFloorRecoversAcrossRefresh(t *testing.T) {
 			map[string]string{labelHost: "f.example.org", labelPort: "8080"},
 			map[string]string{managedNetwork: "172.20.0.9"}),
 	))
-	groups2, err := assembleGroups(context.Background(), dcHealthy, "")
+	groups2, _, err := assembleGroups(context.Background(), dcHealthy, "")
 	if err != nil {
 		t.Fatalf("assembleGroups (healthy): %v", err)
 	}
@@ -928,10 +928,10 @@ func TestMissingHealthLabelWarningDedup(t *testing.T) {
 	log.SetOutput(&buf)
 	defer log.SetOutput(old)
 
-	if _, err := assembleGroups(context.Background(), dc, ""); err != nil {
+	if _, _, err := assembleGroups(context.Background(), dc, ""); err != nil {
 		t.Fatalf("assembleGroups (1st): %v", err)
 	}
-	if _, err := assembleGroups(context.Background(), dc, ""); err != nil {
+	if _, _, err := assembleGroups(context.Background(), dc, ""); err != nil {
 		t.Fatalf("assembleGroups (2nd): %v", err)
 	}
 	if got := strings.Count(buf.String(), name); got != 1 {

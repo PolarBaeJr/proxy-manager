@@ -37,7 +37,17 @@ type peerRouteInfo struct {
 	PathPrefix  string `json:"path,omitempty"`
 	StripPrefix bool   `json:"strip,omitempty"`
 	Name        string `json:"name,omitempty"`
-	Backends    int    `json:"backends"`
+	// Service carries RouteGroup.Service — the proxy.service label name this
+	// route's backends resolve by, static-config or label-managed alike. Lets
+	// the receiving side backfill from ITS OWN backendsByService[Service]
+	// when it has no local group for this route at all (see peermerge.go's
+	// overlay): the same containers that already feed this host's own
+	// Service-resolved static routes are otherwise invisible to a route the
+	// mesh only knows about via this push, so the peer replicas get bypassed
+	// even when healthy and local. See project memory
+	// project_routes_json_service_backend_gap.md for how this was found.
+	Service  string `json:"service,omitempty"`
+	Backends int    `json:"backends"`
 	// Weight is the SUM of the locally-owned backends' proxy.weight values
 	// (each defaulting to 1), which is what the receiving side gives the
 	// single synthetic backend it creates for this peer. Kept separate from
@@ -131,6 +141,7 @@ func (p *PeerSync) tick(ctx context.Context) {
 			Host: g.Host, PathPrefix: g.PathPrefix, StripPrefix: g.StripPrefix,
 			Name: g.Name, Backends: localCount, Weight: localWeight,
 			RateLimit: g.RateLimit, RateRPM: g.RateRPM, Spread: g.SpreadLocal,
+			Service: g.Service,
 		})
 	}
 	if len(routes) == 0 {
