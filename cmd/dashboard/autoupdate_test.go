@@ -33,6 +33,31 @@ func TestShouldAutoUpdate(t *testing.T) {
 	}
 }
 
+func TestAutoUpdateSkipReason(t *testing.T) {
+	base := Service{Name: "app", Image: "img:latest", AutoUpdate: true}
+	avail := &imageStatus{Image: "img:latest", UpdateAvailable: true}
+	cases := []struct {
+		name string
+		svc  Service
+		st   *imageStatus
+		want string
+	}{
+		{"no update available", base, &imageStatus{Image: "img:latest"}, ""},
+		{"nil status", base, nil, ""},
+		{"would fire", base, avail, ""},
+		{"not opted in", Service{Name: "app", Image: "img:latest"}, avail, "auto-update is off for this service"},
+		{"empty image", func() Service { s := base; s.Image = ""; return s }(), avail, "no image recorded"},
+		{"canary in flight", func() Service { s := base; s.CanaryImage = "img:new"; return s }(), avail, "a canary is staged — promote or discard first"},
+		{"all replicas stopped", func() Service { s := base; s.AllStopped = true; return s }(), avail, "service is fully stopped"},
+		{"checker error", base, &imageStatus{Image: "img:latest", UpdateAvailable: true, Err: "boom"}, "last registry check failed: boom"},
+	}
+	for _, tc := range cases {
+		if got := autoUpdateSkipReason(tc.svc, tc.st); got != tc.want {
+			t.Errorf("%s: autoUpdateSkipReason = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestSetAutoUpdate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "onboarded.json")
 	store, err := loadOnboardedStore(path)

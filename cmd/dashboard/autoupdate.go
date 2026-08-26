@@ -50,6 +50,36 @@ func shouldAutoUpdate(svc Service, st *imageStatus, consecutiveFailures int) boo
 		consecutiveFailures < autoUpdateMaxFailures
 }
 
+// autoUpdateSkipReason explains, for list_services/the dashboard, why a
+// service sitting on update_available=true won't actually get picked up by
+// the next auto-update tick — the exact question that went unanswered when
+// badminton-staging-admin/-player sat with update_available=true and
+// auto_update simply never set, with nothing anywhere saying so. Mirrors
+// shouldAutoUpdate's gates but can't see the consecutive-failure backoff
+// count (that's private state inside autoUpdater, not available to a
+// services-list request) — that one case is left unexplained rather than
+// guessed at. Empty string means either no update is pending (nothing to
+// explain) or shouldAutoUpdate would actually fire.
+func autoUpdateSkipReason(svc Service, st *imageStatus) string {
+	if st == nil || !st.UpdateAvailable {
+		return ""
+	}
+	switch {
+	case !svc.AutoUpdate:
+		return "auto-update is off for this service"
+	case svc.Image == "":
+		return "no image recorded"
+	case svc.CanaryImage != "":
+		return "a canary is staged — promote or discard first"
+	case svc.AllStopped:
+		return "service is fully stopped"
+	case st.Err != "":
+		return "last registry check failed: " + st.Err
+	default:
+		return ""
+	}
+}
+
 // runOnce is called synchronously after each image-checker cycle (single
 // goroutine — cycles never overlap). A human clicking Replace at the same
 // moment is unserialized; the engine itself runs one update at a time.

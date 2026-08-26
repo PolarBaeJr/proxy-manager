@@ -79,6 +79,30 @@ func pretty(b []byte) string {
 	return string(out)
 }
 
+// stripServiceLabels drops each service's raw Labels map before it reaches
+// an MCP client. Labels carries every proxy.* AND docker-compose-generated
+// label verbatim — by far the biggest thing in a /api/services response once
+// there are more than a couple of services — and no MCP tool here reads it
+// back. The dashboard UI is a different consumer of the same /api/services
+// endpoint and still needs Labels (ui.go checks proxy.autoupdate directly),
+// so this only trims the MCP-facing copy, never the underlying API response.
+// Falls back to the untouched body on any decode error rather than hiding
+// the real response behind a swallowed error.
+func stripServiceLabels(b []byte) []byte {
+	var svcs []Service
+	if err := json.Unmarshal(b, &svcs); err != nil {
+		return b
+	}
+	for i := range svcs {
+		svcs[i].Labels = nil
+	}
+	out, err := json.Marshal(svcs)
+	if err != nil {
+		return b
+	}
+	return out
+}
+
 // hostArg reads the optional peer-targeting argument named by key, gated
 // separately from allowWrites: a model acting on a hallucinated or wrong
 // host could mutate a service it never meant to touch, so reaching another
@@ -128,7 +152,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			if err != nil {
 				return "", err
 			}
-			return pretty(b), nil
+			return pretty(stripServiceLabels(b)), nil
 		},
 	})
 

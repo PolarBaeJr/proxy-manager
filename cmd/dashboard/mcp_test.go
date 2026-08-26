@@ -202,6 +202,28 @@ func TestToolFailureIsResultNotProtocolError(t *testing.T) {
 	}
 }
 
+// list_services strips each service's raw Labels map before it reaches the
+// model — Labels carries every proxy.* and docker-compose-generated label
+// verbatim and is by far the biggest thing in the response once there's more
+// than a couple of services, and no MCP tool reads it back. Unrelated fields
+// must survive untouched.
+func TestListServicesStripsLabels(t *testing.T) {
+	body := `[{"name":"app","group":"app","image":"ghcr.io/org/app:v1","host":"app.example","port":8080,"replicas":1,"labels":{"com.docker.compose.project":"stack","proxy.enable":"true","proxy.host":"app.example"}}]`
+	c, _ := stubDash(t, 200, body)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true, false)
+
+	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_services","arguments":{}}}`)
+	r := res["result"].(map[string]any)
+	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
+	if strings.Contains(text, "labels") || strings.Contains(text, "com.docker.compose") {
+		t.Errorf("list_services still leaks labels: %s", text)
+	}
+	if !strings.Contains(text, `"app.example"`) || !strings.Contains(text, `"replicas"`) {
+		t.Errorf("list_services dropped an unrelated field: %s", text)
+	}
+}
+
 // Arguments reach the right endpoint with the right method.
 func TestToolsCallCorrectEndpoints(t *testing.T) {
 	cases := []struct {

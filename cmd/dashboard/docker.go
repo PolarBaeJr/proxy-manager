@@ -635,10 +635,15 @@ type Service struct {
 	// UpdateAvailable can never flip true until it's fixed. Empty when the
 	// last check succeeded or hasn't run yet.
 	ImageCheckError string `json:"image_check_error,omitempty"`
-	AutoUpdate      bool   `json:"auto_update,omitempty"`  // opted in to unattended updates
-	CanaryImage     string `json:"canary_image,omitempty"` // non-empty when a stage is in progress
-	CanaryReplicas  int    `json:"canary_replicas,omitempty"`
-	Onboarded       bool   `json:"onboarded,omitempty"` // adopted from an unlabelled container
+	// AutoUpdateSkipReason is set only when UpdateAvailable is true and the
+	// service still won't be picked up by the next auto-update tick — see
+	// autoUpdateSkipReason (autoupdate.go). Empty whenever there's nothing to
+	// explain (no update pending, or it actually will fire).
+	AutoUpdateSkipReason string `json:"autoupdate_skip_reason,omitempty"`
+	AutoUpdate           bool   `json:"auto_update,omitempty"`  // opted in to unattended updates
+	CanaryImage          string `json:"canary_image,omitempty"` // non-empty when a stage is in progress
+	CanaryReplicas       int    `json:"canary_replicas,omitempty"`
+	Onboarded            bool   `json:"onboarded,omitempty"` // adopted from an unlabelled container
 	// DualTracked is true when this service is BOTH still label-managed (a
 	// running container carries proxy.* labels) AND has an onboarded record
 	// tracking it — the state that let the sfubadminton.com incident happen
