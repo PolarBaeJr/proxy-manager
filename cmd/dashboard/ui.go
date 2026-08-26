@@ -1494,21 +1494,27 @@ function anyPeerWritable() {
   for (const k in _peerWrites) if (_peerWrites[k]) return true;
   return false;
 }
-// dupAttr/dupLk gate the "Duplicate to host…" button — foreign rows can't be
-// duplicated FROM here (open the owning peer's dashboard instead), local
-// rows need elevation, and there must be at least one write-accepting peer
-// to duplicate TO.
+// dupAttr/dupLk gate the "Duplicate to host…" button. A foreign row whose
+// owning peer isn't write-accepting can't be duplicated FROM here at all
+// (svcLockedAttr/svcLk's "managed on X" lock, same as every other
+// svcWriteAttr-gated action) — but a foreign row on a write-accepting peer
+// forwards through api.go's forwardServiceMutation exactly like
+// promote/replace/delete do, so it only needs elevation here, same as a
+// local row. A local row additionally needs at least one write-accepting
+// peer to duplicate TO.
 function dupAttr(s) {
-  if (foreignSvc(s)) return 'disabled title="open ' + esc(machineLabel(s.machine)) + '\'s dashboard to duplicate this service"';
+  if (foreignSvc(s) && !peerWritable(s)) return svcLockedAttr(s);
   if (!isElevated()) return lockedAttr();
+  if (foreignSvc(s)) return '';
   if (!anyPeerWritable()) return 'disabled title="no peer host currently accepts writes"';
   return '';
 }
 function dupLk(s) {
-  if (foreignSvc(s)) return '<span class="lock" title="open ' + esc(machineLabel(s.machine)) + '\'s dashboard to duplicate this service">' + I.lock + '</span>';
+  if (foreignSvc(s) && !peerWritable(s)) return svcLk(s);
   if (!isElevated()) return lk();
+  if (foreignSvc(s)) return lk();
   if (!anyPeerWritable()) return '<span class="lock" title="no peer host currently accepts writes">' + I.lock + '</span>';
-  return '';
+  return lk();
 }
 async function renderServices() {
   await loadSelfIdentity();
@@ -1620,10 +1626,13 @@ async function renderServices() {
                   ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', false, this.dataset.host)">' + I.lock + 'Singleton: on' + svcWriteLk(s) + '</button>'
                   : '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', true, this.dataset.host)">' + I.unlock + 'Singleton: off' + svcWriteLk(s) + '</button>'))
               + (s.previous_image ? '<button class="linkbtn" ' + svcWriteAttr(s) + hostAttr + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\', this.dataset.host)">' + I.rewind + 'Rollback' + svcWriteLk(s) + '</button>' : '')
-              // Duplicate reads this host's own live env/mounts server-side
-              // and ships them to a peer — never available for an onboarded
-              // service (duplicate.go only supports label-managed sources).
-              + (s.onboarded ? '' : '<button class="btn" ' + dupAttr(s) + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ')">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>');
+              // Duplicate reads the OWNING host's own live env/mounts
+              // server-side and ships them to a target peer — never
+              // available for an onboarded service (duplicate.go only
+              // supports label-managed sources). hostAttr forwards a
+              // foreign-but-writable row to its owning peer, same as every
+              // other svcWriteAttr-gated action.
+              + (s.onboarded ? '' : '<button class="btn" ' + dupAttr(s) + hostAttr + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ', this.dataset.host)">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
     // replica AND no stopped members (saves card height for the common case).
@@ -2369,18 +2378,32 @@ function openStage(name, currentImage, host) {
 
 // openDuplicate populates the target-host select from the already-fetched
 // peer list (_peerWrites, write-enabled only) and shows the dialog.
-function openDuplicate(name, defaultPort) {
+function openDuplicate(name, defaultPort, host) {
   const f = $('#form-duplicate-service');
   f.serviceName.value = name;
   f.publish_port.value = defaultPort || '';
+  f.dataset.host = host || '';
   const sel = f.target;
   sel.innerHTML = '';
-  for (const identity in _peerWrites) {
-    if (!_peerWrites[identity]) continue;
-    const opt = document.createElement('option');
-    opt.value = identity;
-    opt.textContent = machineLabel(identity);
-    sel.appendChild(opt);
+  if (host) {
+    // Foreign row: this call forwards to host (the owning peer), which
+    // resolves the target against ITS OWN peer registry, not ours — in the
+    // current two-host mesh that registry's only entry is this dashboard's
+    // own identity, so that's the only sensible option to offer here.
+    if (_selfIdentity) {
+      const opt = document.createElement('option');
+      opt.value = _selfIdentity;
+      opt.textContent = machineLabel(_selfIdentity);
+      sel.appendChild(opt);
+    }
+  } else {
+    for (const identity in _peerWrites) {
+      if (!_peerWrites[identity]) continue;
+      const opt = document.createElement('option');
+      opt.value = identity;
+      opt.textContent = machineLabel(identity);
+      sel.appendChild(opt);
+    }
   }
   if (!sel.options.length) { toast('no peer host currently accepts writes', 'err'); return; }
   $('#dlg-duplicate-service').showModal();
@@ -3943,7 +3966,8 @@ function wireDialogForms() {
     const original = submitBtn ? submitBtn.innerHTML : '';
     if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Working…'; }
     try {
-      const resp = await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/duplicate', {
+      const hostParam = f.dataset.host ? '?host=' + encodeURIComponent(f.dataset.host) : '';
+      const resp = await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/duplicate' + hostParam, {
         method: 'POST',
         body: JSON.stringify({ target: f.target.value, publish_port: +f.publish_port.value }),
       });

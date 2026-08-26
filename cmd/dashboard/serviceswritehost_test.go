@@ -141,7 +141,7 @@ func newPeerServicesServer(t *testing.T, containers []dockerContainer, writesEna
 	dc := servicesDockerStub(t, calls, containers)
 	onb := newTestOnboardedStore(t)
 	proxy := noopProxyStub(t)
-	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), "", proxy, writesEnabled))
+	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), nil, "", proxy, writesEnabled))
 	t.Cleanup(srv.Close)
 	return srv, calls
 }
@@ -198,7 +198,7 @@ func newPeerServicesServerReplace(t *testing.T, containers []dockerContainer, wr
 	dc := replaceDockerStub(t, calls, containers)
 	onb := newTestOnboardedStore(t)
 	proxy := noopProxyStub(t)
-	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), "", proxy, writesEnabled))
+	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), nil, "", proxy, writesEnabled))
 	t.Cleanup(srv.Close)
 	return srv, calls
 }
@@ -216,7 +216,7 @@ func newPeerServicesServerOnboarded(t *testing.T, containers []dockerContainer, 
 	dc := replaceDockerStub(t, calls, containers)
 	proxy := noopProxyStub(t)
 	routesPath := filepath.Join(t.TempDir(), "routes.json")
-	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), routesPath, proxy, writesEnabled))
+	srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", dc, onb, newImageChecker(dc), nil, routesPath, proxy, writesEnabled))
 	t.Cleanup(srv.Close)
 	return srv, calls
 }
@@ -352,7 +352,7 @@ func TestServicesPeerSelfGuardRejects(t *testing.T) {
 		Labels: map[string]string{labelEnable: "true", labelService: "dashboard", labelHost: "dashboard.example", labelPort: "8093"},
 	}})
 	peerOnb := newTestOnboardedStore(t)
-	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 	directReq := httptest.NewRequest(http.MethodPost, "/peer/services/dashboard/stop", nil)
 	directReq.Header.Set("Authorization", "Bearer s3cret")
@@ -458,7 +458,7 @@ func TestServicesProxyRefreshHitsPeerProxy(t *testing.T) {
 	calls := &svcCallTracker{}
 	peerDC := servicesDockerStub(t, calls, twoReplicaContainers("running", false))
 	peerOnb := newTestOnboardedStore(t)
-	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", peerProxy.URL, true))
+	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", peerProxy.URL, true))
 	t.Cleanup(peerSrv.Close)
 	reg := newTestPeerRegistry(peerSrv.URL, true)
 
@@ -682,7 +682,7 @@ func TestServicesForwardingRunsBeforeSelfGuard(t *testing.T) {
 		Labels: map[string]string{labelEnable: "true", labelService: "dashboard", labelHost: "dashboard.example", labelPort: "8093"},
 	}})
 	peerOnb := newTestOnboardedStore(t)
-	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true))
+	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true))
 	t.Cleanup(peerSrv.Close)
 	reg := newTestPeerRegistry(peerSrv.URL, true)
 
@@ -757,7 +757,7 @@ func TestServicesMutationForwardsActorAssertion(t *testing.T) {
 	calls := &svcCallTracker{}
 	peerDC := servicesDockerStub(t, calls, twoReplicaContainers("running", false))
 	peerOnb := newTestOnboardedStore(t)
-	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 	var headerMu sync.Mutex
 	var gotHeader string
@@ -995,7 +995,7 @@ func TestServicesLifecycleReplacePeerSelfGuardRejects(t *testing.T) {
 		Labels: map[string]string{labelEnable: "true", labelService: "dashboard", labelHost: "dashboard.example", labelPort: "8093"},
 	}})
 	peerOnb := newTestOnboardedStore(t)
-	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 	directReq := httptest.NewRequest(http.MethodPost, "/peer/services/dashboard/replace", strings.NewReader(`{"image":"ghcr.io/org/dash:v2"}`))
 	directReq.Header.Set("Authorization", "Bearer s3cret")
@@ -1048,7 +1048,7 @@ func TestServicesReplaceEnvConflictRelayedByPeer(t *testing.T) {
 		}
 	}))
 	peerOnb := newTestOnboardedStore(t)
-	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true))
+	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true))
 	t.Cleanup(peerSrv.Close)
 	reg := newTestPeerRegistry(peerSrv.URL, true)
 
@@ -1312,7 +1312,7 @@ func TestServicesPromoteMutationForwardsActorAssertion(t *testing.T) {
 	calls := &svcCallTracker{}
 	peerDC := replaceDockerStub(t, calls, canaryContainers())
 	peerOnb := newTestOnboardedStore(t)
-	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 	var headerMu sync.Mutex
 	var gotHeader string
@@ -1555,7 +1555,7 @@ func TestServicesOffboardDeletePeerSelfGuardRejects(t *testing.T) {
 		Labels: map[string]string{labelEnable: "true", labelService: "dashboard", labelHost: "dashboard.example", labelPort: "8093"},
 	}})
 	peerOnb := newTestOnboardedStore(t)
-	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 	directReq := httptest.NewRequest(http.MethodDelete, "/peer/services/dashboard", strings.NewReader(`{"confirm":"dashboard"}`))
 	directReq.Header.Set("Authorization", "Bearer s3cret")
@@ -1609,7 +1609,7 @@ func TestServicesOffboardDeletePeerInnerGuardFailsClosedOnDockerError(t *testing
 		peerDC := dockerStubAlwaysErrorsTracked(t, calls)
 		peerOnb := newTestOnboardedStore(t)
 		putOnboardedApp(t, peerOnb, false)
-		inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+		inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 		req := httptest.NewRequest(http.MethodPost, "/peer/services/app/offboard", nil)
 		req.Header.Set("Authorization", "Bearer s3cret")
@@ -1628,7 +1628,7 @@ func TestServicesOffboardDeletePeerInnerGuardFailsClosedOnDockerError(t *testing
 		calls := &svcCallTracker{}
 		peerDC := dockerStubAlwaysErrorsTracked(t, calls)
 		peerOnb := newTestOnboardedStore(t) // "app" NOT onboarded — forces the label-managed path
-		inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+		inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 		req := httptest.NewRequest(http.MethodDelete, "/peer/services/app", strings.NewReader(`{"confirm":"app"}`))
 		req.Header.Set("Authorization", "Bearer s3cret")
@@ -1662,7 +1662,7 @@ func TestServicesDeletePeerConfirmValidation(t *testing.T) {
 			calls := &svcCallTracker{}
 			peerDC := servicesDockerStub(t, calls, twoReplicaContainers("running", false))
 			peerOnb := newTestOnboardedStore(t)
-			inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+			inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 			req := httptest.NewRequest(http.MethodDelete, "/peer/services/app", strings.NewReader(tc.body))
 			req.Header.Set("Authorization", "Bearer s3cret")
@@ -1893,7 +1893,7 @@ func TestServicesDeleteMutationForwardsActorAssertion(t *testing.T) {
 	calls := &svcCallTracker{}
 	peerDC := servicesDockerStub(t, calls, twoReplicaContainers("running", false))
 	peerOnb := newTestOnboardedStore(t)
-	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
 
 	var headerMu sync.Mutex
 	var gotHeader string
@@ -1983,7 +1983,7 @@ func TestServicesDeletePartialTeardownMembersActed(t *testing.T) {
 		calls := &svcCallTracker{}
 		peerDC := partialFailDeleteDockerStub(t, calls, threeReplicaContainers(), "c2")
 		peerOnb := newTestOnboardedStore(t)
-		peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), "", noopProxyStub(t), true))
+		peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true))
 		t.Cleanup(peerSrv.Close)
 		reg := newTestPeerRegistry(peerSrv.URL, true)
 
@@ -2007,4 +2007,78 @@ func TestServicesDeletePartialTeardownMembersActed(t *testing.T) {
 			t.Fatalf("forwarded members_acted = %d, want 1 — the peer's partial-teardown count did not survive the hop", body.MembersActed)
 		}
 	})
+}
+
+// TestServicesDuplicateForwardsToOwningPeer proves "Duplicate to host…" on a
+// FOREIGN (peer-owned) service works end to end across two hops: the local
+// dashboard forwards the browser's POST straight through to the owning
+// peer's own /peer/services/{name}/duplicate (never touching the local
+// daemon), and that peer's own runServiceDuplicate call reaches a THIRD
+// host's /peer/duplicate exactly as it would for a locally-owned service.
+// This is the gap dupAttr's unconditional foreign-row lock used to hide:
+// duplicate was never wired into forwardServiceMutation/
+// peerServicesMutateHandler at all.
+func TestServicesDuplicateForwardsToOwningPeer(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	// The ultimate destination ("dashboard-c"): a real /peer/duplicate
+	// handler over an empty container list, recording the create call.
+	var finalCreate atomic.Bool
+	finalDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{})
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			finalCreate.Store(true)
+			json.NewEncoder(w).Encode(map[string]string{"Id": "newid"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+	finalSrv := httptest.NewServer(peerDuplicateHandler("s3cret", "dashboard-c", finalDC, true))
+	t.Cleanup(finalSrv.Close)
+
+	// The owning peer ("dashboard-b"): has "app" as a real label-managed
+	// service, and its own registry resolves "dashboard-c" to finalSrv —
+	// exactly as runServiceDuplicate expects for the local-owner case.
+	calls := &svcCallTracker{}
+	ownerDC := replaceDockerStub(t, calls, []dockerContainer{{
+		ID: "tpl1", Names: []string{"/goproxy-app-1"}, State: "running", Image: "ghcr.io/org/app:v1",
+		Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "8080"},
+	}})
+	ownerOnb := newTestOnboardedStore(t)
+	ownerReg := newPeerRegistry([]string{finalSrv.URL}, "s3cret", "dashboard-b", "dev", 0, nil)
+	ownerReg.recordResult(finalSrv.URL, true, "dashboard-c", "dev", true)
+	ownerRoutesPath := filepath.Join(t.TempDir(), "routes.json")
+	ownerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", ownerDC, ownerOnb, newImageChecker(ownerDC), ownerReg, ownerRoutesPath, noopProxyStub(t), true))
+	t.Cleanup(ownerSrv.Close)
+
+	// The local dashboard: registry resolves "dashboard-b" to ownerSrv. Its
+	// own docker stub must never be hit — the service isn't local here.
+	var localHit atomic.Bool
+	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localHit.Store(true)
+		json.NewEncoder(w).Encode([]dockerContainer{})
+	}))
+	reg := newTestPeerRegistry(ownerSrv.URL, true)
+	mux := newLocalTestMux(t, localDC, reg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/services/app/duplicate?host=dashboard-b",
+		strings.NewReader(`{"target":"dashboard-c","publish_port":18080}`))
+	req.Header.Set("Authorization", "Bearer "+internalToken)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if localHit.Load() {
+		t.Error("local docker stub was hit — a foreign service's duplicate must never touch the local daemon")
+	}
+	if len(calls.all()) == 0 {
+		t.Error("owning peer's docker stub was never hit — duplicate did not run against the real owner")
+	}
+	if !finalCreate.Load() {
+		t.Error("final target never saw /containers/create — the second hop (owner -> ultimate target) never happened")
+	}
 }

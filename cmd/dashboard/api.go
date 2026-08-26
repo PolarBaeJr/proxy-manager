@@ -760,13 +760,16 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteJSON(w, status, payload)
 			return
 		}
-		// "duplicate" is NOT routed through the ?host= forwarding branch
-		// above (there is no case for it in forwardServiceMutation) and must
-		// stay that way: duplicating needs THIS host to read the real
-		// service's live env/mounts server-side (which can include secrets)
-		// rather than relay the browser's raw request body to a peer — see
-		// duplicate.go's package doc comment. runServiceDuplicate calls
-		// peerMutate directly instead.
+		// This branch only runs when host either wasn't given or names THIS
+		// dashboard (hostForReq's isPeer == false above) — i.e. name is owned
+		// locally. runServiceDuplicate reads the real service's live
+		// env/mounts server-side (which can include secrets) rather than
+		// trust a client-supplied body, so it must run wherever the service
+		// actually lives. Duplicating a FOREIGN (peer-owned) service instead
+		// takes the isPeer branch above: forwardServiceMutation relays this
+		// same {target, publish_port} body (no secrets in it) to the owning
+		// peer's /peer/services/{name}/duplicate, which runs this exact
+		// runServiceDuplicate call against ITS OWN local Docker state.
 		if len(parts) == 2 && parts[1] == "duplicate" && req.Method == "POST" {
 			var body DuplicateServiceRequest
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
@@ -2129,6 +2132,8 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		method, peerPath = http.MethodDelete, "/peer/services/"+url.PathEscape(name)+"/canary"
 	case len(parts) == 2 && parts[1] == "offboard" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/offboard"
+	case len(parts) == 2 && parts[1] == "duplicate" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/duplicate"
 	case len(parts) == 1 && req.Method == http.MethodDelete:
 		method, peerPath = http.MethodDelete, "/peer/services/"+url.PathEscape(name)
 	default:
