@@ -520,6 +520,7 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
 	rec := &errCatchingWriter{ResponseWriter: w}
 	failed := false
+	clientGone := false
 	b.proxy.ErrorHandler = func(_ http.ResponseWriter, r *http.Request, err error) {
 		// A canceled request context means the CLIENT went away (refresh,
 		// navigation, closed tab) — Go's reverse proxy reports that the same
@@ -529,7 +530,7 @@ func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
 		// took the whole group down until the next health tick.
 		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
 			log.Printf("backend %s: client disconnected mid-request, not marking unhealthy", b.URL)
-			failed = true
+			clientGone = true
 			return
 		}
 		log.Printf("backend %s error: %v — marking unhealthy", b.URL, err)
@@ -537,6 +538,16 @@ func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
 		failed = true
 	}
 	b.proxy.ServeHTTP(rec, req)
+	if clientGone {
+		// Nobody is waiting for a response, so there's no one left to serve by
+		// retrying — and re-dispatching to a DIFFERENT backend can duplicate
+		// whatever side effect the first backend already started (this
+		// backend may still be mid-handler when the client gave up; a
+		// non-idempotent handler that claims work before finishing it has no
+		// way to know a second backend is about to redo it). Stop the retry
+		// loop here instead of falling through to another backend.
+		return true
+	}
 	return !(failed && !rec.wroteHeader)
 }
 
