@@ -45,7 +45,7 @@ func TestServicesDualTrackedFlag(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest("GET", "/api/services", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)
@@ -122,7 +122,7 @@ func TestServicesEndpointImageCheckError(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest("GET", "/api/services", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)
@@ -177,7 +177,7 @@ func TestServicesEndpointMergesPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	peerSrv := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC)))
+	peerSrv := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil))
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
@@ -189,7 +189,7 @@ func TestServicesEndpointMergesPeer(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest("GET", "/api/services", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)

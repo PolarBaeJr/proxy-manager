@@ -86,7 +86,7 @@ func TestImagesEndpointHostParamForwardsToPeer(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, rs, nil, ih, nil, nil, reg, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, rs, nil, ih, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest("GET", "/api/images?host=dashboard-b", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)
@@ -146,7 +146,7 @@ func TestImagesEndpointNoHostParamTagsLocalMachine(t *testing.T) {
 
 	reg := newPeerRegistry(nil, "s3cret", "dashboard-a", "dev", 0, nil)
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, rs, nil, ih, nil, nil, reg, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, rs, nil, ih, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest("GET", "/api/images", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)
@@ -196,7 +196,7 @@ func TestImagesEndpointHostParamUnknownHost(t *testing.T) {
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
 	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false)
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest("GET", "/api/images?host=nonexistent-host", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)
@@ -222,7 +222,7 @@ func TestImagesEndpointHostParamNoRegistry(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest("GET", "/api/images?host=anything", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)
@@ -257,7 +257,7 @@ func TestImagesEndpointHostParamPeerUnreachable(t *testing.T) {
 	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
 	reg.recordResult(url, true, "dashboard-b", "dev", false)
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest("GET", "/api/images?host=dashboard-b", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)

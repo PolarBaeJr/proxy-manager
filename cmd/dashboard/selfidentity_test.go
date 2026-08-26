@@ -159,15 +159,15 @@ func TestBuildManagedServicesExcludesSelf(t *testing.T) {
 	}
 	ic := newImageChecker(dc)
 
-	svcs, err := buildManagedServices(context.Background(), dc, onb, ic)
+	svcs, err := buildManagedServices(context.Background(), dc, onb, ic, nil)
 	if err != nil {
 		t.Fatalf("buildManagedServices: %v", err)
 	}
 	if pickService(svcs, "dashboard") != nil {
-		t.Error("buildManagedServices() included the dashboard's own service, want it excluded")
+		t.Error("buildManagedServices included the dashboard's own service, want it excluded")
 	}
 	if pickService(svcs, "app") == nil {
-		t.Error("buildManagedServices() dropped the unrelated service, want it kept")
+		t.Error("buildManagedServices dropped the unrelated service, want it kept")
 	}
 }
 
@@ -192,7 +192,7 @@ func TestServicesStopRefusesSelf(t *testing.T) {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), "", nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), "", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest("POST", "/api/services/dashboard/stop", nil)
 	req.Header.Set("Authorization", "Bearer "+internalToken)

@@ -485,7 +485,7 @@ type peerServicesResp struct {
 // peerServiceStatusHandler. Always returns THIS host's own managed services
 // (self-excluded via buildManagedServices) — the caller (api.go's
 // /api/services) is the one that fans out to every configured peer.
-func peerServicesHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, ic *imageChecker) http.Handler {
+func peerServicesHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, ic *imageChecker, blocks *autoUpdateBlockStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if secret == "" {
 			http.NotFound(w, r)
@@ -501,7 +501,7 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		svcs, err := buildManagedServices(r.Context(), dc, onb, ic)
+		svcs, err := buildManagedServices(r.Context(), dc, onb, ic, blocks)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

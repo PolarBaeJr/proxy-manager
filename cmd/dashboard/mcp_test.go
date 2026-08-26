@@ -208,7 +208,7 @@ func TestToolFailureIsResultNotProtocolError(t *testing.T) {
 // than a couple of services, and no MCP tool reads it back. Unrelated fields
 // must survive untouched.
 func TestListServicesStripsLabels(t *testing.T) {
-	body := `[{"name":"app","group":"app","image":"ghcr.io/org/app:v1","host":"app.example","port":8080,"replicas":1,"labels":{"com.docker.compose.project":"stack","proxy.enable":"true","proxy.host":"app.example"}}]`
+	body := `[{"name":"app","group":"app","image":"ghcr.io/org/app:v1","host":"app.example","port":8080,"replicas":1,"autoupdate_skip_reason":"stopped retrying after 3 consecutive failures: boom","labels":{"com.docker.compose.project":"stack","proxy.enable":"true","proxy.host":"app.example"}}]`
 	c, _ := stubDash(t, 200, body)
 	s := NewServer("t", "v")
 	registerMCPTools(s, c, true, false)
@@ -221,6 +221,12 @@ func TestListServicesStripsLabels(t *testing.T) {
 	}
 	if !strings.Contains(text, `"app.example"`) || !strings.Contains(text, `"replicas"`) {
 		t.Errorf("list_services dropped an unrelated field: %s", text)
+	}
+	// The sticky blocked-reason fallback (autoupdate.go's autoUpdateBlockStore)
+	// is exactly the kind of "why is this stuck" signal an MCP client needs —
+	// stripServiceLabels must only drop Labels, never this.
+	if !strings.Contains(text, "stopped retrying after 3 consecutive failures") {
+		t.Errorf("list_services dropped autoupdate_skip_reason: %s", text)
 	}
 }
 

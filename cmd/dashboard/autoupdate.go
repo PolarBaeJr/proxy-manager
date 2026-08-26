@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -12,10 +13,12 @@ import (
 // per-onboarded-service toggle) with a newer registry digest available, runs
 // the same replace path as the dashboard's "Pull update + restart" button.
 
-const (
-	autoUpdateMaxFailures = 3 // stop retrying a service after this many consecutive failures
-	autoUpdateGap         = 2 * time.Second
-)
+const autoUpdateMaxFailures = 3 // stop retrying a service after this many consecutive failures
+
+// autoUpdateGap is a var (not const), same seam as docker.go's
+// replaceSettleDelay, so tests exercising multiple runOnce cycles don't pay
+// the real gap in wall-clock time.
+var autoUpdateGap = 2 * time.Second
 
 type autoUpdater struct {
 	dc         *dockerClient
@@ -23,17 +26,69 @@ type autoUpdater struct {
 	onb        *OnboardedStore
 	routesPath string
 	proxyURL   string
+	blocks     *autoUpdateBlockStore
 	// failures counts consecutive failed auto-updates per service. Only ever
 	// touched from the image-checker loop goroutine — no locking needed.
 	failures map[string]int
 }
 
-func newAutoUpdater(dc *dockerClient, ic *imageChecker, onb *OnboardedStore, routesPath, proxyURL string) *autoUpdater {
+func newAutoUpdater(dc *dockerClient, ic *imageChecker, onb *OnboardedStore, routesPath, proxyURL string, blocks *autoUpdateBlockStore) *autoUpdater {
 	return &autoUpdater{
 		dc: dc, ic: ic, onb: onb,
 		routesPath: routesPath, proxyURL: proxyURL,
+		blocks:   blocks,
 		failures: map[string]int{},
 	}
+}
+
+// autoUpdateBlockStore holds the last-known reason a service's auto-update
+// is stuck at the retry cap, keyed by service name — the piece that went
+// missing once shouldAutoUpdate's cap silences runOnce's own logging for
+// good: once failures >= autoUpdateMaxFailures, shouldAutoUpdate refuses
+// forever, so a blocked service can NEVER reach the success branch again to
+// clear itself. The only clearing path is the top of runOnce's loop, when
+// the registry stops reporting a difference (st == nil || !st.UpdateAvailable)
+// — i.e. someone fixes the problem and pulls the image manually. Shared
+// between the single autoupdate loop goroutine (the only writer) and
+// list_services/buildManagedServices (readers from HTTP handler goroutines),
+// the same cross-goroutine sharing pattern imageChecker already uses for ic.
+//
+// All methods are nil-receiver-safe so call sites (mainly tests) that don't
+// care about this feature can pass a nil *autoUpdateBlockStore.
+type autoUpdateBlockStore struct {
+	mu      sync.Mutex
+	blocked map[string]string
+}
+
+func newAutoUpdateBlockStore() *autoUpdateBlockStore {
+	return &autoUpdateBlockStore{blocked: map[string]string{}}
+}
+
+func (s *autoUpdateBlockStore) Set(name, reason string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blocked[name] = reason
+}
+
+func (s *autoUpdateBlockStore) Clear(name string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.blocked, name)
+}
+
+func (s *autoUpdateBlockStore) Get(name string) string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blocked[name]
 }
 
 // shouldAutoUpdate is the pure gate: opted in, has an image, no canary in
@@ -123,6 +178,7 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 		st := a.ic.Get(svc.Image)
 		if st == nil || !st.UpdateAvailable {
 			delete(a.failures, svc.Name)
+			a.blocks.Clear(svc.Name)
 			continue
 		}
 		if !shouldAutoUpdate(svc, st, a.failures[svc.Name]) {
@@ -142,8 +198,17 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 			a.failures[svc.Name]++
 			log.Printf("autoupdate: %s failed (%d/%d): %v", svc.Name, a.failures[svc.Name], autoUpdateMaxFailures, uerr)
 			audit(nil, "autoupdate", "service.autoupdate_failed", svc.Name+": "+uerr.Error())
+			if a.failures[svc.Name] >= autoUpdateMaxFailures {
+				// This is the last thing anyone hears about this service:
+				// shouldAutoUpdate's cap check above means runOnce silently
+				// skips it on every future tick with no further log line,
+				// so without this it looks identical to "resolved" from the
+				// outside while staying permanently stale.
+				a.blocks.Set(svc.Name, uerr.Error())
+			}
 		} else {
 			delete(a.failures, svc.Name)
+			a.blocks.Clear(svc.Name)
 			// Re-check immediately so the "update available" flag clears
 			// without waiting for the next 10-min poll.
 			a.ic.Check(ctx, svc.Image)

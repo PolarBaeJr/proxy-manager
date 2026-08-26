@@ -70,7 +70,7 @@ func fetchMonitorHealth(monitorURL string) (string, []HealthTarget) {
 	return overall, targets
 }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry, rm *rolloutManager) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry, rm *rolloutManager, blocks *autoUpdateBlockStore) http.Handler {
 	if rm == nil {
 		rm = newRolloutManager(dc, onb, routesConfigPath, proxyURLFromEnv())
 	}
@@ -565,7 +565,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		switch req.Method {
 		case "GET":
 			auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-				svcs, err := buildManagedServices(req.Context(), dc, onb, ic)
+				svcs, err := buildManagedServices(req.Context(), dc, onb, ic, blocks)
 				if err != nil {
 					httpx.WriteErr(w, err)
 					return
@@ -1591,7 +1591,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 // — self-exclusion (Phase 0's excludeSelf) is automatically applied to both,
 // since both funnel through here, so a peer never learns about the
 // dashboard managing itself either.
-func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedStore, ic *imageChecker) ([]Service, error) {
+func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedStore, ic *imageChecker, blocks *autoUpdateBlockStore) ([]Service, error) {
 	svcs, err := dc.listServices(ctx)
 	if err != nil {
 		return nil, err
@@ -1664,6 +1664,16 @@ func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedS
 				svcs[i].ImageCheckError = st.Err
 			}
 			svcs[i].AutoUpdateSkipReason = autoUpdateSkipReason(svcs[i], st)
+			// autoUpdateSkipReason can't see the retry-cap backoff (that
+			// state lives in autoUpdater, not here) — fall back to the
+			// sticky last-failure reason autoUpdater recorded when it gave
+			// up, so a permanently-stuck service still says why instead of
+			// just going quiet after its third failed attempt.
+			if svcs[i].AutoUpdateSkipReason == "" {
+				if blocked := blocks.Get(svcs[i].Name); blocked != "" {
+					svcs[i].AutoUpdateSkipReason = fmt.Sprintf("stopped retrying after %d consecutive failures: %s", autoUpdateMaxFailures, blocked)
+				}
+			}
 		}
 	}
 	return svcs, nil
