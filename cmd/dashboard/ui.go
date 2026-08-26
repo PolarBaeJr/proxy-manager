@@ -1433,8 +1433,12 @@ let _lastServicesHash = '';
 // permanently locking every local, unlabeled row.
 let _selfIdentity = null;
 // _peerWrites: peer identity -> that peer's last-known -peer-writes setting
-// (from /api/peers' writes field — peers.go's peerStatus.Writes). Populated
-// wherever /api/peers gets fetched (loadSelfIdentity, loadImagesPeerOptions).
+// (from /api/peers' writes field — peers.go's peerStatus.Writes). Unlike
+// _selfIdentity, this can flip at any time (a peer's writes flag changes, or
+// its handshake starts/stops succeeding), so loadSelfIdentity refreshes it on
+// every call rather than only the first — otherwise a tab left open across a
+// peer coming back up would show "Duplicate to host…" locked forever despite
+// the hash in renderServices already accounting for _peerWrites changing.
 // Missing/unreachable peers are simply absent, which peerWritable treats as
 // false — fail-safe, same "over-lock is safe, under-lock isn't" reasoning as
 // _selfIdentity above.
@@ -1445,7 +1449,7 @@ function notePeerWrites(peers) {
 async function loadSelfIdentity() {
   try {
     const d = await (await fetch('/api/peers')).json();
-    _selfIdentity = (d.self && d.self.identity) || '';
+    if (_selfIdentity === null) _selfIdentity = (d.self && d.self.identity) || '';
     notePeerWrites(d.peers);
   } catch (e) { /* leave null — retry next render */ }
 }
@@ -1507,7 +1511,7 @@ function dupLk(s) {
   return '';
 }
 async function renderServices() {
-  if (_selfIdentity === null) await loadSelfIdentity();
+  await loadSelfIdentity();
   const svcs = await api('/api/services');
   const el = $('#tab-services');
   // Bail out of the full rebuild on the 5s tick if nothing about the services
