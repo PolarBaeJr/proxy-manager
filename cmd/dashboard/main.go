@@ -303,6 +303,7 @@ func main() {
 		"/peer/access":          peerAccessHandler(peerSecret, identity, proxyURLFromEnv()),
 		"/peer/logs/containers": peerLogsContainersHandler(peerSecret, identity, dc),
 		"/peer/logs/":           peerLogsHandler(peerSecret, identity, dc),
+		"/peer/duplicate":       peerDuplicateHandler(peerSecret, identity, dc, peerWritesEnabled),
 	}
 	writesMsg := "(writes disabled)"
 	if peerWritesEnabled {
@@ -311,10 +312,10 @@ func main() {
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
 		peerServer(*peerAddr, peerHandlers)
-		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, and /peer/stats on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
+		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, and /peer/stats on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
 	case peerSecret != "":
 		peerServer(*peerAddr, peerHandlers)
-		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, and /peer/stats enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
+		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, and /peer/stats enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}

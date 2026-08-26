@@ -656,7 +656,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		// "check" is exempt too: it only queries the registry for image-
 		// update availability (runServiceCheckImage) and never touches
 		// containers, so it can't race the rollout manager.
-		exemptFromRolloutGuard := len(parts) == 2 && (parts[1] == "rollout" || parts[1] == "rollout/advance" || parts[1] == "rollout/abort" || parts[1] == "check")
+		exemptFromRolloutGuard := len(parts) == 2 && (parts[1] == "rollout" || parts[1] == "rollout/advance" || parts[1] == "rollout/abort" || parts[1] == "check" || parts[1] == "duplicate")
 		if !exemptFromRolloutGuard {
 			if st, ok := rm.get(name); ok && rolloutActive(st.Status) {
 				http.Error(w, fmt.Sprintf("%q has an active rollout — advance or abort it before other mutations", name), http.StatusConflict)
@@ -738,6 +738,40 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				return
 			}
 			httpx.WriteJSON(w, status, payload)
+			return
+		}
+		// "duplicate" is NOT routed through the ?host= forwarding branch
+		// above (there is no case for it in forwardServiceMutation) and must
+		// stay that way: duplicating needs THIS host to read the real
+		// service's live env/mounts server-side (which can include secrets)
+		// rather than relay the browser's raw request body to a peer — see
+		// duplicate.go's package doc comment. runServiceDuplicate calls
+		// peerMutate directly instead.
+		if len(parts) == 2 && parts[1] == "duplicate" && req.Method == "POST" {
+			var body DuplicateServiceRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			actor := sessionUser(info)
+			if actor == "" {
+				actor = principalFrom(req)
+			}
+			resp, err := runServiceDuplicate(req.Context(), dc, registry, onb, routesConfigPath, name, body, mintForwardedActor(req, actor))
+			if err != nil {
+				var pe *peerDuplicateError
+				switch {
+				case errors.As(err, &pe):
+					mapPeerMutationErr(w, pe.statusCode, pe.body)
+				case errors.Is(err, errDuplicateNotFound):
+					http.Error(w, "service not found", http.StatusNotFound)
+				default:
+					http.Error(w, err.Error(), http.StatusBadRequest)
+				}
+				return
+			}
+			audit(req, sessionUser(info), "service.duplicate", name+" => "+body.Target)
+			httpx.WriteJSON(w, http.StatusOK, resp)
 			return
 		}
 		if len(parts) == 2 && parts[1] == "stage" && req.Method == "POST" {

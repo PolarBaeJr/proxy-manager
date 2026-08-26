@@ -595,6 +595,7 @@ footer.app code{color:var(--muted)}
 <dialog id="dlg-add-user"><div class="dlg"><div id="add-user-body"></div></div></dialog>
 <dialog id="dlg-token-reveal"></dialog>
 <dialog id="dlg-prompt"></dialog>
+<dialog id="dlg-duplicate-service"></dialog>
 
 <div id="toasts"></div>
 
@@ -1482,6 +1483,29 @@ function svcWriteAttr(s) {
   return (foreignSvc(s) && !peerWritable(s)) ? svcLockedAttr(s) : (isElevated() ? '' : lockedAttr());
 }
 function svcWriteLk(s) { return (foreignSvc(s) && !peerWritable(s)) ? svcLk(s) : lk(); }
+// anyPeerWritable reports whether ANY currently-known peer accepts writes —
+// the gate for "Duplicate to host…", which targets a peer rather than
+// acting on one, so it only cares that SOME destination exists.
+function anyPeerWritable() {
+  for (const k in _peerWrites) if (_peerWrites[k]) return true;
+  return false;
+}
+// dupAttr/dupLk gate the "Duplicate to host…" button — foreign rows can't be
+// duplicated FROM here (open the owning peer's dashboard instead), local
+// rows need elevation, and there must be at least one write-accepting peer
+// to duplicate TO.
+function dupAttr(s) {
+  if (foreignSvc(s)) return 'disabled title="open ' + esc(machineLabel(s.machine)) + '\'s dashboard to duplicate this service"';
+  if (!isElevated()) return lockedAttr();
+  if (!anyPeerWritable()) return 'disabled title="no peer host currently accepts writes"';
+  return '';
+}
+function dupLk(s) {
+  if (foreignSvc(s)) return '<span class="lock" title="open ' + esc(machineLabel(s.machine)) + '\'s dashboard to duplicate this service">' + I.lock + '</span>';
+  if (!isElevated()) return lk();
+  if (!anyPeerWritable()) return '<span class="lock" title="no peer host currently accepts writes">' + I.lock + '</span>';
+  return '';
+}
 async function renderServices() {
   if (_selfIdentity === null) await loadSelfIdentity();
   const svcs = await api('/api/services');
@@ -1585,7 +1609,11 @@ async function renderServices() {
               + (s.auto_update
                   ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', false, this.dataset.host)">' + I.arrowup + 'Auto-update: on' + svcWriteLk(s) + '</button>'
                   : '<button class="btn ghost" ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', true, this.dataset.host)">' + I.arrowup + 'Auto-update: off' + svcWriteLk(s) + '</button>')
-              + (s.previous_image ? '<button class="linkbtn" ' + svcWriteAttr(s) + hostAttr + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\', this.dataset.host)">' + I.rewind + 'Rollback' + svcWriteLk(s) + '</button>' : '');
+              + (s.previous_image ? '<button class="linkbtn" ' + svcWriteAttr(s) + hostAttr + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\', this.dataset.host)">' + I.rewind + 'Rollback' + svcWriteLk(s) + '</button>' : '')
+              // Duplicate reads this host's own live env/mounts server-side
+              // and ships them to a peer — never available for an onboarded
+              // service (duplicate.go only supports label-managed sources).
+              + (s.onboarded ? '' : '<button class="btn" ' + dupAttr(s) + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ')">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>');
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
     // replica AND no stopped members (saves card height for the common case).
@@ -2289,6 +2317,38 @@ function openStage(name, currentImage, host) {
   $('#dlg-replace-service').showModal();
 }
 
+// openDuplicate populates the target-host select from the already-fetched
+// peer list (_peerWrites, write-enabled only) and shows the dialog.
+function openDuplicate(name, defaultPort) {
+  const f = $('#form-duplicate-service');
+  f.serviceName.value = name;
+  f.publish_port.value = defaultPort || '';
+  const sel = f.target;
+  sel.innerHTML = '';
+  for (const identity in _peerWrites) {
+    if (!_peerWrites[identity]) continue;
+    const opt = document.createElement('option');
+    opt.value = identity;
+    opt.textContent = machineLabel(identity);
+    sel.appendChild(opt);
+  }
+  if (!sel.options.length) { toast('no peer host currently accepts writes', 'err'); return; }
+  $('#dlg-duplicate-service').showModal();
+}
+// showDuplicateHint reuses the existing token-reveal dialog (tokenReveal,
+// #dlg-token-reveal) rather than a new modal — same copy-to-clipboard shape,
+// different content.
+function showDuplicateHint(hint) {
+  const d = document.getElementById('dlg-token-reveal');
+  d.innerHTML = '<div class="dlg"><div class="dlg-head"><div class="di">' + I.layers + '</div>'
+    + '<div><h3>Service duplicated</h3><div class="dsub">Optional: raw TCP passthrough for this port</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.x + '</button></div>'
+    + '<div class="dlg-body">'
+    + '<div class="token-block" id="tr-raw" style="margin-top:14px;white-space:pre-wrap">' + esc(hint) + '</div>'
+    + '<button class="btn" style="margin-top:12px" onclick="copyText(document.getElementById(\'tr-raw\').textContent,this)">' + I.copy + 'Copy' + '</button>'
+    + '</div><div class="dialog-actions"><button class="btn primary" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.check + 'Done</button></div></div>';
+  d.showModal();
+}
 async function promoteCanary(name, host) {
   if (!(await confirmDialog('Promote canary to live? Old replicas will be removed.', {title: 'Promote canary'}))) return;
   const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
@@ -3622,6 +3682,20 @@ function buildDialogs() {
     +   '<button type="submit" class="btn primary">' + I.check + 'Replace</button>'
     + '</div></form></div>';
 
+  // Duplicate to host
+  $('#dlg-duplicate-service').innerHTML =
+    '<div class="dlg"><div class="dlg-head"><div class="di">' + I.layers + '</div>'
+    + '<div><h3>Duplicate to host…</h3><div class="dsub">Clone this service onto a peer host over the write mesh</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-duplicate-service\').close()">' + I.x + '</button></div>'
+    + '<form id="form-duplicate-service"><div class="dlg-body">'
+    + '<input type="hidden" name="serviceName">'
+    + '<div class="field"><label>Target host</label><select name="target" required></select></div>'
+    + '<div class="field"><label>Publish port</label><input name="publish_port" type="number" min="1" max="65535" required><div class="hint">Port to publish on the target host so this proxy can reach the new replica.</div></div>'
+    + '</div><div class="dialog-actions">'
+    +   '<button type="button" class="btn" onclick="document.getElementById(\'dlg-duplicate-service\').close()">Cancel</button>'
+    +   '<button type="submit" class="btn primary">' + I.check + 'Duplicate</button>'
+    + '</div></form></div>';
+
   // New DNS — type-aware. The content field swaps shape per type:
   //   A    → IPv4 input
   //   AAAA → IPv6 input
@@ -3791,6 +3865,25 @@ function wireDialogForms() {
       f.reset();
       renderActive();
     } catch (e) { toast(e.message, 'err'); }
+  };
+
+  $('#form-duplicate-service').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const submitBtn = f.querySelector('button[type="submit"]');
+    const original = submitBtn ? submitBtn.innerHTML : '';
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Working…'; }
+    try {
+      const resp = await api('/api/services/' + encodeURIComponent(f.serviceName.value) + '/duplicate', {
+        method: 'POST',
+        body: JSON.stringify({ target: f.target.value, publish_port: +f.publish_port.value }),
+      });
+      $('#dlg-duplicate-service').close();
+      toast('duplicated ' + f.serviceName.value + ' to ' + resp.target);
+      if (resp.nginx_stream_hint) showDuplicateHint(resp.nginx_stream_hint);
+      renderActive();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; } }
   };
 
   $('#form-new-dns').onsubmit = async (e) => {
