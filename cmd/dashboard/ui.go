@@ -1503,6 +1503,7 @@ function anyPeerWritable() {
 // local row. A local row additionally needs at least one write-accepting
 // peer to duplicate TO.
 function dupAttr(s) {
+  if (s.unscalable) return 'disabled title="singleton services can\'t be duplicated"';
   if (foreignSvc(s) && !peerWritable(s)) return svcLockedAttr(s);
   if (!isElevated()) return lockedAttr();
   if (foreignSvc(s)) return '';
@@ -1510,6 +1511,7 @@ function dupAttr(s) {
   return '';
 }
 function dupLk(s) {
+  if (s.unscalable) return '<span class="lock" title="singleton services can\'t be duplicated">' + I.lock + '</span>';
   if (foreignSvc(s) && !peerWritable(s)) return svcLk(s);
   if (!isElevated()) return lk();
   if (foreignSvc(s)) return lk();
