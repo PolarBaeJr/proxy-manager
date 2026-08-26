@@ -133,11 +133,21 @@ func overviewPage(resp serviceStatusResp) *discordgo.MessageEmbed {
 	return embed
 }
 
+// machineFriendlyNames maps the two known DASHBOARD_HOST/proxy identities to
+// friendly display names — kept in sync with cmd/dashboard/ui.go's
+// MACHINE_FRIENDLY_NAMES.
+var machineFriendlyNames = map[string]string{"dashboard": "Pi", "dashboard-mac": "Mac"}
+
 // trimMachineLabel strips the shared ".polardev.org" suffix off a Machine
-// identity so it stays short — shared by machineSuffix (group labels) and
-// the host-roster field names in overviewPage.
+// identity so it stays short, then maps known identities to friendly names —
+// shared by machineSuffix (group labels) and the host-roster field names in
+// overviewPage.
 func trimMachineLabel(machine string) string {
-	return strings.TrimSuffix(machine, ".polardev.org")
+	s := strings.TrimSuffix(machine, ".polardev.org")
+	if friendly, ok := machineFriendlyNames[s]; ok {
+		return friendly
+	}
+	return s
 }
 
 // machineSuffix renders a group's origin host as a short " · label" tag, or
