@@ -519,7 +519,10 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 // constant-time bearer compare, parse the subpath, self-guard, then dispatch
 // against THIS host's own live Docker state (never the requester's claims),
 // auditing every branch as peer-mesh.
-func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, ic *imageChecker, registry *PeerRegistry, routesConfigPath, proxyURL string, writesEnabled bool) http.Handler {
+func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, ic *imageChecker, registry *PeerRegistry, routesConfigPath, proxyURL string, writesEnabled bool, rom *rollingOpManager) http.Handler {
+	if rom == nil {
+		rom = newRollingOpManager(dc)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if secret == "" || !writesEnabled {
 			http.NotFound(w, r)
@@ -752,6 +755,41 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 			}
 			audit(r, "peer-mesh", "service.replace", name+" => "+body.Image)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "replaced", "image": body.Image})
+			return
+		}
+		// rolling-replace, unlike replace above, is label-managed-only (see
+		// rollingop.go/api.go's doc comments) — an onboarded name here is
+		// rejected rather than silently falling back to replaceOnboarded.
+		if len(parts) == 2 && parts[1] == "rolling-replace" && r.Method == http.MethodPost {
+			var body ReplaceServiceRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if body.Image == "" {
+				http.Error(w, "image is required", http.StatusBadRequest)
+				return
+			}
+			if _, ok := onb.Get(name); ok {
+				http.Error(w, fmt.Sprintf("%q is an onboarded service — rolling replace only supports label-managed services", name), http.StatusBadRequest)
+				return
+			}
+			st, err := rom.start(name, body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			audit(r, "peer-mesh", "service.rolling_replace_start", name+" => "+body.Image)
+			httpx.WriteJSON(w, http.StatusAccepted, st)
+			return
+		}
+		if len(parts) == 2 && parts[1] == "rolling-replace" && r.Method == http.MethodGet {
+			st, ok := rom.get(name)
+			if !ok {
+				http.Error(w, "no active rolling replace for "+name, http.StatusNotFound)
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, st)
 			return
 		}
 		if len(parts) == 2 && parts[1] == "stage" && r.Method == http.MethodPost {

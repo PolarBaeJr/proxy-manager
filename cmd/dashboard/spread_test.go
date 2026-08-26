@@ -219,6 +219,104 @@ func TestServicesSpreadForwardsGroupLabel(t *testing.T) {
 // via this handler. No test for that branch; the guarantee comes from
 // docker.go's ingest-time validation instead.
 
+// TestServicesSpreadForwardsAutoUpdateAndWeight is the regression for the bug
+// where a spread replica silently lost proxy.autoupdate and proxy.weight: the
+// peer replica would never auto-update and would always route at the
+// default weight, no matter what the origin's live container was set to.
+func TestServicesSpreadForwardsAutoUpdateAndWeight(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	target, cap := newSpreadTargetServer(t)
+	calls := &svcCallTracker{}
+	containers := []dockerContainer{{
+		ID: "tpl1", Names: []string{"/app"}, State: "running", Image: "ghcr.io/org/app:v1",
+		Labels: map[string]string{
+			labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "8080",
+			labelAutoUpdate: "true", labelWeight: "5",
+		},
+	}}
+	dc := spreadDockerStub(t, calls, containers, nil, nil)
+
+	rec := postSpread(t, dc, target, `{"target":"dashboard-b"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	_, body := cap.first(t)
+	if got := body.Labels[labelAutoUpdate]; got != "true" {
+		t.Errorf("%s = %q, want true — the replica must inherit the origin's auto-update opt-in", labelAutoUpdate, got)
+	}
+	if got := body.Labels[labelWeight]; got != "5" {
+		t.Errorf("%s = %q, want 5 — the replica must inherit the origin's routing weight", labelWeight, got)
+	}
+}
+
+// TestServicesSpreadOmitsDefaultAutoUpdateAndWeight proves the origin's
+// defaults are not written out as labels: an origin with proxy.autoupdate
+// absent and no proxy.weight label must produce a replica with neither
+// label set, the same "absent means default" convention setWeightLabel uses.
+func TestServicesSpreadOmitsDefaultAutoUpdateAndWeight(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	target, cap := newSpreadTargetServer(t)
+	calls := &svcCallTracker{}
+	dc := spreadDockerStub(t, calls, spreadAppContainers(), nil, nil)
+
+	rec := postSpread(t, dc, target, `{"target":"dashboard-b"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	_, body := cap.first(t)
+	if _, ok := body.Labels[labelAutoUpdate]; ok {
+		t.Errorf("%s present = %q, want absent — the origin never opted in", labelAutoUpdate, body.Labels[labelAutoUpdate])
+	}
+	if _, ok := body.Labels[labelWeight]; ok {
+		t.Errorf("%s present = %q, want absent — the origin never set a weight", labelWeight, body.Labels[labelWeight])
+	}
+}
+
+// TestServicesSpreadDropsOutOfRangeWeight proves an origin whose proxy.weight
+// exceeds this codebase's normal range (e.g. hand-authored in a compose file,
+// never run through the dashboard's own weight API) doesn't take the whole
+// spread down with it: peerSpreadHandler validates Weight with the same
+// validWeight bound the /weight endpoint uses, so shipping an out-of-range
+// value verbatim would make the peer hard-refuse the entire request over a
+// number that only affects routing share.
+func TestServicesSpreadDropsOutOfRangeWeight(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	target, cap := newSpreadTargetServer(t)
+	calls := &svcCallTracker{}
+	containers := []dockerContainer{{
+		ID: "tpl1", Names: []string{"/app"}, State: "running", Image: "ghcr.io/org/app:v1",
+		Labels: map[string]string{
+			labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "8080",
+			labelWeight: "250",
+		},
+	}}
+	dc := spreadDockerStub(t, calls, containers, nil, nil)
+
+	rec := postSpread(t, dc, target, `{"target":"dashboard-b"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	var resp SpreadServiceResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(resp.Warnings, "\n")
+	if !strings.Contains(joined, "weight") {
+		t.Errorf("warnings = %q, want the dropped weight named", joined)
+	}
+
+	_, body := cap.first(t)
+	if _, ok := body.Labels[labelWeight]; ok {
+		t.Errorf("%s present = %q, want absent — an out-of-range weight must fall back to the default, not reach the peer", labelWeight, body.Labels[labelWeight])
+	}
+}
+
 // TestServicesSpreadWritesNoRoutesEntry is the direct regression against the
 // incident shape: duplicate.go appends a SECOND, competing routes.json entry
 // for the same host+path. Spread must add none at all — the peer's own proxy
@@ -418,7 +516,7 @@ func TestServicesSpreadForwardsToOwningPeer(t *testing.T) {
 	ownerOnb := newTestOnboardedStore(t)
 	ownerReg := newPeerRegistry([]string{finalSrv.URL}, "s3cret", "dashboard-b", "dev", 0, nil)
 	ownerReg.recordResult(finalSrv.URL, true, "dashboard-c", "dev", true)
-	ownerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", ownerDC, ownerOnb, newImageChecker(ownerDC), ownerReg, filepath.Join(t.TempDir(), "routes.json"), noopProxyStub(t), true))
+	ownerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", ownerDC, ownerOnb, newImageChecker(ownerDC), ownerReg, filepath.Join(t.TempDir(), "routes.json"), noopProxyStub(t), true, nil))
 	t.Cleanup(ownerSrv.Close)
 
 	var localHit atomic.Bool

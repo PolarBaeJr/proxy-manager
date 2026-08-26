@@ -171,6 +171,7 @@ type createBody struct {
 	Labels           map[string]string   `json:"Labels,omitempty"`
 	Env              []string            `json:"Env,omitempty"`
 	ExposedPorts     map[string]struct{} `json:"ExposedPorts,omitempty"`
+	Healthcheck      *healthcheckSpec    `json:"Healthcheck,omitempty"`
 	HostConfig       hostConfig          `json:"HostConfig"`
 	NetworkingConfig struct {
 		EndpointsConfig map[string]struct{} `json:"EndpointsConfig"`
@@ -201,11 +202,25 @@ type mountSpec struct {
 	ReadOnly bool   `json:"ReadOnly,omitempty"`
 }
 
-// cloneSpec is the subset of a container's HostConfig that must ride forward
-// when it's recreated (replace/stage/promote/scale/onboard) but isn't part of
-// the labels/env already carried elsewhere.
+// healthcheckSpec mirrors Docker Engine API's Config.Healthcheck shape. A
+// container's healthcheck is set by whatever created it (a compose file's
+// `healthcheck:` stanza, most often) — it is NOT baked into the image, so a
+// bare recreate from the image alone silently loses it unless the template
+// container's own inspect result is carried forward explicitly.
+type healthcheckSpec struct {
+	Test        []string `json:"Test,omitempty"`
+	Interval    int64    `json:"Interval,omitempty"`
+	Timeout     int64    `json:"Timeout,omitempty"`
+	StartPeriod int64    `json:"StartPeriod,omitempty"`
+	Retries     int      `json:"Retries,omitempty"`
+}
+
+// cloneSpec is the subset of a container's HostConfig/Config that must ride
+// forward when it's recreated (replace/stage/promote/scale/onboard) but
+// isn't part of the labels/env already carried elsewhere.
 type cloneSpec struct {
-	Mounts []mountSpec
+	Mounts      []mountSpec
+	Healthcheck *healthcheckSpec
 }
 
 // pullImage tries to pull from a registry. Errors are non-fatal: if the image
@@ -373,8 +388,8 @@ func (c *dockerClient) inspectRestartCount(ctx context.Context, id string) (int,
 	return resp.RestartCount, nil
 }
 
-// inspectCloneSpec returns the HostConfig fields a recreate must carry
-// forward — currently just Mounts (bind mounts / named volumes), which
+// inspectCloneSpec returns the HostConfig/Config fields a recreate must carry
+// forward — Mounts (bind mounts / named volumes) and Healthcheck — which
 // createBody drops today if the caller doesn't thread them through.
 func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSpec, error) {
 	body, err := c.get(ctx, "/containers/"+id+"/json")
@@ -386,11 +401,14 @@ func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSp
 		HostConfig struct {
 			Mounts []mountSpec `json:"Mounts"`
 		} `json:"HostConfig"`
+		Config struct {
+			Healthcheck *healthcheckSpec `json:"Healthcheck"`
+		} `json:"Config"`
 	}
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
 		return cloneSpec{}, err
 	}
-	return cloneSpec{Mounts: resp.HostConfig.Mounts}, nil
+	return cloneSpec{Mounts: resp.HostConfig.Mounts, Healthcheck: resp.Config.Healthcheck}, nil
 }
 
 // looksLikeBareDigest reports whether s is a bare "sha256:<hex>" image
@@ -518,12 +536,16 @@ func jsonEqual(a, b json.RawMessage) bool {
 // response returns every field present-but-often-zero-valued, which would
 // make a naive "is this field present" check refuse everything.
 //
-// Config.Cmd/Entrypoint/Healthcheck need special handling: Docker populates
-// Config.Cmd from the IMAGE's own CMD for virtually every container (e.g.
+// Config.Cmd/Entrypoint need special handling: Docker populates Config.Cmd
+// from the IMAGE's own CMD for virtually every container (e.g.
 // ["nginx","-g","daemon off;"]), so there is no way to tell "image default"
 // from "user override" from the container's inspect alone. This fetches the
 // image's own inspect and only refuses when the container's value actually
 // differs from what the image would produce on its own.
+//
+// Config.Healthcheck is deliberately NOT checked here: inspectCloneSpec
+// carries it forward on every recreate path (see cloneSpec), so unlike
+// Cmd/Entrypoint it no longer needs a refuse-rather-than-drop guard.
 //
 // TODO(pi-verification): the field lists above were built from the public,
 // documented Docker Engine API HostConfig/Config schema, not a live spot
@@ -540,9 +562,8 @@ func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string)
 		Image      string                     `json:"Image"` // image ID, e.g. "sha256:..."
 		HostConfig map[string]json.RawMessage `json:"HostConfig"`
 		Config     struct {
-			Cmd         json.RawMessage `json:"Cmd"`
-			Entrypoint  json.RawMessage `json:"Entrypoint"`
-			Healthcheck json.RawMessage `json:"Healthcheck"`
+			Cmd        json.RawMessage `json:"Cmd"`
+			Entrypoint json.RawMessage `json:"Entrypoint"`
 		} `json:"Config"`
 		NetworkSettings struct {
 			Networks map[string]json.RawMessage `json:"Networks"`
@@ -567,10 +588,10 @@ func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string)
 		}
 	}
 
-	// Config.Cmd/Entrypoint/Healthcheck: only refuse when they DIFFER from
-	// what the image itself already specifies.
-	if !isZeroJSON(resp.Config.Cmd) || !isZeroJSON(resp.Config.Entrypoint) || !isZeroJSON(resp.Config.Healthcheck) {
-		imgCmd, imgEntrypoint, imgHealthcheck, err := c.inspectImageOverridable(ctx, resp.Image)
+	// Config.Cmd/Entrypoint: only refuse when they DIFFER from what the image
+	// itself already specifies.
+	if !isZeroJSON(resp.Config.Cmd) || !isZeroJSON(resp.Config.Entrypoint) {
+		imgCmd, imgEntrypoint, err := c.inspectImageOverridable(ctx, resp.Image)
 		if err != nil {
 			return nil, fmt.Errorf("inspect image %s: %w", resp.Image, err)
 		}
@@ -580,36 +601,32 @@ func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string)
 		if !isZeroJSON(resp.Config.Entrypoint) && !jsonEqual(resp.Config.Entrypoint, imgEntrypoint) {
 			refused = append(refused, "Config.Entrypoint")
 		}
-		if !isZeroJSON(resp.Config.Healthcheck) && !jsonEqual(resp.Config.Healthcheck, imgHealthcheck) {
-			refused = append(refused, "Config.Healthcheck")
-		}
 	}
 
 	sort.Strings(refused)
 	return refused, nil
 }
 
-// inspectImageOverridable returns an image's own Config.Cmd/Entrypoint/
-// Healthcheck — the baseline inspectHostConfigUnknowns diffs a container's
-// values against, so a container that simply inherited them from its image
-// isn't mistaken for one with an explicit override.
-func (c *dockerClient) inspectImageOverridable(ctx context.Context, imageID string) (cmd, entrypoint, healthcheck json.RawMessage, err error) {
+// inspectImageOverridable returns an image's own Config.Cmd/Entrypoint — the
+// baseline inspectHostConfigUnknowns diffs a container's values against, so a
+// container that simply inherited them from its image isn't mistaken for one
+// with an explicit override.
+func (c *dockerClient) inspectImageOverridable(ctx context.Context, imageID string) (cmd, entrypoint json.RawMessage, err error) {
 	body, err := c.get(ctx, "/images/"+url.PathEscape(imageID)+"/json")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	defer body.Close()
 	var resp struct {
 		Config struct {
-			Cmd         json.RawMessage `json:"Cmd"`
-			Entrypoint  json.RawMessage `json:"Entrypoint"`
-			Healthcheck json.RawMessage `json:"Healthcheck"`
+			Cmd        json.RawMessage `json:"Cmd"`
+			Entrypoint json.RawMessage `json:"Entrypoint"`
 		} `json:"Config"`
 	}
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	return resp.Config.Cmd, resp.Config.Entrypoint, resp.Config.Healthcheck, nil
+	return resp.Config.Cmd, resp.Config.Entrypoint, nil
 }
 
 // ---- Service-level operations ----
@@ -833,6 +850,23 @@ type CreateServiceRequest struct {
 // before removing the old ones.
 var replaceSettleDelay = 5 * time.Second
 
+// rollingReadyTimeout bounds waitReplicaReady's health gate for a single
+// freshly-created replica. Deliberately its own constant rather than reusing
+// canaryPromoteHealthTimeout (30s): that value was tuned for a canary that's
+// already been running for a while before promotion is even attempted, but
+// waitReplicaReady's container is brand new — its Docker healthcheck can
+// legitimately still report "(health: starting)" past 30s depending on the
+// image's configured start_period/interval (observed on badminton-admin:
+// StartPeriod 20s + Interval 30s puts the first health verdict right at the
+// 30s boundary). The failure modes are asymmetric: too short aborts a
+// healthy rollout mid-loop, too long only delays declaring a genuinely
+// broken replica dead — and since surge-of-one never drops capacity below
+// the original count, a slower failure is not an outage. A generous fixed
+// timeout dominates trying to derive one from the image's healthcheck
+// config. Keep N replicas * (rollingReadyTimeout + replaceSettleDelay)
+// comfortably under rollingOpTimeout.
+var rollingReadyTimeout = 3 * time.Minute
+
 // ReplaceServiceRequest swaps a service's image (and optionally env) in place.
 // Spins up new containers first, briefly waits, then removes the old ones —
 // approximation of a rolling deploy on a single host.
@@ -911,7 +945,7 @@ func (c *dockerClient) scaleService(ctx context.Context, name string, desired in
 		for i := 0; i < desired-current; i++ {
 			n := nextReplicaIndex(existing, name) + i
 			cname := fmt.Sprintf("goproxy-%s-%d", name, n)
-			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
+			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
 			if err != nil {
 				return fmt.Errorf("create %s: %w", cname, err)
 			}
@@ -1085,17 +1119,39 @@ func preferRunning(in []dockerContainer) []dockerContainer {
 // replaceService creates fresh containers with a new image (and optionally new
 // env), starts them, waits briefly, then removes the old containers. Replica
 // count is preserved. Labels are inherited from the existing template.
-func (c *dockerClient) replaceService(ctx context.Context, name string, req ReplaceServiceRequest) error {
+// replaceTemplate is the resolved recreate plan prepareReplaceTemplate
+// produces: everything both replaceService's all-at-once tail and
+// replaceServiceRolling's surge-of-one tail need to actually create and swap
+// containers, without either of them re-deriving it (and possibly
+// disagreeing on env, labels, or the starting replica index).
+type replaceTemplate struct {
+	existing  []dockerContainer
+	tplSet    []dockerContainer
+	env       []string
+	clone     cloneSpec
+	newLabels map[string]string
+	startIdx  int
+}
+
+// prepareReplaceTemplate resolves everything a label-managed service replace
+// needs up front — the live/template container sets, the host-config-drop
+// refusal check, merged env, the pulled image, the new containers' labels,
+// and the starting replica index (computed ONCE here, not per-replica by a
+// caller's loop: recomputing after removing an old container could hand out
+// an index still held by an unreleased container and 409 on create) — so
+// replaceService and replaceServiceRolling share one source of truth instead
+// of two copies that could drift.
+func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, req ReplaceServiceRequest) (*replaceTemplate, error) {
 	if req.Image == "" {
-		return fmt.Errorf("image is required")
+		return nil, fmt.Errorf("image is required")
 	}
 	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	existing := liveOnly(all)
 	if len(existing) == 0 {
-		return fmt.Errorf("service %q not found (no live replicas)", name)
+		return nil, fmt.Errorf("service %q not found (no live replicas)", name)
 	}
 	// tplSet prefers RUNNING containers for both template selection and the
 	// recreate count below — a stale exited leftover (e.g. one whose removal
@@ -1116,10 +1172,10 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	for _, ct := range existing {
 		unknowns, err := c.inspectHostConfigUnknowns(ctx, ct.ID)
 		if err != nil {
-			return fmt.Errorf("inspect %s: %w", ct.name(), err)
+			return nil, fmt.Errorf("inspect %s: %w", ct.name(), err)
 		}
 		if len(unknowns) > 0 {
-			return fmt.Errorf("refusing to replace %q: %s would drop %s on recreate — resolve manually first", name, ct.name(), strings.Join(unknowns, ", "))
+			return nil, fmt.Errorf("refusing to replace %q: %s would drop %s on recreate — resolve manually first", name, ct.name(), strings.Join(unknowns, ", "))
 		}
 	}
 
@@ -1128,19 +1184,19 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	// against, not just as a fallback when no edits were sent.
 	base, err := c.inspectEnv(ctx, tpl.ID)
 	if err != nil {
-		return fmt.Errorf("inspect template env: %w", err)
+		return nil, fmt.Errorf("inspect template env: %w", err)
 	}
 	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
 	if err != nil {
-		return fmt.Errorf("inspect template clone spec: %w", err)
+		return nil, fmt.Errorf("inspect template clone spec: %w", err)
 	}
 	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	env, err := mergeEnv(base, edits, req.EnvAck)
 	if err != nil {
-		return redactRefConflicts(err, refs)
+		return nil, redactRefConflicts(err, refs)
 	}
 
 	c.pullImage(ctx, req.Image)
@@ -1170,14 +1226,32 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	// out an index still occupied by a not-yet-removed stale container and
 	// 409 on create.
 	startIdx := nextReplicaIndex(existing, name)
+
+	return &replaceTemplate{
+		existing:  existing,
+		tplSet:    tplSet,
+		env:       env,
+		clone:     clone,
+		newLabels: newLabels,
+		startIdx:  startIdx,
+	}, nil
+}
+
+func (c *dockerClient) replaceService(ctx context.Context, name string, req ReplaceServiceRequest) error {
+	tpl, err := c.prepareReplaceTemplate(ctx, name, req)
+	if err != nil {
+		return err
+	}
+
 	var newIDs []string
-	for i := 0; i < len(tplSet); i++ {
-		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
+	for i := 0; i < len(tpl.tplSet); i++ {
+		cname := fmt.Sprintf("goproxy-%s-%d", name, tpl.startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      req.Image,
-			Labels:     newLabels,
-			Env:        env,
-			HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image:       req.Image,
+			Labels:      tpl.newLabels,
+			Env:         tpl.env,
+			Healthcheck: tpl.clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: tpl.clone.Mounts},
 		})
 		if err != nil {
 			// Roll back: tear down any new ones we already created.
@@ -1200,10 +1274,161 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	// A package var only so tests can shrink it; nothing else reassigns it.
 	time.Sleep(replaceSettleDelay)
 
-	for _, ct := range existing {
+	for _, ct := range tpl.existing {
 		_ = c.stopContainer(ctx, ct.ID)
 		if err := c.removeContainer(ctx, ct.ID); err != nil {
 			log.Printf("replace %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
+		}
+	}
+	return nil
+}
+
+// waitReplicaReady gates replaceServiceRolling's create-before-destroy swap:
+// it polls checkContainerHealthy (docker healthcheck, restart count, and any
+// proxy.health probe) every canaryPromoteHealthPoll up to
+// rollingReadyTimeout, re-listing the container fresh from Docker each
+// poll (its Status/NetworkSettings/restart count all change over its
+// lifetime, so a single snapshot taken at create time would go stale and the
+// health gate would pass vacuously). Once healthy, it additionally requires
+// the container to have been running for at least replaceSettleDelay (the
+// same dwell replaceService's all-at-once tail already uses — reused, not
+// duplicated) before returning, so a container with neither a docker
+// healthcheck nor a proxy.health label — which checkContainerHealthy passes
+// instantly — still isn't trusted with its predecessor's traffic the moment
+// it starts.
+func (c *dockerClient) waitReplicaReady(ctx context.Context, name, id string) error {
+	started := time.Now()
+	deadline := started.Add(rollingReadyTimeout)
+	var lastReason string
+	for {
+		all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
+		if err != nil {
+			return fmt.Errorf("health check: %w", err)
+		}
+		var ct *dockerContainer
+		for i := range all {
+			if all[i].ID == id {
+				ct = &all[i]
+				break
+			}
+		}
+		if ct == nil {
+			return fmt.Errorf("container disappeared while waiting for it to become healthy")
+		}
+		// checkContainerHealthy only treats docker's own "(unhealthy)" status
+		// as a failure — "(health: starting)" (the status every container
+		// with a docker healthcheck reports until its first probe completes,
+		// which can be well past this container's start time depending on
+		// the healthcheck's configured interval) is not "unhealthy" and
+		// would otherwise pass the gate instantly. Treat it as not-yet-ready
+		// here instead, without changing checkContainerHealthy itself — that
+		// function is also checkCanaryHealth's per-container check, and this
+		// rolling-replace-specific gate must not change canary behavior.
+		if parseHealth(ct.Status) == "starting" {
+			lastReason = fmt.Sprintf("%s: healthcheck still starting", ct.name())
+			if !time.Now().Before(deadline) {
+				return fmt.Errorf("failed health gate: %s", lastReason)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(canaryPromoteHealthPoll):
+			}
+			continue
+		}
+		healthy, reason, err := c.checkContainerHealthy(ctx, *ct)
+		if err != nil {
+			return fmt.Errorf("health check: %w", err)
+		}
+		if healthy {
+			break
+		}
+		lastReason = reason
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("failed health gate: %s", lastReason)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(canaryPromoteHealthPoll):
+		}
+	}
+	if wait := replaceSettleDelay - time.Since(started); wait > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return nil
+}
+
+// replaceServiceRolling is replaceService's surge-of-one counterpart: for
+// each replica it creates and starts the NEW container, waits for it to
+// clear waitReplicaReady, THEN removes the one old container it's replacing
+// — so live capacity never drops below the original replica count (it
+// briefly rises to N+1) and services with proxy.unscalable: true never touch
+// zero. On a mid-rollout failure it stops immediately and does NOT roll back
+// replicas already swapped: surge-of-one never dropped capacity, so a
+// partial state is still fully serving traffic. progress, if non-nil, is
+// called once up front with the total replica count (done=0, so a status
+// poll during the — often 5-35s — first replica's swap sees the real total
+// instead of a zero value indistinguishable from "nothing planned"), then
+// again after each replica is successfully swapped.
+func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, req ReplaceServiceRequest, progress func(done, total int)) error {
+	tpl, err := c.prepareReplaceTemplate(ctx, name, req)
+	if err != nil {
+		return err
+	}
+
+	total := len(tpl.tplSet)
+	if progress != nil {
+		progress(0, total)
+	}
+	replaced := map[string]bool{}
+	for i, old := range tpl.tplSet {
+		cname := fmt.Sprintf("goproxy-%s-%d", name, tpl.startIdx+i)
+		id, err := c.createContainer(ctx, cname, createBody{
+			Image:       req.Image,
+			Labels:      tpl.newLabels,
+			Env:         tpl.env,
+			Healthcheck: tpl.clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: tpl.clone.Mounts},
+		})
+		if err != nil {
+			return fmt.Errorf("replaced %d/%d replicas, then failed on %s: create: %w", i, total, cname, err)
+		}
+		if err := c.startContainer(ctx, id); err != nil {
+			_ = c.removeContainer(ctx, id)
+			return fmt.Errorf("replaced %d/%d replicas, then failed on %s: start: %w", i, total, cname, err)
+		}
+		if err := c.waitReplicaReady(ctx, name, id); err != nil {
+			return fmt.Errorf("replaced %d/%d replicas, then failed on %s: %w", i, total, cname, err)
+		}
+
+		_ = c.stopContainer(ctx, old.ID)
+		if err := c.removeContainer(ctx, old.ID); err != nil {
+			log.Printf("rolling-replace %s: failed to remove old %s: %v (new one is running)", name, old.name(), err)
+		}
+		replaced[old.ID] = true
+
+		if progress != nil {
+			progress(i+1, total)
+		}
+	}
+
+	// Sweep any leftovers in existing that tplSet didn't pair with a
+	// replacement (e.g. a stale exited container from a prior replace whose
+	// removal silently failed) — replaceService's all-at-once tail removes
+	// every member of existing unconditionally, and this rolling tail must
+	// leave the same end state.
+	for _, ct := range tpl.existing {
+		if replaced[ct.ID] {
+			continue
+		}
+		_ = c.stopContainer(ctx, ct.ID)
+		if err := c.removeContainer(ctx, ct.ID); err != nil {
+			log.Printf("rolling-replace %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
 		}
 	}
 	return nil
@@ -1258,10 +1483,11 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      tpl.Image,
-			Labels:     newLabels,
-			Env:        env,
-			HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image:       tpl.Image,
+			Labels:      newLabels,
+			Env:         env,
+			Healthcheck: clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1341,10 +1567,11 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      tpl.Image,
-			Labels:     newLabels,
-			Env:        env,
-			HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image:       tpl.Image,
+			Labels:      newLabels,
+			Env:         env,
+			Healthcheck: clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1452,10 +1679,11 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      tpl.Image,
-			Labels:     newLabels,
-			Env:        env,
-			HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image:       tpl.Image,
+			Labels:      newLabels,
+			Env:         env,
+			Healthcheck: clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1537,7 +1765,7 @@ func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, re
 	for i := 0; i < count; i++ {
 		cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image: req.Image, Labels: canaryLabels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image: req.Image, Labels: canaryLabels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			return fmt.Errorf("create canary %s: %w", cname, err)
@@ -1618,7 +1846,7 @@ func (c *dockerClient) scaleCanary(ctx context.Context, name string, target int)
 		startIdx := nextCanaryReplicaIndex(all, name)
 		for i := 0; i < target-current; i++ {
 			cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
-			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
+			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
 			if err != nil {
 				return fmt.Errorf("create canary %s: %w", cname, err)
 			}
@@ -1682,7 +1910,7 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 		}
 		startIdx := nextReplicaIndex(all, name)
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx)
-		id, err := c.createContainer(ctx, cname, createBody{Image: ct.Image, Labels: labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
+		id, err := c.createContainer(ctx, cname, createBody{Image: ct.Image, Labels: labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
 		if err != nil {
 			return fmt.Errorf("create promoted %s: %w", cname, err)
 		}

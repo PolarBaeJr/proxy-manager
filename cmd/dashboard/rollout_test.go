@@ -760,7 +760,7 @@ func newRolloutTestMux(t *testing.T, dc *dockerClient, rm *rolloutManager, onb *
 	t.Helper()
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
-	return newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), routesPath, nil, onb, nil, nil, nil, nil, nil, nil, rm, nil)
+	return newDashboardMux(dc, nil, auth, newRateLimiter(), newImageChecker(dc), routesPath, nil, onb, nil, nil, nil, nil, nil, nil, rm, nil, nil)
 }
 
 func doJSONReq(mux http.Handler, method, path, body string) *httptest.ResponseRecorder {

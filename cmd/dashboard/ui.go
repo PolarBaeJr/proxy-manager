@@ -339,8 +339,14 @@ tr.disc-child td:first-child{padding-left:28px}
 .actionzone .sep{flex:1}
 .member-list{margin-top:12px;padding:8px 10px;background:var(--surface-2);border-radius:var(--radius-sm);display:flex;flex-direction:column;gap:6px}
 /* one .svc-instance per host inside a merged multi-host svc-card — see
-   renderServices()'s mergeKeyOf. Facts/actions stay genuinely per-host, so
-   each instance keeps its own copy; only the card head/stats are shared. */
+   renderServices()'s mergeKeyOf. Most facts/actions (Start/Stop, per-replica
+   Restart, Auto-update, Singleton, Check now, Duplicate, Spread, Delete,
+   Promote/Discard canary, Rollback) stay genuinely per-host, so each
+   instance keeps its own copy. Six controls that would otherwise recreate
+   or rescale containers per host (Replicas, Weight, Add env, Replace, Stage,
+   Pull update) are unified into ONE set of controls per card instead — see
+   the "unit-ctrl" block rendered once above the instances — so one click
+   fans the same action out to every host in the merge unit. */
 .svc-instance{margin-top:10px}
 .svc-instance.sep{margin-top:16px;padding-top:16px;border-top:1px solid var(--border)}
 .svc-instance-label{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px}
@@ -1637,7 +1643,7 @@ async function renderServices() {
   for (const s of ordered) {
     const k = mergeKeyOf(s);
     mergeCounts[k] = (mergeCounts[k] || 0) + 1;
-    const a = unitAgg[k] || (unitAgg[k] = { totalReplicas: 0, allStopped: true, backends: [], hasLocal: false, machines: [], backendsByMachine: {} });
+    const a = unitAgg[k] || (unitAgg[k] = { totalReplicas: 0, allStopped: true, backends: [], hasLocal: false, machines: [], backendsByMachine: {}, instances: [] });
     a.totalReplicas += s.replicas || 0;
     if (!s.all_stopped) a.allStopped = false;
     for (const b of (s.backends || [])) if (a.backends.indexOf(b) === -1) a.backends.push(b);
@@ -1650,7 +1656,57 @@ async function renderServices() {
     const mid = foreignSvc(s) ? s.machine : '';
     const bucket = (a.backendsByMachine[mid] = a.backendsByMachine[mid] || []);
     for (const b of (s.backends || [])) if (bucket.indexOf(b) === -1) bucket.push(b);
-    a.machines.push(s.machine ? machineLabel(s.machine) : (_selfIdentity ? machineLabel(_selfIdentity) : 'this host'));
+    const label = s.machine ? machineLabel(s.machine) : (_selfIdentity ? machineLabel(_selfIdentity) : 'this host');
+    a.machines.push(label);
+    // Raw per-host facts for the unified controls' fan-out (unitHostList
+    // below) — unlike a.machines (a display-only label list), these carry
+    // the actual machine identity (for ?host=), write-mesh gating, and
+    // per-host state (onboarded/unscalable/image/replicas/weight) each
+    // unified control needs to build its own per-host request.
+    a.instances.push({
+      s, machine: s.machine || '', label,
+      isLocal: !foreignSvc(s), writable: !foreignSvc(s) || peerWritable(s),
+      onboarded: !!s.onboarded, unscalable: !!s.unscalable, managed: !s.host,
+    });
+  }
+  // Second pass: derive unit-wide facts that need every instance seen first
+  // (write-mesh gating, which host validates env conflicts first, whether
+  // the weight control even applies). Kept separate from the tally loop
+  // above so these never depend on iteration order within a unit.
+  for (const k in unitAgg) {
+    const a = unitAgg[k];
+    a.allWritable = a.instances.every(i => i.writable);
+    // blockingHost names the first un-writable foreign host, for the
+    // disabled-control's title — "the operator can't currently write to
+    // every host in the unit" per the unify spec's gating rule.
+    const blocking = a.instances.find(i => !i.writable);
+    a.blockingHost = blocking ? blocking.label : '';
+    // host1: the first host a fan-out validates env conflicts against —
+    // prefer local/no-?host= when the unit includes this machine, else the
+    // first foreign host (in the unit's existing instance order).
+    a.host1 = a.instances.find(i => i.isLocal) || a.instances[0];
+    // Weight is a proxy.* label — meaningless for a routeless ("managed") or
+    // onboarded instance. Mixing those into an otherwise-routed unit is an
+    // edge case; hiding the unified control unless EVERY instance is
+    // eligible is the safe direction (never offers a control that would
+    // silently no-op or error on some host).
+    a.weightEligible = a.instances.every(i => !i.managed && !i.onboarded);
+    // Singleton-lock direction is likewise the safe one: if ANY host in the
+    // unit is a fixed-at-1 singleton, the unified replicas control shows
+    // the lock rather than letting an Apply try to scale that host up.
+    a.unscalableAny = a.instances.some(i => i.unscalable);
+    a.anyUpdateAvailable = a.instances.some(i => i.s.update_available);
+    a.anyStopped = a.instances.some(i => i.s.all_stopped);
+    // The four recreate-triggering unified buttons (Add env/Replace/Stage/
+    // Pull update) mirror the per-instance managed/canary exclusions above —
+    // "canary/replace/stop/stats make no sense" for a routeless (managed)
+    // instance, and a host mid-canary needs Promote/Discard, not another
+    // Replace stacked on top. mergeKeyOf includes s.host, so a managed
+    // (routeless) instance can never share a unit with a routed one —
+    // checking host1 alone is equivalent to checking every instance. Canary
+    // isn't part of the merge key, though, so any instance (not just host1)
+    // can be mid-canary independently of the others.
+    a.recreateEligible = !a.host1.managed && !a.instances.some(i => !!i.s.canary_image);
   }
   // Distinct merge units per group, so the folder header's "N services"
   // reflects logical services rather than raw per-host instances.
@@ -1734,10 +1790,16 @@ async function renderServices() {
     if (canary)              facts += '<tr><td>Canary</td><td><span class="ident" style="color:#5eb4ff">' + esc(s.canary_image) + '</span> <span class="meta">· ' + s.canary_replicas + ' replica' + (s.canary_replicas === 1 ? '' : 's') + '</span></td></tr>';
     else if (s.previous_image) facts += '<tr><td>Previous</td><td><span class="ident dim">' + esc(s.previous_image) + '</span></td></tr>';
     facts += '<tr><td>Port</td><td' + (managed ? ' class="meta">—' : ' class="num">' + s.port) + '</td></tr>';
-    facts += '<tr><td>Replicas</td><td>' + replicaCtrl(s) + '</td></tr>';
+    // In a merged card, Replicas/Weight are unified at the unit level (see
+    // unitReplicaCtrl/unitWeightCtrl below) — this row is read-only per host
+    // so the same value never gets two independently-editable controls
+    // (the pre-existing rep-/wt- id collision this replaces).
+    facts += '<tr><td>Replicas</td><td>' + (merged ? replicaReadout(s) : replicaCtrl(s)) + '</td></tr>';
     // Weight is a proxy.* label, so it means nothing for a routeless
     // ("managed") or onboarded service — same gate the singleton toggle uses.
-    if (!managed && !s.onboarded) facts += '<tr><td>Weight</td><td>' + weightCtrl(s) + '</td></tr>';
+    if (!managed && !s.onboarded) {
+      facts += '<tr><td>Weight</td><td>' + (merged ? '<span class="ident">' + (s.weight || 1) + '</span>' : weightCtrl(s)) + '</td></tr>';
+    }
     facts += '</table>';
 
     let actions;
@@ -1754,6 +1816,24 @@ async function renderServices() {
     } else if (canary) {
       actions = '<button class="btn primary" ' + svcWriteAttr(s) + hostAttr + ' onclick="promoteCanary(\'' + sn + '\', this.dataset.host)">' + I.check + 'Promote canary' + svcWriteLk(s) + '</button>'
               + '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="discardCanary(\'' + sn + '\', this.dataset.host)">' + I.x + 'Discard' + svcWriteLk(s) + '</button>';
+    } else if (merged) {
+      // Merged unit: Pull update / Stage / Replace / Add env moved to the
+      // unit-level controls above (see unitActionButtons) — this per-host
+      // action row keeps only what genuinely stays per-host.
+      actions = (s.all_stopped
+                  ? '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleSvc(\'' + sn + '\', \'start\', this.dataset.host)">' + I.bolt + 'Start service' + svcWriteLk(s) + '</button>'
+                  : '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="lifecycleSvc(\'' + sn + '\', \'stop\', this.dataset.host)">' + I.lock + 'Stop service' + svcWriteLk(s) + '</button>')
+              + (s.previous_image ? '<button class="linkbtn" ' + svcWriteAttr(s) + hostAttr + ' onclick="rollback(\'' + sn + '\', \'' + esc(s.previous_image) + '\', this.dataset.host)">' + I.rewind + 'Rollback' + svcWriteLk(s) + '</button>' : '');
+      menuExtra =
+                '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="checkForUpdate(\'' + sn + '\', this, this.dataset.host)">' + I.refresh + 'Check now' + svcWriteLk(s) + '</button>'
+              + (s.auto_update
+                  ? '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', false, this.dataset.host)">' + I.arrowup + 'Auto-update: on' + svcWriteLk(s) + '</button>'
+                  : '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleAutoUpdate(\'' + sn + '\', true, this.dataset.host)">' + I.arrowup + 'Auto-update: off' + svcWriteLk(s) + '</button>')
+              + (s.onboarded ? '' : (s.unscalable
+                  ? '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', false, this.dataset.host)">' + I.lock + 'Singleton: on' + svcWriteLk(s) + '</button>'
+                  : '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', true, this.dataset.host)">' + I.unlock + 'Singleton: off' + svcWriteLk(s) + '</button>'))
+              + (s.onboarded ? '' : '<button ' + dupAttr(s) + hostAttr + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ', this.dataset.host)">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>')
+              + (s.onboarded ? '' : '<button ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>');
     } else {
       // When update_available is true, surface a one-click Update before
       // the other actions — it's the most common click in this state.
@@ -1886,7 +1966,23 @@ async function renderServices() {
              +      '<button class="btn icon' + (s.name === pinnedName ? ' pinned' : '') + '" onclick="togglePin(event, \'' + sn + '\')" title="Pin to top">' + I.pin + '</button>'
              +      '<span class="collapse-chev">' + I.chevron + '</span></span>'
              +  '</div>'
-             +  '<div class="svc-body">';
+             +  '<div class="svc-body">'
+             // Unified controls for the whole unit — rendered ONCE per merged
+             // card, ahead of the per-host .svc-instance blocks below. See
+             // the "Unified multi-host controls" block above renderServices
+             // for unitReplicaCtrl/unitWeightCtrl/unitActionButtons.
+             +  '<div class="unit-ctrl-block" style="margin:0 0 14px;padding:12px 12px 2px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-md)">'
+             +    '<div class="th-row">Unified across ' + mCount + ' hosts</div>'
+             +    '<table class="facts"><tr><td>Replicas</td><td>' + unitReplicaCtrl(agg, s.name) + '</td></tr>'
+             +    (agg.weightEligible ? '<tr><td>Weight</td><td>' + unitWeightCtrl(agg, s.name) + '</td></tr>' : '')
+             +    '</table>'
+             +    (agg.recreateEligible ? '<div class="actionzone" style="border-top:0;padding-top:0;margin-top:0">' + unitActionButtons(agg, s.name) + '</div>' : '')
+             // Live per-host rollout progress (see startUnitJobPolling /
+             // paintUnitJobStatus) — empty until a unified recreate action
+             // starts one, and re-painted here after every re-render so an
+             // in-flight or failed job never silently disappears.
+             +    '<div data-rollout-key="' + esc(mKey) + '"></div>'
+             +  '</div>';
       } else {
         const replicaSummary = '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
           + '<span class="ident dim">' + esc(s.host) + '</span>'
@@ -1904,11 +2000,14 @@ async function renderServices() {
       }
     }
 
-    // A merged card's individual instances keep their own sub-section —
-    // Replicas/Weight/actions stay genuinely per-host (Spread's write-mesh
-    // forwards each action to that specific replica's owning machine),
-    // so there's no single number/button that could cover every host at
-    // once. Only the card head above and the stats panel below are shared.
+    // A merged card's individual instances keep their own sub-section for
+    // the actions that stay genuinely per-host (Spread's write-mesh forwards
+    // each action to that specific replica's owning machine) — Start/Stop,
+    // per-replica Restart, Auto-update, Singleton, Check now, Duplicate,
+    // Spread, Delete, Promote/Discard canary, Rollback. Replicas, Weight,
+    // Add env, Replace, Stage, and Pull update are rendered ONCE at the unit
+    // level instead (see unitActionButtons/unitReplicaCtrl/unitWeightCtrl
+    // above the instances loop) and fan out to every host in the unit.
     if (merged) {
       const label = s.machine ? machineLabel(s.machine) : (_selfIdentity ? machineLabel(_selfIdentity) : 'this host');
       html += '<div class="svc-instance' + (isFirstOfUnit ? '' : ' sep') + '">'
@@ -1941,6 +2040,10 @@ async function renderServices() {
   el.innerHTML = html;
   // Fetch per-service stats only for cards that are actually expanded.
   fillServiceStatsPanels().catch(() => {});
+  // el.innerHTML above just discarded every data-rollout-key div along with
+  // the rest of the old DOM — repaint any in-flight (or still-unacknowledged
+  // failed) unit rollout so it doesn't silently vanish on this tick's re-render.
+  for (const ukey in _rollingJobs) paintUnitJobStatus(ukey);
 }
 
 // Cache last per-host stats so re-render uses prior data instantly — kills
@@ -2388,6 +2491,18 @@ function discoveryShowLabels(name, port) {
   d.showModal();
 }
 
+// replicaReadout — read-only replacement for replicaCtrl on a merged card's
+// per-host instance row: Replicas is unified at the unit level there (see
+// unitReplicaCtrl), so each instance just reports its own current count
+// instead of offering a second, independently-editable stepper.
+function replicaReadout(s) {
+  if (s.unscalable) return '<span class="singleton-lock">' + I.lock + 'Singleton <span class="pill muted" style="margin-left:4px">fixed at 1</span></span>';
+  const stopped = (s.member_summaries || []).filter(m => !m.is_canary && m.state !== 'running').length;
+  const running = s.replicas - stopped;
+  const stoppedNote = stopped ? ' <span class="meta">(' + stopped + ' stopped)</span>' : '';
+  return '<span class="ident">' + running + '</span>' + stoppedNote;
+}
+
 // weightCtrl — view/edit proxy.weight, this service's per-replica share of
 // its route's traffic (and, via the peer mesh's summed advertisement, its
 // share of a cross-host spread).
@@ -2432,6 +2547,155 @@ function replicaCtrl(s) {
        + '<button ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', ' + (s.replicas + 1) + ', this.dataset.host, this)">+</button>'
        + '<button class="apply" ' + dis + hostAttr + ' onclick="scaleSvc(\'' + sn + '\', (+document.getElementById(\'rep-' + sn + '\').value) + ' + stopped + ', this.dataset.host, this)">Apply</button>'
        + '</span>';
+}
+
+/* ---------- Unified multi-host controls for a merged svc-card ---------- */
+// A merged card spans several .svc-instance blocks (one per host — see
+// mergeKeyOf/unitAgg above), but exactly six controls act on the WHOLE unit
+// with one click instead of one-per-host: Replicas Apply, Weight Apply, Add
+// env, Replace, Stage new version, and Pull update + restart. Everything
+// below builds and wires those six; unrelated per-host controls (Start/Stop,
+// per-replica Restart, Auto-update, Singleton, Check now, Duplicate, Spread,
+// Delete, Promote/Discard canary, Rollback) are untouched, still rendered
+// once per .svc-instance exactly as before.
+
+// unitHostList turns an aggregated unit's raw instances into the small,
+// JSON-serializable shape every unified control's data-unit-hosts attribute
+// carries: just enough (machine identity for ?host=, a display label,
+// whether this host is currently write-accepting, whether it's onboarded —
+// rolling-replace refuses onboarded services — and this host's own current
+// image, for actions that keep "the same version" per host) to build a
+// per-host request client-side, without re-deriving any of it from the DOM.
+// host1 (the instance a conflict-detecting fan-out validates against first —
+// see submitUnitReplace) is always ordered first.
+function unitHostList(agg) {
+  const rest = agg.instances.filter(i => i !== agg.host1);
+  return [agg.host1, ...rest].map(i => ({
+    machine: i.machine, label: i.label, writable: i.writable,
+    onboarded: i.onboarded, image: i.s.image || '',
+  }));
+}
+// unitWriteAttr/unitWriteLk are the unit-level counterpart of
+// svcWriteAttr/svcWriteLk: a unified control is disabled, naming the
+// offending host, unless EVERY host in the unit currently accepts writes —
+// "the operator can't currently write to every host in the unit" per the
+// unify spec's gating rule. peerWritable's per-host fail-safe (missing/
+// unreachable peer treated as not-writable) already flows into
+// agg.allWritable via unitAgg's instances pass.
+function unitWriteAttr(agg) {
+  if (!agg.allWritable) return 'disabled title="managed on ' + esc(agg.blockingHost || 'a peer') + ' — not currently write-accepting"';
+  return isElevated() ? '' : lockedAttr();
+}
+function unitWriteLk(agg) {
+  if (!agg.allWritable) return '<span class="lock" title="managed on ' + esc(agg.blockingHost || 'a peer') + '">' + I.lock + '</span>';
+  return lk();
+}
+
+// unitReplicaCtrl — one Replicas control for the whole unit. Applying (or
+// stepping ±1) sends the SAME target replica count to every host's own
+// /scale endpoint — never an auto-split across hosts, per the unify spec.
+function unitReplicaCtrl(agg, svcName) {
+  if (agg.unscalableAny) return '<span class="singleton-lock">' + I.lock + 'Singleton <span class="pill muted" style="margin-left:4px">fixed at 1</span></span>';
+  const dis = unitWriteAttr(agg);
+  const cur = agg.host1.s.replicas || 0;
+  const editable = isElevated() && agg.allWritable;
+  const hostsAttr = ' data-unit-hosts="' + esc(JSON.stringify(unitHostList(agg))) + '" data-svc-name="' + esc(svcName) + '"';
+  return '<span class="replica-ctrl"' + hostsAttr + ' title="Applies the same replica count to all ' + agg.instances.length + ' hosts in this unit">'
+       + '<button ' + dis + ' onclick="stepUnitReplicas(this,-1)">−</button>'
+       + '<input type="number" min="0" value="' + cur + '"' + (editable ? '' : ' disabled') + '>'
+       + '<button ' + dis + ' onclick="stepUnitReplicas(this,1)">+</button>'
+       + '<button class="apply" ' + dis + ' onclick="applyUnitReplicas(this)">Apply</button>'
+       + '</span>';
+}
+// unitWeightCtrl — one Weight control for the whole unit, applying the same
+// proxy.weight to every host. Apply-only, same rationale as weightCtrl.
+function unitWeightCtrl(agg, svcName) {
+  const dis = unitWriteAttr(agg);
+  const cur = agg.host1.s.weight || 1;
+  const editable = isElevated() && agg.allWritable;
+  const hostsAttr = ' data-unit-hosts="' + esc(JSON.stringify(unitHostList(agg))) + '" data-svc-name="' + esc(svcName) + '"';
+  return '<span class="replica-ctrl"' + hostsAttr + ' title="Applies the same weight to all ' + agg.instances.length + ' hosts in this unit. Applying recreates each host\'s replicas.">'
+       + '<input type="number" min="1" max="' + MAX_SVC_WEIGHT + '" value="' + cur + '"' + (editable ? '' : ' disabled') + '>'
+       + '<button class="apply" ' + dis + ' onclick="applyUnitWeight(this)">Apply</button>'
+       + '</span>';
+}
+async function stepUnitReplicas(btn, delta) {
+  const wrap = btn.closest('.replica-ctrl');
+  const input = wrap.querySelector('input');
+  const n = Math.max(0, (+input.value || 0) + delta);
+  input.value = n;
+  await applyUnitTarget(wrap, '/scale', 'replicas', n, 'scaled');
+}
+async function applyUnitReplicas(btn) {
+  const wrap = btn.closest('.replica-ctrl');
+  const input = wrap.querySelector('input');
+  await applyUnitTarget(wrap, '/scale', 'replicas', +input.value, 'scaled');
+}
+async function applyUnitWeight(btn) {
+  const wrap = btn.closest('.replica-ctrl');
+  const input = wrap.querySelector('input');
+  const w = +input.value;
+  if (!(w >= 1 && w <= MAX_SVC_WEIGHT)) { toast('weight must be between 1 and ' + MAX_SVC_WEIGHT, 'err'); return; }
+  await applyUnitTarget(wrap, '/weight', 'weight', w, 'weight for');
+}
+// applyUnitTarget fires one POST per host in wrap's data-unit-hosts, all
+// carrying the SAME body[key]=n — used by both Replicas and Weight Apply.
+// A partial failure across hosts is always surfaced by name, never silently
+// swallowed: the spec is explicit that this must show which host failed and
+// which succeeded, unlike a single-host scaleSvc/setWeight's plain toast.
+async function applyUnitTarget(wrap, endpoint, key, n, verb) {
+  const hosts = JSON.parse(wrap.dataset.unitHosts);
+  const svcName = wrap.dataset.svcName;
+  const applyBtn = wrap.querySelector('.apply');
+  const applyLabel = applyBtn ? applyBtn.textContent : '';
+  wrap.querySelectorAll('button').forEach(b => b.disabled = true);
+  if (applyBtn) applyBtn.textContent = '…';
+  const ok = [], failed = [];
+  for (const h of hosts) {
+    const hostParam = h.machine ? '?host=' + encodeURIComponent(h.machine) : '';
+    try {
+      await api('/api/services/' + encodeURIComponent(svcName) + endpoint + hostParam, {
+        method: 'POST', body: JSON.stringify({ [key]: n }),
+      });
+      ok.push(h.label);
+    } catch (e) {
+      failed.push(h.label + ': ' + e.message);
+    }
+  }
+  if (failed.length) {
+    toast(verb + ' ' + n + ' failed on ' + failed.join('; ') + (ok.length ? ' (ok on ' + ok.join(', ') + ')' : ''), 'err');
+    wrap.querySelectorAll('button').forEach(b => b.disabled = false);
+    if (applyBtn) applyBtn.textContent = applyLabel;
+  } else {
+    toast(verb + ' ' + n + ' for ' + svcName + ' on ' + ok.join(', '));
+    _lastServicesHash = '';
+    renderActive();
+  }
+}
+
+// unitActionButtons — the four recreate-triggering unified buttons (Pull
+// update, Stage, Replace, Add env). Pull update/Replace/Add env route
+// through the new async rolling-replace endpoint per host (surge-of-one,
+// health-gated); Stage has no rolling equivalent on the backend (it starts
+// a canary, not a replace) so it always fans out over the existing
+// synchronous /stage — see submitUnitReplace/fanOutHosts/pullUpdateUnit for
+// the actual dispatch logic this only wires buttons to.
+function unitActionButtons(agg, svcName) {
+  const dis = unitWriteAttr(agg);
+  const lkHtml = unitWriteLk(agg);
+  const hostsAttr = ' data-unit-hosts="' + esc(JSON.stringify(unitHostList(agg))) + '" data-svc-name="' + esc(svcName) + '" data-current-image="' + esc(agg.host1.s.image || '') + '"';
+  let html = '';
+  if (agg.anyUpdateAvailable) {
+    html += '<button class="btn primary" ' + dis + hostsAttr + ' onclick="pullUpdateUnit(this)">' + I.arrowup + 'Pull update + restart' + lkHtml + '</button>';
+  }
+  html += (agg.anyUpdateAvailable
+      ? '<button class="btn" ' + dis + hostsAttr + ' onclick="openStageUnit(this)">' + I.rocket + 'Stage new version' + lkHtml + '</button>'
+      : '<button class="btn primary" ' + dis + hostsAttr + ' onclick="openStageUnit(this)">' + I.rocket + 'Stage new version' + lkHtml + '</button>')
+    + '<button class="btn" ' + dis + hostsAttr + ' onclick="openReplaceUnit(this)">' + I.swap + 'Replace' + lkHtml + '</button>'
+    + (agg.anyStopped
+        ? '<button disabled title="Start every host in this unit first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
+        : '<button ' + dis + hostsAttr + ' onclick="openAddEnvUnit(this)">' + I.plus + 'Add env…' + lkHtml + '</button>');
+  return html;
 }
 
 function toggleMenu(e, id) {
@@ -2679,6 +2943,8 @@ function openAddEnv(name, currentImage, host) {
   clearEnvChoices();
   f.dataset.mode = 'env';
   f.dataset.host = host || '';
+  f.dataset.unitHosts = '';
+  f.dataset.unitKey = '';
   setReplaceDialogMode('env', name);
   $('#dlg-replace-service').showModal();
 }
@@ -2691,6 +2957,8 @@ function openReplace(name, currentImage, host) {
   clearEnvChoices();
   f.dataset.mode = 'replace';
   f.dataset.host = host || '';
+  f.dataset.unitHosts = '';
+  f.dataset.unitKey = '';
   setReplaceDialogMode('replace', name);
   $('#dlg-replace-service').showModal();
 }
@@ -2703,8 +2971,321 @@ function openStage(name, currentImage, host) {
   clearEnvChoices();
   f.dataset.mode = 'stage';
   f.dataset.host = host || '';
+  f.dataset.unitHosts = '';
+  f.dataset.unitKey = '';
   setReplaceDialogMode('stage', name);
   $('#dlg-replace-service').showModal();
+}
+
+// ---- Unit (merged multi-host) variants of the three dialogs above ----
+// Opened from unitActionButtons; the button itself carries data-unit-hosts
+// (JSON, see unitHostList), data-svc-name, and data-current-image. These
+// stash the SAME data onto the shared #form-replace-service's dataset
+// (f.dataset.host is left empty — the unit path never uses it) so the one
+// onsubmit handler below can tell a unit submission apart from a per-host
+// one and dispatch to submitUnitReplace instead.
+function openAddEnvUnit(btn) {
+  const f = $('#form-replace-service');
+  const name = btn.dataset.svcName;
+  f.serviceName.value = name;
+  f.currentImage.value = btn.dataset.currentImage || '';
+  f.image.value = btn.dataset.currentImage || ''; // informational only in unit/env mode — see submitUnitReplace
+  f.env.value = '';
+  clearEnvChoices();
+  f.dataset.mode = 'env';
+  f.dataset.host = '';
+  f.dataset.unitHosts = btn.dataset.unitHosts;
+  f.dataset.unitKey = mergeKeyFromForm(name, btn);
+  setReplaceDialogMode('env', name);
+  $('#dlg-replace-service').showModal();
+}
+function openReplaceUnit(btn) {
+  const f = $('#form-replace-service');
+  const name = btn.dataset.svcName;
+  f.serviceName.value = name;
+  f.currentImage.value = btn.dataset.currentImage || '';
+  f.image.value = '';
+  f.env.value = '';
+  clearEnvChoices();
+  f.dataset.mode = 'replace';
+  f.dataset.host = '';
+  f.dataset.unitHosts = btn.dataset.unitHosts;
+  f.dataset.unitKey = mergeKeyFromForm(name, btn);
+  setReplaceDialogMode('replace', name);
+  $('#dlg-replace-service').showModal();
+}
+function openStageUnit(btn) {
+  const f = $('#form-replace-service');
+  const name = btn.dataset.svcName;
+  f.serviceName.value = name;
+  f.currentImage.value = btn.dataset.currentImage || '';
+  f.image.value = '';
+  f.env.value = '';
+  clearEnvChoices();
+  f.dataset.mode = 'stage';
+  f.dataset.host = '';
+  f.dataset.unitHosts = btn.dataset.unitHosts;
+  f.dataset.unitKey = mergeKeyFromForm(name, btn);
+  setReplaceDialogMode('stage', name);
+  $('#dlg-replace-service').showModal();
+}
+// mergeKeyFromForm recovers the same data-rollout-key the card rendered
+// (renderServices' esc(mKey), read back off the button's own unit-ctrl-block
+// ancestor) so the fan-out's progress line paints into the right card
+// instead of a fresh, unrelated key.
+function mergeKeyFromForm(name, btn) {
+  const block = btn.closest('.unit-ctrl-block');
+  const status = block && block.querySelector('[data-rollout-key]');
+  return (status && status.dataset.rolloutKey) || name;
+}
+// pullUpdateUnit — the unit-level "Pull update + restart": re-runs each
+// host's OWN currently-configured image (never a shared "new" version) via
+// rolling-replace, so every host independently pulls whatever newer digest
+// the registry has for its own tag. No env involved, so — unlike
+// submitUnitReplace's Add-env/Replace paths — there is never a synchronous
+// host1 leg here; every host goes straight to fanOutHosts.
+async function pullUpdateUnit(btn) {
+  const hosts = JSON.parse(btn.dataset.unitHosts);
+  const svcName = btn.dataset.svcName;
+  const ukey = mergeKeyFromForm(svcName, btn);
+  if (!(await confirmDialog('Pull the newer image and replace ' + svcName + ' on all ' + hosts.length + ' hosts? Briefly runs old + new side-by-side per host.', {title: 'Pull update'}))) return;
+  toast('updating ' + svcName + ' across ' + hosts.length + ' host' + (hosts.length === 1 ? '' : 's') + '…');
+  const jobHosts = await fanOutHosts(svcName, hosts, 'replace', (h) => ({ image: h.image, env: null }));
+  startUnitJobPolling(ukey, svcName, jobHosts, hosts);
+  _lastServicesHash = '';
+  renderActive();
+}
+
+// fanOutHosts issues one recreate request per host, in order (not
+// concurrently, so a slow/stuck host can never race a later one for the
+// same audit-log/toast ordering — but each request itself is async and NOT
+// awaited to completion beyond its initial response, so this returns as
+// soon as every host's job has been STARTED, not finished).
+//   mode === 'stage'      -> always the existing synchronous /stage (no
+//                            rolling equivalent exists on the backend —
+//                            staging starts a canary, not a replace).
+//   h.onboarded           -> always the existing synchronous /replace
+//                            (rolling-replace 400s on an onboarded service —
+//                            see api.go's onb.Get(name) check).
+//   otherwise             -> the new async /rolling-replace.
+// A per-host failure (including a 409 from an already-active rollout/rolling
+// job on that host) is recorded in the returned map and toasted immediately
+// by host name — never silently dropped — but does not stop the loop from
+// continuing to the remaining hosts, matching "show which host failed and
+// which succeeded" for the non-recreate Replicas/Weight case, and "surface a
+// clear, visible error naming that host" for this recreate case.
+async function fanOutHosts(svcName, hostsList, mode, buildBody) {
+  const jobHosts = {};
+  for (const h of hostsList) {
+    const useSync = mode === 'stage' || h.onboarded;
+    const url = useSync ? (mode === 'stage' ? '/stage' : '/replace') : '/rolling-replace';
+    const hostParam = h.machine ? '?host=' + encodeURIComponent(h.machine) : '';
+    try {
+      await api('/api/services/' + encodeURIComponent(svcName) + url + hostParam, {
+        method: 'POST', body: JSON.stringify(buildBody(h)),
+      });
+      jobHosts[h.machine] = useSync
+        ? { label: h.label, status: 'completed' }
+        : { label: h.label, status: 'running', done: 0, total: 0 };
+    } catch (e) {
+      jobHosts[h.machine] = { label: h.label, status: 'failed', error: e.message };
+      toast(h.label + ': ' + e.message, 'err');
+    }
+  }
+  return jobHosts;
+}
+
+// submitUnitReplace is the unit-mode counterpart of the single-host
+// #form-replace-service submit path below — same env-edit parsing/dup/
+// conflict-picker semantics, but resolved once and then fanned out.
+//
+// Fan-out order, per the unify spec:
+//  1. host1 (unitHostList's first entry — local if the unit includes this
+//     machine, else the first foreign host) validates env conflicts, but
+//     ONLY when that validation can actually happen synchronously: rolling-
+//     replace's env merge runs in ITS OWN background goroutine (see
+//     rollingop.go's rollingOpManager.start), so it can never return the
+//     structured 409 the conflict picker needs — only the OLD synchronous
+//     /replace (or /stage, or /replace for an onboarded host1) validates
+//     before responding. So host1 uses that synchronous endpoint whenever
+//     there are any env edits to merge (or the mode/onboarded state already
+//     forces a synchronous call for every host — see fanOutHosts); an image-
+//     only Replace or a Pull-update has nothing to conflict on and goes
+//     straight to rolling-replace like every other host.
+//  2. On host1's 409 with a conflicts list, the SAME picker UI as the
+//     single-host path renders in place, the dialog stays open, and no
+//     other host is touched yet.
+//  3. Once host1 is accepted, the dialog closes and a toast announces the
+//     rollout; the SAME resolved payload (including any env_ack the picker
+//     produced) is then fanned out to every other host via fanOutHosts.
+//     Because rolling-replace can't validate synchronously, a later host
+//     whose OWN current env independently conflicts is never auto-acked —
+//     it simply lands as that host's "failed" status once polled (see
+//     replaceServiceRolling's mergeEnv call surfacing as rollingOpState's
+//     last_error), which paintUnitJobStatus keeps visible rather than
+//     silently clearing.
+async function submitUnitReplace(f, mode, envOnly, env, ackFromPicker) {
+  const hosts = JSON.parse(f.dataset.unitHosts);
+  const ukey = f.dataset.unitKey;
+  const svcName = f.serviceName.value;
+  const newImage = envOnly ? '' : normalizeImageRef(f.image.value);
+  // envOnly keeps EACH host on its OWN current image (never forces host1's
+  // image onto a peer whose current tag might legitimately differ);
+  // replace/stage apply the one image the operator typed to every host.
+  const buildBody = (h) => ({
+    image: envOnly ? h.image : newImage,
+    env: Object.keys(env).length ? env : null,
+    env_ack: ackFromPicker && ackFromPicker.length ? ackFromPicker : undefined,
+  });
+  const submitBtn = f.querySelector('button[type="submit"]');
+  const original = submitBtn ? submitBtn.innerHTML : '';
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Working…'; }
+  const host1 = hosts[0];
+  const needsSyncHost1 = mode !== 'stage' && !host1.onboarded && Object.keys(env).length > 0;
+  try {
+    if (mode === 'stage' || host1.onboarded || needsSyncHost1) {
+      const url = mode === 'stage' ? '/stage' : '/replace';
+      const hostParam = host1.machine ? '?host=' + encodeURIComponent(host1.machine) : '';
+      try {
+        await api('/api/services/' + encodeURIComponent(svcName) + url + hostParam, {
+          method: 'POST', body: JSON.stringify(buildBody(host1)),
+        });
+      } catch (e) {
+        // Same discrimination as the single-host handler below: only a
+        // structured conflicts list re-opens the picker. A plain 409 (e.g.
+        // host1 already has an active rollout/rolling job) falls through to
+        // the generic toast and the fan-out never starts.
+        if (e.status === 409 && e.data && e.data.conflicts) {
+          renderEnvChoices(e.data.conflicts.map(c => ({
+            key: c.key,
+            note: 'already set on the running service (' + host1.label + ')',
+            ack: true,
+            options: [
+              { label: c.current === '' ? '(empty)' : c.current, value: null, hint: 'keep current' },
+              { label: c.incoming === '' ? '(empty)' : c.incoming, value: c.incoming, hint: 'use your edit' },
+            ],
+          })));
+          toast(e.data.conflicts.length + ' env conflict' + (e.data.conflicts.length === 1 ? '' : 's') + ' on ' + host1.label + ' — choose which to keep', 'err');
+          return;
+        }
+        throw e;
+      }
+    }
+    clearEnvChoices();
+    $('#dlg-replace-service').close();
+    toast((mode === 'stage' ? 'Staging' : 'Rolling update') + ' started on ' + hosts.length + ' host' + (hosts.length === 1 ? '' : 's') + ' for ' + svcName + '…', 'ok');
+
+    const jobHosts = {};
+    let remaining = hosts;
+    if (mode === 'stage' || host1.onboarded || needsSyncHost1) {
+      // host1 already ran synchronously above and either completed or threw
+      // (caught by the outer catch, which stops before this point).
+      jobHosts[host1.machine] = { label: host1.label, status: 'completed' };
+      remaining = hosts.slice(1);
+    }
+    Object.assign(jobHosts, await fanOutHosts(svcName, remaining, mode, buildBody));
+    startUnitJobPolling(ukey, svcName, jobHosts, hosts);
+    _lastServicesHash = '';
+    renderActive();
+    f.dataset.unitHosts = '';
+    f.dataset.unitKey = '';
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; }
+  }
+}
+
+// ---- Unit rollout polling ----
+// _rollingJobs tracks every merge unit's in-flight (or most-recently-failed)
+// fan-out by merge key (never by service name alone — mergeKeyOf's
+// group::name::host means two units can share a name). One shared
+// setInterval serves every job rather than one timer per card: a card is
+// rebuilt wholesale on every renderServices() hash change (image/replicas/
+// member_summaries all move mid-rollout), so a per-card timer would have no
+// stable DOM node to live on. The tick instead re-locates each job's status
+// line fresh via document.querySelector every time.
+let _rollingJobs = {};
+let _rollingPollTimer = null;
+
+function startUnitJobPolling(ukey, svcName, jobHosts, hostsList) {
+  _rollingJobs[ukey] = { svcName, hosts: jobHosts, hostsList };
+  paintUnitJobStatus(ukey);
+  if (!_rollingPollTimer) _rollingPollTimer = setInterval(pollRollingJobsTick, 2500);
+}
+
+async function pollRollingJobsTick() {
+  const keys = Object.keys(_rollingJobs);
+  if (!keys.length) { clearInterval(_rollingPollTimer); _rollingPollTimer = null; return; }
+  let anyRunning = false;
+  for (const ukey of keys) {
+    const job = _rollingJobs[ukey];
+    let jobHadRunning = false;
+    for (const h of job.hostsList) {
+      const st = job.hosts[h.machine];
+      if (!st || st.status !== 'running') continue;
+      jobHadRunning = true;
+      const hostParam = h.machine ? '?host=' + encodeURIComponent(h.machine) : '';
+      try {
+        const r = await api('/api/services/' + encodeURIComponent(job.svcName) + '/rolling-replace' + hostParam);
+        st.done = r.done; st.total = r.total;
+        if (r.status === 'completed') st.status = 'completed';
+        else if (r.status === 'failed') { st.status = 'failed'; st.error = r.last_error || 'rolling replace failed'; }
+      } catch (e) {
+        // A transient 401/403 (session/2FA lapse mid-poll) isn't the job
+        // failing — leave the host "running" and pick it back up next tick
+        // rather than mislabeling a healthy rollout as failed. api() throws
+        // a plain Error (no .status) for these two cases, so message text
+        // is the only signal available here.
+        if (e.message === 'Session expired — sign in again.' || e.message === '2FA required') { continue; }
+        // A 404 here ("no active rolling replace") shouldn't happen right
+        // after a 202, but treat it (and any other poll error) as terminal
+        // rather than polling a dead job forever.
+        st.status = 'failed';
+        st.error = e.message;
+      }
+    }
+    paintUnitJobStatus(ukey);
+    const stillRunning = job.hostsList.some(h => (job.hosts[h.machine] || {}).status === 'running');
+    if (stillRunning) { anyRunning = true; continue; }
+    if (jobHadRunning) {
+      // Just went fully terminal this tick — force the next services render
+      // to pick up the new image/replicas/env instead of leaving the stale
+      // pre-rollout card in place.
+      _lastServicesHash = '';
+      renderActive();
+    }
+    // A clean (no-failure) job has nothing left worth keeping around —
+    // drop it so paintUnitJobStatus stops rendering a "completed" line
+    // forever. A job with any failure stays until the next start on the
+    // same unit overwrites it (startUnitJobPolling always replaces the
+    // whole entry), so the spec's "don't auto-clear a failure on a timer"
+    // holds even after this tick moves on.
+    if (!job.hostsList.some(h => (job.hosts[h.machine] || {}).status === 'failed')) {
+      delete _rollingJobs[ukey];
+    }
+  }
+  if (!anyRunning) { clearInterval(_rollingPollTimer); _rollingPollTimer = null; }
+}
+
+// paintUnitJobStatus re-locates the card's status line by data-rollout-key
+// (never a cached node reference — renderServices replaces the whole
+// subtree on any hash change) and is a no-op if the card isn't currently
+// rendered (tab switched away, or the unit's cards haven't repainted yet).
+function paintUnitJobStatus(ukey) {
+  const job = _rollingJobs[ukey];
+  const el = document.querySelector('[data-rollout-key="' + CSS.escape(ukey) + '"]');
+  if (!el) return;
+  if (!job) { el.innerHTML = ''; return; }
+  const anyFailed = job.hostsList.some(h => (job.hosts[h.machine] || {}).status === 'failed');
+  const parts = job.hostsList.map(h => {
+    const st = job.hosts[h.machine] || {};
+    if (st.status === 'completed') return h.label + ': completed';
+    if (st.status === 'failed') return h.label + ': failed — ' + (st.error || 'unknown error');
+    if (st.status === 'running') return h.label + ': ' + (st.total ? st.done + '/' + st.total : 'starting…');
+    return h.label + ': —';
+  });
+  el.innerHTML = '<div class="meta" style="margin-top:8px' + (anyFailed ? ';color:var(--red)' : '') + '">' + esc(parts.join(' · ')) + '</div>';
 }
 
 // openDuplicate populates the target-host select from the already-fetched
@@ -4278,6 +4859,19 @@ function wireDialogForms() {
     const mode = f.dataset.mode === 'stage' ? 'stage' : 'replace';
     if (envOnly && !Object.keys(env).length) {
       toast('add at least one KEY=VALUE line', 'err');
+      return;
+    }
+    // A merged unit's dialog (openAddEnvUnit/openReplaceUnit/openStageUnit)
+    // stashes its host list onto f.dataset.unitHosts instead of the single
+    // f.dataset.host — same env parsing/conflict-picker logic above applies
+    // either way, but everything after this point (which endpoint, which
+    // host(s), rolling-replace vs. the old synchronous call) is different
+    // enough to live in its own function. A non-merged service never sets
+    // unitHosts, so this branch — and every behavior change it brings — is
+    // unreachable for the single-host case; single-host services keep
+    // exactly today's synchronous /replace or /stage call, below.
+    if (f.dataset.unitHosts) {
+      await submitUnitReplace(f, mode, envOnly, env, choices.ack);
       return;
     }
     // Long-running on the server (pull + create + start + 3s settle), so show

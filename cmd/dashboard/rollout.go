@@ -594,38 +594,59 @@ func (c *dockerClient) checkCanaryHealth(ctx context.Context, name string) (bool
 		return false, fmt.Sprintf("%q has no canary containers", name), nil
 	}
 	for _, ct := range canary {
-		if parseHealth(ct.Status) == "unhealthy" {
-			return false, fmt.Sprintf("%s: docker healthcheck reports unhealthy", ct.name()), nil
-		}
-		restarts, err := c.inspectRestartCount(ctx, ct.ID)
+		healthy, reason, err := c.checkContainerHealthy(ctx, ct)
 		if err != nil {
-			return false, "", fmt.Errorf("inspect %s: %w", ct.name(), err)
+			return false, "", err
 		}
-		if restarts > canaryMaxRestarts {
-			return false, fmt.Sprintf("%s: restarted %d times since creation", ct.name(), restarts), nil
+		if !healthy {
+			return false, reason, nil
 		}
+	}
+	return true, "", nil
+}
 
-		healthPath := ct.Labels[labelHealth]
-		if healthPath == "" {
-			continue
-		}
-		port := ct.Labels[labelPort]
-		ip := containerIP(ct)
-		if ip == "" || port == "" {
-			return false, fmt.Sprintf("%s: no reachable address for HTTP health probe", ct.name()), nil
-		}
-		url := fmt.Sprintf("http://%s:%s%s", ip, port, healthPath)
-		hctx, cancel := context.WithTimeout(ctx, canaryHealthProbeTimeout)
-		req, _ := http.NewRequestWithContext(hctx, http.MethodGet, url, nil)
-		resp, err := http.DefaultClient.Do(req)
-		cancel()
-		if err != nil {
-			return false, fmt.Sprintf("%s: health probe %s failed: %v", ct.name(), url, err), nil
-		}
-		resp.Body.Close()
-		if resp.StatusCode/100 != 2 {
-			return false, fmt.Sprintf("%s: health probe %s returned %d", ct.name(), url, resp.StatusCode), nil
-		}
+// checkContainerHealthy is checkCanaryHealth's per-container check, factored
+// out so replaceServiceRolling's surge-of-one swap (docker.go) can gate each
+// new replica on the same signals a canary rollout does: no docker-reported
+// "(unhealthy)" status, no more than canaryMaxRestarts restarts since
+// creation, and (only if the container carries a proxy.health label) a 2xx
+// from an HTTP probe against that CONTAINER's own edge-network address —
+// deliberately not the service's public proxy.host, since a request to that
+// hostname goes through the proxy itself, which round-robins across live
+// (and canary) containers and so could randomly hit a healthy sibling and
+// mask a broken one.
+func (c *dockerClient) checkContainerHealthy(ctx context.Context, ct dockerContainer) (bool, string, error) {
+	if parseHealth(ct.Status) == "unhealthy" {
+		return false, fmt.Sprintf("%s: docker healthcheck reports unhealthy", ct.name()), nil
+	}
+	restarts, err := c.inspectRestartCount(ctx, ct.ID)
+	if err != nil {
+		return false, "", fmt.Errorf("inspect %s: %w", ct.name(), err)
+	}
+	if restarts > canaryMaxRestarts {
+		return false, fmt.Sprintf("%s: restarted %d times since creation", ct.name(), restarts), nil
+	}
+
+	healthPath := ct.Labels[labelHealth]
+	if healthPath == "" {
+		return true, "", nil
+	}
+	port := ct.Labels[labelPort]
+	ip := containerIP(ct)
+	if ip == "" || port == "" {
+		return false, fmt.Sprintf("%s: no reachable address for HTTP health probe", ct.name()), nil
+	}
+	url := fmt.Sprintf("http://%s:%s%s", ip, port, healthPath)
+	hctx, cancel := context.WithTimeout(ctx, canaryHealthProbeTimeout)
+	req, _ := http.NewRequestWithContext(hctx, http.MethodGet, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	cancel()
+	if err != nil {
+		return false, fmt.Sprintf("%s: health probe %s failed: %v", ct.name(), url, err), nil
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return false, fmt.Sprintf("%s: health probe %s returned %d", ct.name(), url, resp.StatusCode), nil
 	}
 	return true, "", nil
 }
