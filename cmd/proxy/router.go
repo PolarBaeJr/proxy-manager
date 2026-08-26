@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -476,6 +477,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Metrics are the raw truth — count every 503 honestly. The dashboard
 	// UI is the layer that lets the operator choose to hide stopped-service
 	// hosts from the Top hosts / error-rate view via a toggle.
+	log.Printf("proxy: group %q (host %s) has no healthy backends — serving 503", group.Service, reqHost)
 	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
 }
 
@@ -518,7 +520,18 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
 	rec := &errCatchingWriter{ResponseWriter: w}
 	failed := false
-	b.proxy.ErrorHandler = func(_ http.ResponseWriter, _ *http.Request, err error) {
+	b.proxy.ErrorHandler = func(_ http.ResponseWriter, r *http.Request, err error) {
+		// A canceled request context means the CLIENT went away (refresh,
+		// navigation, closed tab) — Go's reverse proxy reports that the same
+		// way it reports a dead backend. Don't let a healthy backend get
+		// marked down just because someone hit stop; that's how a handful of
+		// aborted requests to a group with only one (peer-learned) backend
+		// took the whole group down until the next health tick.
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+			log.Printf("backend %s: client disconnected mid-request, not marking unhealthy", b.URL)
+			failed = true
+			return
+		}
 		log.Printf("backend %s error: %v — marking unhealthy", b.URL, err)
 		b.markHealthy(false)
 		failed = true

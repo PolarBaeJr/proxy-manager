@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
@@ -936,5 +937,54 @@ func TestMissingHealthLabelWarningDedup(t *testing.T) {
 	}
 	if got := strings.Count(buf.String(), name); got != 1 {
 		t.Fatalf("warning logged %d time(s) across two assembleGroups() calls, want exactly 1 (dedup)", got)
+	}
+}
+
+// TestTryProxyClientDisconnectDoesNotMarkUnhealthy guards against a real bug:
+// a client going away mid-request (refresh, navigation, closed tab) makes
+// Go's reverse proxy report the exact same context.Canceled error a dead
+// backend would produce. Marking the backend unhealthy on that signal is
+// wrong — and on a group with only one backend (e.g. a peer-learned route
+// with no local replica) it took the whole group down until the next health
+// tick, for zero actual backend fault.
+func TestTryProxyClientDisconnectDoesNotMarkUnhealthy(t *testing.T) {
+	target, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	b := &Backend{URL: target.String(), proxy: httputil.NewSingleHostReverseProxy(target)}
+	b.markHealthy(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate the client already having gone away before the proxy dials out
+	req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	tryProxy(rec, req, b)
+
+	if !b.healthy() {
+		t.Error("tryProxy marked the backend unhealthy on a client-side context cancellation — it should not")
+	}
+}
+
+// TestTryProxyBackendErrorMarksUnhealthy is the control for the test above:
+// a real backend fault (nothing listening) must still mark the backend
+// unhealthy, so the client-disconnect carve-out doesn't swallow genuine
+// failures too.
+func TestTryProxyBackendErrorMarksUnhealthy(t *testing.T) {
+	target, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	b := &Backend{URL: target.String(), proxy: httputil.NewSingleHostReverseProxy(target)}
+	b.markHealthy(true)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+
+	tryProxy(rec, req, b)
+
+	if b.healthy() {
+		t.Error("tryProxy left the backend healthy after a genuine connection failure — it should be marked unhealthy")
 	}
 }
