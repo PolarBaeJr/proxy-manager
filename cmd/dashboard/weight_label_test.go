@@ -165,3 +165,39 @@ func TestUIWeightCapMatchesServer(t *testing.T) {
 		t.Errorf("dashboard HTML does not contain %q — the UI cap has drifted from maxServiceWeight", want)
 	}
 }
+
+// TestSetWeightLabelRefusesDuringCanary: a label setter only recreates the
+// live set, and promoteCanary later recreates the staged containers from
+// their stage-time labels — so a weight applied now would be reverted then,
+// and in the meantime the proxy sums the two sets' differing weights into one
+// advertised share. Refuse loudly instead of applying half of it.
+func TestSetWeightLabelRefusesDuringCanary(t *testing.T) {
+	var sawCreate atomic.Bool
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{
+				{ID: "live1", Names: []string{"/goproxy-app-1"}, State: "running", Image: "app:v1",
+					Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "8080"}},
+				{ID: "can1", Names: []string{"/goproxy-app-canary-1"}, State: "running", Image: "app:v2",
+					Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "8080", labelCanary: "true"}},
+			})
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			sawCreate.Store(true)
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	err := dc.setWeightLabel(context.Background(), "app", 4)
+	if err == nil {
+		t.Fatal("setWeightLabel succeeded with a canary staged")
+	}
+	if !strings.Contains(err.Error(), "canary") {
+		t.Errorf("error = %v, want it to name the staged canary", err)
+	}
+	if sawCreate.Load() {
+		t.Error("recreated containers despite refusing — the guard ran too late")
+	}
+}

@@ -1394,6 +1394,17 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	if err != nil {
 		return err
 	}
+	// Refuse mid-stage, which setUnscalableLabel does not need to do. Like
+	// every label setter here this one only recreates the LIVE set, leaving
+	// canary replicas on their stage-time label snapshot — and promoteCanary
+	// later recreates those verbatim, so the new weight would be silently
+	// reverted. Unscalable survives that because it is a boolean gate read
+	// per-container; weight is arithmetic, summed across the whole group into
+	// the one figure the peer is told, so a split set advertises a share that
+	// matches neither the old value nor the requested one.
+	if len(canaryOnly(all)) > 0 {
+		return fmt.Errorf("service %q has a staged canary — promote or discard it before retuning the weight", name)
+	}
 	existing := liveOnly(all)
 	if len(existing) == 0 {
 		return fmt.Errorf("service %q not found (no live replicas)", name)
