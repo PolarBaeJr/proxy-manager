@@ -1477,10 +1477,12 @@ function svcLk(s) {
 // svcLockedAttr/svcLk — used by the controls whose backing endpoint forwards
 // to a peer (replica-count +/-/Apply, service Stop/Start, per-replica
 // Stop/Start, Check now, Auto-update toggle, Promote, Discard, Stage,
-// Replace, Add env, Rollback, Delete service), never by svcLockedAttr/svcLk's
-// remaining callers (Add route, Pull update). Add route has no peer
-// endpoint; Pull update reuses /replace's wire call but is deliberately kept
-// local-only for now — both must keep firing against the LOCAL daemon guard.
+// Replace, Pull update, Add env, Rollback, Delete service), never by
+// svcLockedAttr/svcLk's one remaining caller (Add route, which has no peer
+// endpoint). Pull update reuses /replace's wire call (api.go forwards it via
+// hostForReq before any subpath dispatch, same as every other mutation under
+// /api/services/{name}/...), so it forwards for free once wired the same way
+// as its sibling buttons below.
 // Offboard forwards too (api.go's forwardServiceMutation), but has no
 // dedicated UI entry point yet — API/MCP parity only this phase.
 function svcWriteAttr(s) {
@@ -1595,7 +1597,7 @@ async function renderServices() {
       // When update_available is true, surface a one-click Update before
       // the other actions — it's the most common click in this state.
       const updateBtn = (s.update_available
-        ? '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="oneClickUpdate(\'' + sn + '\', \'' + esc(s.image) + '\')">' + I.arrowup + 'Pull update + restart' + svcLk(s) + '</button>'
+        ? '<button class="btn primary" ' + svcWriteAttr(s) + hostAttr + ' onclick="oneClickUpdate(\'' + sn + '\', \'' + esc(s.image) + '\', this.dataset.host)">' + I.arrowup + 'Pull update + restart' + svcWriteLk(s) + '</button>'
         : '');
       actions = updateBtn
               + (s.update_available
@@ -2193,11 +2195,12 @@ async function lifecycleSvc(name, act, host) {
 // this re-runs Replace with the SAME image string. The proxy pulls the
 // new digest, spins up replacement containers, then drops the old ones
 // (rolling deploy on a single host).
-async function oneClickUpdate(name, image) {
+async function oneClickUpdate(name, image, host) {
   if (!(await confirmDialog('Pull the newer ' + image + ' and replace ' + name + '? Briefly runs old + new side-by-side, then drops the old.', {title: 'Pull update'}))) return;
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
   toast('updating ' + name + ' — pulling ' + image + '…');
   try {
-    await api('/api/services/' + encodeURIComponent(name) + '/replace', {
+    await api('/api/services/' + encodeURIComponent(name) + '/replace' + hostParam, {
       method: 'POST', body: JSON.stringify({ image: image })
     });
     toast('updated ' + name, 'ok');
