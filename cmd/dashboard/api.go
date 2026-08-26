@@ -1663,6 +1663,7 @@ func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedS
 			if st.Err != "" {
 				svcs[i].ImageCheckError = st.Err
 			}
+			svcs[i].AutoUpdateSkipReason = autoUpdateSkipReason(svcs[i], st)
 		}
 	}
 	return svcs, nil
@@ -2039,6 +2040,18 @@ func runServiceCheckImage(ctx context.Context, dc *dockerClient, ic *imageChecke
 	svc, ok, err := findService(ctx, dc, name)
 	if err != nil {
 		return nil, 0, err
+	}
+	// findService/listServices is label-discovery only — an onboarded-only
+	// service (no matching label-managed container) is invisible to it, even
+	// though the background image-checker loop (autoupdate.go's runOnce)
+	// covers it fine via its own separate onboarded-store merge. Without this
+	// fallback, "Check now" 404s for exactly the services whose autoupdate
+	// state is hardest to eyeball any other way.
+	if !ok && onb != nil {
+		if o, obOk := onb.Get(name); obOk {
+			svc = Service{Name: o.Name, Image: o.Image, CanaryImage: o.CanaryImage, Onboarded: true}
+			ok = true
+		}
 	}
 	if !ok {
 		return nil, http.StatusNotFound, nil
