@@ -341,9 +341,24 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 	}
 	rateRPM, _ := strconv.Atoi(tpl.Labels[labelRateRPM])
 
+	// proxy.name is a free-text display label everywhere else in this
+	// codebase (set once at creation, shown escaped in the UI, never itself
+	// identifier-shaped — e.g. "Badminton Player (prod)") but the peer's
+	// receiving handler validates Display with validServiceName, the strict
+	// identifier allowlist meant for proxy.service-style values. Sending an
+	// ordinary human-readable name through would make the peer hard-refuse
+	// the ENTIRE spread over a cosmetic label. Drop it instead of the origin
+	// hard-failing here too — the new replica just falls back to showing its
+	// raw service name, same as any service that never set proxy.name.
+	display := tpl.Labels[labelName]
+	if display != "" && !validServiceName(display) {
+		warnings = append(warnings, fmt.Sprintf("proxy.name %q can't be carried over as-is (letters, digits, . _ - only) — the replica on %s will show its raw service name instead", display, req.Target))
+		display = ""
+	}
+
 	peerReq := peerSpreadRequest{
 		Service:   svc.Name,
-		Display:   tpl.Labels[labelName],
+		Display:   display,
 		Image:     tpl.Image,
 		Env:       env,
 		Host:      svc.Host,
