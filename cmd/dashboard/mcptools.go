@@ -537,6 +537,11 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		},
 	})
 
+	// Deliberately stays on the synchronous POST /api/services/{name}/replace
+	// endpoint, not the newer async /rolling-replace one (see rollingop.go) —
+	// an MCP caller expects this call to return only once the replace has
+	// actually happened, the same contract autoupdate.go's direct
+	// replaceService call relies on.
 	s.Register(Tool{
 		Name:  "replace_service",
 		Title: "Replace a service's image directly",

@@ -68,7 +68,7 @@ func newLocalTestMuxWithOnboarded(t *testing.T, localDC *dockerClient, onb *Onbo
 	t.Helper()
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
-	return newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil)
+	return newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil, nil)
 }
 
 // putOnboardedApp is the standard onboarded "app" fixture shared by most
@@ -102,7 +102,7 @@ func TestAutoUpdateMutationsForwardToPeer(t *testing.T) {
 		peerDC := autoUpdateDockerStub(t, calls, twoReplicaContainers("running", false))
 		peerOnb := newTestOnboardedStore(t)
 		putOnboardedApp(t, peerOnb, autoUpdate)
-		srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true))
+		srv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true, nil))
 		t.Cleanup(srv.Close)
 		return srv, calls, peerOnb
 	}
@@ -179,7 +179,7 @@ func TestAutoUpdatePeerSelfGuardRejects(t *testing.T) {
 	if err := peerOnb.Put(OnboardedService{Name: "dashboard", Host: "dashboard.example", Image: "ghcr.io/org/dash:v1", Replicas: 1}); err != nil {
 		t.Fatal(err)
 	}
-	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/peer/services/dashboard/autoupdate", strings.NewReader(`{"enabled":true}`))
 	req.Header.Set("Authorization", "Bearer s3cret")
@@ -209,7 +209,7 @@ func TestAutoUpdatePeerSelfGuardFailsClosedOnDockerError(t *testing.T) {
 	peerDC := dockerStubAlwaysErrors(t)
 	peerOnb := newTestOnboardedStore(t)
 	putOnboardedApp(t, peerOnb, false)
-	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
+	inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/peer/services/app/autoupdate", strings.NewReader(`{"enabled":true}`))
 	req.Header.Set("Authorization", "Bearer s3cret")
@@ -236,7 +236,7 @@ func TestAutoUpdateManagedOnlyRejectedByPeer(t *testing.T) {
 	if err := peerOnb.Put(OnboardedService{Name: "app", Host: "", Image: "ghcr.io/org/app:v1", Replicas: 1}); err != nil {
 		t.Fatal(err)
 	}
-	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true))
+	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true, nil))
 	t.Cleanup(peerSrv.Close)
 	reg := newTestPeerRegistry(peerSrv.URL, true)
 
@@ -298,7 +298,7 @@ func TestAutoUpdateMutationPeerWritesDisabled(t *testing.T) {
 	peerDC := autoUpdateDockerStub(t, calls, twoReplicaContainers("running", false))
 	peerOnb := newTestOnboardedStore(t)
 	putOnboardedApp(t, peerOnb, false)
-	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), false))
+	peerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), false, nil))
 	t.Cleanup(peerSrv.Close)
 	reg := newTestPeerRegistry(peerSrv.URL, false)
 
@@ -499,7 +499,7 @@ func TestAutoUpdateMutationForwardsActorAssertion(t *testing.T) {
 		peerDC := autoUpdateDockerStub(t, calls, twoReplicaContainers("running", false))
 		peerOnb := newTestOnboardedStore(t)
 		putOnboardedApp(t, peerOnb, false)
-		inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true)
+		inner := peerServicesMutateHandler("s3cret", "dashboard-b", peerDC, peerOnb, newImageChecker(peerDC), nil, "", noopProxyStub(t), true, nil)
 
 		var headerMu sync.Mutex
 		var gotHeader string
@@ -523,7 +523,7 @@ func TestAutoUpdateMutationForwardsActorAssertion(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil, nil)
+		mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil, nil, nil)
 
 		var reqBody *strings.Reader
 		if body != "" {

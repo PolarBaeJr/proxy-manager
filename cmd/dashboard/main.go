@@ -182,10 +182,17 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// rm/rom are constructed before au below: au's runOnce must be able to
+	// check both for an active job on a service before calling replaceService
+	// on it, to avoid racing a canary rollout or a rolling replace already in
+	// flight for that same service.
+	rm := newRolloutManager(dc, onboarded, *staticConfig, proxyURLFromEnv())
+	rom := newRollingOpManager(dc)
+
 	// Background: poll registries every 10 min for newer image digests, then
 	// let the auto-updater act on any opted-in service with a newer digest.
 	autoUpdateBlocks := newAutoUpdateBlockStore()
-	au := newAutoUpdater(dc, ic, onboarded, *staticConfig, proxyURLFromEnv(), autoUpdateBlocks)
+	au := newAutoUpdater(dc, ic, onboarded, *staticConfig, proxyURLFromEnv(), autoUpdateBlocks, rm, rom)
 	go ic.Loop(ctx, func() []string {
 		svcs, err := dc.listServices(ctx)
 		if err != nil {
@@ -218,7 +225,6 @@ func main() {
 
 	// Background: health-gate every service currently mid-rollout and
 	// auto-roll-back the moment a canary looks unhealthy between steps.
-	rm := newRolloutManager(dc, onboarded, *staticConfig, proxyURLFromEnv())
 	go rm.Run(ctx)
 
 	// Background: sample CPU once per second for the header stats widget.
@@ -268,7 +274,7 @@ func main() {
 	peerList := splitAndTrim(*peers)
 	registry := newPeerRegistry(peerList, peerSecret, identity, buildVersion, *peerSyncInterval, redisClient)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages, registry, rm, autoUpdateBlocks)
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages, registry, rm, autoUpdateBlocks, rom)
 
 	// MCP on its own port, proxied at mcp.<domain>/mcp/dashboard. Separate from
 	// :8093 because that one is loopback-only and serves the UI at "/", which
@@ -297,7 +303,7 @@ func main() {
 		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv(), monitorURLFromEnv()),
 		"/peer/stats":           peerStatsHandler(peerSecret, identity),
 		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic, autoUpdateBlocks),
-		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, registry, *staticConfig, proxyURLFromEnv(), peerWritesEnabled),
+		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, registry, *staticConfig, proxyURLFromEnv(), peerWritesEnabled, rom),
 		"/peer/discovery/":      peerDiscoveryMutateHandler(peerSecret, identity, dc, proxyURLFromEnv(), peerWritesEnabled),
 		"/peer/images":          peerImagesHandler(peerSecret, identity, dc, releases, imageHistory, onboarded),
 		"/peer/images/":         peerImagesMutateHandler(peerSecret, identity, dc, releases, imageHistory, onboarded, peerWritesEnabled),

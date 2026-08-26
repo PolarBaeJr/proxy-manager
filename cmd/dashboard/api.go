@@ -70,9 +70,12 @@ func fetchMonitorHealth(monitorURL string) (string, []HealthTarget) {
 	return overall, targets
 }
 
-func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry, rm *rolloutManager, blocks *autoUpdateBlockStore) http.Handler {
+func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, rl *rateLimiter, ic *imageChecker, routesConfigPath string, pm *passkeyManager, onb *OnboardedStore, rs *ReleasesStore, prefs *PrefsStore, ih *ImageHistoryStore, mt *maintStore, mp *maintPageStore, registry *PeerRegistry, rm *rolloutManager, blocks *autoUpdateBlockStore, rom *rollingOpManager) http.Handler {
 	if rm == nil {
 		rm = newRolloutManager(dc, onb, routesConfigPath, proxyURLFromEnv())
+	}
+	if rom == nil {
+		rom = newRollingOpManager(dc)
 	}
 	mux := http.NewServeMux()
 
@@ -661,10 +664,18 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		// "check" is exempt too: it only queries the registry for image-
 		// update availability (runServiceCheckImage) and never touches
 		// containers, so it can't race the rollout manager.
-		exemptFromRolloutGuard := len(parts) == 2 && (parts[1] == "rollout" || parts[1] == "rollout/advance" || parts[1] == "rollout/abort" || parts[1] == "check" || parts[1] == "duplicate")
+		// A rolling-replace GET is a read-only status poll (like rollout's own
+		// GET, "check", and "duplicate" below) so it's exempt too; the POST
+		// that starts one is NOT exempt — it must still be blocked by (and
+		// block) an active rollout or rolling job like any other mutation.
+		exemptFromRolloutGuard := len(parts) == 2 && (parts[1] == "rollout" || parts[1] == "rollout/advance" || parts[1] == "rollout/abort" || parts[1] == "check" || parts[1] == "duplicate" || (parts[1] == "rolling-replace" && req.Method == "GET"))
 		if !exemptFromRolloutGuard {
 			if st, ok := rm.get(name); ok && rolloutActive(st.Status) {
 				http.Error(w, fmt.Sprintf("%q has an active rollout — advance or abort it before other mutations", name), http.StatusConflict)
+				return
+			}
+			if st, ok := rom.get(name); ok && rollingOpActive(st.Status) {
+				http.Error(w, fmt.Sprintf("%q has an active rolling replace — wait for it to finish before other mutations", name), http.StatusConflict)
 				return
 			}
 		}
@@ -705,6 +716,44 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			ic.Check(req.Context(), body.Image)
 			audit(req, sessionUser(info), "service.replace", name+" => "+body.Image)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "replaced", "image": body.Image})
+			return
+		}
+		// rolling-replace is a surge-of-one async alternative to replace, for
+		// label-managed services only (replaceOnboarded's routes.json-backed
+		// substrate is out of scope here). It starts a background job and
+		// returns immediately — see rollingop.go's rollingOpManager — rather
+		// than blocking the request for the whole rollout the way replace
+		// (and the ic.Check above) do.
+		if len(parts) == 2 && parts[1] == "rolling-replace" && req.Method == "POST" {
+			var body ReplaceServiceRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if body.Image == "" {
+				http.Error(w, "image is required", http.StatusBadRequest)
+				return
+			}
+			if _, ok := onb.Get(name); ok {
+				http.Error(w, fmt.Sprintf("%q is an onboarded service — rolling replace only supports label-managed services", name), http.StatusBadRequest)
+				return
+			}
+			st, err := rom.start(name, body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			audit(req, sessionUser(info), "service.rolling_replace_start", name+" => "+body.Image)
+			httpx.WriteJSON(w, http.StatusAccepted, st)
+			return
+		}
+		if len(parts) == 2 && parts[1] == "rolling-replace" && req.Method == "GET" {
+			st, ok := rom.get(name)
+			if !ok {
+				http.Error(w, "no active rolling replace for "+name, http.StatusNotFound)
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, st)
 			return
 		}
 		if len(parts) == 2 && parts[1] == "autoupdate" && req.Method == "POST" {
@@ -1723,7 +1772,7 @@ func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedS
 			if st.Err != "" {
 				svcs[i].ImageCheckError = st.Err
 			}
-			svcs[i].AutoUpdateSkipReason = autoUpdateSkipReason(svcs[i], st)
+			svcs[i].AutoUpdateSkipReason = autoUpdateSkipReason(ctx, dc, svcs[i], st)
 			// autoUpdateSkipReason can't see the retry-cap backoff (that
 			// state lives in autoUpdater, not here) — fall back to the
 			// sticky last-failure reason autoUpdater recorded when it gave
@@ -2172,15 +2221,17 @@ func runServiceCheckImage(ctx context.Context, dc *dockerClient, ic *imageChecke
 // request to the peer identified by host, translating (parts, method) onto
 // its /peer/services/{name}/<sub> counterpart — the write-mesh sibling of
 // forwardImageMutation above. Covers scale, stop, start, replicas/{member}/
-// {stop,start}, autoupdate, check, replace, stage, promote, canary
-// (discard), offboard, weight, and delete — every mutating service action now
-// forwards. The only thing still genuinely local-only among service writes
-// is onboard, which lives under the separate /api/discovery/ path and is out
-// of scope here. DELETE has no subpath (parts is length 1, unlike every
-// other action here), and its outgoing body is always {"confirm": name}
-// constructed server-side below — never read from the incoming request —
-// so a forwarded delete can't be sent without confirmation and can't have
-// its confirmation spoofed by whatever the original caller happened to send.
+// {stop,start}, autoupdate, check, replace, rolling-replace (start AND its
+// status GET — the only GET this function forwards; every other case is a
+// mutation), stage, promote, canary (discard), offboard, weight, and delete —
+// every mutating service action now forwards. The only thing still genuinely
+// local-only among service writes is onboard, which lives under the separate
+// /api/discovery/ path and is out of scope here. DELETE has no subpath
+// (parts is length 1, unlike every other action here), and its outgoing body
+// is always {"confirm": name} constructed server-side below — never read
+// from the incoming request — so a forwarded delete can't be sent without
+// confirmation and can't have its confirmation spoofed by whatever the
+// original caller happened to send.
 func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host string, registry *PeerRegistry, name string, parts []string, actor string) {
 	var method, peerPath string
 	switch {
@@ -2209,6 +2260,14 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/check"
 	case len(parts) == 2 && parts[1] == "replace" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/replace"
+	case len(parts) == 2 && parts[1] == "rolling-replace" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/rolling-replace"
+	case len(parts) == 2 && parts[1] == "rolling-replace" && req.Method == http.MethodGet:
+		// The only GET this function forwards — every other case here is a
+		// mutation (POST/DELETE). Safe with the generic relay logic below:
+		// req.Body is empty for a GET, and peerMutate/the peer's own GET
+		// branch never attempt to decode it.
+		method, peerPath = http.MethodGet, "/peer/services/"+url.PathEscape(name)+"/rolling-replace"
 	case len(parts) == 2 && parts[1] == "stage" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/stage"
 	case len(parts) == 2 && parts[1] == "promote" && req.Method == http.MethodPost:

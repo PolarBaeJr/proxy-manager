@@ -584,7 +584,7 @@ func TestOnboardMutationForwardsActorAssertion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/discovery/myapp/onboard?host=dashboard-b",
 		strings.NewReader(`{"host":"myapp.example.org","port":8080}`))

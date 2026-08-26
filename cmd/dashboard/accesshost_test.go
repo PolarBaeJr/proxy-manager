@@ -190,7 +190,7 @@ func newAccessTestMux(t *testing.T, reg *PeerRegistry) http.Handler {
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	return newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil)
+	return newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil, nil)
 }
 
 func TestAccessEndpointHostParamForwardsToPeer(t *testing.T) {

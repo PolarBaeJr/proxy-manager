@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,16 +29,30 @@ type autoUpdater struct {
 	routesPath string
 	proxyURL   string
 	blocks     *autoUpdateBlockStore
+	// rm/rom let runOnce defer (not fail) a label-managed replace for a
+	// service that already has a canary rollout or a rolling replace in
+	// flight — racing either of those with a plain replaceService call would
+	// mutate the same containers out from under it.
+	rm  *rolloutManager
+	rom *rollingOpManager
 	// failures counts consecutive failed auto-updates per service. Only ever
 	// touched from the image-checker loop goroutine — no locking needed.
 	failures map[string]int
 }
 
-func newAutoUpdater(dc *dockerClient, ic *imageChecker, onb *OnboardedStore, routesPath, proxyURL string, blocks *autoUpdateBlockStore) *autoUpdater {
+func newAutoUpdater(dc *dockerClient, ic *imageChecker, onb *OnboardedStore, routesPath, proxyURL string, blocks *autoUpdateBlockStore, rm *rolloutManager, rom *rollingOpManager) *autoUpdater {
+	if rm == nil {
+		rm = newRolloutManager(dc, onb, routesPath, proxyURL)
+	}
+	if rom == nil {
+		rom = newRollingOpManager(dc)
+	}
 	return &autoUpdater{
 		dc: dc, ic: ic, onb: onb,
 		routesPath: routesPath, proxyURL: proxyURL,
 		blocks:   blocks,
+		rm:       rm,
+		rom:      rom,
 		failures: map[string]int{},
 	}
 }
@@ -115,7 +131,18 @@ func shouldAutoUpdate(svc Service, st *imageStatus, consecutiveFailures int) boo
 // services-list request) — that one case is left unexplained rather than
 // guessed at. Empty string means either no update is pending (nothing to
 // explain) or shouldAutoUpdate would actually fire.
-func autoUpdateSkipReason(svc Service, st *imageStatus) string {
+//
+// Also proactively checks inspectHostConfigUnknowns for a service that would
+// otherwise fire: prepareReplaceTemplate refuses the whole replace when a
+// container carries HostConfig it cannot reproduce on recreate (published
+// ports, extra networks, etc — see hostConfigRefuseFields), but runOnce only
+// records that as a generic per-cycle failure, so an operator saw nothing
+// concrete until autoUpdateMaxFailures consecutive cycles had already been
+// burned. This surfaces the same refusal immediately, before any failed
+// cycles happen. Best-effort: an inspect error here is swallowed rather than
+// surfaced, since a transient inspect failure isn't itself an auto-update
+// blocker and runOnce's own path will report a real error if it recurs.
+func autoUpdateSkipReason(ctx context.Context, dc *dockerClient, svc Service, st *imageStatus) string {
 	if st == nil || !st.UpdateAvailable {
 		return ""
 	}
@@ -130,9 +157,15 @@ func autoUpdateSkipReason(svc Service, st *imageStatus) string {
 		return "service is fully stopped"
 	case st.Err != "":
 		return "last registry check failed: " + st.Err
-	default:
-		return ""
 	}
+	for _, ct := range liveOnly(svc.Members) {
+		unknowns, err := dc.inspectHostConfigUnknowns(ctx, ct.ID)
+		if err != nil || len(unknowns) == 0 {
+			continue
+		}
+		return fmt.Sprintf("auto-update would drop %s on recreate — update manually", strings.Join(unknowns, ", "))
+	}
+	return ""
 }
 
 // runOnce is called synchronously after each image-checker cycle (single
@@ -184,9 +217,27 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 		if !shouldAutoUpdate(svc, st, a.failures[svc.Name]) {
 			continue
 		}
+		_, onboardedSvc := a.onb.Get(svc.Name)
+		if !onboardedSvc {
+			// A canary rollout or a rolling replace already owns this
+			// service's containers — deferring (not failing) here matters:
+			// this isn't the service's fault, so it must not burn its
+			// failures budget or trip the permanent-block state, either of
+			// which would happen if this fell through to the uerr != nil
+			// branch below. The next tick tries again once the other job
+			// finishes.
+			if st, ok := a.rm.get(svc.Name); ok && rolloutActive(st.Status) {
+				log.Printf("autoupdate: %s — active rollout in progress, deferring", svc.Name)
+				continue
+			}
+			if st, ok := a.rom.get(svc.Name); ok && rollingOpActive(st.Status) {
+				log.Printf("autoupdate: %s — active rolling replace in progress, deferring", svc.Name)
+				continue
+			}
+		}
 		log.Printf("autoupdate: %s — newer digest for %s, replacing", svc.Name, svc.Image)
 		var uerr error
-		if _, ok := a.onb.Get(svc.Name); ok {
+		if onboardedSvc {
 			uerr = a.dc.replaceOnboarded(ctx, svc.Name, ReplaceServiceRequest{Image: svc.Image}, a.onb, a.routesPath)
 			if uerr == nil {
 				proxyRefresh(a.proxyURL)

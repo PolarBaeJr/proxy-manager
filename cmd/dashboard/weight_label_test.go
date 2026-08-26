@@ -129,7 +129,7 @@ func TestServicesWeightForwardsToOwningPeer(t *testing.T) {
 	ownerOnb := newTestOnboardedStore(t)
 	ownerReg := newPeerRegistry(nil, "s3cret", "dashboard-b", "dev", 0, nil)
 	ownerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", ownerDC, ownerOnb,
-		newImageChecker(ownerDC), ownerReg, filepath.Join(t.TempDir(), "routes.json"), noopProxyStub(t), true))
+		newImageChecker(ownerDC), ownerReg, filepath.Join(t.TempDir(), "routes.json"), noopProxyStub(t), true, nil))
 	t.Cleanup(ownerSrv.Close)
 
 	var localHit atomic.Bool
