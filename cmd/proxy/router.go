@@ -589,14 +589,18 @@ type staticConfig struct {
 	Routes []staticRoute `json:"routes"`
 }
 
-func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([]*RouteGroup, error) {
+// assembleGroups also returns its local backendsByService map (see the
+// field's own comment below) so peermerge.go's overlay() can apply the same
+// Service-name backfill to a route it only knows about from a peer — see
+// PeerRouteStore.overlay's localBackendsByService parameter.
+func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([]*RouteGroup, map[string][]*Backend, error) {
 	groupsByKey := map[string]*RouteGroup{}
 
 	if configPath != "" {
 		if data, err := os.ReadFile(configPath); err == nil {
 			var cfg staticConfig
 			if err := json.Unmarshal(data, &cfg); err != nil {
-				return nil, fmt.Errorf("parse %s: %w", configPath, err)
+				return nil, nil, fmt.Errorf("parse %s: %w", configPath, err)
 			}
 			for _, sr := range cfg.Routes {
 				key := sr.Host + "|" + sr.Path
@@ -635,7 +639,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 
 	containers, err := dc.listEnabledContainers(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, c := range containers {
 		name := c.name()
@@ -789,7 +793,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		sort.SliceStable(g.Backends, func(i, j int) bool { return g.Backends[i].URL < g.Backends[j].URL })
 		out = append(out, g)
 	}
-	return out, nil
+	return out, backendsByService, nil
 }
 
 // normalizeAuthUsers trims, drops empties, and lowercases so membership

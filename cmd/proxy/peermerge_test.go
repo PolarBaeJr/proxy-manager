@@ -30,13 +30,91 @@ func TestPeerRouteStoreOverlayCreatesLearnedOnlyGroup(t *testing.T) {
 		Routes: []peerRouteInfo{{Host: "new.example.org", Backends: 2}},
 	})
 
-	groups := s.overlay(nil)
+	groups := s.overlay(nil, nil)
 	g := findGroup(groups, "new.example.org", "")
 	if g == nil {
 		t.Fatal("expected a synthesized group for the learned-only host")
 	}
 	if len(g.Backends) != 1 || !g.Backends[0].Learned || g.Backends[0].PeerID != "b" {
 		t.Fatalf("Backends = %+v, want exactly one learned backend from peer b", g.Backends)
+	}
+}
+
+// TestPeerRouteStoreOverlayBackfillsLocalServiceBackends proves the fix for
+// project_routes_json_service_backend_gap.md: a brand-new synthesized group
+// for a route this host has no local knowledge of, but whose advertised
+// Service name matches this host's OWN proxy.service-labeled containers,
+// gets those containers as real (non-Learned) backends — not just the
+// synthetic peer pointer — so they're preferred by pickHealthy and so this
+// host can, in turn, re-advertise the route outward (tick()'s anti-recycling
+// filter needs a nonzero local count).
+func TestPeerRouteStoreOverlayBackfillsLocalServiceBackends(t *testing.T) {
+	s := newPeerRouteStore(time.Minute)
+	s.merge(peerRoutePayload{
+		Peer: "b", Advertise: "http://b:8092",
+		Routes: []peerRouteInfo{{Host: "svc.example.org", Backends: 1, Service: "player"}},
+	})
+
+	local := &Backend{URL: "http://10.0.0.1:8080"}
+	localBackendsByService := map[string][]*Backend{"player": {local}}
+	groups := s.overlay(nil, localBackendsByService)
+
+	g := findGroup(groups, "svc.example.org", "")
+	if g == nil || len(g.Backends) != 2 {
+		t.Fatalf("Backends = %+v, want 1 local (backfilled) + 1 learned", g)
+	}
+	if g.Backends[0] != local || g.Backends[0].Learned {
+		t.Fatalf("Backends[0] = %+v, want the backfilled local backend, unmarked Learned", g.Backends[0])
+	}
+	if !g.Backends[1].Learned || g.Backends[1].PeerID != "b" {
+		t.Fatalf("Backends[1] = %+v, want the synthetic learned backend from peer b", g.Backends[1])
+	}
+}
+
+// TestPeerRouteStoreOverlayNoMatchingLocalServiceBackends proves a Service
+// name with no local match falls back to exactly today's behavior (just the
+// synthetic peer backend) — no panic on a nil/empty localBackendsByService.
+func TestPeerRouteStoreOverlayNoMatchingLocalServiceBackends(t *testing.T) {
+	s := newPeerRouteStore(time.Minute)
+	s.merge(peerRoutePayload{
+		Peer: "b", Advertise: "http://b:8092",
+		Routes: []peerRouteInfo{{Host: "svc2.example.org", Backends: 1, Service: "nothing-local"}},
+	})
+
+	groups := s.overlay(nil, nil)
+	g := findGroup(groups, "svc2.example.org", "")
+	if g == nil || len(g.Backends) != 1 || !g.Backends[0].Learned {
+		t.Fatalf("Backends = %+v, want exactly the 1 synthetic learned backend", g)
+	}
+}
+
+// TestPeerRouteStoreOverlayExistingGroupIgnoresServiceBackfill proves the
+// backfill above is scoped ONLY to a brand-new synthesized group: an
+// existing local group (however it came to exist — routes.json, a directly
+// proxy.host/path-labeled container) must NOT also be backfilled from
+// localBackendsByService, even when a Service name is advertised for it —
+// its local containers are already counted once, either directly in
+// Backends or via assembleGroups' own static backfill. Backfilling again
+// here would append the same *Backend a second time. This is the regression
+// guard for the working "/" Spread case, which always hits this branch.
+func TestPeerRouteStoreOverlayExistingGroupIgnoresServiceBackfill(t *testing.T) {
+	s := newPeerRouteStore(time.Minute)
+	s.merge(peerRoutePayload{
+		Peer: "b", Advertise: "http://b:8092",
+		Routes: []peerRouteInfo{{Host: "shared.example.org", Backends: 1, Service: "player"}},
+	})
+
+	local := &Backend{URL: "http://10.0.0.1:8080"}
+	groups := []*RouteGroup{{Host: "shared.example.org", Backends: []*Backend{local}}}
+	localBackendsByService := map[string][]*Backend{"player": {local}}
+	out := s.overlay(groups, localBackendsByService)
+
+	g := findGroup(out, "shared.example.org", "")
+	if g == nil || len(g.Backends) != 2 {
+		t.Fatalf("Backends = %+v, want local + 1 learned only (no duplicate backfill)", g)
+	}
+	if g.Backends[0] != local {
+		t.Fatal("existing local backend must be untouched (same pointer, unmoved)")
 	}
 }
 
@@ -51,7 +129,7 @@ func TestPeerRouteStoreOverlayAddsToExistingGroup(t *testing.T) {
 
 	local := &Backend{URL: "http://10.0.0.1:8080"}
 	groups := []*RouteGroup{{Host: "shared.example.org", Backends: []*Backend{local}}}
-	out := s.overlay(groups)
+	out := s.overlay(groups, nil)
 
 	g := findGroup(out, "shared.example.org", "")
 	if g == nil || len(g.Backends) != 2 {
@@ -89,8 +167,8 @@ func TestPeerRouteStoreOverlayIdempotentAcrossFreshSlices(t *testing.T) {
 		return n
 	}
 
-	c1 := countLearned(s.overlay(nil))
-	c2 := countLearned(s.overlay(nil))
+	c1 := countLearned(s.overlay(nil, nil))
+	c2 := countLearned(s.overlay(nil, nil))
 	if c1 != 1 || c2 != 1 {
 		t.Fatalf("learned backend counts = %d, %d, want 1, 1 (no accumulation across independent freshly-built slices)", c1, c2)
 	}
@@ -108,7 +186,7 @@ func TestPeerRouteStoreOverlayDropsExpiredEntries(t *testing.T) {
 	})
 
 	s.now = func() time.Time { return base.Add(2 * time.Minute) }
-	groups := s.overlay(nil)
+	groups := s.overlay(nil, nil)
 	if g := findGroup(groups, "exp.example.org", ""); g != nil {
 		t.Fatalf("expired route should have been dropped, got %+v", g)
 	}
@@ -140,7 +218,7 @@ func TestPeerRouteStoreMergeTwiceNoDuplicate(t *testing.T) {
 		t.Fatal("second merge of the same peer/route should report changed=false")
 	}
 
-	groups := s.overlay(nil)
+	groups := s.overlay(nil, nil)
 	g := findGroup(groups, "dup.example.org", "")
 	if g == nil || len(g.Backends) != 1 {
 		t.Fatalf("Backends = %+v, want exactly 1 (no duplicate from merging twice)", g)
@@ -166,7 +244,7 @@ func TestPeerRouteStoreOverlaySynthesizedGroupCarriesRateLimit(t *testing.T) {
 		Routes: []peerRouteInfo{{Host: "rl.example.org", Backends: 1, RateLimit: true, RateRPM: 10}},
 	})
 
-	groups := s.overlay(nil)
+	groups := s.overlay(nil, nil)
 	g := findGroup(groups, "rl.example.org", "")
 	if g == nil {
 		t.Fatal("expected a synthesized group")
@@ -188,7 +266,7 @@ func TestPeerRouteStoreOverlayExistingGroupKeepsOwnRateLimit(t *testing.T) {
 
 	local := &Backend{URL: "http://10.0.0.1:8080"}
 	groups := []*RouteGroup{{Host: "shared.example.org", Backends: []*Backend{local}, RateLimit: false}}
-	out := s.overlay(groups)
+	out := s.overlay(groups, nil)
 
 	g := findGroup(out, "shared.example.org", "")
 	if g == nil || g.RateLimit {
@@ -220,7 +298,7 @@ func TestPeerRouteStoreHasExpired(t *testing.T) {
 		t.Fatal("hasExpired() = false after TTL, want true")
 	}
 
-	s.overlay(nil)
+	s.overlay(nil, nil)
 	if s.hasExpired() {
 		t.Fatal("hasExpired() = true after overlay() evicted the stale entry, want false")
 	}
@@ -250,7 +328,7 @@ func TestPeerRoutesHandlerValidSecretMergesAndRefreshes(t *testing.T) {
 		t.Fatalf("refresh called %d time(s), want 1", refreshed)
 	}
 
-	groups := store.overlay(nil)
+	groups := store.overlay(nil, nil)
 	if findGroup(groups, "x.example.org", "") == nil {
 		t.Fatal("merged route should be visible via overlay")
 	}
