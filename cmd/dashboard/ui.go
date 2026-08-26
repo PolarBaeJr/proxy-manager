@@ -3779,11 +3779,12 @@ function buildDialogs() {
   // 2FA
   $('#dlg-2fa').innerHTML =
     '<div class="dlg"><div class="dlg-head"><div class="di">' + I.shield + '</div>'
-    + '<div><h3>Confirm with 2FA</h3><div class="dsub">Unlocks edit access for 5 minutes</div></div>'
+    + '<div><h3>Confirm with 2FA</h3><div class="dsub">Unlocks edit access</div></div>'
     + '<button class="x" type="button" onclick="document.getElementById(\'dlg-2fa\').close()">' + I.x + '</button></div>'
     + '<form id="form-2fa"><div class="dlg-body">'
     + '<p class="meta" style="margin:0 0 14px">Enter the 6-digit code from your authenticator app.</p>'
     + '<div class="field"><input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required class="otp-input" autocomplete="one-time-code" placeholder="••••••"></div>'
+    + '<p style="text-align:center;margin:10px 0 0"><a href="#" id="dlg-2fa-passkey">Use passkey instead</a></p>'
     + '</div><div class="dialog-actions">'
     +   '<button type="button" class="btn" onclick="document.getElementById(\'dlg-2fa\').close()">Cancel</button>'
     +   '<button type="submit" class="btn primary">' + I.check + 'Confirm</button>'
@@ -3797,12 +3798,30 @@ function wireDialogForms() {
     e.preventDefault();
     try {
       await api('/api/auth/verify-2fa', { method:'POST', body: JSON.stringify({ code: e.target.code.value.trim() })});
-      toast('Unlocked for 5 minutes');
+      toast('Unlocked');
       document.getElementById('dlg-2fa').close();
       e.target.reset();
       await refreshAuth();
     } catch (e) { toast(e.message, 'err'); }
   };
+  const pkLink = $('#dlg-2fa-passkey');
+  if (pkLink) {
+    // Passkey login is both factors at once (see passkeyLogin()), so
+    // re-running it while already authenticated just re-issues a fresh
+    // fully-elevated cookie for the same user — an equivalent way to
+    // satisfy this dialog for accounts that never set up a TOTP app.
+    pkLink.onclick = async (e) => {
+      e.preventDefault();
+      try {
+        await passkeyLogin();
+        toast('Unlocked');
+        document.getElementById('dlg-2fa').close();
+        await refreshAuth();
+      } catch (err) {
+        if (err && err.name !== 'NotAllowedError') toast(err.message || String(err), 'err');
+      }
+    };
+  }
 
   // Reflect the cleaned value back into the field on blur, so a pasted
   // "docker pull ..." visibly becomes the reference that will be sent rather
