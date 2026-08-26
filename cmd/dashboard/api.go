@@ -165,6 +165,11 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			status.Groups = append(status.Groups, peerGroups...)
 			status.Hosts = append(status.Hosts, peerHosts...)
 		}
+		// Fold same-named groups (and, within them, same routed-identity
+		// entries — e.g. a Spread service's replicas on two hosts) into one,
+		// so a service spread across the mesh reports as a single combined
+		// entry instead of one fragment per host. See servicestatus.go.
+		status.Groups = mergeServiceStatusGroups(status.Groups)
 		httpx.WriteJSON(w, http.StatusOK, status)
 	}))
 

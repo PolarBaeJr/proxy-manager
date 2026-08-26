@@ -76,6 +76,7 @@ type SpreadServiceResponse struct {
 type peerSpreadRequest struct {
 	Service   string   `json:"service"` // proxy.service identity, also the replica-name stem
 	Display   string   `json:"display,omitempty"`
+	Group     string   `json:"group,omitempty"`
 	Image     string   `json:"image"`
 	Env       []string `json:"env,omitempty"`
 	Host      string   `json:"host,omitempty"`
@@ -356,9 +357,23 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 		display = ""
 	}
 
+	// proxy.group drives which Status-view/statusbot folder the replica lands
+	// in. Without it, the peer's default-to-service-name rule (docker.go)
+	// puts the new replica in its OWN group instead of the origin's, so the
+	// same logical service shows up as two unrelated-looking entries across
+	// hosts. Drop rather than hard-fail for the same reason as Display: a
+	// group label that predates the identifier-only rule shouldn't block the
+	// whole spread over a cosmetic mismatch.
+	group := tpl.Labels[labelGroup]
+	if group != "" && !validServiceName(group) {
+		warnings = append(warnings, fmt.Sprintf("proxy.group %q can't be carried over as-is (letters, digits, . _ - only) — the replica on %s will default to its own group", group, req.Target))
+		group = ""
+	}
+
 	peerReq := peerSpreadRequest{
 		Service:   svc.Name,
 		Display:   display,
+		Group:     group,
 		Image:     tpl.Image,
 		Env:       env,
 		Host:      svc.Host,
@@ -449,6 +464,10 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 			http.Error(w, "invalid display name", http.StatusBadRequest)
 			return
 		}
+		if req.Group != "" && !validServiceName(req.Group) {
+			http.Error(w, "invalid group", http.StatusBadRequest)
+			return
+		}
 		for _, u := range req.AuthUsers {
 			if !validUsername(u) {
 				http.Error(w, "invalid auth_users entry", http.StatusBadRequest)
@@ -523,6 +542,9 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 			}
 			if req.Display != "" {
 				labels[labelName] = req.Display
+			}
+			if req.Group != "" {
+				labels[labelGroup] = req.Group
 			}
 			if req.Path != "" {
 				labels[labelPath] = req.Path

@@ -24,6 +24,10 @@ type serviceStatusEntry struct {
 	CPUPercent      float64 `json:"cpu_pct"`
 	MemUsedBytes    uint64  `json:"mem_used_bytes"`
 	MemLimitBytes   uint64  `json:"mem_limit_bytes"`
+	// Machines lists every host this entry's replicas were counted on (see
+	// cmd/dashboard/servicestatus.go's mergeServiceStatusGroups) — more than
+	// one element means this is a Spread service combined across hosts.
+	Machines []string `json:"machines,omitempty"`
 }
 
 type serviceStatusGroup struct {
