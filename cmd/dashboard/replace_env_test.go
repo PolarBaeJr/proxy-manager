@@ -157,7 +157,7 @@ func TestReplaceServiceDropsStaleOCIImageLabels(t *testing.T) {
 				Labels: map[string]string{
 					labelEnable: "true", labelService: "app", labelHost: "app.example",
 					"org.opencontainers.image.revision": "stale-old-sha",
-					"org.opencontainers.image.source":    "https://github.com/org/app",
+					"org.opencontainers.image.source":   "https://github.com/org/app",
 				},
 			}})
 		case strings.HasSuffix(r.URL.Path, "/tpl1/json"):
@@ -199,5 +199,74 @@ func TestReplaceServiceDropsStaleOCIImageLabels(t *testing.T) {
 	}
 	if createdLabels[labelService] != "app" {
 		t.Errorf("proxy.service label lost: %v", createdLabels)
+	}
+}
+
+// TestReplaceServiceCarriesHealthcheckForward guards against every recreate
+// path silently dropping a container's Docker healthcheck. The healthcheck
+// is set by whatever created the container (a compose file's `healthcheck:`
+// stanza, most often) — it is NOT baked into the image — so unless the
+// template's inspect result is threaded through explicitly, a bare recreate
+// from the image alone comes up with none. That's a correctness bug on its
+// own, and it also makes replaceServiceRolling's post-swap health gate
+// decorative: with no healthcheck, checkContainerHealthy passes instantly.
+func TestReplaceServiceCarriesHealthcheckForward(t *testing.T) {
+	var createdHealthcheck *healthcheckSpec
+	var sawCreate bool
+
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "tpl1", Names: []string{"/goproxy-app-1"}, State: "running",
+				Image:  "ghcr.io/org/app:v1",
+				Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example"},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/tpl1/json"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"Config": map[string]any{
+					"Env": []string{},
+					"Healthcheck": map[string]any{
+						"Test":     []string{"CMD", "node", "healthcheck.js"},
+						"Interval": 30000000000,
+						"Timeout":  5000000000,
+						"Retries":  3,
+					},
+				},
+			})
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			sawCreate = true
+			var body struct {
+				Healthcheck *healthcheckSpec `json:"Healthcheck"`
+			}
+			b, _ := io.ReadAll(r.Body)
+			json.Unmarshal(b, &body)
+			if createdHealthcheck == nil {
+				createdHealthcheck = body.Healthcheck
+			}
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	if err := dc.replaceService(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}); err != nil {
+		t.Fatalf("replaceService: %v", err)
+	}
+	if !sawCreate {
+		t.Fatal("no container created")
+	}
+	if createdHealthcheck == nil {
+		t.Fatal("healthcheck dropped on recreate")
+	}
+	if len(createdHealthcheck.Test) != 3 || createdHealthcheck.Test[1] != "node" {
+		t.Errorf("healthcheck.Test mangled: %v", createdHealthcheck.Test)
+	}
+	if createdHealthcheck.Retries != 3 {
+		t.Errorf("healthcheck.Retries = %d, want 3", createdHealthcheck.Retries)
 	}
 }

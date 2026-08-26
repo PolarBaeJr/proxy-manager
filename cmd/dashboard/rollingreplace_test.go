@@ -303,3 +303,88 @@ func TestWaitReplicaReadyTimesOutOnStuckHealthStarting(t *testing.T) {
 		t.Error("predecessor was stopped/removed despite the replacement never becoming healthy")
 	}
 }
+
+// TestWaitReplicaReadyPassesOnceHealthy is the positive counterpart to
+// TestWaitReplicaReadyTimesOutOnStuckHealthStarting: a replica that reports
+// "(health: starting)" on its first few polls and then "(healthy)" must let
+// the gate proceed — the predecessor removed, the swap counted as a success —
+// rather than only ever being exercised through the failure path. This is
+// also the case that would silently degrade to a no-op gate if a container's
+// Docker healthcheck were ever dropped on recreate (see
+// TestReplaceServiceCarriesHealthcheckForward in replace_env_test.go): with
+// no healthcheck, Status never reports "(health: starting)" at all and
+// checkContainerHealthy passes on the very first poll instead of waiting for
+// the transition asserted here.
+func TestWaitReplicaReadyPassesOnceHealthy(t *testing.T) {
+	oldTimeout, oldPoll, oldSettle := rollingReadyTimeout, canaryPromoteHealthPoll, replaceSettleDelay
+	rollingReadyTimeout = time.Second
+	canaryPromoteHealthPoll = 5 * time.Millisecond
+	replaceSettleDelay = 0
+	t.Cleanup(func() {
+		rollingReadyTimeout = oldTimeout
+		canaryPromoteHealthPoll = oldPoll
+		replaceSettleDelay = oldSettle
+	})
+
+	var mu sync.Mutex
+	var created bool
+	var newName string
+	var polls int
+	var oldRemoved bool
+
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			list := []dockerContainer{{
+				ID: "old1", Names: []string{"/goproxy-app-1"}, State: "running", Image: "ghcr.io/org/app:v1",
+				Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
+			}}
+			mu.Lock()
+			if created {
+				polls++
+				status := "Up 1 second (health: starting)"
+				if polls >= 3 {
+					status = "Up 3 seconds (healthy)"
+				}
+				list = append(list, dockerContainer{
+					ID: "new1", Names: []string{"/" + newName}, State: "running",
+					Status: status, Image: "ghcr.io/org/app:v2",
+					Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80"},
+				})
+			}
+			mu.Unlock()
+			json.NewEncoder(w).Encode(list)
+		case strings.HasSuffix(r.URL.Path, "/old1/json"):
+			json.NewEncoder(w).Encode(map[string]any{"Config": map[string]any{"Env": []string{}}, "HostConfig": map[string]any{}})
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			mu.Lock()
+			created = true
+			newName = r.URL.Query().Get("name")
+			mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]string{"Id": "new1"})
+		case strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/old1"):
+			mu.Lock()
+			oldRemoved = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	if err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil); err != nil {
+		t.Fatalf("replaceServiceRolling: %v", err)
+	}
+	mu.Lock()
+	removed := oldRemoved
+	seenPolls := polls
+	mu.Unlock()
+	if !removed {
+		t.Error("predecessor was never removed despite the replacement becoming healthy")
+	}
+	if seenPolls < 3 {
+		t.Errorf("gate returned after %d poll(s), want it to have actually waited for the healthy transition", seenPolls)
+	}
+}

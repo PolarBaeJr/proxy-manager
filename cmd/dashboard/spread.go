@@ -92,6 +92,11 @@ type peerSpreadRequest struct {
 	AutoUpdate bool     `json:"autoupdate,omitempty"`
 	Weight     int      `json:"weight,omitempty"`
 	Replicas   int      `json:"replicas"`
+	// Healthcheck carries the origin's Config.Healthcheck (set by whatever
+	// created the origin container — a compose file's `healthcheck:` stanza,
+	// most often — not baked into the image) so the seed replica's own
+	// recreate-based rolling health gate isn't decorative from the start.
+	Healthcheck *healthcheckSpec `json:"healthcheck,omitempty"`
 }
 
 type peerSpreadResponse struct {
@@ -387,24 +392,25 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 	}
 
 	peerReq := peerSpreadRequest{
-		Service:    svc.Name,
-		Display:    display,
-		Group:      group,
-		Image:      tpl.Image,
-		Env:        env,
-		Host:       svc.Host,
-		Port:       svc.Port,
-		Path:       svc.Path,
-		Strip:      tpl.Labels[labelStrip] == "true",
-		Health:     tpl.Labels[labelHealth],
-		Auth:       tpl.Labels[labelAuth] == "true",
-		AuthUsers:  authUsers,
-		AuthMode:   tpl.Labels[labelAuthMode],
-		RateLimit:  tpl.Labels[labelRateLimit] == "true",
-		RateRPM:    rateRPM,
-		AutoUpdate: autoUpdate,
-		Weight:     weight,
-		Replicas:   replicas,
+		Service:     svc.Name,
+		Display:     display,
+		Group:       group,
+		Image:       tpl.Image,
+		Env:         env,
+		Host:        svc.Host,
+		Port:        svc.Port,
+		Path:        svc.Path,
+		Strip:       tpl.Labels[labelStrip] == "true",
+		Health:      tpl.Labels[labelHealth],
+		Auth:        tpl.Labels[labelAuth] == "true",
+		AuthUsers:   authUsers,
+		AuthMode:    tpl.Labels[labelAuthMode],
+		RateLimit:   tpl.Labels[labelRateLimit] == "true",
+		RateRPM:     rateRPM,
+		AutoUpdate:  autoUpdate,
+		Weight:      weight,
+		Replicas:    replicas,
+		Healthcheck: clone.Healthcheck,
 	}
 	reqBody, err := json.Marshal(peerReq)
 	if err != nil {
@@ -617,6 +623,7 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 				Image:        req.Image,
 				Labels:       labels,
 				Env:          req.Env,
+				Healthcheck:  req.Healthcheck,
 				ExposedPorts: map[string]struct{}{fmt.Sprintf("%d/tcp", req.Port): {}},
 			})
 			if err != nil {

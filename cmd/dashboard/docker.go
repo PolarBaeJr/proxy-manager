@@ -171,6 +171,7 @@ type createBody struct {
 	Labels           map[string]string   `json:"Labels,omitempty"`
 	Env              []string            `json:"Env,omitempty"`
 	ExposedPorts     map[string]struct{} `json:"ExposedPorts,omitempty"`
+	Healthcheck      *healthcheckSpec    `json:"Healthcheck,omitempty"`
 	HostConfig       hostConfig          `json:"HostConfig"`
 	NetworkingConfig struct {
 		EndpointsConfig map[string]struct{} `json:"EndpointsConfig"`
@@ -201,11 +202,25 @@ type mountSpec struct {
 	ReadOnly bool   `json:"ReadOnly,omitempty"`
 }
 
-// cloneSpec is the subset of a container's HostConfig that must ride forward
-// when it's recreated (replace/stage/promote/scale/onboard) but isn't part of
-// the labels/env already carried elsewhere.
+// healthcheckSpec mirrors Docker Engine API's Config.Healthcheck shape. A
+// container's healthcheck is set by whatever created it (a compose file's
+// `healthcheck:` stanza, most often) — it is NOT baked into the image, so a
+// bare recreate from the image alone silently loses it unless the template
+// container's own inspect result is carried forward explicitly.
+type healthcheckSpec struct {
+	Test        []string `json:"Test,omitempty"`
+	Interval    int64    `json:"Interval,omitempty"`
+	Timeout     int64    `json:"Timeout,omitempty"`
+	StartPeriod int64    `json:"StartPeriod,omitempty"`
+	Retries     int      `json:"Retries,omitempty"`
+}
+
+// cloneSpec is the subset of a container's HostConfig/Config that must ride
+// forward when it's recreated (replace/stage/promote/scale/onboard) but
+// isn't part of the labels/env already carried elsewhere.
 type cloneSpec struct {
-	Mounts []mountSpec
+	Mounts      []mountSpec
+	Healthcheck *healthcheckSpec
 }
 
 // pullImage tries to pull from a registry. Errors are non-fatal: if the image
@@ -373,8 +388,8 @@ func (c *dockerClient) inspectRestartCount(ctx context.Context, id string) (int,
 	return resp.RestartCount, nil
 }
 
-// inspectCloneSpec returns the HostConfig fields a recreate must carry
-// forward — currently just Mounts (bind mounts / named volumes), which
+// inspectCloneSpec returns the HostConfig/Config fields a recreate must carry
+// forward — Mounts (bind mounts / named volumes) and Healthcheck — which
 // createBody drops today if the caller doesn't thread them through.
 func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSpec, error) {
 	body, err := c.get(ctx, "/containers/"+id+"/json")
@@ -386,11 +401,14 @@ func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSp
 		HostConfig struct {
 			Mounts []mountSpec `json:"Mounts"`
 		} `json:"HostConfig"`
+		Config struct {
+			Healthcheck *healthcheckSpec `json:"Healthcheck"`
+		} `json:"Config"`
 	}
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
 		return cloneSpec{}, err
 	}
-	return cloneSpec{Mounts: resp.HostConfig.Mounts}, nil
+	return cloneSpec{Mounts: resp.HostConfig.Mounts, Healthcheck: resp.Config.Healthcheck}, nil
 }
 
 // looksLikeBareDigest reports whether s is a bare "sha256:<hex>" image
@@ -518,12 +536,16 @@ func jsonEqual(a, b json.RawMessage) bool {
 // response returns every field present-but-often-zero-valued, which would
 // make a naive "is this field present" check refuse everything.
 //
-// Config.Cmd/Entrypoint/Healthcheck need special handling: Docker populates
-// Config.Cmd from the IMAGE's own CMD for virtually every container (e.g.
+// Config.Cmd/Entrypoint need special handling: Docker populates Config.Cmd
+// from the IMAGE's own CMD for virtually every container (e.g.
 // ["nginx","-g","daemon off;"]), so there is no way to tell "image default"
 // from "user override" from the container's inspect alone. This fetches the
 // image's own inspect and only refuses when the container's value actually
 // differs from what the image would produce on its own.
+//
+// Config.Healthcheck is deliberately NOT checked here: inspectCloneSpec
+// carries it forward on every recreate path (see cloneSpec), so unlike
+// Cmd/Entrypoint it no longer needs a refuse-rather-than-drop guard.
 //
 // TODO(pi-verification): the field lists above were built from the public,
 // documented Docker Engine API HostConfig/Config schema, not a live spot
@@ -540,9 +562,8 @@ func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string)
 		Image      string                     `json:"Image"` // image ID, e.g. "sha256:..."
 		HostConfig map[string]json.RawMessage `json:"HostConfig"`
 		Config     struct {
-			Cmd         json.RawMessage `json:"Cmd"`
-			Entrypoint  json.RawMessage `json:"Entrypoint"`
-			Healthcheck json.RawMessage `json:"Healthcheck"`
+			Cmd        json.RawMessage `json:"Cmd"`
+			Entrypoint json.RawMessage `json:"Entrypoint"`
 		} `json:"Config"`
 		NetworkSettings struct {
 			Networks map[string]json.RawMessage `json:"Networks"`
@@ -567,10 +588,10 @@ func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string)
 		}
 	}
 
-	// Config.Cmd/Entrypoint/Healthcheck: only refuse when they DIFFER from
-	// what the image itself already specifies.
-	if !isZeroJSON(resp.Config.Cmd) || !isZeroJSON(resp.Config.Entrypoint) || !isZeroJSON(resp.Config.Healthcheck) {
-		imgCmd, imgEntrypoint, imgHealthcheck, err := c.inspectImageOverridable(ctx, resp.Image)
+	// Config.Cmd/Entrypoint: only refuse when they DIFFER from what the image
+	// itself already specifies.
+	if !isZeroJSON(resp.Config.Cmd) || !isZeroJSON(resp.Config.Entrypoint) {
+		imgCmd, imgEntrypoint, err := c.inspectImageOverridable(ctx, resp.Image)
 		if err != nil {
 			return nil, fmt.Errorf("inspect image %s: %w", resp.Image, err)
 		}
@@ -580,36 +601,32 @@ func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string)
 		if !isZeroJSON(resp.Config.Entrypoint) && !jsonEqual(resp.Config.Entrypoint, imgEntrypoint) {
 			refused = append(refused, "Config.Entrypoint")
 		}
-		if !isZeroJSON(resp.Config.Healthcheck) && !jsonEqual(resp.Config.Healthcheck, imgHealthcheck) {
-			refused = append(refused, "Config.Healthcheck")
-		}
 	}
 
 	sort.Strings(refused)
 	return refused, nil
 }
 
-// inspectImageOverridable returns an image's own Config.Cmd/Entrypoint/
-// Healthcheck — the baseline inspectHostConfigUnknowns diffs a container's
-// values against, so a container that simply inherited them from its image
-// isn't mistaken for one with an explicit override.
-func (c *dockerClient) inspectImageOverridable(ctx context.Context, imageID string) (cmd, entrypoint, healthcheck json.RawMessage, err error) {
+// inspectImageOverridable returns an image's own Config.Cmd/Entrypoint — the
+// baseline inspectHostConfigUnknowns diffs a container's values against, so a
+// container that simply inherited them from its image isn't mistaken for one
+// with an explicit override.
+func (c *dockerClient) inspectImageOverridable(ctx context.Context, imageID string) (cmd, entrypoint json.RawMessage, err error) {
 	body, err := c.get(ctx, "/images/"+url.PathEscape(imageID)+"/json")
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	defer body.Close()
 	var resp struct {
 		Config struct {
-			Cmd         json.RawMessage `json:"Cmd"`
-			Entrypoint  json.RawMessage `json:"Entrypoint"`
-			Healthcheck json.RawMessage `json:"Healthcheck"`
+			Cmd        json.RawMessage `json:"Cmd"`
+			Entrypoint json.RawMessage `json:"Entrypoint"`
 		} `json:"Config"`
 	}
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
-	return resp.Config.Cmd, resp.Config.Entrypoint, resp.Config.Healthcheck, nil
+	return resp.Config.Cmd, resp.Config.Entrypoint, nil
 }
 
 // ---- Service-level operations ----
@@ -928,7 +945,7 @@ func (c *dockerClient) scaleService(ctx context.Context, name string, desired in
 		for i := 0; i < desired-current; i++ {
 			n := nextReplicaIndex(existing, name) + i
 			cname := fmt.Sprintf("goproxy-%s-%d", name, n)
-			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
+			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
 			if err != nil {
 				return fmt.Errorf("create %s: %w", cname, err)
 			}
@@ -1230,10 +1247,11 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	for i := 0; i < len(tpl.tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, tpl.startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      req.Image,
-			Labels:     tpl.newLabels,
-			Env:        tpl.env,
-			HostConfig: hostConfig{Mounts: tpl.clone.Mounts},
+			Image:       req.Image,
+			Labels:      tpl.newLabels,
+			Env:         tpl.env,
+			Healthcheck: tpl.clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: tpl.clone.Mounts},
 		})
 		if err != nil {
 			// Roll back: tear down any new ones we already created.
@@ -1371,10 +1389,11 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 	for i, old := range tpl.tplSet {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, tpl.startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      req.Image,
-			Labels:     tpl.newLabels,
-			Env:        tpl.env,
-			HostConfig: hostConfig{Mounts: tpl.clone.Mounts},
+			Image:       req.Image,
+			Labels:      tpl.newLabels,
+			Env:         tpl.env,
+			Healthcheck: tpl.clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: tpl.clone.Mounts},
 		})
 		if err != nil {
 			return fmt.Errorf("replaced %d/%d replicas, then failed on %s: create: %w", i, total, cname, err)
@@ -1464,10 +1483,11 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      tpl.Image,
-			Labels:     newLabels,
-			Env:        env,
-			HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image:       tpl.Image,
+			Labels:      newLabels,
+			Env:         env,
+			Healthcheck: clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1547,10 +1567,11 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      tpl.Image,
-			Labels:     newLabels,
-			Env:        env,
-			HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image:       tpl.Image,
+			Labels:      newLabels,
+			Env:         env,
+			Healthcheck: clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1658,10 +1679,11 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:      tpl.Image,
-			Labels:     newLabels,
-			Env:        env,
-			HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image:       tpl.Image,
+			Labels:      newLabels,
+			Env:         env,
+			Healthcheck: clone.Healthcheck,
+			HostConfig:  hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1743,7 +1765,7 @@ func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, re
 	for i := 0; i < count; i++ {
 		cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image: req.Image, Labels: canaryLabels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image: req.Image, Labels: canaryLabels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts},
 		})
 		if err != nil {
 			return fmt.Errorf("create canary %s: %w", cname, err)
@@ -1824,7 +1846,7 @@ func (c *dockerClient) scaleCanary(ctx context.Context, name string, target int)
 		startIdx := nextCanaryReplicaIndex(all, name)
 		for i := 0; i < target-current; i++ {
 			cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
-			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
+			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
 			if err != nil {
 				return fmt.Errorf("create canary %s: %w", cname, err)
 			}
@@ -1888,7 +1910,7 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 		}
 		startIdx := nextReplicaIndex(all, name)
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx)
-		id, err := c.createContainer(ctx, cname, createBody{Image: ct.Image, Labels: labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts}})
+		id, err := c.createContainer(ctx, cname, createBody{Image: ct.Image, Labels: labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
 		if err != nil {
 			return fmt.Errorf("create promoted %s: %w", cname, err)
 		}
