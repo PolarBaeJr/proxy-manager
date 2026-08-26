@@ -296,7 +296,7 @@ func main() {
 		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv(), monitorURLFromEnv()),
 		"/peer/stats":           peerStatsHandler(peerSecret, identity),
 		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic),
-		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, *staticConfig, proxyURLFromEnv(), peerWritesEnabled),
+		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, registry, *staticConfig, proxyURLFromEnv(), peerWritesEnabled),
 		"/peer/discovery/":      peerDiscoveryMutateHandler(peerSecret, identity, dc, proxyURLFromEnv(), peerWritesEnabled),
 		"/peer/images":          peerImagesHandler(peerSecret, identity, dc, releases, imageHistory, onboarded),
 		"/peer/images/":         peerImagesMutateHandler(peerSecret, identity, dc, releases, imageHistory, onboarded, peerWritesEnabled),

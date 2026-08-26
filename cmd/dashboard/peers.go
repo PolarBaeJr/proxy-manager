@@ -519,7 +519,7 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 // constant-time bearer compare, parse the subpath, self-guard, then dispatch
 // against THIS host's own live Docker state (never the requester's claims),
 // auditing every branch as peer-mesh.
-func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, ic *imageChecker, routesConfigPath, proxyURL string, writesEnabled bool) http.Handler {
+func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *OnboardedStore, ic *imageChecker, registry *PeerRegistry, routesConfigPath, proxyURL string, writesEnabled bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if secret == "" || !writesEnabled {
 			http.NotFound(w, r)
@@ -791,6 +791,34 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 			proxyRefresh(proxyURL)
 			audit(r, "peer-mesh", "service.offboard", name)
 			httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "offboarded"})
+			return
+		}
+		if len(parts) == 2 && parts[1] == "duplicate" && r.Method == http.MethodPost {
+			var body DuplicateServiceRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			// The inbound assertion (if any) is relayed as-is to the second
+			// hop's peerMutate call inside runServiceDuplicate — forwardedActorTTL
+			// (2 minutes) comfortably covers this synchronous two-hop chain, and
+			// relaying the original signed claims keeps audit attribution on the
+			// real user across both hops rather than collapsing to "peer-mesh".
+			resp, err := runServiceDuplicate(r.Context(), dc, registry, onb, routesConfigPath, name, body, r.Header.Get(actorHeader))
+			if err != nil {
+				var pe *peerDuplicateError
+				switch {
+				case errors.As(err, &pe):
+					mapPeerMutationErr(w, pe.statusCode, pe.body)
+				case errors.Is(err, errDuplicateNotFound):
+					http.Error(w, "service not found", http.StatusNotFound)
+				default:
+					http.Error(w, err.Error(), http.StatusBadRequest)
+				}
+				return
+			}
+			audit(r, "peer-mesh", "service.duplicate", name+" => "+body.Target)
+			httpx.WriteJSON(w, http.StatusOK, resp)
 			return
 		}
 		if len(parts) == 1 && r.Method == http.MethodDelete {
