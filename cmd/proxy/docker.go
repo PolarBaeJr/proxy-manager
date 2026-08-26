@@ -33,6 +33,12 @@ const (
 	labelAuthMode  = "proxy.auth.mode"
 	labelRateLimit = "proxy.ratelimit"
 	labelRateRPM   = "proxy.ratelimit.rpm"
+	// labelSpread opts a route out of pickHealthy's default peer-as-failover
+	// tiering and into active load balancing across the mesh — see
+	// RouteGroup.Spread. Set by cmd/dashboard's cross-host scale
+	// (spread.go) on the replicas it places on a peer; nothing sets it
+	// implicitly, so every existing route keeps failover-only semantics.
+	labelSpread = "proxy.spread"
 	// labelCanary does not otherwise exist in the proxy package — canary is
 	// managed by the dashboard (cmd/dashboard/docker.go's labelCanary) and
 	// the proxy has never needed to know about it, since a canary container

@@ -1,8 +1,10 @@
 # Peer mesh — chosen design (orientation, not a spec)
 
-Status: **Phase 2 (peer discovery + handshake) implemented.** Route sync
-(peer-as-backend forwarding, `peersync.go`/`peermerge.go`) is not yet built —
-see the note below. This is the actual direction picked for proxy-level
+Status: **Phase 3 (route sync, `peersync.go`/`peermerge.go`) implemented**, on
+top of Phase 2's discovery/handshake. Peer-as-backend is failover-only by
+default; the opt-in active-pool case the "shared rate limiting" section below
+anticipated now exists too — see "Spread" at the end. This is the actual
+direction picked for proxy-level
 (request-path) federation, as opposed to `PEERS_PLAN.md`'s narrower
 dashboard-only aggregation. Written so a future session doesn't re-derive the
 design or accidentally build the older, narrower plan instead. Keep this
@@ -32,13 +34,17 @@ existing gossip. `cmd/proxy/peersync.go` (push loop) and `cmd/proxy/peermerge.go
 so a reviewer maps them onto `cmd/edge/peers.go`'s `PeerSync`/`gossipHandler`
 by inspection.
 
-**Implemented so far (Phase 2):** `cmd/proxy/peers.go` holds the peer
+**Implemented (Phase 2):** `cmd/proxy/peers.go` holds the peer
 list/config plumbing — a `PeerRegistry` that periodically POSTs an
 authenticated, placeholder handshake to every configured peer's
 `/peer/handshake` endpoint (also in `peers.go`) and records success/failure +
-last-contact time per peer. This proves connectivity and auth work end to
-end; no route/backend data crosses the wire yet. **`peersync.go` and
-`peermerge.go` do not exist yet** — that's the next phase to pick up.
+last-contact time per peer. This proves connectivity and auth work end to end.
+
+**Implemented (Phase 3):** `peersync.go` pushes locally-owned routes (counts
+only, never backend URLs) and `peermerge.go` turns each received route into
+one synthetic backend aimed at the sender's `-peer-advertise-url`. Note that
+push is disabled — receive-only — unless `-peer-advertise-url` is set, which
+is a per-host value and cannot be defaulted.
 
 ## Trust: one shared bearer secret for v1
 
@@ -82,6 +88,52 @@ backend actually being down, to every prober in the mesh at once.)
 The fix is architectural (keep health-check dependency paths internal to the
 Docker network, not routed back through the proxy/edge), not something this
 plan's failover mechanism can paper over.
+
+## Spread: the opt-in active pool
+
+`pickHealthy` treats a peer as a failover tier, which is right for a route
+that happens to exist on two hosts independently but wrong for one service
+deliberately scaled across both. `RouteGroup.Spread` collapses the two tiers
+into a single weighted pool, with the peer's advertised local-backend count as
+its weight so the split follows replicas rather than proxies. It is opt-in
+per route: set by the `proxy.spread` label, and adopted by a peer that
+receives it in an advertisement — that adoption is load-bearing, because
+`cmd/dashboard`'s cross-host scale (`spread.go`) labels only the replicas it
+places on the target, never the origin's pre-existing containers.
+
+Adoption is deliberately **one-way**: a host advertises `SpreadLocal` (what its
+own labels say) and never the value it adopted. Re-advertising the adopted flag
+would latch it on permanently — each host adopting its own claim back through
+the other, with the route still being advertised so TTL never fires to clear
+it. The off-switch is therefore the label: remove `proxy.spread` from the
+replicas carrying it and both hosts fall back to failover-only on the next
+refresh.
+
+Two properties this deliberately keeps: an already-forwarded request
+(`PeerHopHeader`) still gets the local-only tier, so spread cannot loop; and a
+spread group with no healthy local backend still falls through to the peer,
+so opting in never costs the failover it generalizes.
+
+The residual risk is health granularity. A synthetic peer backend has no
+`HealthPath` (see `checkBackend`) — a bare TCP dial of the peer PROXY. Under
+failover that was harmless; under spread, a peer whose container dies keeps
+receiving its share until the route ages out of `PeerRouteStore`, which is
+`3 x peerSyncInterval`. The compose default was lowered from 5s to 2s for
+exactly this reason, putting the window at ~6s rather than ~15s. It applies to
+plain failover detection too, not only spread.
+
+### Weight
+
+A peer's synthetic backend is weighted by the SUM of the `proxy.weight` labels
+on the peer's own replicas (each defaulting to 1), advertised as
+`peerRouteInfo.Weight`. So the same label that already sets a backend's share
+within one host's pool now also sets a host's share of a cross-host spread —
+one weight concept, not two. `Backends` stays a plain count and remains the
+validity gate; a peer that advertises no weight at all (an older binary) falls
+back to it, so a rolling deploy doesn't transiently collapse a multi-replica
+peer to weight 1. The dashboard edits the label via
+`POST /api/services/{name}/weight`, which recreates the service's replicas —
+Docker has no in-place label edit.
 
 ## Relationship to `PEERS_PLAN.md`
 

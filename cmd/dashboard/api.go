@@ -738,6 +738,30 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": body.Enabled})
 			return
 		}
+		if len(parts) == 2 && parts[1] == "weight" && req.Method == "POST" {
+			var body struct {
+				Weight int `json:"weight"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			if !validWeight(body.Weight) {
+				http.Error(w, fmt.Sprintf("weight must be between 1 and %d", maxServiceWeight), http.StatusBadRequest)
+				return
+			}
+			if _, ok := onb.Get(name); ok {
+				http.Error(w, "weight is only supported for label-managed services", http.StatusBadRequest)
+				return
+			}
+			if err := dc.setWeightLabel(req.Context(), name, body.Weight); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			audit(req, sessionUser(info), "service.weight_set", name+" => "+strconv.Itoa(body.Weight))
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "weight": body.Weight})
+			return
+		}
 		if len(parts) == 2 && parts[1] == "check" && req.Method == "POST" {
 			payload, status, err := runServiceCheckImage(req.Context(), dc, ic, onb, name)
 			if err != nil {
@@ -794,6 +818,37 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				return
 			}
 			audit(req, sessionUser(info), "service.duplicate", name+" => "+body.Target)
+			httpx.WriteJSON(w, http.StatusOK, resp)
+			return
+		}
+		// Same locality rule as duplicate above: runServiceSpread reads the
+		// real service's live env server-side, so it must run where the
+		// service actually lives. A foreign service takes the isPeer branch
+		// and reaches its owner's /peer/services/{name}/spread instead.
+		if len(parts) == 2 && parts[1] == "spread" && req.Method == "POST" {
+			var body SpreadServiceRequest
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				httpx.WriteErr(w, err)
+				return
+			}
+			actor := sessionUser(info)
+			if actor == "" {
+				actor = principalFrom(req)
+			}
+			resp, err := runServiceSpread(req.Context(), dc, registry, onb, name, body, mintForwardedActor(req, actor))
+			if err != nil {
+				var pe *peerSpreadError
+				switch {
+				case errors.As(err, &pe):
+					mapPeerMutationErr(w, pe.statusCode, pe.body)
+				case errors.Is(err, errSpreadNotFound):
+					http.Error(w, "service not found", http.StatusNotFound)
+				default:
+					http.Error(w, err.Error(), http.StatusBadRequest)
+				}
+				return
+			}
+			audit(req, sessionUser(info), "service.spread", name+" => "+body.Target)
 			httpx.WriteJSON(w, http.StatusOK, resp)
 			return
 		}
@@ -2113,7 +2168,7 @@ func runServiceCheckImage(ctx context.Context, dc *dockerClient, ic *imageChecke
 // its /peer/services/{name}/<sub> counterpart — the write-mesh sibling of
 // forwardImageMutation above. Covers scale, stop, start, replicas/{member}/
 // {stop,start}, autoupdate, check, replace, stage, promote, canary
-// (discard), offboard, and delete — every mutating service action now
+// (discard), offboard, weight, and delete — every mutating service action now
 // forwards. The only thing still genuinely local-only among service writes
 // is onboard, which lives under the separate /api/discovery/ path and is out
 // of scope here. DELETE has no subpath (parts is length 1, unlike every
@@ -2143,6 +2198,8 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/autoupdate"
 	case len(parts) == 2 && parts[1] == "singleton" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/singleton"
+	case len(parts) == 2 && parts[1] == "weight" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/weight"
 	case len(parts) == 2 && parts[1] == "check" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/check"
 	case len(parts) == 2 && parts[1] == "replace" && req.Method == http.MethodPost:
@@ -2157,6 +2214,8 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/offboard"
 	case len(parts) == 2 && parts[1] == "duplicate" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/duplicate"
+	case len(parts) == 2 && parts[1] == "spread" && req.Method == http.MethodPost:
+		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/spread"
 	case len(parts) == 1 && req.Method == http.MethodDelete:
 		method, peerPath = http.MethodDelete, "/peer/services/"+url.PathEscape(name)
 	default:

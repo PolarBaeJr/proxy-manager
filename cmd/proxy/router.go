@@ -60,6 +60,25 @@ type RouteGroup struct {
 	RateRPM   int
 	limiter   limiter
 
+	// Spread turns this group's learned (peer) backends from a failover tier
+	// into equal members of one load-balanced pool — the "treating two
+	// hosts' backends for the same route as one pool" case
+	// docs/PEER_MESH_PLAN.md scopes, whose stated prerequisite (the
+	// Redis-backed shared limiter in redisrl.go, so a client can't get
+	// N x instances throughput by being balanced across peers) is already
+	// in place. Opt-in only: set from the proxy.spread label locally, or
+	// adopted from a peer that advertises it (peermerge.go's overlay).
+	Spread bool
+
+	// SpreadLocal is the half of Spread that came from THIS host's own
+	// labels, and is the only half peersync.go advertises. Advertising the
+	// adopted value instead would latch the flag on permanently: this host
+	// would re-advertise what it learned, the peer would adopt its own claim
+	// back, and neither side could ever clear it while the route itself kept
+	// being advertised (so TTL expiry never fires). Symmetry is unaffected —
+	// whichever host actually carries the label keeps advertising it.
+	SpreadLocal bool
+
 	cursor atomic.Uint64
 
 	// static marks a group whose backend list is owned by routes.json / a
@@ -99,6 +118,16 @@ const PeerHopHeader = "X-Pmgr-Peer-Hop"
 // (and its round-robin sequence) untouched when there are no learned
 // backends at all.
 func (g *RouteGroup) pickHealthy(skip map[*Backend]bool, allowPeer bool) *Backend {
+	// Spread collapses the two tiers into one pool, but only for a request
+	// that hasn't already been forwarded once (allowPeer). A hopped request
+	// still gets the local-only tier, which is what keeps two spread proxies
+	// from bouncing a request between each other forever.
+	if g.Spread && allowPeer {
+		if b := g.pickHealthyPool(skip); b != nil {
+			return b
+		}
+		return nil
+	}
 	if b := g.pickHealthyTier(skip, false); b != nil {
 		return b
 	}
@@ -106,6 +135,28 @@ func (g *RouteGroup) pickHealthy(skip map[*Backend]bool, allowPeer bool) *Backen
 		return g.pickHealthyTier(skip, true)
 	}
 	return nil
+}
+
+// pickHealthyPool is pickHealthyTier without the Learned partition: one
+// weighted round-robin over every eligible backend, local and peer alike.
+func (g *RouteGroup) pickHealthyPool(skip map[*Backend]bool) *Backend {
+	var pool []*Backend
+	for _, b := range g.Backends {
+		if !b.healthy() || skip[b] {
+			continue
+		}
+		w := b.Weight
+		if w < 1 {
+			w = 1
+		}
+		for i := 0; i < w; i++ {
+			pool = append(pool, b)
+		}
+	}
+	if len(pool) == 0 {
+		return nil
+	}
+	return pool[int(g.cursor.Add(1)-1)%len(pool)]
 }
 
 // pickHealthyTier restricts selection to backends whose Learned flag matches
@@ -697,6 +748,14 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		if c.Labels[labelRateLimit] == "true" {
 			g.RateLimit = true
 		}
+		// Spread merges across replicas the same way auth/ratelimit do: one
+		// replica opting the route in is enough, since a cross-host scale
+		// only ever labels the replicas it places on the peer, never the
+		// pre-existing originals it found here.
+		if c.Labels[labelSpread] == "true" {
+			g.SpreadLocal = true
+			g.Spread = true
+		}
 		if rpmStr := c.Labels[labelRateRPM]; rpmStr != "" && g.RateRPM == 0 {
 			rpm, err := strconv.Atoi(rpmStr)
 			if err != nil || rpm <= 0 {
@@ -766,7 +825,13 @@ func makeBackend(rawURL string, weight int, container, healthPath string, u *url
 // (see the StripPrefix block above); without that restoration the peer's own
 // ServeHTTP wouldn't be able to match/strip it itself. Returns nil if
 // peerBaseURL doesn't parse.
-func makePeerBackend(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool, peerID string) *Backend {
+//
+// weight is the number of local backends the peer advertised for this route,
+// so a spread group balances per-REPLICA rather than per-proxy: without it a
+// peer running four replicas would receive the same share as one running a
+// single replica. Values < 1 are floored to 1 by pickHealthy*, so a peer that
+// advertises nothing usable still stays selectable as a failover backend.
+func makePeerBackend(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool, peerID string, weight int) *Backend {
 	u, err := url.Parse(peerBaseURL)
 	if err != nil {
 		log.Printf("peer backend: bad URL %q: %v", peerBaseURL, err)
@@ -782,8 +847,11 @@ func makePeerBackend(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool
 		}
 		req.Header.Set(PeerHopHeader, "1")
 	}
+	if weight < 1 {
+		weight = 1
+	}
 	return &Backend{
-		URL: peerBaseURL, Weight: 1, Container: "peer:" + peerID, proxy: p,
+		URL: peerBaseURL, Weight: weight, Container: "peer:" + peerID, proxy: p,
 		Learned: true, PeerID: peerID,
 	}
 }

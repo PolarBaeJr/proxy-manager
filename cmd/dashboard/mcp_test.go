@@ -67,7 +67,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	ro := NewServer("t", "v")
 	registerMCPTools(ro, c, false, false)
 	names := toolNames(t, ro)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if names[w] {
 			t.Errorf("mutating tool %q registered in read-only mode", w)
 		}
@@ -81,7 +81,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	rw := NewServer("t", "v")
 	registerMCPTools(rw, c, true, false)
 	rwNames := toolNames(t, rw)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if !rwNames[w] {
 			t.Errorf("mutating tool %q missing when writes are allowed", w)
 		}
@@ -751,6 +751,33 @@ var peerTargetableTools = map[string]string{
 	"onboard_service":   "peer_host",
 	"offboard_service":  "host",
 	"restart_replica":   "host",
+}
+
+// spread_service is peer-targeted by construction — its "target" is not
+// optional the way "host" is elsewhere — so it must be refused outright
+// without MCP_ALLOW_PEER_WRITES rather than falling back to a local call.
+func TestSpreadServiceRequiresPeerWrites(t *testing.T) {
+	c, calls := stubDash(t, 200, `{"ok":true}`)
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true, false)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spread_service","arguments":{"service":"app","target":"peer-b"}}}`
+	res, _ := rpc(t, s, body)
+	r, ok := res["result"].(map[string]any)
+	if !ok || r["isError"] != true {
+		t.Fatalf("expected isError, got %v", res)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("calls = %v, want the dashboard never contacted", *calls)
+	}
+
+	sOK := NewServer("t", "v")
+	registerMCPTools(sOK, c, true, true)
+	body = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spread_service","arguments":{"service":"app","target":"peer-b","replicas":2}}}`
+	rpc(t, sOK, body)
+	if len(*calls) != 1 || (*calls)[0] != "POST /api/services/app/spread" {
+		t.Fatalf("calls = %v, want one POST to the local spread endpoint (the ORIGIN reads the template, so this is never ?host=-forwarded)", *calls)
+	}
 }
 
 // A host/peer_host argument must be refused before the dashboard is

@@ -48,6 +48,13 @@ func validProxyPath(s string) bool   { return proxyPathRE.MatchString(s) }
 func validCFRecordID(s string) bool  { return cfRecordIDRE.MatchString(s) }
 func validPort(p int) bool           { return p > 0 && p <= 65535 }
 
+// maxServiceWeight bounds proxy.weight. There is no protocol limit — the cap
+// exists because weight is a RATIO, so 1:1000 splits are a fat-fingered zero
+// away from black-holing a host, and nothing legitimate needs that range.
+const maxServiceWeight = 100
+
+func validWeight(w int) bool { return w >= 1 && w <= maxServiceWeight }
+
 // validMaintHost gates the only value that ever becomes a maintenance flag
 // filename. The regex's leading/trailing-alnum anchors already reject ".",
 // "..", "..." and "../x"; the Contains check adds embedded "..", which the

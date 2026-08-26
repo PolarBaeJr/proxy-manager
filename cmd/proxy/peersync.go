@@ -38,8 +38,25 @@ type peerRouteInfo struct {
 	StripPrefix bool   `json:"strip,omitempty"`
 	Name        string `json:"name,omitempty"`
 	Backends    int    `json:"backends"`
-	RateLimit   bool   `json:"ratelimit,omitempty"`
-	RateRPM     int    `json:"ratelimit_rpm,omitempty"`
+	// Weight is the SUM of the locally-owned backends' proxy.weight values
+	// (each defaulting to 1), which is what the receiving side gives the
+	// single synthetic backend it creates for this peer. Kept separate from
+	// Backends rather than folded into it: Backends stays a plain count and
+	// remains the validity gate in peermerge.merge, and the two diverge as
+	// soon as an operator edits proxy.weight. Zero means "peer didn't send
+	// one" — an older binary — and merge falls back to Backends there.
+	Weight    int  `json:"weight,omitempty"`
+	RateLimit bool `json:"ratelimit,omitempty"`
+	RateRPM   int  `json:"ratelimit_rpm,omitempty"`
+	// Spread carries RouteGroup.SpreadLocal — this host's OWN proxy.spread
+	// labels — across the wire so the receiving side load-balances into this
+	// peer instead of holding it in reserve as a failover tier. Deliberately
+	// not the adopted RouteGroup.Spread: re-advertising what we learned would
+	// latch the flag on forever, each host adopting its own claim back through
+	// the other, with no way to clear it short of restarting both proxies
+	// inside one TTL window. Removing the label from the replicas that carry
+	// it is the off-switch, and it only works if adoption stays one-way.
+	Spread bool `json:"spread,omitempty"`
 }
 
 // peerRoutePayload is the body POSTed to a peer's /peer/routes endpoint.
@@ -100,10 +117,11 @@ func (p *PeerSync) Run(ctx context.Context) {
 func (p *PeerSync) tick(ctx context.Context) {
 	var routes []peerRouteInfo
 	for _, g := range p.router.Snapshot() {
-		localCount := 0
+		localCount, localWeight := 0, 0
 		for _, b := range g.Backends {
 			if !b.Learned {
 				localCount++
+				localWeight += b.Weight
 			}
 		}
 		if localCount == 0 {
@@ -111,8 +129,8 @@ func (p *PeerSync) tick(ctx context.Context) {
 		}
 		routes = append(routes, peerRouteInfo{
 			Host: g.Host, PathPrefix: g.PathPrefix, StripPrefix: g.StripPrefix,
-			Name: g.Name, Backends: localCount,
-			RateLimit: g.RateLimit, RateRPM: g.RateRPM,
+			Name: g.Name, Backends: localCount, Weight: localWeight,
+			RateLimit: g.RateLimit, RateRPM: g.RateRPM, Spread: g.SpreadLocal,
 		})
 	}
 	if len(routes) == 0 {

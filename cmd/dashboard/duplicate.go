@@ -257,11 +257,20 @@ func runServiceDuplicate(ctx context.Context, dc *dockerClient, registry *PeerRe
 	}
 	proxyRefresh(proxyURLFromEnv())
 
+	// NOT optional, despite what this hint said until 2026-08-26: the route
+	// entry written just above points at <peer>:<port>, but
+	// peerDuplicateHandler binds that port to 127.0.0.1 on the peer. Until
+	// this block exists ON THE TARGET HOST, the backend is a black hole and
+	// the duplicated service silently absorbs a share of the route's traffic
+	// as errors. Cross-host SCALING (spread.go) needs none of this — it adds
+	// no published port and no route entry.
 	hint := fmt.Sprintf(
-		"# Optional: raw TCP passthrough for %s on this host's Tailscale IP.\n"+
+		"# REQUIRED on %s — the route entry just written points here, and until\n"+
+			"# this exists the duplicated backend is unreachable (the container's\n"+
+			"# port is bound to 127.0.0.1 on that host).\n"+
 			"# Add to the stream{} block — Pi: /etc/nginx-stream/nginx.conf, Mac: ~/deploy/nginx-stream/nginx.conf\n"+
 			"server {\n    listen <tailscale-ip>:%d;\n    proxy_pass 127.0.0.1:%d;\n}\n",
-		name, port, port,
+		req.Target, port, port,
 	)
 	return DuplicateServiceResponse{Status: "duplicated", Target: req.Target, Port: port, NginxStreamHint: hint}, nil
 }

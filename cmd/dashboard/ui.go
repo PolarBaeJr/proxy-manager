@@ -1425,6 +1425,10 @@ async function renderRoutes() {
 }
 
 /* ---------- Services ---------- */
+// Mirrors maxServiceWeight in validate.go — the server is the real gate, this
+// is only so the input's max and the client-side message match what the API
+// will accept. TestUIWeightCapMatchesServer fails if the two ever drift.
+const MAX_SVC_WEIGHT = 100;
 let _lastServicesHash = '';
 // This host's own peer identity (DASHBOARD_HOST, see peers.go), lazily
 // fetched once from /api/peers. null means "not known yet" — foreignSvc()
@@ -1585,6 +1589,9 @@ async function renderServices() {
     else if (s.previous_image) facts += '<tr><td>Previous</td><td><span class="ident dim">' + esc(s.previous_image) + '</span></td></tr>';
     facts += '<tr><td>Port</td><td' + (managed ? ' class="meta">—' : ' class="num">' + s.port) + '</td></tr>';
     facts += '<tr><td>Replicas</td><td>' + replicaCtrl(s) + '</td></tr>';
+    // Weight is a proxy.* label, so it means nothing for a routeless
+    // ("managed") or onboarded service — same gate the singleton toggle uses.
+    if (!managed && !s.onboarded) facts += '<tr><td>Weight</td><td>' + weightCtrl(s) + '</td></tr>';
     facts += '</table>';
 
     let actions;
@@ -2112,6 +2119,28 @@ function discoveryShowLabels(name, port) {
   d.showModal();
 }
 
+// weightCtrl — view/edit proxy.weight, this service's per-replica share of
+// its route's traffic (and, via the peer mesh's summed advertisement, its
+// share of a cross-host spread).
+//
+// No −/+ steppers, unlike replicaCtrl: setting the label means recreating
+// every replica (Docker can't edit a label in place), so each nudge would
+// restart the service. Apply-only makes that one deliberate action.
+function weightCtrl(s) {
+  const sn = esc(s.name);
+  const dis = svcWriteAttr(s);
+  // See the hostAttr comment in renderServices — data-host, never spliced
+  // into the onclick string directly, because s.machine is unvalidated
+  // operator-set text.
+  const hostAttr = (foreignSvc(s) && peerWritable(s)) ? ' data-host="' + esc(s.machine) + '"' : '';
+  const cur = s.weight || 1;
+  const editable = isElevated() && (!foreignSvc(s) || peerWritable(s));
+  return '<span class="replica-ctrl" title="Relative routing weight per replica. Applying recreates this service\'s replicas.">'
+       + '<input type="number" min="1" max="' + MAX_SVC_WEIGHT + '" value="' + cur + '" id="wt-' + sn + '"' + (editable ? '' : ' disabled') + '>'
+       + '<button class="apply" ' + dis + hostAttr + ' onclick="setWeight(\'' + sn + '\', +document.getElementById(\'wt-' + sn + '\').value, this.dataset.host, this)">Apply</button>'
+       + '</span>';
+}
+
 function replicaCtrl(s) {
   if (s.unscalable) return '<span class="singleton-lock">' + I.lock + 'Singleton <span class="pill muted" style="margin-left:4px">fixed at 1</span></span>';
   const sn = esc(s.name);
@@ -2220,6 +2249,34 @@ async function toggleAutoUpdate(name, enabled, host) {
     _lastServicesHash = '';
     renderActive();
   } catch (e) { toast(e.message, 'err'); }
+}
+
+// setWeight — set proxy.weight for a label-managed service. Borrows
+// scaleSvc's in-flight treatment: applying recreates every replica, so this
+// is slower than it looks and the button must not read as idle meanwhile.
+async function setWeight(name, w, host, btn) {
+  if (!(w >= 1 && w <= MAX_SVC_WEIGHT)) { toast('weight must be between 1 and ' + MAX_SVC_WEIGHT, 'err'); return; }
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
+  const wrap = btn && btn.closest('.replica-ctrl');
+  const applyLabel = btn ? btn.textContent : '';
+  if (wrap) {
+    wrap.querySelectorAll('button').forEach(b => b.disabled = true);
+    if (btn) btn.textContent = '…';
+  }
+  try {
+    await api('/api/services/' + encodeURIComponent(name) + '/weight' + hostParam, {
+      method: 'POST', body: JSON.stringify({ weight: w })
+    });
+    toast('weight for ' + name + ' → ' + w);
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) {
+    toast(e.message, 'err');
+    if (wrap) {
+      wrap.querySelectorAll('button').forEach(b => b.disabled = false);
+      if (btn) btn.textContent = applyLabel;
+    }
+  }
 }
 
 // toggleSingleton — flip proxy.unscalable for a label-managed service.
