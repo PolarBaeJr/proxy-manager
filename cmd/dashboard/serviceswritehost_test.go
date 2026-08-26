@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -2080,5 +2081,45 @@ func TestServicesDuplicateForwardsToOwningPeer(t *testing.T) {
 	}
 	if !finalCreate.Load() {
 		t.Error("final target never saw /containers/create — the second hop (owner -> ultimate target) never happened")
+	}
+}
+
+// TestServicesDuplicateRefusesSingleton proves runServiceDuplicate refuses a
+// service labeled proxy.unscalable=true before ever contacting a peer —
+// covering both the local (api.go) and peer-mesh (peers.go) call paths,
+// which both funnel through this one guard. This is the fix for the
+// incident where duplicating a singleton service created a second,
+// independent container plus a competing routes.json entry for the same
+// host+path.
+func TestServicesDuplicateRefusesSingleton(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	var peerHit atomic.Bool
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peerHit.Store(true)
+		json.NewEncoder(w).Encode(peerDuplicateResponse{Status: "ok"})
+	}))
+	t.Cleanup(peerSrv.Close)
+
+	calls := &svcCallTracker{}
+	dc := replaceDockerStub(t, calls, []dockerContainer{{
+		ID: "tpl1", Names: []string{"/goproxy-app-1"}, State: "running", Image: "ghcr.io/org/app:v1",
+		Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "8080", labelUnscalable: "true"},
+	}})
+	onb := newTestOnboardedStore(t)
+	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
+	routesPath := filepath.Join(t.TempDir(), "routes.json")
+
+	_, err := runServiceDuplicate(context.Background(), dc, reg, onb, routesPath, "app",
+		DuplicateServiceRequest{Target: "dashboard-b", PublishPort: 18080}, "")
+	if err == nil {
+		t.Fatal("expected an error duplicating a singleton service, got nil")
+	}
+	if !strings.Contains(err.Error(), "singleton") {
+		t.Errorf("error = %q, want it to mention singleton", err.Error())
+	}
+	if peerHit.Load() {
+		t.Error("peer was contacted — singleton refusal must happen before any peer call")
 	}
 }

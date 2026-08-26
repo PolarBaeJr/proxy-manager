@@ -134,6 +134,14 @@ func runServiceDuplicate(ctx context.Context, dc *dockerClient, registry *PeerRe
 			return DuplicateServiceResponse{}, fmt.Errorf("%q is an onboarded service — duplicate only supports label-managed services", name)
 		}
 	}
+	// A singleton service has exactly one intended holder of its identity
+	// (a fixed port binding, a leader lease, etc.) — a second independent
+	// copy is a competing container plus a competing routes.json entry for
+	// the same host+path, not a usable replica. Refuse here so both the
+	// local and peer-mesh call paths get this for free.
+	if svc.Unscalable {
+		return DuplicateServiceResponse{}, fmt.Errorf("%q is a singleton service — duplicate is not supported for singleton services", name)
+	}
 	if registry == nil {
 		return DuplicateServiceResponse{}, fmt.Errorf("peer mesh not configured")
 	}
