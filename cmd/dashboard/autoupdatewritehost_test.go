@@ -68,7 +68,7 @@ func newLocalTestMuxWithOnboarded(t *testing.T, localDC *dockerClient, onb *Onbo
 	t.Helper()
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
-	return newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, onb, nil, nil, nil, nil, nil, reg, nil)
+	return newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil)
 }
 
 // putOnboardedApp is the standard onboarded "app" fixture shared by most
@@ -523,7 +523,7 @@ func TestAutoUpdateMutationForwardsActorAssertion(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil)
+		mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), newImageChecker(localDC), "", nil, localOnb, nil, nil, nil, nil, nil, reg, nil, nil)
 
 		var reqBody *strings.Reader
 		if body != "" {

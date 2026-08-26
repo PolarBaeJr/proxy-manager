@@ -317,7 +317,7 @@ func TestPeerServicesHandlerValidSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	ic := newImageChecker(dc)
-	h := peerServicesHandler("s3cret", "dashboard-b", dc, onb, ic)
+	h := peerServicesHandler("s3cret", "dashboard-b", dc, onb, ic, nil)
 	req := httptest.NewRequest(http.MethodGet, "/peer/services", nil)
 	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
@@ -339,7 +339,7 @@ func TestPeerServicesHandlerValidSecret(t *testing.T) {
 }
 
 func TestPeerServicesHandlerWrongSecret(t *testing.T) {
-	h := peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil)
+	h := peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/peer/services", nil)
 	req.Header.Set("Authorization", "Bearer wrong")
 	rec := httptest.NewRecorder()
@@ -350,7 +350,7 @@ func TestPeerServicesHandlerWrongSecret(t *testing.T) {
 }
 
 func TestPeerServicesHandlerEmptySecretDisabled(t *testing.T) {
-	h := peerServicesHandler("", "dashboard-b", nil, nil, nil)
+	h := peerServicesHandler("", "dashboard-b", nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/peer/services", nil)
 	req.Header.Set("Authorization", "Bearer anything")
 	rec := httptest.NewRecorder()
@@ -361,7 +361,7 @@ func TestPeerServicesHandlerEmptySecretDisabled(t *testing.T) {
 }
 
 func TestPeerServicesHandlerWrongMethod(t *testing.T) {
-	h := peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil)
+	h := peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/peer/services", nil)
 	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
@@ -435,7 +435,7 @@ func TestFetchPeerServicesTagsMachineAndMerges(t *testing.T) {
 		t.Fatal(err)
 	}
 	ic := newImageChecker(dcB)
-	srvB := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", dcB, onb, ic))
+	srvB := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", dcB, onb, ic, nil))
 	defer srvB.Close()
 
 	reg := newPeerRegistry([]string{srvB.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
@@ -449,7 +449,7 @@ func TestFetchPeerServicesTagsMachineAndMerges(t *testing.T) {
 }
 
 func TestFetchPeerServicesSkipsUnreachablePeer(t *testing.T) {
-	srv := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil))
+	srv := httptest.NewServer(peerServicesHandler("s3cret", "dashboard-b", nil, nil, nil, nil))
 	url := srv.URL
 	srv.Close() // guarantees connection-refused without hardcoding a port
 

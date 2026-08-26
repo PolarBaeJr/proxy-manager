@@ -184,7 +184,8 @@ func main() {
 
 	// Background: poll registries every 10 min for newer image digests, then
 	// let the auto-updater act on any opted-in service with a newer digest.
-	au := newAutoUpdater(dc, ic, onboarded, *staticConfig, proxyURLFromEnv())
+	autoUpdateBlocks := newAutoUpdateBlockStore()
+	au := newAutoUpdater(dc, ic, onboarded, *staticConfig, proxyURLFromEnv(), autoUpdateBlocks)
 	go ic.Loop(ctx, func() []string {
 		svcs, err := dc.listServices(ctx)
 		if err != nil {
@@ -267,7 +268,7 @@ func main() {
 	peerList := splitAndTrim(*peers)
 	registry := newPeerRegistry(peerList, peerSecret, identity, buildVersion, *peerSyncInterval, redisClient)
 
-	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages, registry, rm)
+	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages, registry, rm, autoUpdateBlocks)
 
 	// MCP on its own port, proxied at mcp.<domain>/mcp/dashboard. Separate from
 	// :8093 because that one is loopback-only and serves the UI at "/", which
@@ -295,7 +296,7 @@ func main() {
 		"/peer/handshake":       peerHandshakeHandler(peerSecret, identity, buildVersion, peerWritesEnabled),
 		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv(), monitorURLFromEnv()),
 		"/peer/stats":           peerStatsHandler(peerSecret, identity),
-		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic),
+		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic, autoUpdateBlocks),
 		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, registry, *staticConfig, proxyURLFromEnv(), peerWritesEnabled),
 		"/peer/discovery/":      peerDiscoveryMutateHandler(peerSecret, identity, dc, proxyURLFromEnv(), peerWritesEnabled),
 		"/peer/images":          peerImagesHandler(peerSecret, identity, dc, releases, imageHistory, onboarded),

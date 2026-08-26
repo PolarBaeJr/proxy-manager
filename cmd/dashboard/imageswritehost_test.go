@@ -112,7 +112,7 @@ func TestImagesMarkUnmarkForwardToPeer(t *testing.T) {
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	markReq := httptest.NewRequest(http.MethodPost, "/api/images/mark?host=dashboard-b",
 		strings.NewReader(`{"service":"app","tag":"v2","label":"pin"}`))
@@ -178,7 +178,7 @@ func TestImagesDeleteForwardsToPeer(t *testing.T) {
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/images/delete?host=dashboard-b",
 		strings.NewReader(`{"service":"app","ref":"ghcr.io/org/app:v2"}`))
@@ -223,7 +223,7 @@ func TestImagesDeletePeerRejectsUnsafeClaim(t *testing.T) {
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/images/delete?host=dashboard-b",
 		strings.NewReader(`{"service":"app","ref":"ghcr.io/org/app:v1"}`))
@@ -265,7 +265,7 @@ func TestImagesPruneForwardsToPeer(t *testing.T) {
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/images/prune?host=dashboard-b",
 		strings.NewReader(`{"service":"app","keep_n":0}`))
@@ -319,7 +319,7 @@ func TestImagesMutationPeerWritesDisabled(t *testing.T) {
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	for _, tc := range []struct {
 		name, method, path, body string
@@ -357,7 +357,7 @@ func TestImagesMutationUnknownHost(t *testing.T) {
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
 	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", true)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/images/prune?host=nonexistent-host",
 		strings.NewReader(`{"service":"","keep_n":0}`))
@@ -379,7 +379,7 @@ func TestImagesMutationNoRegistry(t *testing.T) {
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, nil, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/images/prune?host=anything",
 		strings.NewReader(`{"service":"","keep_n":0}`))
@@ -412,7 +412,7 @@ func TestImagesMutationPeerUnreachable(t *testing.T) {
 	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
 	reg.recordResult(url, true, "dashboard-b", "dev", true)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/images/prune?host=dashboard-b",
 		strings.NewReader(`{"service":"","keep_n":0}`))
@@ -446,7 +446,7 @@ func TestImagesMutationPeerAuthRejected(t *testing.T) {
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
 	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/images/prune?host=dashboard-b",
 		strings.NewReader(`{"service":"","keep_n":0}`))
@@ -472,7 +472,7 @@ func TestImagesMutationsLocalStillWork(t *testing.T) {
 	auth, _ := newConfirmedStore(t, "alice", "correct horse")
 	setInternalToken(t)
 
-	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, rs, nil, ih, nil, nil, nil, nil)
+	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, rs, nil, ih, nil, nil, nil, nil, nil)
 
 	do := func(method, path, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -579,7 +579,7 @@ func TestImagesMutationForwardsActorAssertion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil)
+	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/images/mark?host=dashboard-b",
 		strings.NewReader(`{"service":"app","tag":"v2","label":"pin"}`))

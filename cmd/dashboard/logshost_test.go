@@ -65,7 +65,7 @@ func newLogsTestMux(t *testing.T, dc *dockerClient, reg *PeerRegistry) http.Hand
 	internalToken = "pmt_internal_test"
 	t.Cleanup(func() { internalToken = prev })
 
-	return newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil)
+	return newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil)
 }
 
 func TestLogsContainersEndpointHostParamForwardsToPeer(t *testing.T) {
