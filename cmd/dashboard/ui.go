@@ -337,6 +337,12 @@ tr.disc-child td:first-child{padding-left:28px}
 .actionzone{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
 .actionzone .sep{flex:1}
 .member-list{margin-top:12px;padding:8px 10px;background:var(--surface-2);border-radius:var(--radius-sm);display:flex;flex-direction:column;gap:6px}
+/* one .svc-instance per host inside a merged multi-host svc-card — see
+   renderServices()'s mergeKeyOf. Facts/actions stay genuinely per-host, so
+   each instance keeps its own copy; only the card head/stats are shared. */
+.svc-instance{margin-top:10px}
+.svc-instance.sep{margin-top:16px;padding-top:16px;border-top:1px solid var(--border)}
+.svc-instance-label{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px}
 .member-row{display:flex;align-items:center;gap:8px;font-size:12px;font-family:var(--font-mono)}
 .member-row .spacer{flex:1}
 .menu{position:relative}
@@ -1593,26 +1599,66 @@ async function renderServices() {
   // run of DOM siblings up to the next .subhead) — sorting by group then
   // name keeps a singleton service (the common case) at the same
   // alphabetical spot it holds today, since its group equals its name.
-  const groupCounts = {};
-  for (const s of svcs) groupCounts[s.group] = (groupCounts[s.group] || 0) + 1;
   const ordered = svcs.slice().sort((a, b) => {
     if (a.group !== b.group) return a.group < b.group ? -1 : 1;
     return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
   });
-  let lastGroup = null;
+  // mergeKeyOf identifies replicas of the SAME distributed service across
+  // machines: Spread joins a peer's replicas onto ONE route (same
+  // group+name+host), so those instances belong in a single card, just
+  // like the Status tab's mergeServiceStatusGroups (servicestatus.go)
+  // already does for its read-only view. An unrouted ("managed", host ==
+  // "") service merges on group+name alone — e.g. an identically-named
+  // sidecar provisioned per-machine (a per-stack Postgres) is "the same
+  // thing" to an operator even with no route to match instances by.
+  function mergeKeyOf(s) { return s.group + '::' + s.name + '::' + (s.host || ''); }
+  // Pre-pass: tally each merge unit before rendering, since the FIRST
+  // instance of a multi-instance unit needs the combined totals for its
+  // card head/stats before later instances in "ordered" have been visited.
+  const mergeCounts = {};
+  const unitAgg = {};
   for (const s of ordered) {
-    // Only a real group (2+ members) earns a header — Group defaults to
-    // Name, so most services would otherwise get a one-item folder, which
-    // is more clutter than today's flat list, not less.
+    const k = mergeKeyOf(s);
+    mergeCounts[k] = (mergeCounts[k] || 0) + 1;
+    const a = unitAgg[k] || (unitAgg[k] = { totalReplicas: 0, allStopped: true, backends: [], hasLocal: false, machines: [] });
+    a.totalReplicas += s.replicas || 0;
+    if (!s.all_stopped) a.allStopped = false;
+    for (const b of (s.backends || [])) if (a.backends.indexOf(b) === -1) a.backends.push(b);
+    if (!foreignSvc(s)) a.hasLocal = true;
+    a.machines.push(s.machine ? machineLabel(s.machine) : (_selfIdentity ? machineLabel(_selfIdentity) : 'this host'));
+  }
+  // Distinct merge units per group, so the folder header's "N services"
+  // reflects logical services rather than raw per-host instances.
+  const unitKeysByGroup = {};
+  const seenUnitKeys = new Set();
+  for (const s of ordered) {
+    const k = mergeKeyOf(s);
+    if (seenUnitKeys.has(k)) continue;
+    seenUnitKeys.add(k);
+    (unitKeysByGroup[s.group] = unitKeysByGroup[s.group] || []).push(k);
+  }
+  let lastGroup = null;
+  const mergeSeen = {};
+  for (const s of ordered) {
+    const mKey = mergeKeyOf(s);
+    const mCount = mergeCounts[mKey];
+    const merged = mCount > 1;
+    mergeSeen[mKey] = (mergeSeen[mKey] || 0) + 1;
+    const isFirstOfUnit = mergeSeen[mKey] === 1;
+    const isLastOfUnit = mergeSeen[mKey] === mCount;
+    // Only a real group (2+ logical services) earns a header — Group
+    // defaults to Name, so most services would otherwise get a one-item
+    // folder, which is more clutter than today's flat list, not less.
     if (s.group !== lastGroup) {
       lastGroup = s.group;
-      if (groupCounts[s.group] > 1) {
+      const unitKeys = unitKeysByGroup[s.group] || [];
+      if (unitKeys.length > 1) {
         const members = ordered.filter(x => x.group === s.group);
         let replicas = 0, down = 0;
         for (const m of members) { replicas += m.replicas || 0; if (m.all_stopped) down++; }
         html += '<div class="subhead">' + I.services + esc(s.group)
           + '<span class="meta" style="margin-left:8px;text-transform:none;letter-spacing:0;font-weight:500">'
-          + members.length + ' services · ' + replicas + ' replica' + (replicas === 1 ? '' : 's')
+          + unitKeys.length + ' services · ' + replicas + ' replica' + (replicas === 1 ? '' : 's')
           + (down ? ' · <span class="pill bad" style="margin-left:4px">' + down + ' down</span>' : '')
           + '</span></div>';
       }
@@ -1793,28 +1839,65 @@ async function renderServices() {
                + '<div class="menu-pop" id="' + menuId + '">' + menuBody + '</div></div>';
 
     // Per-card collapse: clicking the svc-head folds facts + actionzone to a
-    // one-line summary. Persisted in localStorage keyed by service name.
+    // one-line summary. Persisted in localStorage keyed by service name
+    // (shared across a merged unit's instances, which all share s.name).
     const collapsedKey = 'pmgr-svc-collapsed';
     const collapsedState = JSON.parse(loadPref(collapsedKey, '{}'));
     const isCollapsed = !!collapsedState[s.name];
-    const replicaSummary = '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
-      + '<span class="ident dim">' + esc(s.host) + '</span>'
-      + '<span>' + s.replicas + ' replica' + (s.replicas === 1 ? '' : 's') + '</span>'
-      + '<span class="collapse-chev">' + I.chevron + '</span></span>';
-    html += '<div class="card svc-card' + (isCollapsed ? ' collapsed' : '') + '" data-svc="' + sn + '">'
-         +  '<div class="svc-head" onclick="toggleServiceCard(\'' + sn + '\')">'
-         +    '<div class="ic">' + I.services + '</div>'
-         +    '<div style="flex:1;min-width:0"><div class="svc-name">' + esc(s.name) + badges + '</div>'
-         +    '<div class="svc-img">' + I.layers + '<b>' + esc(s.image) + '</b></div></div>'
-         +    replicaSummary
-         +  '</div>'
-         +  '<div class="svc-body">'
-         +    facts
-         +    memberList
-         +    '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>'
-         +    ((managed || foreignSvc(s)) ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-service="' + sn + '" data-backends="' + esc((s.backends || []).join(' ')) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
-         +  '</div>'
-         +  '</div>';
+
+    if (isFirstOfUnit) {
+      if (merged) {
+        const agg = unitAgg[mKey];
+        html += '<div class="card svc-card' + (isCollapsed ? ' collapsed' : '') + '" data-svc="' + sn + '">'
+             +  '<div class="svc-head" onclick="toggleServiceCard(\'' + sn + '\')">'
+             +    '<div class="ic">' + I.services + '</div>'
+             +    '<div style="flex:1;min-width:0"><div class="svc-name">' + esc(s.name)
+             +      (agg.allStopped ? ' <span class="pill bad">' + I.alert + 'down</span>' : '')
+             +      ' <span class="pill muted" title="' + esc(agg.machines.join(' + ')) + '">' + I.layers + mCount + ' hosts</span></div>'
+             +    '<div class="svc-img">' + I.layers + '<b>' + esc(s.image) + '</b></div></div>'
+             +    '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
+             +      (s.host ? '<span class="ident dim">' + esc(s.host) + '</span>' : '')
+             +      '<span>' + agg.totalReplicas + ' replica' + (agg.totalReplicas === 1 ? '' : 's') + ' total</span>'
+             +      '<span class="collapse-chev">' + I.chevron + '</span></span>'
+             +  '</div>'
+             +  '<div class="svc-body">';
+      } else {
+        const replicaSummary = '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
+          + '<span class="ident dim">' + esc(s.host) + '</span>'
+          + '<span>' + s.replicas + ' replica' + (s.replicas === 1 ? '' : 's') + '</span>'
+          + '<span class="collapse-chev">' + I.chevron + '</span></span>';
+        html += '<div class="card svc-card' + (isCollapsed ? ' collapsed' : '') + '" data-svc="' + sn + '">'
+             +  '<div class="svc-head" onclick="toggleServiceCard(\'' + sn + '\')">'
+             +    '<div class="ic">' + I.services + '</div>'
+             +    '<div style="flex:1;min-width:0"><div class="svc-name">' + esc(s.name) + badges + '</div>'
+             +    '<div class="svc-img">' + I.layers + '<b>' + esc(s.image) + '</b></div></div>'
+             +    replicaSummary
+             +  '</div>'
+             +  '<div class="svc-body">';
+      }
+    }
+
+    // A merged card's individual instances keep their own sub-section —
+    // Replicas/Weight/actions stay genuinely per-host (Spread's write-mesh
+    // forwards each action to that specific replica's owning machine),
+    // so there's no single number/button that could cover every host at
+    // once. Only the card head above and the stats panel below are shared.
+    if (merged) {
+      const label = s.machine ? machineLabel(s.machine) : (_selfIdentity ? machineLabel(_selfIdentity) : 'this host');
+      html += '<div class="svc-instance' + (isFirstOfUnit ? '' : ' sep') + '">'
+           +  '<div class="svc-instance-label">' + esc(label) + badges + '</div>';
+    }
+    html += facts + memberList + '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>';
+    if (merged) html += '</div>';
+
+    if (isLastOfUnit) {
+      const agg = unitAgg[mKey];
+      const backends = merged ? agg.backends : (s.backends || []);
+      const skipStats = managed || !agg.hasLocal;
+      html += (skipStats ? '' : '<div class="svc-stats" data-host="' + esc(s.host) + '" data-service="' + sn + '" data-backends="' + esc(backends.join(' ')) + '"><div class="meta" style="padding:8px 0">Loading stats…</div></div>')
+           +  '</div>'
+           +  '</div>';
+    }
   }
   el.innerHTML = html;
   // Fetch per-service stats only for cards that are actually expanded.
