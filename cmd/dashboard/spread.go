@@ -217,6 +217,18 @@ func hostLocalTarget(v string) bool {
 	return !strings.Contains(v, ".") && !strings.Contains(v, ":")
 }
 
+// anySpreadLabeled reports whether any of these containers was placed by a
+// spread, which is what distinguishes replicas this feature owns from a
+// same-named service that arrived on the host some other way.
+func anySpreadLabeled(in []dockerContainer) bool {
+	for _, ct := range in {
+		if ct.Labels[labelSpread] == "true" {
+			return true
+		}
+	}
+	return false
+}
+
 // runServiceSpread places `replicas` members of a label-managed service on a
 // peer host under the same proxy.service identity. Refuses anything it cannot
 // verify is safe to run a second live copy of; on success the peer's own
@@ -452,7 +464,23 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 			}
 		}
 
-		live := len(liveOnly(all))
+		// Containers this host already runs for the service that spread did NOT
+		// place — most plausibly a leftover from "Duplicate to host…", which
+		// names its container <service> and sets no proxy.spread. Proceeding
+		// would hand the count to scaleService, which clones the labels of the
+		// container it finds, so every new replica would come up WITHOUT the
+		// spread label and the pool would never activate: the service ends up
+		// running on both hosts, looking healthy everywhere, receiving no
+		// cross-host traffic at all. Refuse instead of succeeding invisibly.
+		liveHere := liveOnly(all)
+		if len(liveHere) > 0 && !anySpreadLabeled(liveHere) {
+			http.Error(w, fmt.Sprintf(
+				"this host already runs containers for %q that spread did not place (no %s label) — remove or relabel them first, or use the existing duplicate flow",
+				req.Service, labelSpread), http.StatusConflict)
+			return
+		}
+
+		live := len(liveHere)
 		if live == 0 {
 			cname := fmt.Sprintf("goproxy-%s-%d", req.Service, nextReplicaIndex(all, req.Service))
 			named, err := dc.listAll(r.Context(), fmt.Sprintf(`{"name":["%s"]}`, cname))

@@ -40,11 +40,14 @@ type peerRouteInfo struct {
 	Backends    int    `json:"backends"`
 	RateLimit   bool   `json:"ratelimit,omitempty"`
 	RateRPM     int    `json:"ratelimit_rpm,omitempty"`
-	// Spread carries RouteGroup.Spread across the wire so the receiving
-	// side load-balances into this peer instead of holding it in reserve as
-	// a failover tier. Advertised whether this host set it from its own
-	// proxy.spread label or adopted it from another peer — that's what makes
-	// the pool symmetric once either side of a cross-host scale opts in.
+	// Spread carries RouteGroup.SpreadLocal — this host's OWN proxy.spread
+	// labels — across the wire so the receiving side load-balances into this
+	// peer instead of holding it in reserve as a failover tier. Deliberately
+	// not the adopted RouteGroup.Spread: re-advertising what we learned would
+	// latch the flag on forever, each host adopting its own claim back through
+	// the other, with no way to clear it short of restarting both proxies
+	// inside one TTL window. Removing the label from the replicas that carry
+	// it is the off-switch, and it only works if adoption stays one-way.
 	Spread bool `json:"spread,omitempty"`
 }
 
@@ -118,7 +121,7 @@ func (p *PeerSync) tick(ctx context.Context) {
 		routes = append(routes, peerRouteInfo{
 			Host: g.Host, PathPrefix: g.PathPrefix, StripPrefix: g.StripPrefix,
 			Name: g.Name, Backends: localCount,
-			RateLimit: g.RateLimit, RateRPM: g.RateRPM, Spread: g.Spread,
+			RateLimit: g.RateLimit, RateRPM: g.RateRPM, Spread: g.SpreadLocal,
 		})
 	}
 	if len(routes) == 0 {

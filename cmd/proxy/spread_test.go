@@ -132,8 +132,10 @@ func TestAssembleGroupsSpreadLabel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembleGroups: %v", err)
 	}
-	if g := findGroup(groups, "a.example.org", ""); g == nil || !g.Spread {
-		t.Errorf("a group = %+v, want Spread from the one labeled replica", g)
+	// SpreadLocal too, not just Spread: the label is what this host advertises,
+	// and only the locally-derived half may go on the wire.
+	if g := findGroup(groups, "a.example.org", ""); g == nil || !g.Spread || !g.SpreadLocal {
+		t.Errorf("a group = %+v, want Spread and SpreadLocal from the one labeled replica", g)
 	}
 	if g := findGroup(groups, "c.example.org", ""); g == nil || g.Spread {
 		t.Errorf("c group = %+v, want Spread off — nothing opted it in", g)
@@ -191,11 +193,46 @@ func TestPeerRouteStoreLeavesSpreadOffWhenNotAdvertised(t *testing.T) {
 	}
 }
 
-// TestPeerSyncAdvertisesSpread proves the flag reaches the wire even when
-// this host only ADOPTED it from another peer rather than carrying the label
-// itself — that re-advertisement is what makes the pool symmetric once
-// either side of a cross-host scale opts in.
+// TestPeerSyncAdvertisesOnlyLocalSpread pins the anti-latch rule: a host
+// advertises the spread it derives from its OWN labels and never the spread it
+// adopted from a peer. Re-advertising the adopted value would make the flag
+// self-sustaining — each host adopting its own claim back through the other,
+// with no way to clear it while the route kept being advertised.
+func TestPeerSyncAdvertisesOnlyLocalSpread(t *testing.T) {
+	adopted := &RouteGroup{
+		Host:     "adopted.example.org",
+		Backends: []*Backend{makeBackendForTest("http://172.26.0.5:8080")},
+		Spread:   true, // adopted from a peer; SpreadLocal deliberately false
+	}
+	routes := advertisedRoutes(t, adopted)
+	if routes[0].Spread {
+		t.Error("re-advertised a spread flag this host only adopted — that latches the flag on permanently")
+	}
+}
+
+// TestPeerSyncAdvertisesSpread covers the other half: a host that does carry
+// proxy.spread on its own containers must advertise it, or the peer would
+// never join the pool.
 func TestPeerSyncAdvertisesSpread(t *testing.T) {
+	local := makeBackendForTest("http://172.26.0.5:8080")
+	learned := makePeerBackend("http://100.1.1.1:8092", "app.example.org", "", false, "peer-c", 1)
+	routes := advertisedRoutes(t, &RouteGroup{
+		Host:     "app.example.org",
+		Backends: []*Backend{local, learned},
+		Spread:   true, SpreadLocal: true,
+	})
+	if !routes[0].Spread {
+		t.Error("Spread not advertised")
+	}
+	if routes[0].Backends != 1 {
+		t.Errorf("advertised backends = %d, want 1 — a learned backend is not local capacity", routes[0].Backends)
+	}
+}
+
+// advertisedRoutes runs one real PeerSync tick against a stub peer and returns
+// the routes it put on the wire.
+func advertisedRoutes(t *testing.T, groups ...*RouteGroup) []peerRouteInfo {
+	t.Helper()
 	bodyCh := make(chan []byte, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -204,13 +241,9 @@ func TestPeerSyncAdvertisesSpread(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	local := makeBackendForTest("http://172.26.0.5:8080")
-	learned := makePeerBackend("http://100.1.1.1:8092", "app.example.org", "", false, "peer-c", 1)
 	r := &Router{}
-	r.Set([]*RouteGroup{{Host: "app.example.org", Backends: []*Backend{local, learned}, Spread: true}})
-
-	ps := newPeerSync(r, []string{srv.URL}, "s3cret", "peer-a", "http://100.0.0.1:8092", 0)
-	ps.tick(context.Background())
+	r.Set(groups)
+	newPeerSync(r, []string{srv.URL}, "s3cret", "peer-a", "http://100.0.0.1:8092", 0).tick(context.Background())
 
 	var body []byte
 	select {
@@ -222,13 +255,40 @@ func TestPeerSyncAdvertisesSpread(t *testing.T) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.Routes) != 1 {
-		t.Fatalf("Routes = %+v, want exactly 1", payload.Routes)
+	if len(payload.Routes) != len(groups) {
+		t.Fatalf("Routes = %+v, want %d", payload.Routes, len(groups))
 	}
-	if !payload.Routes[0].Spread {
-		t.Error("Spread not advertised")
+	return payload.Routes
+}
+
+// TestPeerRouteStoreClearsAdoptedSpread is the off-switch: once the peer stops
+// advertising spread (its replicas lost the label), the route must go back to
+// failover-only WITHOUT waiting for TTL expiry — the route itself is still
+// being advertised, so TTL never fires and would never clear it.
+func TestPeerRouteStoreClearsAdoptedSpread(t *testing.T) {
+	s := newPeerRouteStore(time.Minute)
+	adv := func(spread bool) peerRoutePayload {
+		return peerRoutePayload{
+			Peer:      "peer-b",
+			Advertise: "http://100.83.62.68:8092",
+			Routes:    []peerRouteInfo{{Host: "app.example.org", Backends: 2, Spread: spread}},
+		}
 	}
-	if payload.Routes[0].Backends != 1 {
-		t.Errorf("advertised backends = %d, want 1 — a learned backend is not local capacity", payload.Routes[0].Backends)
+	// Rebuilt each time, mirroring main.go's refresh(): assembleGroups then
+	// overlay, so an adopted flag never survives on its own.
+	fresh := func() *RouteGroup {
+		return &RouteGroup{Host: "app.example.org", Backends: []*Backend{makeBackendForTest("http://172.26.0.5:8080")}}
+	}
+
+	s.merge(adv(true))
+	if !s.overlay([]*RouteGroup{fresh()})[0].Spread {
+		t.Fatal("Spread not adopted on the first advertisement")
+	}
+
+	if !s.merge(adv(false)) {
+		t.Error("merge reported no change on a flipped spread flag — refresh() would not run, leaving the stale flag live")
+	}
+	if s.overlay([]*RouteGroup{fresh()})[0].Spread {
+		t.Error("Spread still on after the peer stopped advertising it — the flag has no off-switch")
 	}
 }

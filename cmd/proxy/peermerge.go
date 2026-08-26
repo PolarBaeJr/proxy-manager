@@ -60,8 +60,9 @@ func splitRouteKey(key string) (host, path string) {
 
 // merge upserts every advertised route (with Backends > 0) into the store,
 // keyed by payload.Peer under its host|path. Returns true only when this
-// merge introduced a new host|path key or a new peer under an existing
-// key — a bare lastSeen refresh for an already-known peer/route returns
+// merge introduced a new host|path key, a new peer under an existing key, or
+// a flipped spread flag — a bare lastSeen refresh for an already-known
+// peer/route returns
 // false, so the caller (peerRoutesHandler) can skip an unnecessary refresh()
 // on steady-state pushes and rely on the periodic resync ticker for TTL
 // eviction instead.
@@ -84,7 +85,14 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 			s.routes[key] = peersForKey
 			changed = true
 		}
-		if _, ok := peersForKey[payload.Peer]; !ok {
+		// A flipped spread flag counts as a change even though the peer and
+		// route are both already known: unlike the other advertised fields it
+		// decides whether this route load-balances into the peer or holds it
+		// in reserve, and the periodic tick below only calls refresh() when
+		// something has EXPIRED. Without this, turning spread off on the peer
+		// would leave the flag live here until some unrelated Docker event
+		// happened to trigger a rebuild.
+		if prev, ok := peersForKey[payload.Peer]; !ok || prev.spread != r.Spread {
 			changed = true
 		}
 		peersForKey[payload.Peer] = learnedRoute{
@@ -158,9 +166,11 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup) []*RouteGroup {
 			// local group, unlike RateLimit/RateRPM above — it has to be, or
 			// the cross-host scale that set proxy.spread on the peer's
 			// replicas could never reach the origin, whose own containers
-			// deliberately keep their labels untouched. It only ever turns
-			// spreading ON; a peer that stops advertising it drops out with
-			// the rest of its entry at TTL expiry.
+			// deliberately keep their labels untouched. Adoption is one-way
+			// (see peersync.go: we advertise SpreadLocal, never this) and
+			// non-sticky — overlay runs on a freshly assembled group set every
+			// refresh, so a peer that stops advertising spread clears it here
+			// on the next one, without waiting for TTL expiry.
 			if lr.spread {
 				g.Spread = true
 			}

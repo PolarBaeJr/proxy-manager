@@ -70,6 +70,15 @@ type RouteGroup struct {
 	// adopted from a peer that advertises it (peermerge.go's overlay).
 	Spread bool
 
+	// SpreadLocal is the half of Spread that came from THIS host's own
+	// labels, and is the only half peersync.go advertises. Advertising the
+	// adopted value instead would latch the flag on permanently: this host
+	// would re-advertise what it learned, the peer would adopt its own claim
+	// back, and neither side could ever clear it while the route itself kept
+	// being advertised (so TTL expiry never fires). Symmetry is unaffected —
+	// whichever host actually carries the label keeps advertising it.
+	SpreadLocal bool
+
 	cursor atomic.Uint64
 
 	// static marks a group whose backend list is owned by routes.json / a
@@ -744,6 +753,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		// only ever labels the replicas it places on the peer, never the
 		// pre-existing originals it found here.
 		if c.Labels[labelSpread] == "true" {
+			g.SpreadLocal = true
 			g.Spread = true
 		}
 		if rpmStr := c.Labels[labelRateRPM]; rpmStr != "" && g.RateRPM == 0 {

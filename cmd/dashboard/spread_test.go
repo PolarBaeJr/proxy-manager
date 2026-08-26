@@ -461,3 +461,48 @@ func TestUnreachableEnvKeysScoping(t *testing.T) {
 		t.Errorf("missed %q — a replica on another host cannot resolve it", k)
 	}
 }
+
+// TestPeerSpreadRefusesForeignContainers guards the invisible-success case: if
+// the target already runs containers for the service that spread did not place
+// — a leftover from "Duplicate to host…", say — scaleService would clone THEIR
+// labels, so every replica would come up without proxy.spread and the pool
+// would never activate. The service would run on both hosts and take no
+// cross-host traffic, looking healthy at every layer. Must refuse instead.
+func TestPeerSpreadRefusesForeignContainers(t *testing.T) {
+	cap := &createCapture{}
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			var b createBody
+			json.NewDecoder(r.Body).Decode(&b)
+			cap.add(r.URL.Query().Get("name"), b)
+			json.NewEncoder(w).Encode(map[string]string{"Id": "id-x"})
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			// Named "app", not "goproxy-app-N", and carrying no proxy.spread.
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "dup1", Names: []string{"/app"}, State: "running", Image: "app:1",
+				Labels: map[string]string{labelService: "app", labelHost: "app.example.org", labelPort: "8080"},
+			}})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+	srv := httptest.NewServer(peerSpreadHandler("s3cret", "dashboard-b", dc, true))
+	defer srv.Close()
+
+	body := `{"service":"app","image":"app:1","host":"app.example.org","port":8080,"replicas":2}`
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status = %d, want 409 — spread must not adopt containers it did not place", resp.StatusCode)
+	}
+	if cap.count() != 0 {
+		t.Errorf("created %d container(s) on a refusal", cap.count())
+	}
+}

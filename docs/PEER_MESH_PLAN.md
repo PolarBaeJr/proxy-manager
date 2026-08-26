@@ -101,6 +101,14 @@ receives it in an advertisement — that adoption is load-bearing, because
 `cmd/dashboard`'s cross-host scale (`spread.go`) labels only the replicas it
 places on the target, never the origin's pre-existing containers.
 
+Adoption is deliberately **one-way**: a host advertises `SpreadLocal` (what its
+own labels say) and never the value it adopted. Re-advertising the adopted flag
+would latch it on permanently — each host adopting its own claim back through
+the other, with the route still being advertised so TTL never fires to clear
+it. The off-switch is therefore the label: remove `proxy.spread` from the
+replicas carrying it and both hosts fall back to failover-only on the next
+refresh.
+
 Two properties this deliberately keeps: an already-forwarded request
 (`PeerHopHeader`) still gets the local-only tier, so spread cannot loop; and a
 spread group with no healthy local backend still falls through to the peer,
