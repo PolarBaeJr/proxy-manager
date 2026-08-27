@@ -2185,20 +2185,22 @@ function renderServiceStatsPanel(stats, recent, panel, svcStatus) {
     const reqsVal = fmt(tot) + (svcStatus && svcStatus.rate_truncated
       ? ' <small title="Access log wrapped inside the 5-minute window — may be undercounted">≈</small>' : '');
     // Label the window explicitly once svcReqs is populated — it's a 5m
-    // count, not the lifetime total the tile used to show, and sitting next
-    // to In flight/p95/Errors (still lifetime) makes the distinction easy
-    // to miss otherwise.
+    // count, not the lifetime total the tile used to show.
     const reqsLabel = svcReqs != null ? 'Requests (5m)' : 'Requests';
     html += '<div class="grid k4" style="margin-bottom:4px">'
           + kpiSm(reqsLabel, reqsVal)
           + kpiSm('In flight', String(inflight))
           + kpiSm('p95', p95 + ' <small>ms</small>')
-          + kpiSm('Errors', pct(errPct), errAccent(errPct))
+          + kpiSm('Errors (5m)', pct(errPct), errAccent(errPct))
           + '</div>';
     // In flight / p95 / errors still come from per-HOST metrics — a host can
     // front several services, so only THOSE three numbers are host-wide.
-    // Requests above is now this service's own count.
-    if (host) html += '<div class="meta" style="margin:0 0 10px;font-size:11px">In flight / p95 / errors are host-wide (all services on ' + esc(host) + ').</div>';
+    // Requests above is now this service's own count. Errors is windowed to
+    // the same trailing 5m as Requests (see monitor's TargetHosts) — it used
+    // to be a lifetime-cumulative percentage sitting right next to a 5m
+    // count, which could read as a live outage when the traffic causing it
+    // was hours old.
+    if (host) html += '<div class="meta" style="margin:0 0 10px;font-size:11px">In flight / p95 are host-wide (all services on ' + esc(host) + ').</div>';
     if (Object.keys(by).length) html += statusBarFromCodes(by);
   }
   if (recent.length) {
