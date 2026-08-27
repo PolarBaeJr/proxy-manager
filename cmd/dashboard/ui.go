@@ -1786,10 +1786,17 @@ async function renderServices() {
     if (s.dual_tracked) badges += ' <span class="pill warn" title="Both label-managed (docker ps) and onboarded (onboarded.json) under the same name — edits should go through one path consistently">' + I.rocket + 'dual-tracked</span>';
     if (foreignSvc(s)) badges += ' <span class="pill muted" title="Managed on ' + esc(machineLabel(s.machine)) + ' — read-only here">' + I.layers + esc(machineLabel(s.machine)) + '</span>';
     let facts = '<table class="facts">';
-    facts += '<tr><td>Host</td><td>' + (managed ? '<span class="meta">—</span>' : '<span class="ident">' + esc(s.host) + (s.path ? esc(s.path) : '') + '</span>') + '</td></tr>';
+    // Host/Port are part of mergeKeyOf, so every instance in a merged unit
+    // has the identical value already shown once in the unit header above —
+    // repeating it per host was pure clutter, not information.
+    if (!merged) {
+      facts += '<tr><td>Host</td><td>' + (managed ? '<span class="meta">—</span>' : '<span class="ident">' + esc(s.host) + (s.path ? esc(s.path) : '') + '</span>') + '</td></tr>';
+    }
     if (canary)              facts += '<tr><td>Canary</td><td><span class="ident" style="color:#5eb4ff">' + esc(s.canary_image) + '</span> <span class="meta">· ' + s.canary_replicas + ' replica' + (s.canary_replicas === 1 ? '' : 's') + '</span></td></tr>';
     else if (s.previous_image) facts += '<tr><td>Previous</td><td><span class="ident dim">' + esc(s.previous_image) + '</span></td></tr>';
-    facts += '<tr><td>Port</td><td' + (managed ? ' class="meta">—' : ' class="num">' + s.port) + '</td></tr>';
+    if (!merged) {
+      facts += '<tr><td>Port</td><td' + (managed ? ' class="meta">—' : ' class="num">' + s.port) + '</td></tr>';
+    }
     // In a merged card, Replicas/Weight are unified at the unit level (see
     // unitReplicaCtrl/unitWeightCtrl below) — this row is read-only per host
     // so the same value never gets two independently-editable controls
@@ -1961,7 +1968,7 @@ async function renderServices() {
              +      ' <span class="pill muted" title="' + esc(agg.machines.join(' + ')) + '">' + I.layers + mCount + ' hosts</span></div>'
              +    '<div class="svc-img">' + I.layers + '<b>' + esc(s.image) + '</b></div></div>'
              +    '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
-             +      (s.host ? '<span class="ident dim">' + esc(s.host) + '</span>' : '')
+             +      (s.host ? '<span class="ident dim">' + esc(s.host) + esc(s.path || '') + (s.port ? ':' + s.port : '') + '</span>' : '')
              +      '<span>' + agg.totalReplicas + ' replica' + (agg.totalReplicas === 1 ? '' : 's') + ' total</span>'
              +      '<button class="btn icon' + (s.name === pinnedName ? ' pinned' : '') + '" onclick="togglePin(event, \'' + sn + '\')" title="Pin to top">' + I.pin + '</button>'
              +      '<span class="collapse-chev">' + I.chevron + '</span></span>'
