@@ -1214,3 +1214,86 @@ func TestServeHTTPStill503WhenGroupHasNoBackendsAtAll(t *testing.T) {
 		t.Fatalf("code = %d, want 503 (no backends at all, panic mode has nothing to fall back to)", rec.Code)
 	}
 }
+
+// TestServeHTTPDropsConfiguredHeaders proves DropHeaders is applied to the
+// forwarded request before it reaches any backend, regardless of which
+// backend pickHealthy ends up choosing.
+func TestServeHTTPDropsConfiguredHeaders(t *testing.T) {
+	var gotCookie, gotOther string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCookie = r.Header.Get("Cookie")
+		gotOther = r.Header.Get("X-Other")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	g := mkGroup(t, "supabase.example.org", "", false, backend.URL)
+	g.DropHeaders = []string{"Cookie"}
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	req := httptest.NewRequest("GET", "http://supabase.example.org/realtime/v1/websocket", nil)
+	req.Header.Set("Cookie", "sb-auth-token=verylongvalue")
+	req.Header.Set("X-Other", "keep-me")
+	rec := httptest.NewRecorder()
+	aw := &accessWriter{ResponseWriter: rec}
+	r.ServeHTTP(aw, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if gotCookie != "" {
+		t.Fatalf("backend received Cookie=%q, want it stripped", gotCookie)
+	}
+	if gotOther != "keep-me" {
+		t.Fatalf("backend received X-Other=%q, want untouched header preserved", gotOther)
+	}
+}
+
+func TestSplitTrimmed(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"Cookie", []string{"Cookie"}},
+		{"Cookie, X-Foo ,, Bar", []string{"Cookie", "X-Foo", "Bar"}},
+	}
+	for _, c := range cases {
+		got := splitTrimmed(c.in)
+		if len(got) != len(c.want) {
+			t.Fatalf("splitTrimmed(%q) = %v, want %v", c.in, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("splitTrimmed(%q) = %v, want %v", c.in, got, c.want)
+			}
+		}
+	}
+}
+
+// TestAssembleGroupsDropHeadersStaticAndLabel proves drop_headers is wired
+// through both the routes.json static path and the proxy.drop_headers label.
+func TestAssembleGroupsDropHeadersStaticAndLabel(t *testing.T) {
+	cfgPath := writeStaticConfig(t, staticRoute{
+		Host: "static.example.com", Backends: []string{"http://10.0.0.9:8080"},
+		DropHeaders: []string{"Cookie"},
+	})
+	dc := fakeDocker(t, dockerJSON(
+		container("lbl", "app-lbl", "running",
+			map[string]string{labelHost: "label.example.com", labelPort: "8080", labelDropHeaders: "Cookie, X-Session"},
+			map[string]string{managedNetwork: "172.20.0.7"}),
+	))
+
+	groups, _, err := assembleGroups(context.Background(), dc, cfgPath)
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	if g := findGroup(groups, "static.example.com", ""); g == nil || len(g.DropHeaders) != 1 || g.DropHeaders[0] != "Cookie" {
+		t.Fatalf("static group DropHeaders = %+v, want [Cookie]", g)
+	}
+	if g := findGroup(groups, "label.example.com", ""); g == nil || len(g.DropHeaders) != 2 || g.DropHeaders[0] != "Cookie" || g.DropHeaders[1] != "X-Session" {
+		t.Fatalf("label group DropHeaders = %+v, want [Cookie X-Session]", g)
+	}
+}
