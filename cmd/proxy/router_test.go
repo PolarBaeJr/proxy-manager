@@ -379,6 +379,37 @@ func mkGroup(t *testing.T, host, prefix string, strip bool, target string) *Rout
 	return &RouteGroup{Host: host, PathPrefix: prefix, StripPrefix: strip, Backends: []*Backend{b}}
 }
 
+// mkBackend builds a *Backend pointed at an httptest.Server, for sticky tests
+// needing several backends per group (mkGroup only supports one).
+func mkBackend(t *testing.T, host string, srv *httptest.Server) *Backend {
+	t.Helper()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", srv.URL, err)
+	}
+	return makeBackend(srv.URL, 1, srv.URL, "", u, host)
+}
+
+// mkGroupMulti builds a RouteGroup directly from pre-built backends, for
+// sticky tests needing more than mkGroup's single-backend shape.
+func mkGroupMulti(host, prefix string, backends ...*Backend) *RouteGroup {
+	return &RouteGroup{Host: host, PathPrefix: prefix, Backends: backends}
+}
+
+// stickyCookies filters a recorded response's Set-Cookie headers down to
+// just this group's sticky cookie name, so assertions about "exactly one
+// sticky cookie" aren't fooled by an unrelated Set-Cookie header (e.g. SSO).
+func stickyCookies(rec *httptest.ResponseRecorder, g *RouteGroup) []*http.Cookie {
+	name := stickyCookieName(g)
+	var out []*http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == name {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func TestServeHTTPHostMatch(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("hello"))
@@ -1295,5 +1326,495 @@ func TestAssembleGroupsDropHeadersStaticAndLabel(t *testing.T) {
 	}
 	if g := findGroup(groups, "label.example.com", ""); g == nil || len(g.DropHeaders) != 2 || g.DropHeaders[0] != "Cookie" || g.DropHeaders[1] != "X-Session" {
 		t.Fatalf("label group DropHeaders = %+v, want [Cookie X-Session]", g)
+	}
+}
+
+// TestServeHTTPStickyIssuesCookieOnFirstRequest proves a sticky group issues
+// exactly one affinity cookie, named per stickyCookieName and valued at the
+// chosen backend's stickyID, on a request carrying no prior cookie.
+func TestServeHTTPStickyIssuesCookieOnFirstRequest(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	g := mkGroup(t, "issue.example.org", "", false, backend.URL)
+	g.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	req := httptest.NewRequest("GET", "http://issue.example.org/", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	cookies := stickyCookies(rec, g)
+	if len(cookies) != 1 {
+		t.Fatalf("sticky Set-Cookie count = %d, want 1", len(cookies))
+	}
+	if cookies[0].Value != g.Backends[0].stickyID {
+		t.Fatalf("cookie value = %q, want %q", cookies[0].Value, g.Backends[0].stickyID)
+	}
+	if c := cookies[0]; c.Path != "/" || !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("cookie attributes = %+v, want Path=/ HttpOnly Secure SameSite=Lax", c)
+	}
+}
+
+// TestServeHTTPStickyPinsSubsequentRequest proves a client carrying the
+// affinity cookie is pinned to the same backend on every subsequent request,
+// rather than round-robining across the group's two backends.
+func TestServeHTTPStickyPinsSubsequentRequest(t *testing.T) {
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("A")) }))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("B")) }))
+	defer srvB.Close()
+
+	bA := mkBackend(t, "pin.example.org", srvA)
+	bB := mkBackend(t, "pin.example.org", srvB)
+	g := mkGroupMulti("pin.example.org", "", bA, bB)
+	g.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://pin.example.org/", nil)
+	r.ServeHTTP(rec, req)
+	cookies := stickyCookies(rec, g)
+	if len(cookies) != 1 {
+		t.Fatalf("sticky Set-Cookie count = %d, want 1", len(cookies))
+	}
+	pin := cookies[0]
+	first := rec.Body.String()
+
+	for i := 0; i < 5; i++ {
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest("GET", "http://pin.example.org/", nil)
+		req.AddCookie(pin)
+		r.ServeHTTP(rec, req)
+		if rec.Body.String() != first {
+			t.Fatalf("request %d served by a different backend: got %q, want %q", i, rec.Body.String(), first)
+		}
+	}
+}
+
+// TestServeHTTPStickyCursorUnchangedWhenPinned proves the pinned path never
+// calls pickHealthy/pickTier/pickPool — none of which the group's cursor
+// should advance for while a client stays pinned.
+func TestServeHTTPStickyCursorUnchangedWhenPinned(t *testing.T) {
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("A")) }))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("B")) }))
+	defer srvB.Close()
+
+	bA := mkBackend(t, "cursor.example.org", srvA)
+	bB := mkBackend(t, "cursor.example.org", srvB)
+	g := mkGroupMulti("cursor.example.org", "", bA, bB)
+	g.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://cursor.example.org/", nil)
+	r.ServeHTTP(rec, req)
+	cookies := stickyCookies(rec, g)
+	if len(cookies) != 1 {
+		t.Fatalf("sticky Set-Cookie count = %d, want 1", len(cookies))
+	}
+	pin := cookies[0]
+	cursorAfterFirst := g.cursor.Load()
+
+	for i := 0; i < 5; i++ {
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest("GET", "http://cursor.example.org/", nil)
+		req.AddCookie(pin)
+		r.ServeHTTP(rec, req)
+	}
+	if got := g.cursor.Load(); got != cursorAfterFirst {
+		t.Fatalf("cursor changed while pinned: got %d, want %d (unchanged)", got, cursorAfterFirst)
+	}
+}
+
+// TestServeHTTPStickyFallsBackWhenBackendRemoved proves a pin that no longer
+// resolves to any backend in the (refreshed) group falls back to normal
+// pickHealthy and reissues a fresh cookie pointing at whatever's left.
+func TestServeHTTPStickyFallsBackWhenBackendRemoved(t *testing.T) {
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("A")) }))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("B")) }))
+	defer srvB.Close()
+
+	bA := mkBackend(t, "removed.example.org", srvA)
+	bB := mkBackend(t, "removed.example.org", srvB)
+	g1 := mkGroupMulti("removed.example.org", "", bA, bB)
+	g1.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g1})
+
+	// Forge the pin directly (rather than relying on round-robin order) so
+	// this test doesn't depend on which backend a live request happens to
+	// pick first.
+	pin := &http.Cookie{Name: stickyCookieName(g1), Value: bA.stickyID}
+
+	// Simulate a refresh where A no longer exists in the group — a fresh
+	// RouteGroup (new pointer), same host+path, only B remains.
+	bB2 := mkBackend(t, "removed.example.org", srvB)
+	g2 := mkGroupMulti("removed.example.org", "", bB2)
+	g2.Sticky = true
+	r.Set([]*RouteGroup{g2})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://removed.example.org/", nil)
+	req.AddCookie(pin)
+	r.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	newCookies := stickyCookies(rec, g2)
+	if len(newCookies) != 1 || newCookies[0].Value != bB2.stickyID {
+		t.Fatalf("reissued cookie = %+v, want exactly 1 with value %q", newCookies, bB2.stickyID)
+	}
+}
+
+// TestServeHTTPStickyFallsBackWhenBackendUnhealthy proves a pin to a backend
+// that's since gone unhealthy falls through to a healthy one, with a fresh
+// cookie reissued for it.
+func TestServeHTTPStickyFallsBackWhenBackendUnhealthy(t *testing.T) {
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("A")) }))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("B")) }))
+	defer srvB.Close()
+
+	bA := mkBackend(t, "unhealthy.example.org", srvA)
+	bB := mkBackend(t, "unhealthy.example.org", srvB)
+	g := mkGroupMulti("unhealthy.example.org", "", bA, bB)
+	g.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	pin := &http.Cookie{Name: stickyCookieName(g), Value: bA.stickyID}
+	bA.markHealthy(false)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://unhealthy.example.org/", nil)
+	req.AddCookie(pin)
+	r.ServeHTTP(rec, req)
+	if rec.Body.String() != "B" {
+		t.Fatalf("body = %q, want B (fallback to the healthy backend)", rec.Body.String())
+	}
+	newCookies := stickyCookies(rec, g)
+	if len(newCookies) != 1 || newCookies[0].Value != bB.stickyID {
+		t.Fatalf("reissued cookie = %+v, want exactly 1 with value %q", newCookies, bB.stickyID)
+	}
+}
+
+// TestServeHTTPStickyRepicksOnTryProxyFailure proves that when the pinned
+// backend fails at the tryProxy layer, the retry loop falls through to a
+// second healthy backend, and the response carries exactly one sticky
+// Set-Cookie — proving setStickyCookie's per-attempt dedupe — valued at the
+// SECOND backend's stickyID, not the first.
+func TestServeHTTPStickyRepicksOnTryProxyFailure(t *testing.T) {
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("B")) }))
+	defer srvB.Close()
+
+	// A guaranteed-refused address, same convention as
+	// TestServeHTTPClientDisconnectDoesNotRedispatch/TestServeHTTPUnroutedIsThrottled.
+	uDead, err := url.Parse("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	bDead := makeBackend("http://127.0.0.1:1", 1, "dead", "", uDead, "retry.example.org")
+	bB := mkBackend(t, "retry.example.org", srvB)
+	g := mkGroupMulti("retry.example.org", "", bDead, bB)
+	g.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	req := httptest.NewRequest("GET", "http://retry.example.org/", nil)
+	req.AddCookie(&http.Cookie{Name: stickyCookieName(g), Value: bDead.stickyID})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != 200 || rec.Body.String() != "B" {
+		t.Fatalf("code=%d body=%q, want 200/B (fallback to the second backend)", rec.Code, rec.Body.String())
+	}
+	cookies := stickyCookies(rec, g)
+	if len(cookies) != 1 {
+		t.Fatalf("sticky Set-Cookie count = %d, want exactly 1 (dedupe)", len(cookies))
+	}
+	if cookies[0].Value != bB.stickyID {
+		t.Fatalf("final cookie value = %q, want %q (second backend, not the first)", cookies[0].Value, bB.stickyID)
+	}
+}
+
+// TestServeHTTPStickyNoCookieWhenDisabled proves a group with Sticky unset
+// never issues an affinity cookie.
+func TestServeHTTPStickyNoCookieWhenDisabled(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	g := mkGroup(t, "disabled.example.org", "", false, backend.URL)
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://disabled.example.org/", nil)
+	r.ServeHTTP(rec, req)
+	if got := rec.Result().Cookies(); len(got) != 0 {
+		t.Fatalf("Set-Cookie count = %d, want 0 (Sticky disabled)", len(got))
+	}
+}
+
+// TestServeHTTPStickyForgedCookieFallsBackGracefully proves a cookie with the
+// correct sticky name but a garbage/unknown value never panics or errors —
+// it just falls through to normal pickHealthy and gets a fresh, valid cookie.
+func TestServeHTTPStickyForgedCookieFallsBackGracefully(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	g := mkGroup(t, "forged.example.org", "", false, backend.URL)
+	g.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	req := httptest.NewRequest("GET", "http://forged.example.org/", nil)
+	req.AddCookie(&http.Cookie{Name: stickyCookieName(g), Value: "garbage-not-a-real-id"})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != 200 || rec.Body.String() != "ok" {
+		t.Fatalf("code=%d body=%q, want 200/ok", rec.Code, rec.Body.String())
+	}
+	cookies := stickyCookies(rec, g)
+	if len(cookies) != 1 || cookies[0].Value != g.Backends[0].stickyID {
+		t.Fatalf("cookies = %+v, want exactly 1 fresh valid cookie for the only backend", cookies)
+	}
+}
+
+// TestServeHTTPStickySurvivesDropHeadersCookie proves Sticky and
+// DropHeaders: ["Cookie"] coexist correctly: the backend never sees a Cookie
+// header at all, yet the sticky cookie is still issued and still pins
+// correctly on the next request.
+func TestServeHTTPStickySurvivesDropHeadersCookie(t *testing.T) {
+	var gotCookie string
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCookie = r.Header.Get("Cookie")
+		_, _ = w.Write([]byte("A"))
+	}))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCookie = r.Header.Get("Cookie")
+		_, _ = w.Write([]byte("B"))
+	}))
+	defer srvB.Close()
+
+	bA := mkBackend(t, "dropcookie.example.org", srvA)
+	bB := mkBackend(t, "dropcookie.example.org", srvB)
+	g := mkGroupMulti("dropcookie.example.org", "", bA, bB)
+	g.Sticky = true
+	g.DropHeaders = []string{"Cookie"}
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	req := httptest.NewRequest("GET", "http://dropcookie.example.org/", nil)
+	req.Header.Set("Cookie", "unrelated=1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if gotCookie != "" {
+		t.Fatalf("backend received Cookie=%q, want stripped", gotCookie)
+	}
+	cookies := stickyCookies(rec, g)
+	if len(cookies) != 1 {
+		t.Fatalf("sticky Set-Cookie count = %d, want 1", len(cookies))
+	}
+	pin := cookies[0]
+	first := rec.Body.String()
+
+	gotCookie = "unset"
+	req = httptest.NewRequest("GET", "http://dropcookie.example.org/", nil)
+	req.AddCookie(pin)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if gotCookie != "" {
+		t.Fatalf("backend received Cookie=%q on the pinned request, want stripped", gotCookie)
+	}
+	if rec.Body.String() != first {
+		t.Fatalf("pinned request served by a different backend: got %q, want %q", rec.Body.String(), first)
+	}
+}
+
+// TestServeHTTPStickyIgnoresLearnedPinWithoutSpread proves a pin minted for a
+// Learned (peer) backend is ignored when Spread is off — routing goes to the
+// local backend instead, and a fresh cookie pointing at the local backend is
+// reissued (so a stale learned pin can't linger forever).
+func TestServeHTTPStickyIgnoresLearnedPinWithoutSpread(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("local")) }))
+	defer localSrv.Close()
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("peer")) }))
+	defer peerSrv.Close()
+
+	local := mkBackend(t, "learned.example.org", localSrv)
+	learned := makePeerBackend(peerSrv.URL, "learned.example.org", "", false, "peer-x", 1)
+	g := mkGroupMulti("learned.example.org", "", local, learned)
+	g.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	req := httptest.NewRequest("GET", "http://learned.example.org/", nil)
+	req.AddCookie(&http.Cookie{Name: stickyCookieName(g), Value: learned.stickyID})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Body.String() != "local" {
+		t.Fatalf("body = %q, want local (a learned pin must be ignored without Spread)", rec.Body.String())
+	}
+	cookies := stickyCookies(rec, g)
+	if len(cookies) != 1 || cookies[0].Value != local.stickyID {
+		t.Fatalf("reissued cookie = %+v, want exactly 1 pointing at the local backend (%q)", cookies, local.stickyID)
+	}
+}
+
+// TestServeHTTPStickyHonorsLearnedPinWithSpread is the Spread:true companion
+// to the test above: with Spread on, a Learned backend is an equal pool
+// member, so a pin to it must be honored.
+func TestServeHTTPStickyHonorsLearnedPinWithSpread(t *testing.T) {
+	localSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("local")) }))
+	defer localSrv.Close()
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("peer")) }))
+	defer peerSrv.Close()
+
+	local := mkBackend(t, "learnedspread.example.org", localSrv)
+	learned := makePeerBackend(peerSrv.URL, "learnedspread.example.org", "", false, "peer-x", 1)
+	g := mkGroupMulti("learnedspread.example.org", "", local, learned)
+	g.Sticky = true
+	g.Spread = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	req := httptest.NewRequest("GET", "http://learnedspread.example.org/", nil)
+	req.AddCookie(&http.Cookie{Name: stickyCookieName(g), Value: learned.stickyID})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Body.String() != "peer" {
+		t.Fatalf("body = %q, want peer (a learned pin must be honored under Spread)", rec.Body.String())
+	}
+}
+
+// TestServeHTTPStickyIgnoredOnHoppedRequest proves a hopped request never
+// reads or writes sticky cookies, even on a sticky group carrying a
+// valid-format cookie.
+func TestServeHTTPStickyIgnoredOnHoppedRequest(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	g := mkGroup(t, "hopped.example.org", "", false, backend.URL)
+	g.Sticky = true
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	req := httptest.NewRequest("GET", "http://hopped.example.org/", nil)
+	req.Header.Set(PeerHopHeader, "1")
+	req.AddCookie(&http.Cookie{Name: stickyCookieName(g), Value: g.Backends[0].stickyID})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	if got := rec.Result().Cookies(); len(got) != 0 {
+		t.Fatalf("Set-Cookie count = %d, want 0 for a hopped request", len(got))
+	}
+}
+
+// TestAssembleGroupsStickyStaticAndLabel proves sticky is wired through both
+// the routes.json static path (Sticky field) and the proxy.sticky docker
+// label — mirrors TestAssembleGroupsDropHeadersStaticAndLabel.
+func TestAssembleGroupsStickyStaticAndLabel(t *testing.T) {
+	cfgPath := writeStaticConfig(t, staticRoute{
+		Host: "sticky-static.example.com", Backends: []string{"http://10.0.0.9:8080"},
+		Sticky: true,
+	})
+	dc := fakeDocker(t, dockerJSON(
+		container("lbl", "app-sticky-lbl", "running",
+			map[string]string{labelHost: "sticky-label.example.com", labelPort: "8080", labelSticky: "true"},
+			map[string]string{managedNetwork: "172.20.0.7"}),
+	))
+
+	groups, _, err := assembleGroups(context.Background(), dc, cfgPath)
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	if g := findGroup(groups, "sticky-static.example.com", ""); g == nil || !g.Sticky {
+		t.Fatalf("static group Sticky = %+v, want true", g)
+	}
+	if g := findGroup(groups, "sticky-label.example.com", ""); g == nil || !g.Sticky {
+		t.Fatalf("label group Sticky = %+v, want true", g)
+	}
+}
+
+// TestAssembleGroupsStickyLabelMergesAcrossReplicas mirrors
+// TestAssembleAuthMergeRule's merge-if-any-replica semantics for Sticky: only
+// one of two replicas carries proxy.sticky=true, yet the resulting group
+// must have Sticky true and both replicas as backends.
+func TestAssembleGroupsStickyLabelMergesAcrossReplicas(t *testing.T) {
+	dc := fakeDocker(t, dockerJSON(
+		container("r1", "app-sticky-r1", "running",
+			map[string]string{labelHost: "sticky-merge.example.org", labelPort: "8080"},
+			map[string]string{managedNetwork: "172.20.0.11"}),
+		container("r2", "app-sticky-r2", "running",
+			map[string]string{labelHost: "sticky-merge.example.org", labelPort: "8080", labelSticky: "true"},
+			map[string]string{managedNetwork: "172.20.0.12"}),
+	))
+
+	groups, _, err := assembleGroups(context.Background(), dc, "")
+	if err != nil {
+		t.Fatalf("assembleGroups: %v", err)
+	}
+	g := findGroup(groups, "sticky-merge.example.org", "")
+	if g == nil {
+		t.Fatal("group missing")
+	}
+	if !g.Sticky {
+		t.Fatal("Sticky should be true (any replica proxy.sticky=true)")
+	}
+	if len(g.Backends) != 2 {
+		t.Fatalf("Backends = %d, want 2 (both replicas joined the same label-managed group)", len(g.Backends))
+	}
+}
+
+// TestStickyCookieNameScopedPerRoute proves two RouteGroups on the same Host
+// at different PathPrefixes never collide on cookie name.
+func TestStickyCookieNameScopedPerRoute(t *testing.T) {
+	g1 := &RouteGroup{Host: "scope.example.org", PathPrefix: "", Sticky: true}
+	g2 := &RouteGroup{Host: "scope.example.org", PathPrefix: "/api", Sticky: true}
+	if stickyCookieName(g1) == stickyCookieName(g2) {
+		t.Fatalf("cookie names collide: %q", stickyCookieName(g1))
+	}
+	if !strings.HasPrefix(stickyCookieName(g1), stickyCookiePrefix) {
+		t.Fatalf("cookie name %q lacks the %q prefix setStickyCookie's dedupe matches on", stickyCookieName(g1), stickyCookiePrefix)
+	}
+	if got := stickyCookiePath(g1); got != "/" {
+		t.Fatalf("stickyCookiePath(no prefix) = %q, want /", got)
+	}
+	if got := stickyCookiePath(g2); got != "/api" {
+		t.Fatalf("stickyCookiePath(/api) = %q, want /api", got)
 	}
 }

@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,13 @@ type Backend struct {
 	HealthPath  string
 	proxy       *httputil.ReverseProxy
 	healthyFlag atomic.Bool
+
+	// stickyID is the opaque per-backend value carried in the affinity
+	// cookie when RouteGroup.Sticky is on (see setStickyCookie). Derived
+	// from URL via backendStickyID at construction and never mutated —
+	// deliberately not the raw backend URL itself, which would leak
+	// internal container topology to the client.
+	stickyID string
 
 	// consecFails counts consecutive failed periodic probes (health.go's
 	// checkBackend only — see recordHealthCheck). Not carried forward across
@@ -110,6 +119,15 @@ type RouteGroup struct {
 	// e.g. Cookie on a Supabase /realtime or /rest prefix that authenticates
 	// via apikey/Authorization instead.
 	DropHeaders []string
+
+	// Sticky opts this route into cookie-based session affinity: once a
+	// client is routed to a backend, subsequent requests pin back to it (see
+	// stickyCookieName/setStickyCookie in ServeHTTP). Dual-path config,
+	// same as DropHeaders — routes.json's "sticky" field or the
+	// proxy.sticky docker label. Deliberately not advertised across the
+	// peer mesh (peersync.go/peermerge.go never touch it) and never applied
+	// to a hopped request — see the hopped gating in ServeHTTP.
+	Sticky bool
 
 	AuthRequired bool
 	AuthUsers    []string // lowercased; empty = any authenticated user
@@ -293,6 +311,76 @@ func (g *RouteGroup) pickTier(skip map[*Backend]bool, wantLearned, ignoreHealth 
 		return nil
 	}
 	return pool[int(g.cursor.Add(1)-1)%len(pool)]
+}
+
+// stickyCookiePrefix names every affinity cookie this proxy issues, so
+// setStickyCookie can recognize and strip its own prior header value without
+// touching an unrelated Set-Cookie (e.g. an SSO auth cookie) added earlier in
+// the same ServeHTTP call.
+const stickyCookiePrefix = "_pmgr_sticky_"
+
+// stickyCookieMaxAge is reissued on every request that reaches a sticky
+// group, so it slides forward for an active session rather than expiring a
+// client mid-use.
+const stickyCookieMaxAge = 2 * time.Hour
+
+// stickyCookieName derives the cookie NAME (not just its Path) from the
+// route's own identity — Host + PathPrefix — so two different sticky
+// RouteGroups on the same Host at different PathPrefixes can never collide.
+// Path-scoping alone isn't sufficient: browsers don't guarantee a
+// deterministic Cookie-header order across same-named cookies set at
+// different paths.
+func stickyCookieName(g *RouteGroup) string {
+	sum := sha256.Sum256([]byte(g.Host + "|" + g.PathPrefix))
+	return stickyCookiePrefix + hex.EncodeToString(sum[:4])
+}
+
+// stickyCookiePath is the cookie's Path attribute — PathPrefix, or "/" when
+// the route has none. Defense in depth alongside the name-scoping above.
+func stickyCookiePath(g *RouteGroup) string {
+	if g.PathPrefix != "" {
+		return g.PathPrefix
+	}
+	return "/"
+}
+
+// backendByStickyID resolves a cookie's pinned value back to a live backend
+// in this group, or nil if the pin no longer matches anything (backend
+// removed, group reconfigured, etc.) — the caller falls through to normal
+// pickHealthy in that case.
+func (g *RouteGroup) backendByStickyID(id string) *Backend {
+	for _, b := range g.Backends {
+		if b.stickyID == id {
+			return b
+		}
+	}
+	return nil
+}
+
+// setStickyCookie issues (or reissues) this group's affinity cookie. It
+// first strips any prior Set-Cookie value for this same cookie name already
+// queued on w — needed because a failed pinned attempt followed by a
+// successful fallback pick must not emit two Set-Cookie headers for the same
+// name in one ServeHTTP call — while leaving every other queued Set-Cookie
+// header (e.g. an SSO auth cookie) untouched.
+func setStickyCookie(w http.ResponseWriter, g *RouteGroup, stickyID string) {
+	name := stickyCookieName(g)
+	existing := w.Header()["Set-Cookie"]
+	w.Header().Del("Set-Cookie")
+	for _, v := range existing {
+		if !strings.HasPrefix(v, name+"=") {
+			w.Header().Add("Set-Cookie", v)
+		}
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    stickyID,
+		Path:     stickyCookiePath(g),
+		MaxAge:   int(stickyCookieMaxAge / time.Second),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 type Router struct {
@@ -575,24 +663,52 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			req.URL.Path = "/" + req.URL.Path
 		}
 	}
+	// Sticky is read here, between the StripPrefix mutation above and the
+	// DropHeaders strip below — load-bearing order: a route with
+	// DropHeaders: ["Cookie"] deletes the whole Cookie header, so reading
+	// after that loop would break sticky on any route that also drops
+	// cookies. Gated on !hopped, same as the allowPeer plumbing below — a
+	// hopped request never applies sticky logic.
+	var stickyPin string
+	if group.Sticky && !hopped {
+		if c, err := req.Cookie(stickyCookieName(group)); err == nil && c.Value != "" {
+			stickyPin = c.Value
+		}
+	}
+
 	for _, h := range group.DropHeaders {
 		req.Header.Del(h)
 	}
 
 	tried := map[*Backend]bool{}
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		b := group.pickHealthy(tried, !hopped)
+		var b *Backend
+		if stickyPin != "" {
+			// A pin to a Learned (peer) backend is only honored when Spread
+			// is on: peers are otherwise failover-only, never load-balanced,
+			// so honoring a stale pin after local backends recover would
+			// strand the client on an unnecessary extra hop.
+			if pinned := group.backendByStickyID(stickyPin); pinned != nil && pinned.healthy() && (!pinned.Learned || group.Spread) {
+				b = pinned
+			}
+			// Only the first iteration consults the pin — a failed pinned
+			// attempt falls through to normal pickHealthy for any retry.
+			stickyPin = ""
+		}
 		if b == nil {
-			// Health data says nothing eligible is left — either every
-			// backend is genuinely down, or the health state is simply
-			// wrong. Rather than guarantee a 503 on that belief, stop
-			// trusting it and try whatever's left anyway: stale health data
-			// is a likelier explanation than every backend being
-			// simultaneously dead. Still gated by allowPeer/tried inside
-			// pickAny, so a hopped request can't loop back onto a peer.
-			if pb := group.pickAny(tried, !hopped); pb != nil {
-				group.logPanicOnce(reqHost)
-				b = pb
+			b = group.pickHealthy(tried, !hopped)
+			if b == nil {
+				// Health data says nothing eligible is left — either every
+				// backend is genuinely down, or the health state is simply
+				// wrong. Rather than guarantee a 503 on that belief, stop
+				// trusting it and try whatever's left anyway: stale health data
+				// is a likelier explanation than every backend being
+				// simultaneously dead. Still gated by allowPeer/tried inside
+				// pickAny, so a hopped request can't loop back onto a peer.
+				if pb := group.pickAny(tried, !hopped); pb != nil {
+					group.logPanicOnce(reqHost)
+					b = pb
+				}
 			}
 		}
 		if b == nil {
@@ -603,6 +719,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// Interface-based so this file stays free of accesslog imports.
 		if setter, ok := w.(interface{ SetBackend(string) }); ok {
 			setter.SetBackend(b.URL)
+		}
+		if group.Sticky && !hopped {
+			setStickyCookie(w, group, b.stickyID)
 		}
 		if tryProxy(w, req, b) {
 			return
@@ -742,6 +861,7 @@ type staticRoute struct {
 	RateLimit   bool     `json:"ratelimit,omitempty"`
 	RateRPM     int      `json:"ratelimit_rpm,omitempty"`
 	DropHeaders []string `json:"drop_headers,omitempty"`
+	Sticky      bool     `json:"sticky,omitempty"`
 }
 
 type staticConfig struct {
@@ -769,6 +889,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 						Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name, Service: sr.Service,
 						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers), AuthMode: sr.AuthMode,
 						RateLimit: sr.RateLimit, RateRPM: sr.RateRPM, DropHeaders: sr.DropHeaders,
+						Sticky: sr.Sticky,
 					}
 					groupsByKey[key] = g
 					g.static = true
@@ -920,6 +1041,11 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 			g.SpreadLocal = true
 			g.Spread = true
 		}
+		// Sticky merges across replicas the same way auth/ratelimit/spread
+		// do: one replica opting the route in is enough.
+		if c.Labels[labelSticky] == "true" {
+			g.Sticky = true
+		}
 		if rpmStr := c.Labels[labelRateRPM]; rpmStr != "" && g.RateRPM == 0 {
 			rpm, err := strconv.Atoi(rpmStr)
 			if err != nil || rpm <= 0 {
@@ -987,6 +1113,16 @@ func normalizeAuthUsers(in []string) []string {
 	return out
 }
 
+// backendStickyID derives the opaque per-backend value used in the affinity
+// cookie from its raw URL — deterministic across refreshes (so an existing
+// client's cookie still resolves after a Router.Set()) without ever exposing
+// the URL itself to the client. 16 hex chars is enough entropy to avoid
+// collisions within one route group's small backend set.
+func backendStickyID(rawURL string) string {
+	sum := sha256.Sum256([]byte(rawURL))
+	return hex.EncodeToString(sum[:8])
+}
+
 func makeBackend(rawURL string, weight int, container, healthPath string, u *url.URL, hostHeader string) *Backend {
 	p := httputil.NewSingleHostReverseProxy(u)
 	orig := p.Director
@@ -996,6 +1132,7 @@ func makeBackend(rawURL string, weight int, container, healthPath string, u *url
 	}
 	return &Backend{
 		URL: rawURL, Weight: weight, Container: container, HealthPath: healthPath, proxy: p,
+		stickyID: backendStickyID(rawURL),
 	}
 }
 
@@ -1035,5 +1172,6 @@ func makePeerBackend(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool
 	return &Backend{
 		URL: peerBaseURL, Weight: weight, Container: "peer:" + peerID, proxy: p,
 		Learned: true, PeerID: peerID,
+		stickyID: backendStickyID(peerBaseURL),
 	}
 }
