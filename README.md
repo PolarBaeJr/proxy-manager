@@ -109,6 +109,7 @@ Drop these on any container you want routed:
 | `proxy.auth.mode=oauth` |   | bearer-only OAuth mode for MCP servers (default is cookie SSO) |
 | `proxy.ratelimit=true` |   | per-client-IP rate limit (default: off) — spoof-resistant client IP, `429` when exceeded. In-memory per-instance by default; shared across every proxy in the mesh when `REDIS_ADDR` is set (see `.env.example`) |
 | `proxy.ratelimit.rpm=60` |   | requests per minute per IP (default 60 if enabled without a value) |
+| `proxy.sticky=true` |   | cookie-based session affinity — pins a client to the backend it first hit for this route (default: off) |
 
 ### MCP servers
 

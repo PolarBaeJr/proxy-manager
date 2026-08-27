@@ -42,6 +42,10 @@ const (
 	// (spread.go) on the replicas it places on a peer; nothing sets it
 	// implicitly, so every existing route keeps failover-only semantics.
 	labelSpread = "proxy.spread"
+	// labelSticky opts a route into cookie-based session affinity — see
+	// RouteGroup.Sticky. Boolean convention matches labelSpread: "true" merges
+	// the flag on for the whole group if ANY replica carries it.
+	labelSticky = "proxy.sticky"
 	// labelCanary does not otherwise exist in the proxy package — canary is
 	// managed by the dashboard (cmd/dashboard/docker.go's labelCanary) and
 	// the proxy has never needed to know about it, since a canary container
