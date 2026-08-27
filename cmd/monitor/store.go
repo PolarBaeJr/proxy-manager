@@ -311,8 +311,18 @@ func (s *Store) errorPctRecent(name string) float64 {
 	return 100 * errs / total
 }
 
-// TargetHosts returns the per-host traffic + error breakdown for one target.
-// Sorted by total requests descending.
+// hostStatsWindow matches the "Requests (5m)" figure the dashboard already
+// shows next to this data — TargetHosts reports traffic/errors as a delta
+// over this same trailing window (latest sample minus the sample from ~window
+// ago), not /metrics' lifetime-cumulative totals. Without this, the two
+// numbers on one card describe different spans of time: a handful of recent
+// requests sitting next to an error percentage computed since the process
+// started (hours or days of history), which reads as a live outage when
+// there isn't one.
+const hostStatsWindow = 5 * time.Minute
+
+// TargetHosts returns the per-host traffic + error breakdown for one target,
+// windowed to hostStatsWindow. Sorted by total requests descending.
 func (s *Store) TargetHosts(name string) []map[string]any {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -320,21 +330,61 @@ func (s *Store) TargetHosts(name string) []map[string]any {
 	if !ok || st.Latest == nil || st.Latest.Data == nil {
 		return nil
 	}
-	byHost, _ := st.Latest.Data["by_host"].(map[string]any)
-	byHostStatus, _ := st.Latest.Data["by_host_status"].(map[string]any)
+	latest := st.Latest
+	cutoff := latest.At.Add(-hostStatsWindow)
+
+	// Nearest OK sample at or before cutoff. nil means we haven't been
+	// watching this target for a full window yet — every delta below then
+	// falls back to the raw cumulative value, which is the best available
+	// answer (rather than reporting 0 traffic during startup).
+	var baseline *Sample
+	series := s.series[name]
+	for i := len(series) - 1; i >= 0; i-- {
+		if series[i].OK && series[i].Data != nil && !series[i].At.After(cutoff) {
+			baseline = series[i]
+			break
+		}
+	}
+	var baseHost, baseHostStatus map[string]any
+	if baseline != nil {
+		baseHost, _ = baseline.Data["by_host"].(map[string]any)
+		baseHostStatus, _ = baseline.Data["by_host_status"].(map[string]any)
+	}
+	delta := func(cur, base map[string]any, key string) float64 {
+		c, _ := cur[key].(float64)
+		if base == nil {
+			return c
+		}
+		b, _ := base[key].(float64)
+		if b > c {
+			// Counter reset mid-window (process restart) — the whole
+			// current value is "new" rather than negative.
+			return c
+		}
+		return c - b
+	}
+
+	byHost, _ := latest.Data["by_host"].(map[string]any)
+	byHostStatus, _ := latest.Data["by_host_status"].(map[string]any)
 	out := make([]map[string]any, 0, len(byHost))
-	for host, total := range byHost {
-		totalN, _ := total.(float64)
+	for host := range byHost {
+		totalN := delta(byHost, baseHost, host)
 		entry := map[string]any{"host": host, "total": totalN}
 		var errs float64
-		if statuses, ok := byHostStatus[host].(map[string]any); ok {
-			entry["by_status"] = statuses
-			for k, v := range statuses {
-				n, _ := v.(float64)
+		if curStatuses, ok := byHostStatus[host].(map[string]any); ok {
+			var baseStatuses map[string]any
+			if baseHostStatus != nil {
+				baseStatuses, _ = baseHostStatus[host].(map[string]any)
+			}
+			statuses := map[string]any{}
+			for k := range curStatuses {
+				n := delta(curStatuses, baseStatuses, k)
+				statuses[k] = n
 				if len(k) > 0 && (k[0] == '4' || k[0] == '5') {
 					errs += n
 				}
 			}
+			entry["by_status"] = statuses
 		}
 		if totalN > 0 {
 			entry["error_pct"] = 100 * errs / totalN
