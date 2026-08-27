@@ -902,6 +902,43 @@ func TestDockerHealthFloorRecoversAcrossRefresh(t *testing.T) {
 	}
 }
 
+// TestPrevHealthScopedByRoute is the regression test for the cross-route
+// health bleed found investigating a live case: two different routes
+// (different Host) whose backend lists happen to share the same literal
+// backend URL — e.g. two static routes.json entries proxying the same
+// upstream — must carry forward their healthyFlag independently. Keying
+// prevHealth by the bare backend URL alone let one route's failure silently
+// flip the other's backend unhealthy on the very next refresh, even though
+// the two routes are otherwise unrelated.
+func TestPrevHealthScopedByRoute(t *testing.T) {
+	const sharedTarget = "http://10.0.0.9:54321"
+	gA := mkGroup(t, "a.example.org", "/x", false, sharedTarget)
+	gB := mkGroup(t, "b.example.org", "/y", false, sharedTarget)
+
+	r := &Router{}
+	r.Set([]*RouteGroup{gA, gB})
+	if !gA.Backends[0].healthy() || !gB.Backends[0].healthy() {
+		t.Fatal("both backends should default healthy on first Set()")
+	}
+
+	// Only A's backend goes unhealthy (e.g. its own health check fails).
+	gA.Backends[0].markHealthy(false)
+
+	// Next refresh rebuilds both groups from scratch (fresh *Backend
+	// pointers, same URLs) — exactly what assembleGroups()/overlay() do
+	// every refresh() cycle.
+	gA2 := mkGroup(t, "a.example.org", "/x", false, sharedTarget)
+	gB2 := mkGroup(t, "b.example.org", "/y", false, sharedTarget)
+	r.Set([]*RouteGroup{gA2, gB2})
+
+	if gA2.Backends[0].healthy() {
+		t.Fatal("A's own unhealthy state should carry forward for A")
+	}
+	if !gB2.Backends[0].healthy() {
+		t.Fatal("B's backend should stay healthy — A's failure must not bleed into B just because they share a backend URL")
+	}
+}
+
 // TestMissingHealthLabelWarningDedup proves the missing-proxy.health warning
 // (steps 8-9) only LOGS once per container name for the process lifetime,
 // even across repeated assembleGroups() calls (which now happen far more
