@@ -251,15 +251,21 @@ func (r *Router) Set(groups []*RouteGroup) {
 	r.groups = groups
 	r.mu.Unlock()
 
+	// Keyed by route identity + backend URL, not the bare URL alone: two
+	// different routes can legitimately point at the same literal backend
+	// (e.g. two static routes.json entries proxying the same upstream), and
+	// a bare-URL key would conflate their health state on every refresh —
+	// one route's transient failure silently flips the other's backend
+	// unhealthy (or vice versa) even though they're unrelated route entries.
 	prevHealth := map[string]bool{}
 	for _, g := range prev {
 		for _, b := range g.Backends {
-			prevHealth[b.URL] = b.healthyFlag.Load()
+			prevHealth[g.Host+"|"+g.PathPrefix+"|"+b.URL] = b.healthyFlag.Load()
 		}
 	}
 	for _, g := range groups {
 		for _, b := range g.Backends {
-			if h, ok := prevHealth[b.URL]; ok {
+			if h, ok := prevHealth[g.Host+"|"+g.PathPrefix+"|"+b.URL]; ok {
 				b.healthyFlag.Store(h)
 			} else {
 				b.healthyFlag.Store(true)

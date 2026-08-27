@@ -60,6 +60,7 @@ func checkBackend(b *Backend) {
 	d := net.Dialer{Timeout: healthTimeout}
 	conn, err := d.DialContext(ctx, "tcp", u.Host)
 	if err != nil {
+		log.Printf("health check dial %s: %v (timeout budget %s) — marking unhealthy", b.URL, err, healthTimeout)
 		b.markHealthy(false)
 		return
 	}
