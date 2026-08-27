@@ -186,6 +186,11 @@ services:
       # static route. Empty => read-only tools; true => also maintenance,
       # scale, start/stop, autoupdate and canary.
       MCP_ALLOW_WRITES:     ${MCP_ALLOW_WRITES:-}
+      # Narrower opt-in on top of MCP_ALLOW_WRITES above: lets an MCP tool
+      # target a peer host by name (e.g. spread_service's target arg) instead
+      # of only ever acting on this instance. Empty/false => cross-host MCP
+      # calls are refused even with MCP_ALLOW_WRITES set.
+      MCP_ALLOW_PEER_WRITES: ${MCP_ALLOW_PEER_WRITES:-}
       # WebAuthn RP identity — see cmd/dashboard/passkey.go's doc comment.
       # Set PASSKEY_RP_ID to the shared parent domain (e.g. "polardev.org")
       # and list every instance's full origin in PASSKEY_RP_ORIGINS so a
