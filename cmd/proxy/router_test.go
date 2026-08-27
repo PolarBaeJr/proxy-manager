@@ -1149,6 +1149,27 @@ func TestPickAnyPanicModeFallback(t *testing.T) {
 	}
 }
 
+// TestPickAnyStillHonorsDockerUnhealthyFloor proves panic mode only
+// distrusts the proxy's own probe result (healthyFlag), not Docker's own
+// HEALTHCHECK verdict (DockerUnhealthy) — a deliberate choice, not an
+// oversight. A container Docker itself reports unhealthy (e.g. deadlocked
+// but still accepting TCP) must stay excluded even in panic mode; the
+// alternative trades a fast 503 for a hang.
+func TestPickAnyStillHonorsDockerUnhealthyFloor(t *testing.T) {
+	sick := &Backend{URL: "http://sick", Weight: 1, DockerUnhealthy: true}
+	fine := &Backend{URL: "http://fine", Weight: 1}
+	sick.markHealthy(false)
+	fine.markHealthy(false)
+	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{sick, fine}}
+
+	if b := g.pickAny(nil, true); b != fine {
+		t.Fatalf("pickAny should skip the DockerUnhealthy backend and pick the other one, got %v", b)
+	}
+	if b := g.pickAny(map[*Backend]bool{fine: true}, true); b != nil {
+		t.Fatal("pickAny must never select a DockerUnhealthy backend, even as the only thing left")
+	}
+}
+
 // TestServeHTTPPanicModeRoutesWhenAllUnhealthy is the regression test for the
 // panic-mode fallback: a group whose only backend is marked unhealthy must
 // still be routed to rather than unconditionally served a 503, because

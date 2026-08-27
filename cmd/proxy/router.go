@@ -79,6 +79,23 @@ func (b *Backend) recordHealthCheck(ok bool) {
 func (b *Backend) markHealthy(ok bool) { b.healthyFlag.Store(ok) }
 func (b *Backend) healthy() bool       { return !b.DockerUnhealthy && b.healthyFlag.Load() }
 
+// excludedFrom is healthy()'s inverse, but lets pickAny's panic mode
+// (ignoreHealth=true) distrust only healthyFlag — the proxy's own probe
+// result, exactly what panic mode exists to second-guess — while still
+// honoring DockerUnhealthy unconditionally. DockerUnhealthy comes from
+// Docker's own HEALTHCHECK, run from inside/alongside the container, a
+// different and more authoritative signal than our own TCP/HTTP probe; it's
+// also what catches a deadlocked process that still accepts TCP connections
+// — precisely the case where panic-mode routing would trade a fast 503 for
+// a hang. So it stays load-bearing even when we've decided not to trust our
+// own probe anymore.
+func (b *Backend) excludedFrom(ignoreHealth bool) bool {
+	if b.DockerUnhealthy {
+		return true
+	}
+	return !ignoreHealth && !b.healthyFlag.Load()
+}
+
 type RouteGroup struct {
 	Host        string
 	PathPrefix  string
@@ -198,13 +215,16 @@ func (g *RouteGroup) pickHealthy(skip map[*Backend]bool, allowPeer bool) *Backen
 	return nil
 }
 
-// pickAny is pickHealthy with the healthy() filter dropped — a last-resort
-// fallback for when a group has nothing left that its own health data
-// trusts. Only ever called after pickHealthy has already returned nil for
-// this request, so it never overrides or races a legitimately-healthy pick;
-// see the panic-mode fallback in ServeHTTP. Same tiering/skip/weight rules
-// as pickHealthy, so it can't select a Learned backend on a hopped request
-// either — it only widens what "eligible" means within the same tiers.
+// pickAny is pickHealthy with the probe-based healthyFlag filter dropped —
+// a last-resort fallback for when a group has nothing left that its own
+// probe data trusts. Only ever called after pickHealthy has already
+// returned nil for this request, so it never overrides or races a
+// legitimately-healthy pick; see the panic-mode fallback in ServeHTTP. Same
+// tiering/skip/weight rules as pickHealthy, so it can't select a Learned
+// backend on a hopped request either — it only widens what "eligible" means
+// within the same tiers. Deliberately does NOT drop the DockerUnhealthy
+// floor — see Backend.excludedFrom for why that signal stays load-bearing
+// even in panic mode.
 func (g *RouteGroup) pickAny(skip map[*Backend]bool, allowPeer bool) *Backend {
 	if g.Spread && allowPeer {
 		if b := g.pickPool(skip, true); b != nil {
@@ -223,11 +243,11 @@ func (g *RouteGroup) pickAny(skip map[*Backend]bool, allowPeer bool) *Backend {
 
 // pickPool is pickTier without the Learned partition: one weighted
 // round-robin over every eligible backend, local and peer alike. ignoreHealth
-// drops the healthy() filter entirely — see pickAny.
+// drops the probe-based healthyFlag filter — see pickAny/excludedFrom.
 func (g *RouteGroup) pickPool(skip map[*Backend]bool, ignoreHealth bool) *Backend {
 	var pool []*Backend
 	for _, b := range g.Backends {
-		if skip[b] || (!ignoreHealth && !b.healthy()) {
+		if skip[b] || b.excludedFrom(ignoreHealth) {
 			continue
 		}
 		w := b.Weight
@@ -246,12 +266,12 @@ func (g *RouteGroup) pickPool(skip map[*Backend]bool, ignoreHealth bool) *Backen
 
 // pickTier restricts selection to backends whose Learned flag matches
 // wantLearned, applying the same skip-set + weighted round-robin logic
-// pickHealthy always used. ignoreHealth drops the healthy() filter entirely
-// — see pickAny.
+// pickHealthy always used. ignoreHealth drops the probe-based healthyFlag
+// filter — see pickAny/excludedFrom.
 func (g *RouteGroup) pickTier(skip map[*Backend]bool, wantLearned, ignoreHealth bool) *Backend {
 	var pool []*Backend
 	for _, b := range g.Backends {
-		if skip[b] || b.Learned != wantLearned || (!ignoreHealth && !b.healthy()) {
+		if skip[b] || b.Learned != wantLearned || b.excludedFrom(ignoreHealth) {
 			continue
 		}
 		w := b.Weight
