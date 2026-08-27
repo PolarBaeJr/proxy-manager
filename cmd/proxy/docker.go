@@ -33,6 +33,9 @@ const (
 	labelAuthMode  = "proxy.auth.mode"
 	labelRateLimit = "proxy.ratelimit"
 	labelRateRPM   = "proxy.ratelimit.rpm"
+	// labelDropHeaders is a comma-separated list of header names to strip
+	// from the request before forwarding — see RouteGroup.DropHeaders.
+	labelDropHeaders = "proxy.drop_headers"
 	// labelSpread opts a route out of pickHealthy's default peer-as-failover
 	// tiering and into active load balancing across the mesh — see
 	// RouteGroup.Spread. Set by cmd/dashboard's cross-host scale

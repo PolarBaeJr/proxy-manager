@@ -104,6 +104,13 @@ type RouteGroup struct {
 	Service     string
 	Backends    []*Backend
 
+	// DropHeaders are stripped from the request before it's forwarded to any
+	// backend in this group (see ServeHTTP) — for routes whose backend has a
+	// hard limit on total header size and doesn't need the header at all,
+	// e.g. Cookie on a Supabase /realtime or /rest prefix that authenticates
+	// via apikey/Authorization instead.
+	DropHeaders []string
+
 	AuthRequired bool
 	AuthUsers    []string // lowercased; empty = any authenticated user
 	AuthMode     string   // "" = sso (cookie or login redirect), "oauth" = bearer-first MCP mode
@@ -568,6 +575,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			req.URL.Path = "/" + req.URL.Path
 		}
 	}
+	for _, h := range group.DropHeaders {
+		req.Header.Del(h)
+	}
 
 	tried := map[*Backend]bool{}
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -724,13 +734,14 @@ type staticRoute struct {
 	// needs a hand-curated routes.json entry: per-path rate limits on a
 	// single container serving multiple internal paths. May be set alongside
 	// literal Backends; both are used.
-	Service   string   `json:"service,omitempty"`
-	Health    string   `json:"health,omitempty"`
-	Auth      bool     `json:"auth,omitempty"`
-	AuthUsers []string `json:"auth_users,omitempty"`
-	AuthMode  string   `json:"auth_mode,omitempty"`
-	RateLimit bool     `json:"ratelimit,omitempty"`
-	RateRPM   int      `json:"ratelimit_rpm,omitempty"`
+	Service     string   `json:"service,omitempty"`
+	Health      string   `json:"health,omitempty"`
+	Auth        bool     `json:"auth,omitempty"`
+	AuthUsers   []string `json:"auth_users,omitempty"`
+	AuthMode    string   `json:"auth_mode,omitempty"`
+	RateLimit   bool     `json:"ratelimit,omitempty"`
+	RateRPM     int      `json:"ratelimit_rpm,omitempty"`
+	DropHeaders []string `json:"drop_headers,omitempty"`
 }
 
 type staticConfig struct {
@@ -757,7 +768,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 					g = &RouteGroup{
 						Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name, Service: sr.Service,
 						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers), AuthMode: sr.AuthMode,
-						RateLimit: sr.RateLimit, RateRPM: sr.RateRPM,
+						RateLimit: sr.RateLimit, RateRPM: sr.RateRPM, DropHeaders: sr.DropHeaders,
 					}
 					groupsByKey[key] = g
 					g.static = true
@@ -878,6 +889,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 			g = &RouteGroup{
 				Host: host, PathPrefix: path, StripPrefix: c.Labels[labelStrip] == "true",
 				Name: display, Service: c.Labels[labelService],
+				DropHeaders: splitTrimmed(c.Labels[labelDropHeaders]),
 			}
 			groupsByKey[key] = g
 		}
@@ -942,6 +954,24 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		out = append(out, g)
 	}
 	return out, backendsByService, nil
+}
+
+// splitTrimmed splits a comma-separated label value, trimming whitespace and
+// dropping empties. Returns nil (not an empty slice) for "" so an unset
+// label leaves RouteGroup.DropHeaders nil, matching the static-config
+// zero-value case.
+func splitTrimmed(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // normalizeAuthUsers trims, drops empties, and lowercases so membership
