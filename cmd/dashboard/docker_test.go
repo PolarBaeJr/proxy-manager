@@ -357,3 +357,160 @@ func TestReplaceServiceProceedsWithoutHostPorts(t *testing.T) {
 		t.Fatal("no container was created")
 	}
 }
+
+// TestReplaceServiceCarriesForwardExtraNetwork is the regression test for the
+// badminton-admin bug: a container attached to BOTH the managed network and
+// an extra (compose-project) network with a load-bearing alias must no
+// longer be refused. The extra network is reconnected via
+// /networks/{name}/connect after create, and the container's own name is
+// filtered out of the aliases carried onto both networks.
+func TestReplaceServiceCarriesForwardExtraNetwork(t *testing.T) {
+	var edgeAliases, extraAliases []string
+	var sawConnect bool
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "tpl1", Names: []string{"/badminton-admin-1"}, State: "running",
+				Image:  "ghcr.io/org/admin:v1",
+				Labels: map[string]string{labelEnable: "true", labelService: "badminton-admin", labelHost: "admin.example"},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/tpl1/json"):
+			w.Write([]byte(`{
+				"Name": "/badminton-admin-1",
+				"Image": "sha256:abc",
+				"HostConfig": {"Mounts": []},
+				"Config": {},
+				"NetworkSettings": {"Networks": {
+					"edge": {"Aliases": ["badminton-admin-1", "admin-internal"]},
+					"badminton_default": {"Aliases": ["badminton-admin-1", "admin"]}
+				}}
+			}`))
+		case strings.Contains(r.URL.Path, "/networks/badminton_default/connect"):
+			sawConnect = true
+			var body struct {
+				Container      string
+				EndpointConfig struct{ Aliases []string }
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			extraAliases = body.EndpointConfig.Aliases
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			var body struct {
+				NetworkingConfig struct {
+					EndpointsConfig map[string]struct{ Aliases []string }
+				}
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			edgeAliases = body.NetworkingConfig.EndpointsConfig["edge"].Aliases
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	if err := dc.replaceService(context.Background(), "badminton-admin", ReplaceServiceRequest{Image: "ghcr.io/org/admin:v2"}); err != nil {
+		t.Fatalf("replaceService: %v", err)
+	}
+	if !sawConnect {
+		t.Fatal("expected a connect call to badminton_default, saw none")
+	}
+	if contains(edgeAliases, "badminton-admin-1") {
+		t.Fatalf("edge aliases = %v, self-name should have been filtered", edgeAliases)
+	}
+	if len(edgeAliases) != 1 || edgeAliases[0] != "admin-internal" {
+		t.Fatalf("edge aliases = %v, want [\"admin-internal\"] (self-name filtered, custom alias kept)", edgeAliases)
+	}
+	if contains(extraAliases, "badminton-admin-1") {
+		t.Fatalf("extra network aliases = %v, self-name should have been filtered", extraAliases)
+	}
+	if len(extraAliases) != 1 || extraAliases[0] != "admin" {
+		t.Fatalf("extra network aliases = %v, want [\"admin\"]", extraAliases)
+	}
+}
+
+// TestCreateContainerRollsBackOnConnectFailure proves createContainer's
+// rollback contract: if reconnecting an extra network fails after the
+// container was already created, createContainer must remove the
+// just-created container itself (the caller never received its ID) and
+// return an error naming the network, rather than leaking an orphaned,
+// half-networked container.
+func TestCreateContainerRollsBackOnConnectFailure(t *testing.T) {
+	var sawDelete bool
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/networks/badminton_default/connect"):
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/new1"):
+			sawDelete = true
+			w.WriteHeader(http.StatusNoContent)
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	_, err := dc.createContainer(context.Background(), "goproxy-badminton-admin-1", createBody{
+		Image: "ghcr.io/org/admin:v2",
+		ExtraNetworks: []networkAttachment{
+			{Name: "badminton_default", Aliases: []string{"admin"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("createContainer should fail when reconnecting an extra network fails")
+	}
+	if !strings.Contains(err.Error(), "badminton_default") {
+		t.Fatalf("error = %q, want it to name the network", err.Error())
+	}
+	if !sawDelete {
+		t.Fatal("createContainer should have removed the just-created container on connect failure")
+	}
+}
+
+// TestReplaceServiceStillRefusesPortBindingsWithCleanExtraNetwork proves the
+// narrowed network-refusal check didn't overshoot: a genuinely unreproducible
+// HostConfig field (PortBindings) must still refuse the replace even when the
+// container also carries a clean extra network that, on its own, is now fine
+// to carry forward.
+func TestReplaceServiceStillRefusesPortBindingsWithCleanExtraNetwork(t *testing.T) {
+	var sawCreate bool
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode([]dockerContainer{{
+				ID: "tpl1", Names: []string{"/goproxy-app-1"}, State: "running",
+				Image:  "ghcr.io/org/app:v1",
+				Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example"},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/tpl1/json"):
+			w.Write([]byte(`{
+				"Name": "/goproxy-app-1",
+				"Image": "sha256:abc",
+				"HostConfig": {"PortBindings": {"80/tcp": [{"HostPort": "8080"}]}},
+				"Config": {},
+				"NetworkSettings": {"Networks": {"edge": {}, "myproj_default": {}}}
+			}`))
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			sawCreate = true
+			json.NewEncoder(w).Encode(map[string]any{"Id": "new1"})
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	old := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { replaceSettleDelay = old })
+
+	if err := dc.replaceService(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}); err == nil {
+		t.Fatal("replaceService should still refuse a template with PortBindings, even alongside a clean extra network")
+	}
+	if sawCreate {
+		t.Fatal("no container should have been created")
+	}
+}
