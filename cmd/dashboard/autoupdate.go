@@ -159,8 +159,9 @@ func shouldAutoUpdate(svc Service, st *imageStatus, consecutiveFailures int) boo
 // Also proactively checks inspectHostConfigUnknowns for a service that would
 // otherwise fire: prepareReplaceTemplate refuses the whole replace when a
 // container carries HostConfig it cannot reproduce on recreate (published
-// ports, extra networks, etc — see hostConfigRefuseFields), but runOnce only
-// records that as a generic per-cycle failure, so an operator saw nothing
+// ports, a static IP/links/driver opts on an extra network, etc — see
+// hostConfigRefuseFields), but runOnce only records that as a generic
+// per-cycle failure, so an operator saw nothing
 // concrete until autoUpdateMaxFailures consecutive cycles had already been
 // burned. This surfaces the same refusal immediately, before any failed
 // cycles happen. Best-effort: an inspect error here is swallowed rather than

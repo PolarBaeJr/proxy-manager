@@ -179,9 +179,12 @@ func TestInspectHostConfigUnknownsCmdOverrideRefused(t *testing.T) {
 	}
 }
 
-// TestInspectHostConfigUnknownsExtraNetworkRefused proves a container on a
-// second (e.g. compose-project) network beyond the managed one is refused.
-func TestInspectHostConfigUnknownsExtraNetworkRefused(t *testing.T) {
+// TestInspectHostConfigUnknownsCleanExtraNetworkPasses proves a container on
+// a second (e.g. compose-project) network beyond the managed one is no
+// longer refused, as long as that network carries nothing genuinely
+// unreproducible — it's carried forward via cloneSpec/createContainer
+// instead (see docker_test.go's end-to-end replaceService tests).
+func TestInspectHostConfigUnknownsCleanExtraNetworkPasses(t *testing.T) {
 	dc := hostConfigStub(t, `{
 		"Image": "sha256:abc",
 		"HostConfig": {"NetworkMode": "edge"},
@@ -193,8 +196,28 @@ func TestInspectHostConfigUnknownsExtraNetworkRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inspectHostConfigUnknowns: %v", err)
 	}
-	if !contains(got, "NetworkSettings.Networks.myproj_default") {
-		t.Fatalf("refused = %v, want the extra network flagged", got)
+	if len(got) != 0 {
+		t.Fatalf("refused = %v, want none (a clean extra network is now carried forward)", got)
+	}
+}
+
+// TestInspectHostConfigUnknownsStaticIPNetworkRefused proves an extra network
+// whose endpoint carries a static IP (IPAMConfig) is still refused — a
+// recreate has no way to reproduce it.
+func TestInspectHostConfigUnknownsStaticIPNetworkRefused(t *testing.T) {
+	dc := hostConfigStub(t, `{
+		"Image": "sha256:abc",
+		"HostConfig": {"NetworkMode": "edge"},
+		"Config": {},
+		"NetworkSettings": {"Networks": {"edge": {}, "myproj_default": {"IPAMConfig": {"IPv4Address": "172.20.0.5"}}}}
+	}`, "")
+
+	got, err := dc.inspectHostConfigUnknowns(context.Background(), "id1")
+	if err != nil {
+		t.Fatalf("inspectHostConfigUnknowns: %v", err)
+	}
+	if !contains(got, "NetworkSettings.Networks.myproj_default.IPAMConfig") {
+		t.Fatalf("refused = %v, want the static-IP network flagged", got)
 	}
 }
 

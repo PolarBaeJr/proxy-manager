@@ -174,8 +174,24 @@ type createBody struct {
 	Healthcheck      *healthcheckSpec    `json:"Healthcheck,omitempty"`
 	HostConfig       hostConfig          `json:"HostConfig"`
 	NetworkingConfig struct {
-		EndpointsConfig map[string]struct{} `json:"EndpointsConfig"`
+		EndpointsConfig map[string]endpointSettings `json:"EndpointsConfig"`
 	} `json:"NetworkingConfig"`
+	// ManagedAliases and ExtraNetworks are NOT sent to Docker directly as part
+	// of this struct (json:"-") — createContainer uses them to build the real
+	// request/follow-up calls: ManagedAliases feeds the managed network's own
+	// EndpointsConfig entry, ExtraNetworks drives a POST /networks/{n}/connect
+	// per network after the container exists (Docker rejects a multi-endpoint
+	// create alongside an explicit HostConfig.NetworkMode, which
+	// createContainer always sets).
+	ManagedAliases []string            `json:"-"`
+	ExtraNetworks  []networkAttachment `json:"-"`
+}
+
+// endpointSettings mirrors Docker Engine API's EndpointSettings shape, just
+// enough to carry custom DNS aliases through NetworkingConfig.EndpointsConfig
+// and a /networks/{name}/connect EndpointConfig.
+type endpointSettings struct {
+	Aliases []string `json:"Aliases,omitempty"`
 }
 type hostConfig struct {
 	NetworkMode   string `json:"NetworkMode"`
@@ -219,8 +235,19 @@ type healthcheckSpec struct {
 // forward when it's recreated (replace/stage/promote/scale/onboard) but
 // isn't part of the labels/env already carried elsewhere.
 type cloneSpec struct {
-	Mounts      []mountSpec
-	Healthcheck *healthcheckSpec
+	Mounts         []mountSpec
+	Healthcheck    *healthcheckSpec
+	ManagedAliases []string            // custom aliases to reassert on the managed network's own endpoint
+	ExtraNetworks  []networkAttachment // non-managed networks + aliases to reconnect after create
+}
+
+// networkAttachment is one non-managed docker network a container is
+// connected to, plus whatever custom DNS aliases it was given on that
+// network — e.g. a compose project's own network with a load-bearing alias
+// another container on it reaches this one by.
+type networkAttachment struct {
+	Name    string
+	Aliases []string
 }
 
 // pullImage tries to pull from a registry. Errors are non-fatal: if the image
@@ -257,16 +284,52 @@ func (c *dockerClient) createVolume(ctx context.Context, name string) error {
 func (c *dockerClient) createContainer(ctx context.Context, name string, body createBody) (string, error) {
 	body.HostConfig.NetworkMode = managedNetwork
 	body.HostConfig.RestartPolicy.Name = "unless-stopped"
-	body.NetworkingConfig.EndpointsConfig = map[string]struct{}{managedNetwork: {}}
+	body.NetworkingConfig.EndpointsConfig = map[string]endpointSettings{
+		managedNetwork: {Aliases: body.ManagedAliases},
+	}
 	resp, err := c.do(ctx, "POST", "/containers/create?name="+url.QueryEscape(name), body)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Close()
 	var out struct {
 		ID string `json:"Id"`
 	}
-	return out.ID, json.NewDecoder(resp).Decode(&out)
+	decodeErr := json.NewDecoder(resp).Decode(&out)
+	resp.Close()
+	if decodeErr != nil {
+		return "", decodeErr
+	}
+	// Roll back here rather than leaving cleanup to the caller: create+connect
+	// is meant to look like one atomic "create" to callers, and on failure we
+	// return "" with no ID — the caller has no way to know what to remove.
+	for _, n := range body.ExtraNetworks {
+		if err := c.connectNetwork(ctx, n.Name, out.ID, n.Aliases); err != nil {
+			_ = c.removeContainer(ctx, out.ID)
+			return "", fmt.Errorf("connect %s to %s: %w", name, n.Name, err)
+		}
+	}
+	return out.ID, nil
+}
+
+// connectNetwork attaches an existing container to a non-managed network,
+// asserting the given aliases (custom DNS names other containers reach it
+// by) on that network's own endpoint. Mirrors connectToEdge's shape (see
+// onboarded.go) — an "already exists"/"already attached" error from Docker
+// is treated as a no-op success, defensive against a retried call.
+func (c *dockerClient) connectNetwork(ctx context.Context, network, containerID string, aliases []string) error {
+	body := map[string]any{"Container": containerID}
+	if len(aliases) > 0 {
+		body["EndpointConfig"] = endpointSettings{Aliases: aliases}
+	}
+	resp, err := c.do(ctx, "POST", "/networks/"+network+"/connect", body)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "already attached") {
+			return nil
+		}
+		return err
+	}
+	resp.Close()
+	return nil
 }
 
 // startContainer issues POST /containers/{id}/start. Docker returns
@@ -389,8 +452,10 @@ func (c *dockerClient) inspectRestartCount(ctx context.Context, id string) (int,
 }
 
 // inspectCloneSpec returns the HostConfig/Config fields a recreate must carry
-// forward — Mounts (bind mounts / named volumes) and Healthcheck — which
-// createBody drops today if the caller doesn't thread them through.
+// forward — Mounts (bind mounts / named volumes), Healthcheck, and every
+// docker network the container is attached to (with its custom DNS
+// aliases) — which createBody drops today if the caller doesn't thread them
+// through.
 func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSpec, error) {
 	body, err := c.get(ctx, "/containers/"+id+"/json")
 	if err != nil {
@@ -398,17 +463,57 @@ func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSp
 	}
 	defer body.Close()
 	var resp struct {
+		Name       string `json:"Name"`
 		HostConfig struct {
 			Mounts []mountSpec `json:"Mounts"`
 		} `json:"HostConfig"`
 		Config struct {
 			Healthcheck *healthcheckSpec `json:"Healthcheck"`
 		} `json:"Config"`
+		NetworkSettings struct {
+			Networks map[string]struct {
+				Aliases []string `json:"Aliases"`
+			} `json:"Networks"`
+		} `json:"NetworkSettings"`
 	}
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
 		return cloneSpec{}, err
 	}
-	return cloneSpec{Mounts: resp.HostConfig.Mounts, Healthcheck: resp.Config.Healthcheck}, nil
+
+	// Docker auto-resolves a container's own name (and short ID) as an
+	// implicit alias on every network it joins — the replacement container
+	// gets a new name/ID and that resolution for free, so carrying the old
+	// literal name/ID forward as an alias is clutter, not preservation. The
+	// short-ID check requires the full 12-char length Docker always uses, so
+	// a short, legitimate custom alias that happens to prefix-match id isn't
+	// mistaken for the auto-generated one.
+	selfName := strings.TrimPrefix(resp.Name, "/")
+	filterSelf := func(aliases []string) []string {
+		var out []string
+		for _, a := range aliases {
+			if a == selfName || (len(a) >= 12 && strings.HasPrefix(id, a)) {
+				continue
+			}
+			out = append(out, a)
+		}
+		return out
+	}
+
+	spec := cloneSpec{Mounts: resp.HostConfig.Mounts, Healthcheck: resp.Config.Healthcheck}
+	for name, net := range resp.NetworkSettings.Networks {
+		aliases := filterSelf(net.Aliases)
+		if name == managedNetwork {
+			spec.ManagedAliases = aliases
+			continue
+		}
+		spec.ExtraNetworks = append(spec.ExtraNetworks, networkAttachment{Name: name, Aliases: aliases})
+	}
+	sort.Strings(spec.ManagedAliases)
+	sort.Slice(spec.ExtraNetworks, func(i, j int) bool { return spec.ExtraNetworks[i].Name < spec.ExtraNetworks[j].Name })
+	for i := range spec.ExtraNetworks {
+		sort.Strings(spec.ExtraNetworks[i].Aliases)
+	}
+	return spec, nil
 }
 
 // looksLikeBareDigest reports whether s is a bare "sha256:<hex>" image
@@ -526,6 +631,20 @@ func jsonEqual(a, b json.RawMessage) bool {
 	return string(ab) == string(bb)
 }
 
+// endpointRefuseFields is NetworkSettings.Networks' counterpart to
+// hostConfigRefuseFields — a CLOSED allowlist of per-network
+// endpoint field names that, if set to a non-zero value, mean that network
+// attachment carries config a recreate genuinely cannot reproduce (a static
+// IP, legacy container links, driver-specific options). This is deliberately
+// NOT a blanket "any non-managed network is refused": a real `docker
+// inspect` NetworkSettings.Networks[x] entry always carries plenty of
+// daemon-populated fields (IPAddress, Gateway, EndpointID, NetworkID,
+// MacAddress, IPPrefixLen, GlobalIPv6Address, ...) that are non-zero on
+// every container attached to every network — refusing on any of those
+// would refuse every extra network carried forward by
+// inspectCloneSpec/createContainer.
+var endpointRefuseFields = []string{"IPAMConfig", "Links", "DriverOpts"}
+
 // inspectHostConfigUnknowns fetches a container's inspect output and returns
 // the names of any HostConfig/Config/NetworkSettings fields it carries that a
 // recreate (onboarding, replace, autoupdate) has no way to reproduce — the
@@ -547,6 +666,13 @@ func jsonEqual(a, b json.RawMessage) bool {
 // carries it forward on every recreate path (see cloneSpec), so unlike
 // Cmd/Entrypoint it no longer needs a refuse-rather-than-drop guard.
 //
+// Extra (non-managed) networks are likewise NOT blanket-refused: inspectCloneSpec
+// carries every network a container is attached to — plus its custom DNS
+// aliases — forward via cloneSpec.ExtraNetworks, and createContainer
+// reconnects them after create. A network is only refused when its own
+// endpoint carries one of endpointRefuseFields — an attribute (static IP,
+// links, driver opts) a recreate genuinely cannot reproduce.
+//
 // TODO(pi-verification): the field lists above were built from the public,
 // documented Docker Engine API HostConfig/Config schema, not a live spot
 // check — re-verify against a real `docker inspect` on the Pi once it's back
@@ -566,7 +692,7 @@ func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string)
 			Entrypoint json.RawMessage `json:"Entrypoint"`
 		} `json:"Config"`
 		NetworkSettings struct {
-			Networks map[string]json.RawMessage `json:"Networks"`
+			Networks map[string]map[string]json.RawMessage `json:"Networks"`
 		} `json:"NetworkSettings"`
 	}
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
@@ -582,9 +708,16 @@ func (c *dockerClient) inspectHostConfigUnknowns(ctx context.Context, id string)
 		refused = append(refused, f)
 	}
 
-	for netName := range resp.NetworkSettings.Networks {
-		if netName != managedNetwork {
-			refused = append(refused, "NetworkSettings.Networks."+netName)
+	for netName, endpoint := range resp.NetworkSettings.Networks {
+		if netName == managedNetwork {
+			continue
+		}
+		for _, f := range endpointRefuseFields {
+			raw, ok := endpoint[f]
+			if !ok || isZeroJSON(raw) {
+				continue
+			}
+			refused = append(refused, "NetworkSettings.Networks."+netName+"."+f)
 		}
 	}
 
@@ -1247,11 +1380,13 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	for i := 0; i < len(tpl.tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, tpl.startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:       req.Image,
-			Labels:      tpl.newLabels,
-			Env:         tpl.env,
-			Healthcheck: tpl.clone.Healthcheck,
-			HostConfig:  hostConfig{Mounts: tpl.clone.Mounts},
+			Image:          req.Image,
+			Labels:         tpl.newLabels,
+			Env:            tpl.env,
+			Healthcheck:    tpl.clone.Healthcheck,
+			HostConfig:     hostConfig{Mounts: tpl.clone.Mounts},
+			ManagedAliases: tpl.clone.ManagedAliases,
+			ExtraNetworks:  tpl.clone.ExtraNetworks,
 		})
 		if err != nil {
 			// Roll back: tear down any new ones we already created.
@@ -1389,11 +1524,13 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 	for i, old := range tpl.tplSet {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, tpl.startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:       req.Image,
-			Labels:      tpl.newLabels,
-			Env:         tpl.env,
-			Healthcheck: tpl.clone.Healthcheck,
-			HostConfig:  hostConfig{Mounts: tpl.clone.Mounts},
+			Image:          req.Image,
+			Labels:         tpl.newLabels,
+			Env:            tpl.env,
+			Healthcheck:    tpl.clone.Healthcheck,
+			HostConfig:     hostConfig{Mounts: tpl.clone.Mounts},
+			ManagedAliases: tpl.clone.ManagedAliases,
+			ExtraNetworks:  tpl.clone.ExtraNetworks,
 		})
 		if err != nil {
 			return fmt.Errorf("replaced %d/%d replicas, then failed on %s: create: %w", i, total, cname, err)
