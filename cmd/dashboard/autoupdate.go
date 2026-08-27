@@ -63,8 +63,8 @@ func newAutoUpdater(dc *dockerClient, ic *imageChecker, onb *OnboardedStore, rou
 // good: once failures >= autoUpdateMaxFailures, shouldAutoUpdate refuses
 // forever, so a blocked service can NEVER reach the success branch again to
 // clear itself. The only clearing path is the top of runOnce's loop, when
-// the registry stops reporting a difference (st == nil || !st.UpdateAvailable)
-// — i.e. someone fixes the problem and pulls the image manually. Shared
+// nothing is left to update (st == nil || !needsUpdate(svc, st)) — i.e.
+// someone fixes the problem and pulls/applies the image manually. Shared
 // between the single autoupdate loop goroutine (the only writer) and
 // list_services/buildManagedServices (readers from HTTP handler goroutines),
 // the same cross-goroutine sharing pattern imageChecker already uses for ic.
@@ -107,16 +107,40 @@ func (s *autoUpdateBlockStore) Get(name string) string {
 	return s.blocked[name]
 }
 
+// containerStale reports whether svc's RUNNING CONTAINER is on a different
+// image than what's already pulled locally under its tag. This is the case
+// imageStatus.UpdateAvailable (LocalDigest vs RegistryDigest) structurally
+// cannot see: if a pull once succeeded but the recreate/apply step didn't
+// (or applied to a different container than the one still running), local
+// and registry digests agree forever afterward and the checker reports
+// "up to date" while the live container never actually changed. Guarded on
+// both IDs being non-empty so a checker error or a not-yet-discovered
+// container never produces a false positive.
+func containerStale(svc Service, st *imageStatus) bool {
+	return st != nil && st.LocalImageID != "" && svc.ImageID != "" && svc.ImageID != st.LocalImageID
+}
+
+// needsUpdate is the actual "does this service need attention" predicate —
+// either the registry has something newer to pull, or the tag is already
+// resolved locally but the running container was never recreated onto it.
+// Both drive the same replace path (replaceOnboarded/replaceService pull
+// unconditionally, so an already-current pull is a cheap no-op there).
+func needsUpdate(svc Service, st *imageStatus) bool {
+	return st != nil && (st.UpdateAvailable || containerStale(svc, st))
+}
+
 // shouldAutoUpdate is the pure gate: opted in, has an image, no canary in
-// flight, not fully stopped, checker says a newer digest exists cleanly, and
-// we haven't hit the consecutive-failure backoff cap.
+// flight, not fully stopped, checker says an update is needed (registry has
+// something newer, or the container is stale relative to what's already
+// pulled) with no check error, and we haven't hit the consecutive-failure
+// backoff cap.
 func shouldAutoUpdate(svc Service, st *imageStatus, consecutiveFailures int) bool {
 	return svc.AutoUpdate &&
 		svc.Image != "" &&
 		svc.CanaryImage == "" &&
 		!svc.AllStopped &&
 		st != nil &&
-		st.UpdateAvailable &&
+		needsUpdate(svc, st) &&
 		st.Err == "" &&
 		consecutiveFailures < autoUpdateMaxFailures
 }
@@ -143,7 +167,7 @@ func shouldAutoUpdate(svc Service, st *imageStatus, consecutiveFailures int) boo
 // surfaced, since a transient inspect failure isn't itself an auto-update
 // blocker and runOnce's own path will report a real error if it recurs.
 func autoUpdateSkipReason(ctx context.Context, dc *dockerClient, svc Service, st *imageStatus) string {
-	if st == nil || !st.UpdateAvailable {
+	if st == nil || !needsUpdate(svc, st) {
 		return ""
 	}
 	switch {
@@ -209,7 +233,7 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 			return
 		}
 		st := a.ic.Get(svc.Image)
-		if st == nil || !st.UpdateAvailable {
+		if st == nil || !needsUpdate(svc, st) {
 			delete(a.failures, svc.Name)
 			a.blocks.Clear(svc.Name)
 			continue
@@ -235,7 +259,11 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 				continue
 			}
 		}
-		log.Printf("autoupdate: %s — newer digest for %s, replacing", svc.Name, svc.Image)
+		if st.UpdateAvailable {
+			log.Printf("autoupdate: %s — newer digest for %s, replacing", svc.Name, svc.Image)
+		} else {
+			log.Printf("autoupdate: %s — %s is already pulled locally but the running container never applied it, replacing", svc.Name, svc.Image)
+		}
 		var uerr error
 		if onboardedSvc {
 			uerr = a.dc.replaceOnboarded(ctx, svc.Name, ReplaceServiceRequest{Image: svc.Image}, a.onb, a.routesPath)

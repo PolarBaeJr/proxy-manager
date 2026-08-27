@@ -1766,7 +1766,7 @@ func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedS
 	// onboarded-only entries get the update badge too.
 	for i := range svcs {
 		if st := ic.Get(svcs[i].Image); st != nil {
-			if st.UpdateAvailable {
+			if needsUpdate(svcs[i], st) {
 				svcs[i].UpdateAvailable = true
 			}
 			if st.Err != "" {
