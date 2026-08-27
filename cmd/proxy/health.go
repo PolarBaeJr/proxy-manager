@@ -39,15 +39,13 @@ func checkBackend(b *Backend) {
 		req, _ := http.NewRequestWithContext(ctx, "GET", b.URL+b.HealthPath, nil)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			log.Printf("health check %s%s: %v (timeout budget %s) — marking unhealthy", b.URL, b.HealthPath, err, healthTimeout)
+			log.Printf("health check DIAG %s%s: dial/req error: %v (timeout budget %s) — marking unhealthy", b.URL, b.HealthPath, err, healthTimeout)
 			b.markHealthy(false)
 			return
 		}
 		resp.Body.Close()
 		ok := resp.StatusCode/100 == 2
-		if !ok {
-			log.Printf("health check %s%s: status %d — marking unhealthy", b.URL, b.HealthPath, resp.StatusCode)
-		}
+		log.Printf("health check DIAG %s%s: status %d ok=%v", b.URL, b.HealthPath, resp.StatusCode, ok)
 		b.markHealthy(ok)
 		return
 	}
@@ -60,9 +58,11 @@ func checkBackend(b *Backend) {
 	d := net.Dialer{Timeout: healthTimeout}
 	conn, err := d.DialContext(ctx, "tcp", u.Host)
 	if err != nil {
+		log.Printf("health check DIAG dial %s: fail: %v (timeout budget %s) — marking unhealthy", b.URL, err, healthTimeout)
 		b.markHealthy(false)
 		return
 	}
 	conn.Close()
+	log.Printf("health check DIAG dial %s: ok", b.URL)
 	b.markHealthy(true)
 }
