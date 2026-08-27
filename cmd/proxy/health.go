@@ -39,16 +39,16 @@ func checkBackend(b *Backend) {
 		req, _ := http.NewRequestWithContext(ctx, "GET", b.URL+b.HealthPath, nil)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			log.Printf("health check %s%s: %v (timeout budget %s) — marking unhealthy", b.URL, b.HealthPath, err, healthTimeout)
-			b.markHealthy(false)
+			log.Printf("health check %s%s: %v (timeout budget %s) — recording failure", b.URL, b.HealthPath, err, healthTimeout)
+			b.recordHealthCheck(false)
 			return
 		}
 		resp.Body.Close()
 		ok := resp.StatusCode/100 == 2
 		if !ok {
-			log.Printf("health check %s%s: status %d — marking unhealthy", b.URL, b.HealthPath, resp.StatusCode)
+			log.Printf("health check %s%s: status %d — recording failure", b.URL, b.HealthPath, resp.StatusCode)
 		}
-		b.markHealthy(ok)
+		b.recordHealthCheck(ok)
 		return
 	}
 	// A learned (peer) backend has no HealthPath — deliberately: this bare TCP
@@ -60,10 +60,10 @@ func checkBackend(b *Backend) {
 	d := net.Dialer{Timeout: healthTimeout}
 	conn, err := d.DialContext(ctx, "tcp", u.Host)
 	if err != nil {
-		log.Printf("health check dial %s: %v (timeout budget %s) — marking unhealthy", b.URL, err, healthTimeout)
-		b.markHealthy(false)
+		log.Printf("health check dial %s: %v (timeout budget %s) — recording failure", b.URL, err, healthTimeout)
+		b.recordHealthCheck(false)
 		return
 	}
 	conn.Close()
-	b.markHealthy(true)
+	b.recordHealthCheck(true)
 }
