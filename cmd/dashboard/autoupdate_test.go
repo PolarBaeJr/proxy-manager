@@ -13,6 +13,8 @@ import (
 func TestShouldAutoUpdate(t *testing.T) {
 	base := Service{Name: "app", Image: "img:latest", AutoUpdate: true}
 	avail := &imageStatus{Image: "img:latest", UpdateAvailable: true}
+	stale := Service{Name: "app", Image: "img:latest", AutoUpdate: true, ImageID: "sha256:running"}
+	staleSt := &imageStatus{Image: "img:latest", LocalImageID: "sha256:pulled"}
 	cases := []struct {
 		name  string
 		svc   Service
@@ -30,10 +32,45 @@ func TestShouldAutoUpdate(t *testing.T) {
 		{"empty image", func() Service { s := base; s.Image = ""; return s }(), avail, 0, false},
 		{"failures at cap", base, avail, autoUpdateMaxFailures, false},
 		{"failures below cap", base, avail, autoUpdateMaxFailures - 1, true},
+		{"container stale, digests agree", stale, staleSt, 0, true},
+		{"container matches pulled tag, digests agree", Service{Name: "app", Image: "img:latest", AutoUpdate: true, ImageID: "sha256:pulled"}, staleSt, 0, false},
+		{"container stale but not opted in", func() Service { s := stale; s.AutoUpdate = false; return s }(), staleSt, 0, false},
 	}
 	for _, tc := range cases {
 		if got := shouldAutoUpdate(tc.svc, tc.st, tc.fails); got != tc.want {
 			t.Errorf("%s: shouldAutoUpdate = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestContainerStaleAndNeedsUpdate proves the actual bug report: a service
+// whose running container's image ID differs from what's already pulled
+// locally under its tag must be detected even when LocalDigest ==
+// RegistryDigest (the imageChecker.Check comparison that badminton-staging-
+// admin/-player defeated by getting pulled once and never actually
+// recreated onto the new image).
+func TestContainerStaleAndNeedsUpdate(t *testing.T) {
+	digestsAgree := &imageStatus{Image: "img:latest", LocalDigest: "sha256:d", RegistryDigest: "sha256:d", LocalImageID: "sha256:pulled"}
+	cases := []struct {
+		name            string
+		svc             Service
+		st              *imageStatus
+		wantStale       bool
+		wantNeedsUpdate bool
+	}{
+		{"running the pulled image", Service{ImageID: "sha256:pulled"}, digestsAgree, false, false},
+		{"running a different (stale) image", Service{ImageID: "sha256:running"}, digestsAgree, true, true},
+		{"no ImageID recorded yet", Service{}, digestsAgree, false, false},
+		{"checker never resolved LocalImageID", Service{ImageID: "sha256:running"}, &imageStatus{LocalDigest: "sha256:d", RegistryDigest: "sha256:d"}, false, false},
+		{"nil status", Service{ImageID: "sha256:running"}, nil, false, false},
+		{"registry update available takes priority regardless of container id", Service{ImageID: "sha256:pulled"}, &imageStatus{UpdateAvailable: true, LocalImageID: "sha256:pulled"}, false, true},
+	}
+	for _, tc := range cases {
+		if got := containerStale(tc.svc, tc.st); got != tc.wantStale {
+			t.Errorf("%s: containerStale = %v, want %v", tc.name, got, tc.wantStale)
+		}
+		if got := needsUpdate(tc.svc, tc.st); got != tc.wantNeedsUpdate {
+			t.Errorf("%s: needsUpdate = %v, want %v", tc.name, got, tc.wantNeedsUpdate)
 		}
 	}
 }
@@ -55,6 +92,7 @@ func TestAutoUpdateSkipReason(t *testing.T) {
 		{"canary in flight", func() Service { s := base; s.CanaryImage = "img:new"; return s }(), avail, "a canary is staged — promote or discard first"},
 		{"all replicas stopped", func() Service { s := base; s.AllStopped = true; return s }(), avail, "service is fully stopped"},
 		{"checker error", base, &imageStatus{Image: "img:latest", UpdateAvailable: true, Err: "boom"}, "last registry check failed: boom"},
+		{"container stale, digests agree, would fire", func() Service { s := base; s.ImageID = "sha256:running"; return s }(), &imageStatus{Image: "img:latest", LocalImageID: "sha256:pulled"}, ""},
 	}
 	ctx := context.Background()
 	for _, tc := range cases {
@@ -320,6 +358,98 @@ func TestRunOnceDefersOnActiveRollingReplaceWithoutCountingFailure(t *testing.T)
 	}
 	if got := blocks.Get("app"); got != "" {
 		t.Errorf("blocks.Get(\"app\") = %q, want empty — deferral must not latch a block reason", got)
+	}
+}
+
+// runOnceStaleContainerStub reproduces the exact shape of the bug the
+// sfu-badminton-app session found in production: the tag is fully resolved
+// (LocalDigest == RegistryDigest, so imageStatus.UpdateAvailable is false),
+// but the container's own ImageID never matches what's pulled locally —
+// standing in for a pull that succeeded once with no recreate ever applied.
+// Every replace-path call (create/start/stop/remove) succeeds, via the same
+// default-200 catch-all runOnceStartFailureStub uses, so a successful run
+// proves the FULL path — detection through to an actual container replace —
+// not just the detection predicate in isolation.
+func runOnceStaleContainerStub(t *testing.T, createCalls *atomic.Int32) *dockerClient {
+	t.Helper()
+	containers := []dockerContainer{{
+		ID: "c1", Names: []string{"/app"}, State: "running", Image: "ghcr.io/org/app:v1", ImageID: "sha256:running",
+		Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80", labelAutoUpdate: "true"},
+	}}
+	return dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode(containers)
+		case strings.Contains(r.URL.Path, "/containers/create"):
+			createCalls.Add(1)
+			json.NewEncoder(w).Encode(map[string]string{"Id": "new1"})
+		case strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"Image":           "sha256:running",
+				"HostConfig":      map[string]any{},
+				"Config":          map[string]any{},
+				"NetworkSettings": map[string]any{"Networks": map[string]any{}},
+			})
+		case strings.Contains(r.URL.Path, "/images/"):
+			// Registry digest matches local — nothing new to pull — but the
+			// resolved local image ID ("Id") differs from the running
+			// container's ImageID above.
+			json.NewEncoder(w).Encode(map[string]any{
+				"Id":          "sha256:pulled",
+				"RepoDigests": []string{"ghcr.io/org/app@sha256:same"},
+			})
+		case strings.Contains(r.URL.Path, "/distribution/"):
+			json.NewEncoder(w).Encode(map[string]any{"Descriptor": map[string]any{"digest": "sha256:same"}})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+}
+
+// TestRunOnceReplacesContainerStaleService is the end-to-end regression for
+// the badminton-staging-admin/-player bug: badges/gates that only ever
+// compared LocalDigest vs RegistryDigest left an already-pulled-but-never-
+// applied service permanently invisible to auto-update. Proves runOnce now
+// detects and actually replaces it even though the image checker reports no
+// digest difference at all.
+func TestRunOnceReplacesContainerStaleService(t *testing.T) {
+	old := autoUpdateGap
+	autoUpdateGap = 0
+	oldSettle := replaceSettleDelay
+	replaceSettleDelay = 0
+	t.Cleanup(func() { autoUpdateGap = old; replaceSettleDelay = oldSettle })
+
+	var createCalls atomic.Int32
+	dc := runOnceStaleContainerStub(t, &createCalls)
+
+	onb := newTestOnboardedStore(t)
+	ic := newImageChecker(dc)
+	ctx := context.Background()
+	ic.Check(ctx, "ghcr.io/org/app:v1")
+
+	st := ic.Get("ghcr.io/org/app:v1")
+	if st == nil || st.UpdateAvailable {
+		t.Fatalf("st = %+v, want a resolved checker result with UpdateAvailable=false (digests agree)", st)
+	}
+	if st.LocalImageID != "sha256:pulled" {
+		t.Fatalf("st.LocalImageID = %q, want sha256:pulled", st.LocalImageID)
+	}
+
+	blocks := newAutoUpdateBlockStore()
+	au := newAutoUpdater(dc, ic, onb, "", noopProxyStub(t), blocks, nil, nil)
+	au.runOnce(ctx)
+
+	if createCalls.Load() == 0 {
+		t.Fatal("no /containers/create call observed — runOnce did not attempt a replace for the container-stale service")
+	}
+	if n := au.failures["app"]; n != 0 {
+		t.Errorf("failures[\"app\"] = %d, want 0 (replace should have succeeded)", n)
+	}
+	if got := blocks.Get("app"); got != "" {
+		t.Errorf("blocks.Get(\"app\") = %q, want empty", got)
 	}
 }
 

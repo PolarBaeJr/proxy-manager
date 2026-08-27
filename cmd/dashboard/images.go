@@ -19,12 +19,21 @@ import (
 // registry conversation for us, including auth. Works for any registry the
 // engine itself can pull from.
 
-const imageCheckInterval = 10 * time.Minute
+const imageCheckInterval = 1 * time.Minute
 
 type imageStatus struct {
-	Image           string    `json:"image"`
-	LocalDigest     string    `json:"local_digest,omitempty"`
-	RegistryDigest  string    `json:"registry_digest,omitempty"`
+	Image          string `json:"image"`
+	LocalDigest    string `json:"local_digest,omitempty"`
+	RegistryDigest string `json:"registry_digest,omitempty"`
+	// LocalImageID is the resolved image ID (e.g. "sha256:...") the tag
+	// currently points to locally — /images/{name}/json's "Id" field.
+	// Compared against a specific service's own Service.ImageID (the ID the
+	// RUNNING CONTAINER was created from) to catch the case LocalDigest ==
+	// RegistryDigest can't see: an image that was pulled but never actually
+	// applied to the container (see containerStale in autoupdate.go). Same
+	// for every service sharing this tag; the per-service comparison happens
+	// at the call site, not here.
+	LocalImageID    string    `json:"local_image_id,omitempty"`
 	UpdateAvailable bool      `json:"update_available"`
 	LastChecked     time.Time `json:"last_checked"`
 	Err             string    `json:"error,omitempty"`
@@ -56,13 +65,15 @@ func (ic *imageChecker) Check(ctx context.Context, image string) {
 		ic.mu.Unlock()
 	}()
 
-	// Local digest from /images/{name}/json → RepoDigests
+	// Local digest + resolved image ID from /images/{name}/json.
 	if body, err := ic.dc.get(ctx, "/images/"+url.PathEscape(image)+"/json"); err == nil {
 		var resp struct {
+			Id          string   `json:"Id"`
 			RepoDigests []string `json:"RepoDigests"`
 		}
 		_ = json.NewDecoder(body).Decode(&resp)
 		body.Close()
+		status.LocalImageID = resp.Id
 		for _, d := range resp.RepoDigests {
 			if i := strings.Index(d, "@"); i != -1 {
 				status.LocalDigest = d[i+1:]
