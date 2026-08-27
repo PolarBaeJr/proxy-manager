@@ -1085,3 +1085,132 @@ func TestTryProxyBackendErrorMarksUnhealthy(t *testing.T) {
 		t.Error("tryProxy left the backend healthy after a genuine connection failure — it should be marked unhealthy")
 	}
 }
+
+// TestRecordHealthCheckHysteresis proves the periodic-probe path (health.go's
+// checkBackend, via recordHealthCheck) requires unhealthyAfterConsecutiveFails
+// consecutive failures before marking a backend down, but recovers on a
+// single success — asymmetric on purpose, since a slow-to-recover backend is
+// worse than a slow-to-fail one.
+func TestRecordHealthCheckHysteresis(t *testing.T) {
+	b := &Backend{}
+	b.markHealthy(true)
+
+	for i := 0; i < unhealthyAfterConsecutiveFails-1; i++ {
+		b.recordHealthCheck(false)
+		if !b.healthy() {
+			t.Fatalf("after %d failure(s), backend should still be healthy (threshold is %d)", i+1, unhealthyAfterConsecutiveFails)
+		}
+	}
+	b.recordHealthCheck(false)
+	if b.healthy() {
+		t.Fatalf("after %d consecutive failures, backend should be unhealthy", unhealthyAfterConsecutiveFails)
+	}
+
+	b.recordHealthCheck(true)
+	if !b.healthy() {
+		t.Fatal("a single success should immediately clear unhealthy — recovery is not gated by hysteresis")
+	}
+
+	// A success anywhere in the streak resets the failure count — it isn't
+	// enough to fail unhealthyAfterConsecutiveFails-1 times, succeed once,
+	// then fail unhealthyAfterConsecutiveFails-1 more times again.
+	b.recordHealthCheck(false)
+	b.recordHealthCheck(true)
+	for i := 0; i < unhealthyAfterConsecutiveFails-1; i++ {
+		b.recordHealthCheck(false)
+	}
+	if !b.healthy() {
+		t.Fatal("failure count should have reset after the intervening success")
+	}
+}
+
+// TestPickAnyPanicModeFallback proves pickAny selects an unhealthy backend
+// that pickHealthy would refuse, respects the skip set, and — on a hopped
+// request — still refuses to select a Learned backend, matching pickHealthy's
+// own loop-prevention rule.
+func TestPickAnyPanicModeFallback(t *testing.T) {
+	local := &Backend{URL: "http://local", Weight: 1}
+	learned := &Backend{URL: "http://learned", Weight: 1, Learned: true}
+	local.markHealthy(false)
+	learned.markHealthy(false)
+	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{local, learned}}
+
+	if b := g.pickHealthy(nil, true); b != nil {
+		t.Fatalf("pickHealthy should return nil when everything is unhealthy, got %v", b.URL)
+	}
+	if b := g.pickAny(nil, true); b != local {
+		t.Fatalf("pickAny(allowPeer=true) should prefer the local tier even when unhealthy, got %v", b)
+	}
+	if b := g.pickAny(map[*Backend]bool{local: true}, true); b != learned {
+		t.Fatalf("pickAny should fall through to the learned tier once local is skipped, got %v", b)
+	}
+	if b := g.pickAny(map[*Backend]bool{local: true}, false); b != nil {
+		t.Fatal("pickAny on a hopped request (allowPeer=false) must never select a Learned backend — loop prevention")
+	}
+}
+
+// TestPickAnyStillHonorsDockerUnhealthyFloor proves panic mode only
+// distrusts the proxy's own probe result (healthyFlag), not Docker's own
+// HEALTHCHECK verdict (DockerUnhealthy) — a deliberate choice, not an
+// oversight. A container Docker itself reports unhealthy (e.g. deadlocked
+// but still accepting TCP) must stay excluded even in panic mode; the
+// alternative trades a fast 503 for a hang.
+func TestPickAnyStillHonorsDockerUnhealthyFloor(t *testing.T) {
+	sick := &Backend{URL: "http://sick", Weight: 1, DockerUnhealthy: true}
+	fine := &Backend{URL: "http://fine", Weight: 1}
+	sick.markHealthy(false)
+	fine.markHealthy(false)
+	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{sick, fine}}
+
+	if b := g.pickAny(nil, true); b != fine {
+		t.Fatalf("pickAny should skip the DockerUnhealthy backend and pick the other one, got %v", b)
+	}
+	if b := g.pickAny(map[*Backend]bool{fine: true}, true); b != nil {
+		t.Fatal("pickAny must never select a DockerUnhealthy backend, even as the only thing left")
+	}
+}
+
+// TestServeHTTPPanicModeRoutesWhenAllUnhealthy is the regression test for the
+// panic-mode fallback: a group whose only backend is marked unhealthy must
+// still be routed to rather than unconditionally served a 503, because
+// stale/wrong health data is a likelier explanation than the backend being
+// genuinely down when it's otherwise reachable.
+func TestServeHTTPPanicModeRoutesWhenAllUnhealthy(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("still alive"))
+	}))
+	defer backend.Close()
+
+	g := mkGroup(t, "panic.example.org", "", false, backend.URL)
+	g.Backends[0].markHealthy(false)
+
+	r := &Router{}
+	r.Set([]*RouteGroup{g})
+
+	rec := httptest.NewRecorder()
+	aw := &accessWriter{ResponseWriter: rec}
+	req := httptest.NewRequest("GET", "http://panic.example.org/", nil)
+	r.ServeHTTP(aw, req)
+
+	if rec.Code != 200 || rec.Body.String() != "still alive" {
+		t.Fatalf("panic-mode fallback should have routed anyway: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestServeHTTPStill503WhenGroupHasNoBackendsAtAll proves the panic-mode
+// fallback doesn't paper over the case that actually has no candidate at
+// all (a stopped service with zero backends, not merely an unhealthy one) —
+// pickAny has nothing to iterate either, so the 503 path is unchanged.
+func TestServeHTTPStill503WhenGroupHasNoBackendsAtAll(t *testing.T) {
+	r := &Router{}
+	r.Set([]*RouteGroup{{Host: "empty.example.org"}})
+
+	rec := httptest.NewRecorder()
+	aw := &accessWriter{ResponseWriter: rec}
+	req := httptest.NewRequest("GET", "http://empty.example.org/", nil)
+	r.ServeHTTP(aw, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503 (no backends at all, panic mode has nothing to fall back to)", rec.Code)
+	}
+}

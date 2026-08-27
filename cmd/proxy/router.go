@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Backend struct {
@@ -27,6 +28,15 @@ type Backend struct {
 	HealthPath  string
 	proxy       *httputil.ReverseProxy
 	healthyFlag atomic.Bool
+
+	// consecFails counts consecutive failed periodic probes (health.go's
+	// checkBackend only — see recordHealthCheck). Not carried forward across
+	// a Router.Set() refresh the way healthyFlag is: refreshes are rare in
+	// practice (driven by docker events / peer sync, not a fixed tick), and
+	// losing a partial, sub-threshold streak on the odd refresh only delays
+	// marking a backend down by a bit longer, never falsely clears a real
+	// unhealthy verdict — healthyFlag itself still carries forward.
+	consecFails atomic.Int32
 
 	// DockerUnhealthy floors healthy() to false whenever Docker's own
 	// HEALTHCHECK reports this container unhealthy, independent of the
@@ -42,8 +52,49 @@ type Backend struct {
 	PeerID  string
 }
 
+// unhealthyAfterConsecutiveFails gates recordHealthCheck's failure side:
+// deliberately asymmetric with recovery (immediate on a single success)
+// because a backend that's slow to come back is strictly worse than one
+// that's slow to go away — one dropped packet inside the probe's timeout
+// budget shouldn't blackhole a good backend for a full health-check
+// interval.
+const unhealthyAfterConsecutiveFails = 2
+
+// recordHealthCheck applies hysteresis to a periodic probe result — use this
+// from health.go's checkBackend, not markHealthy directly. tryProxy's
+// ErrorHandler (router.go) deliberately keeps calling markHealthy directly:
+// that path has already observed one genuine failed request and needs no
+// corroborating probe before reacting.
+func (b *Backend) recordHealthCheck(ok bool) {
+	if ok {
+		b.consecFails.Store(0)
+		b.markHealthy(true)
+		return
+	}
+	if b.consecFails.Add(1) >= unhealthyAfterConsecutiveFails {
+		b.markHealthy(false)
+	}
+}
+
 func (b *Backend) markHealthy(ok bool) { b.healthyFlag.Store(ok) }
 func (b *Backend) healthy() bool       { return !b.DockerUnhealthy && b.healthyFlag.Load() }
+
+// excludedFrom is healthy()'s inverse, but lets pickAny's panic mode
+// (ignoreHealth=true) distrust only healthyFlag — the proxy's own probe
+// result, exactly what panic mode exists to second-guess — while still
+// honoring DockerUnhealthy unconditionally. DockerUnhealthy comes from
+// Docker's own HEALTHCHECK, run from inside/alongside the container, a
+// different and more authoritative signal than our own TCP/HTTP probe; it's
+// also what catches a deadlocked process that still accepts TCP connections
+// — precisely the case where panic-mode routing would trade a fast 503 for
+// a hang. So it stays load-bearing even when we've decided not to trust our
+// own probe anymore.
+func (b *Backend) excludedFrom(ignoreHealth bool) bool {
+	if b.DockerUnhealthy {
+		return true
+	}
+	return !ignoreHealth && !b.healthyFlag.Load()
+}
 
 type RouteGroup struct {
 	Host        string
@@ -82,6 +133,13 @@ type RouteGroup struct {
 
 	cursor atomic.Uint64
 
+	// panicLogAt throttles the panic-mode fallback's log line (see
+	// logPanicOnce/ServeHTTP) to once per panicLogInterval per group — a real
+	// outage can push every request in the group through the fallback, and
+	// logging each one would spam the log exactly when it's least useful.
+	// Unix nanoseconds, 0 = never logged.
+	panicLogAt atomic.Int64
+
 	// static marks a group whose backend list is owned by routes.json / a
 	// hand-curated static config entry. Once true, a lingering docker label
 	// for the same host+path must not re-join this group as a direct
@@ -106,6 +164,25 @@ type RouteGroup struct {
 // for a given route.
 const PeerHopHeader = "X-Pmgr-Peer-Hop"
 
+// panicLogInterval bounds how often ServeHTTP logs the panic-mode fallback
+// engaging for a given group — see RouteGroup.panicLogAt.
+const panicLogInterval = 30 * time.Second
+
+// logPanicOnce logs that this group's panic-mode fallback engaged, at most
+// once per panicLogInterval. CompareAndSwap (rather than a plain load+store)
+// so concurrent requests hitting the fallback simultaneously log exactly
+// once, not once each.
+func (g *RouteGroup) logPanicOnce(host string) {
+	now := time.Now().UnixNano()
+	last := g.panicLogAt.Load()
+	if now-last < int64(panicLogInterval) {
+		return
+	}
+	if g.panicLogAt.CompareAndSwap(last, now) {
+		log.Printf("proxy: group %q (host %s) has no healthy backends — panic-mode routing anyway (health data untrusted)", g.Service, host)
+	}
+}
+
 // pickHealthy is a two-tier preference: a healthy local (non-learned) backend
 // is always chosen over a healthy learned (peer) one when both exist for the
 // route, so a peer is only ever used as a failover — per
@@ -124,26 +201,53 @@ func (g *RouteGroup) pickHealthy(skip map[*Backend]bool, allowPeer bool) *Backen
 	// still gets the local-only tier, which is what keeps two spread proxies
 	// from bouncing a request between each other forever.
 	if g.Spread && allowPeer {
-		if b := g.pickHealthyPool(skip); b != nil {
+		if b := g.pickPool(skip, false); b != nil {
 			return b
 		}
 		return nil
 	}
-	if b := g.pickHealthyTier(skip, false); b != nil {
+	if b := g.pickTier(skip, false, false); b != nil {
 		return b
 	}
 	if allowPeer {
-		return g.pickHealthyTier(skip, true)
+		return g.pickTier(skip, true, false)
 	}
 	return nil
 }
 
-// pickHealthyPool is pickHealthyTier without the Learned partition: one
-// weighted round-robin over every eligible backend, local and peer alike.
-func (g *RouteGroup) pickHealthyPool(skip map[*Backend]bool) *Backend {
+// pickAny is pickHealthy with the probe-based healthyFlag filter dropped —
+// a last-resort fallback for when a group has nothing left that its own
+// probe data trusts. Only ever called after pickHealthy has already
+// returned nil for this request, so it never overrides or races a
+// legitimately-healthy pick; see the panic-mode fallback in ServeHTTP. Same
+// tiering/skip/weight rules as pickHealthy, so it can't select a Learned
+// backend on a hopped request either — it only widens what "eligible" means
+// within the same tiers. Deliberately does NOT drop the DockerUnhealthy
+// floor — see Backend.excludedFrom for why that signal stays load-bearing
+// even in panic mode.
+func (g *RouteGroup) pickAny(skip map[*Backend]bool, allowPeer bool) *Backend {
+	if g.Spread && allowPeer {
+		if b := g.pickPool(skip, true); b != nil {
+			return b
+		}
+		return nil
+	}
+	if b := g.pickTier(skip, false, true); b != nil {
+		return b
+	}
+	if allowPeer {
+		return g.pickTier(skip, true, true)
+	}
+	return nil
+}
+
+// pickPool is pickTier without the Learned partition: one weighted
+// round-robin over every eligible backend, local and peer alike. ignoreHealth
+// drops the probe-based healthyFlag filter — see pickAny/excludedFrom.
+func (g *RouteGroup) pickPool(skip map[*Backend]bool, ignoreHealth bool) *Backend {
 	var pool []*Backend
 	for _, b := range g.Backends {
-		if !b.healthy() || skip[b] {
+		if skip[b] || b.excludedFrom(ignoreHealth) {
 			continue
 		}
 		w := b.Weight
@@ -160,13 +264,14 @@ func (g *RouteGroup) pickHealthyPool(skip map[*Backend]bool) *Backend {
 	return pool[int(g.cursor.Add(1)-1)%len(pool)]
 }
 
-// pickHealthyTier restricts selection to backends whose Learned flag matches
+// pickTier restricts selection to backends whose Learned flag matches
 // wantLearned, applying the same skip-set + weighted round-robin logic
-// pickHealthy always used.
-func (g *RouteGroup) pickHealthyTier(skip map[*Backend]bool, wantLearned bool) *Backend {
+// pickHealthy always used. ignoreHealth drops the probe-based healthyFlag
+// filter — see pickAny/excludedFrom.
+func (g *RouteGroup) pickTier(skip map[*Backend]bool, wantLearned, ignoreHealth bool) *Backend {
 	var pool []*Backend
 	for _, b := range g.Backends {
-		if !b.healthy() || skip[b] || b.Learned != wantLearned {
+		if skip[b] || b.Learned != wantLearned || b.excludedFrom(ignoreHealth) {
 			continue
 		}
 		w := b.Weight
@@ -467,6 +572,19 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	tried := map[*Backend]bool{}
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		b := group.pickHealthy(tried, !hopped)
+		if b == nil {
+			// Health data says nothing eligible is left — either every
+			// backend is genuinely down, or the health state is simply
+			// wrong. Rather than guarantee a 503 on that belief, stop
+			// trusting it and try whatever's left anyway: stale health data
+			// is a likelier explanation than every backend being
+			// simultaneously dead. Still gated by allowPeer/tried inside
+			// pickAny, so a hopped request can't loop back onto a peer.
+			if pb := group.pickAny(tried, !hopped); pb != nil {
+				group.logPanicOnce(reqHost)
+				b = pb
+			}
+		}
 		if b == nil {
 			break
 		}
