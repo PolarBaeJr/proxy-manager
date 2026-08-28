@@ -1506,11 +1506,13 @@ func (c *dockerClient) waitReplicaReady(ctx context.Context, name, id string) er
 // zero. On a mid-rollout failure it stops immediately and does NOT roll back
 // replicas already swapped: surge-of-one never dropped capacity, so a
 // partial state is still fully serving traffic. progress, if non-nil, is
-// called once up front with the total replica count (done=0, so a status
-// poll during the — often 5-35s — first replica's swap sees the real total
-// instead of a zero value indistinguishable from "nothing planned"), then
-// again after each replica is successfully swapped.
-func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, req ReplaceServiceRequest, progress func(done, total int)) error {
+// called once up front with the total replica count (done=0, replicaName="",
+// verdict="", so a status poll during the — often 5-35s — first replica's
+// swap sees the real total instead of a zero value indistinguishable from
+// "nothing planned"), then again after each replica is confirmed healthy and
+// swapped in, this time with that replica's container name and a short
+// verdict string.
+func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, req ReplaceServiceRequest, progress func(done, total int, replicaName, verdict string)) error {
 	tpl, err := c.prepareReplaceTemplate(ctx, name, req)
 	if err != nil {
 		return err
@@ -1518,7 +1520,7 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 
 	total := len(tpl.tplSet)
 	if progress != nil {
-		progress(0, total)
+		progress(0, total, "", "")
 	}
 	replaced := map[string]bool{}
 	for i, old := range tpl.tplSet {
@@ -1549,8 +1551,9 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 		}
 		replaced[old.ID] = true
 
+		log.Printf("rolling-replace %s: replica %s healthy, swapped in (%d/%d)", name, cname, i+1, total)
 		if progress != nil {
-			progress(i+1, total)
+			progress(i+1, total, cname, "healthy, swapped in")
 		}
 	}
 

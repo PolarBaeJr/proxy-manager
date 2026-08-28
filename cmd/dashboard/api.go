@@ -738,6 +738,10 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				http.Error(w, fmt.Sprintf("%q is an onboarded service — rolling replace only supports label-managed services", name), http.StatusBadRequest)
 				return
 			}
+			if err := ensureRollingReplaceCapacity(req.Context(), dc, registry, strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET")), name); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			st, err := rom.start(name, body)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusConflict)
