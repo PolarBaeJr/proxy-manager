@@ -774,6 +774,10 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 				http.Error(w, fmt.Sprintf("%q is an onboarded service — rolling replace only supports label-managed services", name), http.StatusBadRequest)
 				return
 			}
+			if err := ensureRollingReplaceCapacity(r.Context(), dc, registry, secret, name); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 			st, err := rom.start(name, body)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusConflict)

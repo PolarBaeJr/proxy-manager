@@ -67,7 +67,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	ro := NewServer("t", "v")
 	registerMCPTools(ro, c, false, false)
 	names := toolNames(t, ro)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "rolling_replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if names[w] {
 			t.Errorf("mutating tool %q registered in read-only mode", w)
 		}
@@ -81,7 +81,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	rw := NewServer("t", "v")
 	registerMCPTools(rw, c, true, false)
 	rwNames := toolNames(t, rw)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "rolling_replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record"} {
 		if !rwNames[w] {
 			t.Errorf("mutating tool %q missing when writes are allowed", w)
 		}
@@ -737,20 +737,21 @@ func TestOnboardServiceRequiresHostAndPort(t *testing.T) {
 	}
 }
 
-// The 10 tools that support peer targeting, and the argument key each one
+// The 11 tools that support peer targeting, and the argument key each one
 // reads it under. onboard_service alone uses "peer_host" — its own "host"
 // key already means the hostname to ROUTE.
 var peerTargetableTools = map[string]string{
-	"check_for_update":  "host",
-	"scale_service":     "host",
-	"lifecycle_service": "host",
-	"set_autoupdate":    "host",
-	"stage_canary":      "host",
-	"replace_service":   "host",
-	"resolve_canary":    "host",
-	"onboard_service":   "peer_host",
-	"offboard_service":  "host",
-	"restart_replica":   "host",
+	"check_for_update":        "host",
+	"scale_service":           "host",
+	"lifecycle_service":       "host",
+	"set_autoupdate":          "host",
+	"stage_canary":            "host",
+	"replace_service":         "host",
+	"rolling_replace_service": "host",
+	"resolve_canary":          "host",
+	"onboard_service":         "peer_host",
+	"offboard_service":        "host",
+	"restart_replica":         "host",
 }
 
 // spread_service is peer-targeted by construction — its "target" is not
@@ -945,6 +946,109 @@ func TestToolSchemasIncludeHostWhereExpected(t *testing.T) {
 		}
 		if _, present := props["peer_host"]; present {
 			t.Errorf("%s: unexpected \"peer_host\" property", tool.Name)
+		}
+	}
+}
+
+// rolling_replace_service starts the job with a POST, then polls GET on the
+// same path until the status is terminal, returning the final state.
+func TestRollingReplaceServicePollsUntilTerminal(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	var calls []string
+	getCount := 0
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(rollingOpState{Service: "app", Status: rollingOpStatusRunning, Done: 0, Total: 2})
+		case http.MethodGet:
+			getCount++
+			if getCount < 2 {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(rollingOpState{Service: "app", Status: rollingOpStatusRunning, Done: 1, Total: 2})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(rollingOpState{Service: "app", Status: rollingOpStatusCompleted, Done: 2, Total: 2})
+		}
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true, false)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rolling_replace_service","arguments":{"service":"app","image":"i:v2"}}}`
+	res, _ := rpc(t, s, body)
+	r, ok := res["result"].(map[string]any)
+	if !ok || r["isError"] == true {
+		t.Fatalf("tool errored: %v", res)
+	}
+	if len(calls) < 3 {
+		t.Fatalf("calls = %v, want a POST followed by at least 2 GETs (poll until terminal)", calls)
+	}
+	if calls[0] != "POST /api/services/app/rolling-replace" {
+		t.Fatalf("first call = %q, want the POST to start the job", calls[0])
+	}
+	for _, call := range calls[1:] {
+		if call != "GET /api/services/app/rolling-replace" {
+			t.Errorf("poll call = %q, want repeated GETs on the same path", call)
+		}
+	}
+	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(text, `"status": "completed"`) {
+		t.Errorf("result does not reflect the terminal completed status: %q", text)
+	}
+}
+
+// rolling_replace_service is peer-targetable (it's in peerTargetableTools and
+// carries the host schema property), and the host must be appended to BOTH
+// the POST that starts the job and every GET that polls it — a poll that
+// dropped ?host= would silently read the LOCAL job status (likely a 404)
+// instead of the peer's.
+func TestRollingReplaceServiceHostParamOnStartAndPoll(t *testing.T) {
+	prev := internalToken
+	internalToken = "pmt_internal_test"
+	t.Cleanup(func() { internalToken = prev })
+
+	var calls []string
+	getCount := 0
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(rollingOpState{Service: "app", Status: rollingOpStatusRunning, Done: 0, Total: 1})
+		case http.MethodGet:
+			getCount++
+			w.WriteHeader(http.StatusOK)
+			if getCount < 2 {
+				json.NewEncoder(w).Encode(rollingOpState{Service: "app", Status: rollingOpStatusRunning, Done: 0, Total: 1})
+				return
+			}
+			json.NewEncoder(w).Encode(rollingOpState{Service: "app", Status: rollingOpStatusCompleted, Done: 1, Total: 1})
+		}
+	})
+	c := &apiCaller{mux: h}
+	s := NewServer("t", "v")
+	registerMCPTools(s, c, true, true)
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rolling_replace_service","arguments":{"service":"app","image":"i:v2","host":"peer-b"}}}`
+	res, _ := rpc(t, s, body)
+	r, ok := res["result"].(map[string]any)
+	if !ok || r["isError"] == true {
+		t.Fatalf("tool errored: %v", res)
+	}
+	if len(calls) < 3 {
+		t.Fatalf("calls = %v, want a POST followed by at least 2 GETs", calls)
+	}
+	for _, call := range calls {
+		if !strings.HasSuffix(call, "?host=peer-b") {
+			t.Errorf("call %q does not carry ?host=peer-b", call)
 		}
 	}
 }

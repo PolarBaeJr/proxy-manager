@@ -20,6 +20,13 @@ const (
 	rollingOpStatusFailed    = "failed"
 )
 
+// rollingOpReplica is one replica's outcome within a rolling-replace job, in
+// swap order.
+type rollingOpReplica struct {
+	Name    string `json:"name"`
+	Verdict string `json:"verdict"`
+}
+
 // rollingOpTimeout bounds a single rolling-replace job's background
 // context — generous enough to cover many replicas each waiting out
 // canaryPromoteHealthTimeout + replaceSettleDelay, but finite so a wedged
@@ -38,13 +45,14 @@ func rollingOpActive(status string) bool {
 // rollingOpState is one service's in-flight (or most-recently-finished)
 // rolling replace.
 type rollingOpState struct {
-	Service   string    `json:"service"`
-	Image     string    `json:"image"`
-	Done      int       `json:"done"`
-	Total     int       `json:"total"`
-	Status    string    `json:"status"`
-	LastError string    `json:"last_error,omitempty"`
-	StartedAt time.Time `json:"started_at"`
+	Service   string             `json:"service"`
+	Image     string             `json:"image"`
+	Done      int                `json:"done"`
+	Total     int                `json:"total"`
+	Status    string             `json:"status"`
+	LastError string             `json:"last_error,omitempty"`
+	StartedAt time.Time          `json:"started_at"`
+	Replicas  []rollingOpReplica `json:"replicas,omitempty"`
 }
 
 // rollingOpManager tracks every service's in-flight rolling replace — a
@@ -72,6 +80,13 @@ func (m *rollingOpManager) get(name string) (*rollingOpState, bool) {
 		return nil, false
 	}
 	cp := *r
+	// r.Replicas is a slice header sharing r's backing array with the job
+	// goroutine's still-in-progress update() appends — copying just the
+	// struct above leaves cp.Replicas pointing at that same backing array,
+	// so a concurrent append (and any resulting reallocation/overwrite) is a
+	// real data race with a caller reading cp.Replicas afterward. Deep-copy
+	// it before returning.
+	cp.Replicas = append([]rollingOpReplica(nil), r.Replicas...)
 	return &cp, true
 }
 
@@ -113,10 +128,17 @@ func (m *rollingOpManager) start(name string, req ReplaceServiceRequest) (*rolli
 		// required or every job would die on its first Docker call.
 		ctx, cancel := context.WithTimeout(context.Background(), rollingOpTimeout)
 		defer cancel()
-		err := m.dc.replaceServiceRolling(ctx, name, req, func(done, total int) {
+		err := m.dc.replaceServiceRolling(ctx, name, req, func(done, total int, replicaName, verdict string) {
 			m.update(name, func(s *rollingOpState) {
 				s.Done = done
 				s.Total = total
+				// The initial progress(0, total, "", "") call up front (see
+				// replaceServiceRolling's doc comment) carries no replica
+				// yet — guard on replicaName so it doesn't append an empty
+				// entry to Replicas.
+				if replicaName != "" {
+					s.Replicas = append(s.Replicas, rollingOpReplica{Name: replicaName, Verdict: verdict})
+				}
 			})
 		})
 		m.update(name, func(s *rollingOpState) {

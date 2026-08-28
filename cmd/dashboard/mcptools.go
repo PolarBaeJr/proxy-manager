@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // apiCaller dispatches a request through the dashboard's API handlers.
@@ -548,7 +549,12 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		Description: "Replace a service's running image directly — NOT reversible (old " +
 			"containers are torn down immediately). Optionally edits env vars using the same " +
 			"merge/conflict rules as stage_canary. Prefer stage_canary + resolve_canary when " +
-			"you want a reversible rollout; use this only when a direct swap is intended.",
+			"you want a reversible rollout; use this only when a direct swap is intended. " +
+			"This path is NOT health-gated — new containers are created, given a brief fixed " +
+			"settle delay, then the old ones are torn down unconditionally, even if the new " +
+			"ones never became healthy. On a multi-replica service this can zero its capacity. " +
+			"Prefer rolling_replace_service, which health-gates each replica one at a time and " +
+			"never drops capacity, for any production multi-replica service.",
 		Mutating: true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
@@ -609,6 +615,113 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 				return "", err
 			}
 			return pretty(b), nil
+		},
+	})
+
+	// rollingReplaceToolPollInterval is how often this tool re-polls
+	// GET /api/services/{name}/rolling-replace while a job is running.
+	const rollingReplaceToolPollInterval = 2 * time.Second
+
+	s.Register(Tool{
+		Name:  "rolling_replace_service",
+		Title: "Replace a service's image one replica at a time",
+		Description: "Replace a service's running image via a health-gated, surge-of-one " +
+			"rolling replace: each replica is created and health-checked BEFORE its " +
+			"predecessor is torn down, so capacity never drops. Refuses to start if it would " +
+			"leave the service with fewer than " + fmt.Sprint(minHealthyReplicasForRollingReplace) +
+			" healthy replicas across every host (a single-replica service on one host alone " +
+			"cannot pass this — spread it across hosts first, or use replace_service if you " +
+			"accept that risk). The job itself runs asynchronously on the dashboard, but this " +
+			"tool call blocks and polls until it actually finishes (completed or failed) before " +
+			"returning, matching the synchronous contract replace_service documents. Like " +
+			"replace_service, this is NOT reversible.",
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+			"image":   prop("string", "Full image reference including tag."),
+			"env": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description": "Env var edits (name -> new value), merged onto the service's " +
+					"current env. A name whose value differs from what's running is refused as " +
+					"a conflict unless also listed in env_ack; call again with the conflicting " +
+					"keys in env_ack to confirm the overwrite. For a REAL SECRET, never pass the " +
+					"literal value here — it would land in this tool call and in your transcript. " +
+					"Pass \"ref:NAME\" instead; the dashboard resolves NAME server-side from a " +
+					"secrets file (SECRETS_DIR/<service>.env, mounted only on the Pi) and the literal value " +
+					"never reaches this API. Ask the operator to add the KEY=VALUE line to " +
+					"this service's own secrets file (SECRETS_DIR/<service>.env) if the ref " +
+					"doesn't resolve.",
+			},
+			"env_ack": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+				"description": "Env var names from a prior conflict response that should be " +
+					"overwritten. Resubmit the same env plus these names.",
+			},
+			"host": prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
+		}, "service", "image"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			image, err := argString(args, "image")
+			if err != nil {
+				return "", err
+			}
+			env, err := argEnvEdits(args, "env")
+			if err != nil {
+				return "", err
+			}
+			ack, err := argStringSlice(args, "env_ack")
+			if err != nil {
+				return "", err
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			body := map[string]any{"image": image}
+			if len(env) > 0 {
+				body["env"] = env
+			}
+			if len(ack) > 0 {
+				body["env_ack"] = ack
+			}
+			path := "/api/services/" + url.PathEscape(name) + "/rolling-replace"
+			b, err := a.call(ctx, "POST", withHost(path, host), body)
+			if err != nil {
+				return "", err
+			}
+
+			deadline := time.Now().Add(rollingOpTimeout)
+			for {
+				var st rollingOpState
+				if err := json.Unmarshal(b, &st); err != nil {
+					return "", err
+				}
+				if st.Status == rollingOpStatusCompleted || st.Status == rollingOpStatusFailed {
+					return pretty(b), nil
+				}
+				if !time.Now().Before(deadline) {
+					// The server-side job is itself bounded by
+					// rollingOpTimeout, so hitting this client-side cap
+					// means the job should already be terminal or about
+					// to become so — return the last known state rather
+					// than manufacturing an error.
+					return pretty(b), nil
+				}
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-time.After(rollingReplaceToolPollInterval):
+				}
+				b, err = a.call(ctx, "GET", withHost(path, host), nil)
+				if err != nil {
+					return "", err
+				}
+			}
 		},
 	})
 
