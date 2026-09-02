@@ -142,7 +142,31 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	// statusbot's Discord embed). Combines listServices, the proxy's access
 	// log, and the docker-stats cache — see servicestatus.go.
 	mux.HandleFunc("/api/service-status", auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-		status, err := buildServiceStatus(req.Context(), dc, proxyURLFromEnv())
+		// Read-only: serve the container list from the event-invalidated
+		// cache (containercache.go) rather than a fresh docker ps per poll.
+		ctx := withCachedListing(req.Context())
+		// The peer fan-out and the monitor probe are both blocking HTTP
+		// calls that don't depend on the local build — overlap them with
+		// it instead of paying for them in series. Results land in locals
+		// guarded by done; on a local-build error the handler returns while
+		// the goroutine is still bounded by peerGET's own timeout.
+		var (
+			peerGroups   []ServiceStatusGroup
+			peerHosts    []HostHealth
+			localStatus  string
+			localTargets []HealthTarget
+			done         chan struct{}
+		)
+		if registry != nil {
+			done = make(chan struct{})
+			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+			go func() {
+				defer close(done)
+				localStatus, localTargets = fetchMonitorHealth(monitorURLFromEnv())
+				peerGroups, peerHosts = fetchPeerServiceStatus(ctx, registry, peerSecret)
+			}()
+		}
+		status, err := buildServiceStatus(ctx, dc, proxyURLFromEnv())
 		if err != nil {
 			httpx.WriteErr(w, err)
 			return
@@ -154,17 +178,15 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		// identity as Machine too, so every group in the response is
 		// consistently labeled, not just the merged-in ones.
 		if registry != nil {
+			<-done
 			for i := range status.Groups {
 				status.Groups[i].Machine = registry.Identity()
 			}
-			localStatus, localTargets := fetchMonitorHealth(monitorURLFromEnv())
 			status.Hosts = append(status.Hosts, HostHealth{
 				Machine: registry.Identity(), Reachable: true,
 				Status: localStatus, Targets: localTargets,
 				CheckedAt: time.Now().UTC().Format(time.RFC3339),
 			})
-			peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
-			peerGroups, peerHosts := fetchPeerServiceStatus(req.Context(), registry, peerSecret)
 			status.Groups = append(status.Groups, peerGroups...)
 			status.Hosts = append(status.Hosts, peerHosts...)
 		}
@@ -569,11 +591,29 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	}))
 
 	// ---- Services ----
-	mux.HandleFunc("/api/services", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/api/services", invalidateAfterWrite(dc, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch req.Method {
 		case "GET":
 			auth.requireAuth(func(w http.ResponseWriter, req *http.Request) {
-				svcs, err := buildManagedServices(req.Context(), dc, onb, ic, blocks)
+				// Read-only: serve the container list from the
+				// event-invalidated cache (containercache.go) rather than a
+				// fresh docker ps per poll.
+				ctx := withCachedListing(req.Context())
+				// Peer fan-out doesn't depend on the local build — overlap
+				// the two. peerSvcs is only read after <-done.
+				var (
+					peerSvcs []Service
+					done     chan struct{}
+				)
+				if registry != nil {
+					done = make(chan struct{})
+					peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+					go func() {
+						defer close(done)
+						peerSvcs = fetchPeerServices(ctx, registry, peerSecret)
+					}()
+				}
+				svcs, err := buildManagedServices(ctx, dc, onb, ic, blocks)
 				if err != nil {
 					httpx.WriteErr(w, err)
 					return
@@ -585,11 +625,11 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				// too, so every service in the response is consistently
 				// labeled, not just the merged-in ones.
 				if registry != nil {
+					<-done
 					for i := range svcs {
 						svcs[i].Machine = registry.Identity()
 					}
-					peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
-					svcs = append(svcs, fetchPeerServices(req.Context(), registry, peerSecret)...)
+					svcs = append(svcs, peerSvcs...)
 				}
 				httpx.WriteJSON(w, http.StatusOK, svcs)
 			})(w, req)
@@ -611,9 +651,12 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
+	})))
 
-	mux.HandleFunc("/api/services/", auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
+	// Every mutation under /api/services/ drops the container cache on the
+	// way out (see invalidateAfterWrite) so the UI's immediate re-poll sees
+	// the change without waiting on the daemon's event stream.
+	mux.HandleFunc("/api/services/", invalidateAfterWrite(dc, auth.requireElevated(func(w http.ResponseWriter, req *http.Request) {
 		rest := strings.TrimPrefix(req.URL.Path, "/api/services/")
 		parts := strings.SplitN(rest, "/", 2)
 		name := parts[0]
@@ -1148,7 +1191,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			return
 		}
 		http.NotFound(w, req)
-	}))
+	})))
 
 	// ---- Cloudflare ----
 	mux.HandleFunc("/api/cf/enabled", auth.requireAuth(func(w http.ResponseWriter, _ *http.Request) {

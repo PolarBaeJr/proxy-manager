@@ -82,6 +82,10 @@ func main() {
 	}
 
 	dc := newDockerClient()
+	// Container-list cache for the read-only service handlers; kept fresh
+	// by the event watcher started below and by invalidateAfterWrite on the
+	// mutation routes. 10s is the hard ceiling if both somehow miss.
+	dc.cache = newContainerCache(dc, 10*time.Second)
 
 	// One-shot visibility check: confirm self-identification (isSelfContainer,
 	// selfidentity.go) actually matches this process's own container among
@@ -181,6 +185,11 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Background: follow the daemon's container events so the container
+	// cache is dropped the moment anything starts/stops/dies, instead of
+	// the services list polling docker ps on every request.
+	go dc.cache.watchEvents(ctx)
 
 	// rm/rom are constructed before au below: au's runOnce must be able to
 	// check both for an active job on a service before calling replaceService
@@ -303,7 +312,7 @@ func main() {
 		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv(), monitorURLFromEnv()),
 		"/peer/stats":           peerStatsHandler(peerSecret, identity),
 		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic, autoUpdateBlocks),
-		"/peer/services/":       peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, registry, *staticConfig, proxyURLFromEnv(), peerWritesEnabled, rom),
+		"/peer/services/":       invalidateAfterWrite(dc, peerServicesMutateHandler(peerSecret, identity, dc, onboarded, ic, registry, *staticConfig, proxyURLFromEnv(), peerWritesEnabled, rom)),
 		"/peer/discovery/":      peerDiscoveryMutateHandler(peerSecret, identity, dc, proxyURLFromEnv(), peerWritesEnabled),
 		"/peer/images":          peerImagesHandler(peerSecret, identity, dc, releases, imageHistory, onboarded),
 		"/peer/images/":         peerImagesMutateHandler(peerSecret, identity, dc, releases, imageHistory, onboarded, peerWritesEnabled),
