@@ -54,6 +54,12 @@ type dockerClient struct {
 	// (including every test that builds a dockerClient by hand) — that's
 	// fine, ref: edits just error out asking for SECRETS_DIR.
 	secrets *secretsStore
+	// cache is the event-invalidated container-list cache the read-only
+	// handlers (/api/services GET, /api/service-status and their /peer/
+	// twins) opt into via withCachedListing. Nil in the zero value (every
+	// test that builds a dockerClient by hand) and until main.go attaches
+	// it — nil means every list goes straight to Docker.
+	cache *containerCache
 }
 
 func newDockerClient() *dockerClient {
@@ -98,12 +104,16 @@ func (c *dockerClient) get(ctx context.Context, path string) (io.ReadCloser, err
 }
 
 type dockerContainer struct {
-	ID              string            `json:"Id"`
-	Names           []string          `json:"Names"`
-	Image           string            `json:"Image"`
-	ImageID         string            `json:"ImageID"`
-	State           string            `json:"State"`
-	Status          string            `json:"Status"` // raw docker status, e.g. "Up 2 minutes (healthy)"
+	ID      string   `json:"Id"`
+	Names   []string `json:"Names"`
+	Image   string   `json:"Image"`
+	ImageID string   `json:"ImageID"`
+	State   string   `json:"State"`
+	Status  string   `json:"Status"` // raw docker status, e.g. "Up 2 minutes (healthy)"
+	// Labels and NetworkSettings.Networks are read-only: on the cached read
+	// path (containercache.go) the maps are shared with the cache and every
+	// other concurrent cached caller. Nothing writes to them today; keep it
+	// that way, or copy first.
 	Labels          map[string]string `json:"Labels"`
 	NetworkSettings struct {
 		Networks map[string]struct {
@@ -136,7 +146,20 @@ func parseHealth(status string) string {
 	}
 }
 
+// listAll serves from the container cache when the caller opted in via
+// withCachedListing AND the cache can apply the filter in-process; every
+// other call (mutation paths, background loops, unusual filters) goes
+// straight to Docker via listAllDirect.
 func (c *dockerClient) listAll(ctx context.Context, filter string) ([]dockerContainer, error) {
+	if cachedListing(ctx) && c.cache != nil {
+		if out, ok, err := c.cache.filtered(ctx, filter, false); ok {
+			return out, err
+		}
+	}
+	return c.listAllDirect(ctx, filter)
+}
+
+func (c *dockerClient) listAllDirect(ctx context.Context, filter string) ([]dockerContainer, error) {
 	q := "/containers/json?all=true"
 	if filter != "" {
 		q += "&filters=" + url.QueryEscape(filter)
@@ -150,7 +173,19 @@ func (c *dockerClient) listAll(ctx context.Context, filter string) ([]dockerCont
 	return out, json.NewDecoder(body).Decode(&out)
 }
 
+// listRunning is the running-only twin of listAll; the cached path filters
+// the all=true snapshot on State == "running", which agrees with what
+// /containers/json returns without all=true.
 func (c *dockerClient) listRunning(ctx context.Context, filter string) ([]dockerContainer, error) {
+	if cachedListing(ctx) && c.cache != nil {
+		if out, ok, err := c.cache.filtered(ctx, filter, true); ok {
+			return out, err
+		}
+	}
+	return c.listRunningDirect(ctx, filter)
+}
+
+func (c *dockerClient) listRunningDirect(ctx context.Context, filter string) ([]dockerContainer, error) {
 	q := "/containers/json"
 	if filter != "" {
 		q += "?filters=" + url.QueryEscape(filter)

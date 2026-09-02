@@ -366,7 +366,8 @@ func peerServiceStatusHandler(secret, identity string, dc *dockerClient, proxyUR
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		status, err := buildServiceStatus(r.Context(), dc, proxyURL)
+		// Read-only: opt into the container cache (containercache.go).
+		status, err := buildServiceStatus(withCachedListing(r.Context()), dc, proxyURL)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -501,7 +502,8 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		svcs, err := buildManagedServices(r.Context(), dc, onb, ic, blocks)
+		// Read-only: opt into the container cache (containercache.go).
+		svcs, err := buildManagedServices(withCachedListing(r.Context()), dc, onb, ic, blocks)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
