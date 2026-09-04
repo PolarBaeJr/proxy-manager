@@ -129,6 +129,23 @@ type RouteGroup struct {
 	// to a hopped request — see the hopped gating in ServeHTTP.
 	Sticky bool
 
+	// CacheTTL > 0 opts this route into the anonymous GET/HEAD micro-cache
+	// (cache.go); CachePaths optionally narrows it to client-path prefixes.
+	// Dual-path config like DropHeaders/Sticky — routes.json's "cache" /
+	// "cache_paths" or the proxy.cache / proxy.cache.paths labels. Not
+	// advertised over the peer mesh (peersync.go/peermerge.go never touch
+	// it): each proxy caches what it serves. Composes with the other
+	// per-route knobs by construction rather than special-casing: an
+	// auth-gated route is effectively always BYPASS (the SSO cookie is a
+	// Cookie header), and a sticky route never stores (setStickyCookie
+	// queues a Set-Cookie before every backend attempt).
+	CacheTTL   time.Duration
+	CachePaths []string
+	// cache is set only by Router.Set (like limiter below), which persists
+	// the store across rebuilds in Router.caches so a refresh doesn't dump
+	// every cached body. nil when CacheTTL == 0.
+	cache *responseCache
+
 	AuthRequired bool
 	AuthUsers    []string // lowercased; empty = any authenticated user
 	AuthMode     string   // "" = sso (cookie or login redirect), "oauth" = bearer-first MCP mode
@@ -390,6 +407,7 @@ type Router struct {
 	// limiters persist across refreshes, keyed by group key host+"|"+path, so
 	// config edits don't reset per-IP buckets. Guarded by mu.
 	limiters   map[string]limiter
+	caches     map[string]*responseCache // same key scheme as limiters; guarded by mu
 	xffTrusted []*net.IPNet
 
 	// newLimiter constructs a fresh limiter for a route group, given its
@@ -446,6 +464,32 @@ func (r *Router) Set(groups []*RouteGroup) {
 		if !live[key] {
 			rl.Stop()
 			delete(r.limiters, key)
+		}
+	}
+	// Per-route caches reconcile the same way, and for the same reason
+	// g.cache is wired before r.groups is published.
+	if r.caches == nil {
+		r.caches = map[string]*responseCache{}
+	}
+	liveCache := map[string]bool{}
+	for _, g := range groups {
+		if g.CacheTTL <= 0 {
+			continue
+		}
+		key := g.Host + "|" + g.PathPrefix
+		liveCache[key] = true
+		if c, ok := r.caches[key]; ok {
+			c.setTTL(g.CacheTTL)
+			g.cache = c
+		} else {
+			c := newResponseCache(g.CacheTTL)
+			r.caches[key] = c
+			g.cache = c
+		}
+	}
+	for key := range r.caches {
+		if !liveCache[key] {
+			delete(r.caches, key)
 		}
 	}
 	r.groups = groups
@@ -657,6 +701,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+	// Captured before the StripPrefix mutation below: the cache key must be
+	// what the client asked for, not what the backend will see.
+	origPath, origQuery := req.URL.Path, req.URL.RawQuery
 	if group.StripPrefix && group.PathPrefix != "" {
 		req.URL.Path = strings.TrimPrefix(req.URL.Path, group.PathPrefix)
 		if !strings.HasPrefix(req.URL.Path, "/") {
@@ -676,10 +723,100 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// Cache eligibility reads Cookie/Authorization/Range, so like sticky it
+	// must be evaluated BEFORE DropHeaders can delete Cookie — otherwise a
+	// route dropping cookies would happily cache a logged-in user's page.
+	cacheable := cacheRequestEligible(req, group, origPath)
+	var key string
+	if group.cache != nil {
+		key = cacheKey(group.Host, origPath, origQuery, req.Header.Get("Accept-Encoding"))
+	}
+
 	for _, h := range group.DropHeaders {
 		req.Header.Del(h)
 	}
 
+	if group.cache == nil {
+		r.proxyToGroup(w, req, group, reqHost, hopped, stickyPin)
+		return
+	}
+	r.serveWithCache(w, req, group, reqHost, hopped, stickyPin, cacheable, key)
+}
+
+// serveWithCache is the cached-route tail of ServeHTTP. It sits AFTER the
+// limiter and auth gates on purpose: a HIT still costs a rate-limit token
+// (the cache protects the backend, not the proxy), and an auth-gated route
+// always ends up BYPASS because the SSO cookie is itself a Cookie header —
+// the cache never gets to answer for an authorize() it didn't run. Sticky
+// routes never store (setStickyCookie queues a Set-Cookie on every attempt)
+// and client no-cache is ignored (see cacheRequestEligible).
+func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, group *RouteGroup, reqHost string, hopped bool, stickyPin string, cacheable bool, key string) {
+	c := group.cache
+	if !cacheable {
+		r.proxyToGroup(&cacheRecorder{ResponseWriter: w, mode: "BYPASS"}, req, group, reqHost, hopped, stickyPin)
+		return
+	}
+	now := c.now()
+	if e, ok := c.get(key, now); ok {
+		serveCached(w, req, e, now)
+		return
+	}
+	// A HEAD miss never fills: the backend's HEAD response has no body to
+	// store, and pretending otherwise would cache an empty 200 for GETs.
+	if req.Method == http.MethodHead {
+		r.proxyToGroup(&cacheRecorder{ResponseWriter: w, mode: "BYPASS"}, req, group, reqHost, hopped, stickyPin)
+		return
+	}
+	f, owner := c.beginFill(key)
+	if !owner {
+		f.waiters.Add(1)
+		select {
+		case <-f.done:
+		case <-req.Context().Done():
+			return
+		}
+		now = c.now()
+		if e, ok := c.get(key, now); ok {
+			serveCached(w, req, e, now)
+			return
+		}
+		// The filler produced nothing storable (Set-Cookie, non-200, over
+		// the cap...). Go to the backend ourselves, but as an UNREGISTERED
+		// filler: still record and store if this response happens to be
+		// storable, never take the inflight slot or wait a second time.
+	}
+	rw := &cacheRecorder{ResponseWriter: w, mode: "MISS", record: true}
+	// Defer order is load-bearing (LIFO): the store must land BEFORE the
+	// waiters are released, or they'd wake to a miss and all stampede the
+	// backend — exactly what coalescing exists to prevent. Registering
+	// endFill first also guarantees release on a panic or 503.
+	if owner {
+		defer c.endFill(key, f)
+	}
+	// completed gates the store on a normal return: ReverseProxy aborts a
+	// mid-body copy failure (backend died, client vanished) by panicking
+	// with http.ErrAbortHandler, and these defers still run on the way out
+	// — without the gate, a truncated body would be cached for the full
+	// TTL. endFill above still releases the waiters either way.
+	completed := false
+	defer func() {
+		if !completed {
+			return
+		}
+		if e := rw.entry(); e != nil {
+			e.storedAt = c.now()
+			c.put(key, e)
+		}
+	}()
+	r.proxyToGroup(rw, req, group, reqHost, hopped, stickyPin)
+	completed = true
+}
+
+// proxyToGroup is ServeHTTP's backend loop: pick, attribute, attempt, retry,
+// and finally 503. Split out so the cached and uncached paths share it
+// verbatim; w may be a cacheRecorder, which forwards SetBackend so the
+// attribution still reaches the access-log writer underneath.
+func (r *Router) proxyToGroup(w http.ResponseWriter, req *http.Request, group *RouteGroup, reqHost string, hopped bool, stickyPin string) {
 	tried := map[*Backend]bool{}
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		var b *Backend
@@ -840,6 +977,13 @@ var (
 	healthLabelWarnSeen = map[string]bool{}
 )
 
+// cacheLabelWarnSeen dedups the bad-proxy.cache warning the same way, for
+// the same reason.
+var (
+	cacheLabelWarnMu   sync.Mutex
+	cacheLabelWarnSeen = map[string]bool{}
+)
+
 // ---- Assembly: docker labels + static config ----
 
 type staticRoute struct {
@@ -862,6 +1006,8 @@ type staticRoute struct {
 	RateRPM     int      `json:"ratelimit_rpm,omitempty"`
 	DropHeaders []string `json:"drop_headers,omitempty"`
 	Sticky      bool     `json:"sticky,omitempty"`
+	Cache       string   `json:"cache,omitempty"`
+	CachePaths  []string `json:"cache_paths,omitempty"`
 }
 
 type staticConfig struct {
@@ -885,11 +1031,16 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 				key := sr.Host + "|" + sr.Path
 				g, ok := groupsByKey[key]
 				if !ok {
+					cacheTTL, err := parseCacheTTL(sr.Cache)
+					if err != nil {
+						log.Printf("static route %s%s: bad cache=%q, caching off", sr.Host, sr.Path, sr.Cache)
+						cacheTTL = 0
+					}
 					g = &RouteGroup{
 						Host: sr.Host, PathPrefix: sr.Path, StripPrefix: sr.Strip, Name: sr.Name, Service: sr.Service,
 						AuthRequired: sr.Auth, AuthUsers: normalizeAuthUsers(sr.AuthUsers), AuthMode: sr.AuthMode,
 						RateLimit: sr.RateLimit, RateRPM: sr.RateRPM, DropHeaders: sr.DropHeaders,
-						Sticky: sr.Sticky,
+						Sticky: sr.Sticky, CacheTTL: cacheTTL, CachePaths: unionStrings(nil, sr.CachePaths),
 					}
 					groupsByKey[key] = g
 					g.static = true
@@ -1046,6 +1197,24 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		if c.Labels[labelSticky] == "true" {
 			g.Sticky = true
 		}
+		// Cache merges as the largest TTL any replica sets plus the union of
+		// their path prefixes: a rolling replace briefly runs old and new
+		// labels side by side, and the more generous setting is the one the
+		// operator just added.
+		if v := c.Labels[labelCache]; v != "" {
+			d, err := parseCacheTTL(v)
+			if err != nil {
+				cacheLabelWarnMu.Lock()
+				if !cacheLabelWarnSeen[name] {
+					cacheLabelWarnSeen[name] = true
+					log.Printf("%s: bad %s=%q, caching off", name, labelCache, v)
+				}
+				cacheLabelWarnMu.Unlock()
+			} else if d > g.CacheTTL {
+				g.CacheTTL = d
+			}
+		}
+		g.CachePaths = unionStrings(g.CachePaths, splitTrimmed(c.Labels[labelCachePaths]))
 		if rpmStr := c.Labels[labelRateRPM]; rpmStr != "" && g.RateRPM == 0 {
 			rpm, err := strconv.Atoi(rpmStr)
 			if err != nil || rpm <= 0 {
