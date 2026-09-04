@@ -31,6 +31,10 @@ func TestReadWriteRoutesFilePreservesAllFields(t *testing.T) {
       "auth_mode": "basic",
       "ratelimit": true,
       "ratelimit_rpm": 120,
+      "drop_headers": ["Cookie"],
+      "sticky": true,
+      "cache": "5s",
+      "cache_paths": ["/api"],
       "onboarded": "auth"
     }
   ]
@@ -47,19 +51,23 @@ func TestReadWriteRoutesFilePreservesAllFields(t *testing.T) {
 		t.Fatalf("routes = %d, want 1", len(f.Routes))
 	}
 	want := routesEntry{
-		Name:      "curated",
-		Host:      "svc.example.com",
-		Path:      "/admin",
-		Strip:     true,
-		Backends:  []string{"http://10.0.0.1:8080"},
-		Service:   "auth",
-		Health:    "/healthz",
-		Auth:      true,
-		AuthUsers: []string{"alice", "bob"},
-		AuthMode:  "basic",
-		RateLimit: true,
-		RateRPM:   120,
-		Onboarded: "auth",
+		Name:        "curated",
+		Host:        "svc.example.com",
+		Path:        "/admin",
+		Strip:       true,
+		Backends:    []string{"http://10.0.0.1:8080"},
+		Service:     "auth",
+		Health:      "/healthz",
+		Auth:        true,
+		AuthUsers:   []string{"alice", "bob"},
+		AuthMode:    "basic",
+		RateLimit:   true,
+		RateRPM:     120,
+		DropHeaders: []string{"Cookie"},
+		Sticky:      true,
+		Cache:       "5s",
+		CachePaths:  []string{"/api"},
+		Onboarded:   "auth",
 	}
 	if !reflect.DeepEqual(f.Routes[0], want) {
 		t.Fatalf("decoded entry = %+v, want %+v", f.Routes[0], want)

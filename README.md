@@ -110,6 +110,10 @@ Drop these on any container you want routed:
 | `proxy.ratelimit=true` |   | per-client-IP rate limit (default: off) — spoof-resistant client IP, `429` when exceeded. In-memory per-instance by default; shared across every proxy in the mesh when `REDIS_ADDR` is set (see `.env.example`) |
 | `proxy.ratelimit.rpm=60` |   | requests per minute per IP (default 60 if enabled without a value) |
 | `proxy.sticky=true` |   | cookie-based session affinity — pins a client to the backend it first hit for this route (default: off) |
+| `proxy.cache=5s` |   | opt-in micro-cache for whole `GET`/`HEAD` 200 responses for this TTL (default: off) — bypassed for any request carrying `Cookie`, `Authorization` or `Range`; never stores responses with `Set-Cookie`, `Cache-Control: private/no-store/no-cache`, a `Vary` other than `Accept-Encoding`, or a body over 1 MiB; concurrent misses for one URL are coalesced into a single backend hit; `X-Cache: HIT|MISS|BYPASS` on every response |
+| `proxy.cache.paths=/api/schedule,/standings` |   | optional comma-separated client-path prefixes eligible for caching (default: every path on the route) |
+
+The cache never serves a personalized response: any request with cookies or auth goes straight to the backend, so an SSO-gated (`proxy.auth`) route is effectively uncached. The routes.json equivalents are `"cache"` and `"cache_paths"`.
 
 ### MCP servers
 

@@ -46,6 +46,15 @@ const (
 	// RouteGroup.Sticky. Boolean convention matches labelSpread: "true" merges
 	// the flag on for the whole group if ANY replica carries it.
 	labelSticky = "proxy.sticky"
+	// labelCache opts a route into the anonymous GET/HEAD micro-cache — see
+	// RouteGroup.CacheTTL. A Go duration; absent, "", "0" or "false" = off.
+	// Unlike the boolean labels above, the largest non-zero value across
+	// replicas wins rather than any-replica-true.
+	labelCache = "proxy.cache"
+	// labelCachePaths narrows labelCache to a comma-separated list of
+	// client-path prefixes — see RouteGroup.CachePaths. Unioned across
+	// replicas.
+	labelCachePaths = "proxy.cache.paths"
 	// labelCanary does not otherwise exist in the proxy package — canary is
 	// managed by the dashboard (cmd/dashboard/docker.go's labelCanary) and
 	// the proxy has never needed to know about it, since a canary container

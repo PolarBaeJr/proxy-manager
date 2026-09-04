@@ -174,6 +174,13 @@ type routesEntry struct {
 	AuthMode  string   `json:"auth_mode,omitempty"`
 	RateLimit bool     `json:"ratelimit,omitempty"`
 	RateRPM   int      `json:"ratelimit_rpm,omitempty"`
+	// Mirrors of cmd/proxy's staticRoute fields the dashboard never sets
+	// itself, carried so a read-modify-write of routes.json doesn't drop
+	// a hand-curated entry's settings.
+	DropHeaders []string `json:"drop_headers,omitempty"`
+	Sticky      bool     `json:"sticky,omitempty"`
+	Cache       string   `json:"cache,omitempty"`
+	CachePaths  []string `json:"cache_paths,omitempty"`
 	// Marker: routes the dashboard wrote, so we can rewrite/delete them
 	// without touching user-curated entries.
 	Onboarded string `json:"onboarded,omitempty"` // matches OnboardedService.Name
