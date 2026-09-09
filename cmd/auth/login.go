@@ -80,7 +80,7 @@ const loginPage = `<!doctype html><html lang=en><meta charset=utf-8>
     <input id=u name=username autocomplete=username autofocus required>
     <label for=p>Password</label>
     <input id=p name=password type=password autocomplete=current-password required>
-    <label for=c>2FA code <span class=hint>(if enabled)</span></label>
+    <label for=c>2FA code <span class=hint>(required if 2FA is enabled)</span></label>
     <input id=c name=code inputmode=numeric pattern="[0-9]*" maxlength=6 autocomplete=one-time-code>
     <input type=hidden name=csrf value="%s">
     <input type=hidden name=redirect value="%s">
@@ -188,7 +188,7 @@ func (s *loginServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		msg := ""
 		switch {
 		case r.URL.Query().Get("err") == "1":
-			msg = "<p class=msg>Invalid credentials.</p>"
+			msg = "<p class=msg>Invalid credentials. If 2FA is enabled on your account, enter the current 6-digit code as well.</p>"
 		case r.URL.Query().Get("ok") == "1":
 			msg = "<p class=\"msg ok\">Logged in. You can close this tab.</p>"
 			if s.passkeyEnabled {
@@ -310,8 +310,13 @@ func (s *loginServer) doLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Enrolled users must supply a valid TOTP code. The generic err=1 page
-	// deliberately doesn't reveal that the password itself was correct.
+	// deliberately doesn't reveal that the password itself was correct, so the
+	// operator-only server log is the sole place this branch is distinguishable
+	// from a wrong password — without it a correct password plus a missing code
+	// is silently indistinguishable from a bad credential, in the logs as well
+	// as on screen.
 	if *out.TOTPEnrolled && !out.CodeValid {
+		log.Printf("login: %q rejected: 2FA code missing or invalid", username)
 		http.Redirect(w, r, "/login?err=1&redirect="+url.QueryEscape(redirect), http.StatusFound)
 		return
 	}

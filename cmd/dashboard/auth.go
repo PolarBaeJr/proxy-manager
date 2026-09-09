@@ -464,7 +464,14 @@ func (s *AuthStore) verifyTokenKind(raw string) (id string, elevated bool) {
 	for i := range s.data.ServiceTokens {
 		if subtle.ConstantTimeCompare([]byte(s.data.ServiceTokens[i].Hash), []byte(hashHex)) == 1 {
 			s.data.ServiceTokens[i].LastUsedAt = time.Now().Unix()
-			_ = s.save()
+			// Same reasoning as the user-token branch below: with Redis
+			// configured this is a display-only timestamp, so it isn't worth a
+			// disk write per verification. statusbot, monitor and the peer mesh
+			// all poll with a service token every few seconds, and saving here
+			// unconditionally rewrote auth.json several times a second.
+			if s.txRunner == nil {
+				_ = s.save()
+			}
 			return s.data.ServiceTokens[i].Label, false
 		}
 	}

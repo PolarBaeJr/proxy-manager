@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -236,5 +238,71 @@ func TestServiceTokenDoesNotElevate(t *testing.T) {
 	}
 	if got := s.VerifyElevatedToken(userRaw); got != "alice" {
 		t.Fatalf("VerifyElevatedToken(userRaw) = %q, want %q", got, "alice")
+	}
+}
+
+// verifyTokenKind's ServiceTokens branch used to save() on every verification.
+// statusbot, monitor and the peer mesh each poll with a service token every few
+// seconds, so with Redis configured that rewrote auth.json several times a
+// second to persist a timestamp that is only ever displayed. The two tests
+// below pin both halves of the guard that fixes it.
+
+func serviceTokenWriteProbe(t *testing.T, s *AuthStore, raw string) (before, after []byte) {
+	t.Helper()
+	// Zero the timestamp and flush first, so that a save() during verification
+	// is visible as a change in the file's bytes rather than being masked by
+	// LastUsedAt already holding the current second.
+	s.mu.Lock()
+	s.data.ServiceTokens[0].LastUsedAt = 0
+	err := s.save()
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if before, err = os.ReadFile(s.path); err != nil {
+		t.Fatalf("read auth.json before: %v", err)
+	}
+	if got := s.VerifyToken(raw); got != "statusbot" {
+		t.Fatalf("VerifyToken = %q, want %q", got, "statusbot")
+	}
+	if after, err = os.ReadFile(s.path); err != nil {
+		t.Fatalf("read auth.json after: %v", err)
+	}
+	return before, after
+}
+
+func TestServiceTokenVerifySkipsSaveWhenRedisConfigured(t *testing.T) {
+	s, _ := newConfirmedStore(t, "alice", "correct horse")
+	raw, err := s.RemintServiceToken("statusbot")
+	if err != nil {
+		t.Fatalf("RemintServiceToken: %v", err)
+	}
+	s.txRunner = &fakeTxRunner{}
+
+	before, after := serviceTokenWriteProbe(t, s, raw)
+	if !bytes.Equal(before, after) {
+		t.Error("auth.json was rewritten on service-token verification; with Redis configured the display-only LastUsedAt must not cost a disk write per poll")
+	}
+	// The timestamp is still maintained, just in memory only.
+	s.mu.RLock()
+	lastUsed := s.data.ServiceTokens[0].LastUsedAt
+	s.mu.RUnlock()
+	if lastUsed == 0 {
+		t.Error("LastUsedAt was not updated in memory")
+	}
+}
+
+func TestServiceTokenVerifyStillSavesWithoutRedis(t *testing.T) {
+	// txRunner stays nil: no Redis mirror exists, so the file is the only place
+	// LastUsedAt can survive a restart and the save must still happen.
+	s, _ := newConfirmedStore(t, "alice", "correct horse")
+	raw, err := s.RemintServiceToken("statusbot")
+	if err != nil {
+		t.Fatalf("RemintServiceToken: %v", err)
+	}
+
+	before, after := serviceTokenWriteProbe(t, s, raw)
+	if bytes.Equal(before, after) {
+		t.Error("auth.json was not rewritten on service-token verification without Redis; LastUsedAt would not survive a restart")
 	}
 }
