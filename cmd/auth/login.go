@@ -47,8 +47,9 @@ type loginServer struct {
 	usedJTI map[string]time.Time // consumed code/refresh JTIs → their expiry
 }
 
-// loginPage is rendered via Fprintf: %s = message HTML, %s = CSRF token (hex),
-// %s = escaped redirect.
+// loginPage is rendered via Fprintf with five arguments: %s = message HTML,
+// then the CSRF token (hex) and escaped redirect once for the password form
+// and again for the API-token form.
 // Styled after the proxy's serveUnavailable page — self-contained, no JS, no
 // external assets.
 const loginPage = `<!doctype html><html lang=en><meta charset=utf-8>
@@ -87,6 +88,16 @@ const loginPage = `<!doctype html><html lang=en><meta charset=utf-8>
     <button type=submit>Sign in</button>
   </form>
   <button type=button id=pk-btn class=alt hidden>Sign in with passkey</button>
+  <details>
+    <summary>Sign in with an API token</summary>
+    <form method=post action=/login/token>
+      <label for=t>API token</label>
+      <input id=t name=token type=password autocomplete=off required>
+      <input type=hidden name=csrf value="%s">
+      <input type=hidden name=redirect value="%s">
+      <button type=submit class=alt>Sign in</button>
+    </form>
+  </details>
 </div>
 <script>
 function b64uToBuf(s) {
@@ -218,7 +229,8 @@ func (s *loginServer) renderLogin(w http.ResponseWriter, msgHTML, redirect strin
 	})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	fmt.Fprintf(w, loginPage, msgHTML, token, html.EscapeString(redirect))
+	esc := html.EscapeString(redirect)
+	fmt.Fprintf(w, loginPage, msgHTML, token, esc, token, esc)
 }
 
 func newCSRFToken() string {

@@ -497,6 +497,32 @@ verifies but *before* minting the cookie. Any failure — network error, non-200
 or `exists=false` — yields `403` and no cookie, so a passkey belonging to a
 since-deleted account cannot mint a session.
 
+### Break-glass token login
+
+`POST /login/token` exchanges a dashboard API token for an SSO session. It
+exists because the normal recovery paths are circular: every account is
+TOTP-enrolled and the portal fail-closes on a missing code, there is no TOTP
+reset, and enrolling a portal passkey itself requires a live SSO session — so
+an operator who loses their authenticator has no way back in. An API token is
+the one remaining proof of identity, and this is what unblocks passkey
+enrollment.
+
+Only **elevated** `pmt_` tokens are accepted. The portal verifies against the
+dashboard's `/api/auth/verify-token`, which now reports an `elevated` flag
+alongside the username; auto-provisioned service tokens (a sibling container's
+mounted credential) resolve to an identity but report `elevated:false` and are
+rejected, so a container mount can never become a human session. The flag is
+read as a pointer and a missing one is a rejection, so an older dashboard image
+fails closed rather than being trusted. Every other failure — unreachable
+dashboard, non-200, decode error, empty username — is likewise a `401` with no
+cookie.
+
+On success the cookie is byte-for-byte the shape password+TOTP login mints
+(same name, domain, lifetime and flags), the same `validRedirect` open-redirect
+guard applies to the post-login target, and the endpoint has its own per-IP
+rate-limit bucket kept separate from the passkey limiter so a passkey flood
+can't lock out recovery.
+
 ### Security properties
 
 - **Fail-closed.** A missing `PMGR_AUTH_SECRET` or an unrecognized domain
