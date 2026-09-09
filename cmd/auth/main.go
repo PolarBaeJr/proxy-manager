@@ -53,7 +53,11 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// Its own bucket, kept separate from the passkey limiter below so a
+	// passkey-login flood can't lock out the break-glass recovery path.
+	tokenRL := newRateLimiter()
 	mux.HandleFunc("/login", s.handleLogin)
+	mux.HandleFunc("/login/token", tokenRL.limit(s.handleTokenLogin))
 	mux.HandleFunc("/logout", s.handleLogout)
 	// Trailing-slash registrations catch the path-suffixed metadata variants
 	// (issuer URLs with a path component).

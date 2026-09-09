@@ -376,8 +376,17 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 	}))
 
 	// Used by the proxy's auth gate to resolve a bearer API token (pmt_...)
-	// to its owning username. Rate-limited like login — token guessing gets
-	// the same treatment as password guessing.
+	// to its owning username, and by the SSO portal's break-glass token login.
+	// Rate-limited like login — token guessing gets the same treatment as
+	// password guessing.
+	//
+	// "elevated" is false for auto-provisioned service tokens (see
+	// RemintServiceToken): they resolve to an identity but must never stand in
+	// for a person, so the portal refuses to mint a session for them. The
+	// in-process internal credential reports elevated:true — it is
+	// memory-only, regenerated per restart, never persisted or logged, and
+	// VerifyElevatedToken already accepts it, so reporting it here keeps the
+	// HTTP surface consistent with the in-process check.
 	mux.HandleFunc("/api/auth/verify-token", rl.limit(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != "POST" {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
@@ -388,13 +397,13 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			httpx.WriteErr(w, err)
 			return
 		}
-		u := auth.VerifyToken(body.Token)
+		u, elevated := auth.verifyTokenKind(body.Token)
 		if u == "" {
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}
 		audit(req, u, "auth.token_verified", "")
-		httpx.WriteJSON(w, http.StatusOK, map[string]string{"username": u})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"username": u, "elevated": elevated})
 	}))
 
 	mux.HandleFunc("/api/auth/verify-2fa", rl.limit(func(w http.ResponseWriter, req *http.Request) {
