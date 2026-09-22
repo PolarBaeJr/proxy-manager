@@ -411,6 +411,9 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	if err := checkOnboardTarget(*ct); err != nil {
 		return err
 	}
+	if err := c.refuseCentrallyManaged(name, ct.Labels, "onboarded flows can't honor a central env; manage it as a label-managed service and use scale/spread"); err != nil {
+		return err
+	}
 
 	// Fail closed: refuse rather than silently drop any HostConfig/Config/
 	// network config a recreate has no way to reproduce. Deliberately does
@@ -547,6 +550,9 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 	if desired < 1 {
 		return fmt.Errorf("onboarded services must keep at least the original (>= 1)")
 	}
+	if err := c.refuseCentrallyManaged(name, nil, "onboarded flows can't honor a central env; manage it as a label-managed service and use scale/spread"); err != nil {
+		return err
+	}
 	// Find all current containers: the original + any goproxy-onb-<name>-N.
 	cloneFilter := fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name)
 	clones, err := c.listAll(ctx, cloneFilter)
@@ -627,6 +633,9 @@ func (c *dockerClient) scaleOnboardedCanary(ctx context.Context, name string, ta
 	}
 	if svc.CanaryImage == "" {
 		return fmt.Errorf("has no canary staged for %q", name)
+	}
+	if err := c.refuseCentrallyManaged(name, nil, "onboarded flows can't honor a central env; manage it as a label-managed service and use scale/spread"); err != nil {
+		return err
 	}
 	all, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-c"]}`, name))
 	if err != nil {
@@ -743,6 +752,9 @@ func (c *dockerClient) stageOnboarded(ctx context.Context, name string, req Repl
 	if svc.CanaryImage != "" {
 		return fmt.Errorf("%q already has a canary — promote or discard first", name)
 	}
+	if err := c.refuseCentrallyManaged(name, nil, "onboarded flows can't honor a central env; manage it as a label-managed service and use scale/spread"); err != nil {
+		return err
+	}
 	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
 		return err
@@ -791,6 +803,9 @@ func (c *dockerClient) stageOnboardedCanary(ctx context.Context, name string, re
 	}
 	if count < 1 {
 		return fmt.Errorf("canary count must be >= 1")
+	}
+	if err := c.refuseCentrallyManaged(name, nil, "onboarded flows can't honor a central env; manage it as a label-managed service and use scale/spread"); err != nil {
+		return err
 	}
 	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {
@@ -931,6 +946,9 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 	}
 	if svc.CanaryImage != "" {
 		return fmt.Errorf("%q has a canary in flight — promote or discard first", name)
+	}
+	if err := c.refuseCentrallyManaged(name, nil, "onboarded flows can't honor a central env; manage it as a label-managed service and use scale/spread"); err != nil {
+		return err
 	}
 	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
 	if err != nil {

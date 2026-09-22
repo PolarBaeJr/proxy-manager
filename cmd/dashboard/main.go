@@ -126,6 +126,46 @@ func main() {
 	}
 	dc.secrets = secrets
 
+	// Cross-host dashboard peer handshake (Stage 2 of the cross-host control
+	// feature). Identity must be distinguishable across instances — unlike
+	// cmd/proxy, both dashboard containers share container_name "dashboard",
+	// so os.Hostname() alone can't tell them apart. Prefer DASHBOARD_HOST
+	// (already set per-instance for WebAuthn), then hostname, then a literal
+	// fallback.
+	identity := strings.TrimSpace(os.Getenv("DASHBOARD_HOST"))
+	if identity == "" {
+		if h, err := os.Hostname(); err == nil {
+			identity = h
+		}
+	}
+	if identity == "" {
+		identity = "dashboard"
+		log.Printf("⚠ DASHBOARD_HOST and hostname both unset — peer identity %q is indistinguishable from other dashboard instances", identity)
+	}
+
+	// Central per-service env (centralenv.go), off unless CENTRAL_ENV is set.
+	// Wired here — before any background loop below can reach a create path
+	// (the auto-updater's replaceService, most obviously) — so dc.central is
+	// never written while something else reads it. Keyed by the same identity
+	// the peer mesh uses: per-host overrides and replica provenance labels
+	// name hosts by it. Logs counts only, never a service's env.
+	centralEnvOn := isTrue(os.Getenv("CENTRAL_ENV"))
+	var handshakeFeatures []string
+	if centralEnvOn {
+		store, err := loadCentralEnvStore(firstNonEmpty(strings.TrimSpace(os.Getenv("CENTRAL_ENV_DIR")), defaultCentralEnvDir))
+		if err != nil {
+			log.Fatalf("central env store: %v", err)
+		}
+		cache, err := loadCentralEnvCache(firstNonEmpty(strings.TrimSpace(os.Getenv("CENTRAL_ENV_CACHE_DIR")), defaultCentralEnvCacheDir))
+		if err != nil {
+			log.Fatalf("central env cache: %v", err)
+		}
+		dc.central = &centralEnv{enabled: true, identity: identity, store: store, cache: cache, secrets: secrets}
+		handshakeFeatures = []string{centralEnvFeature}
+		owned, broken := store.Counts()
+		log.Printf("central env enabled as %q: %d service(s) owned, %d broken (fail closed), %d cached from peers", identity, owned, broken, cache.Len())
+	}
+
 	cf, cfMsgs := newCloudflareRegistryFromEnv(os.Getenv)
 	for _, m := range cfMsgs {
 		log.Printf("%s", m)
@@ -260,22 +300,6 @@ func main() {
 		go maintPages.SyncLoop(ctx, dc)
 	}
 
-	// Cross-host dashboard peer handshake (Stage 2 of the cross-host control
-	// feature). Identity must be distinguishable across instances — unlike
-	// cmd/proxy, both dashboard containers share container_name "dashboard",
-	// so os.Hostname() alone can't tell them apart. Prefer DASHBOARD_HOST
-	// (already set per-instance for WebAuthn), then hostname, then a literal
-	// fallback.
-	identity := strings.TrimSpace(os.Getenv("DASHBOARD_HOST"))
-	if identity == "" {
-		if h, err := os.Hostname(); err == nil {
-			identity = h
-		}
-	}
-	if identity == "" {
-		identity = "dashboard"
-		log.Printf("⚠ DASHBOARD_HOST and hostname both unset — peer identity %q is indistinguishable from other dashboard instances", identity)
-	}
 	// Separate trust boundary from PMGR_PEER_SECRET (proxy mesh) and
 	// PMGR_ACTOR_SECRET (audit attribution) — never read, share, or fall back
 	// between them.
@@ -308,7 +332,7 @@ func main() {
 		go registry.Run(ctx)
 	}
 	peerHandlers := map[string]http.Handler{
-		"/peer/handshake":       peerHandshakeHandler(peerSecret, identity, buildVersion, peerWritesEnabled),
+		"/peer/handshake":       peerHandshakeHandler(peerSecret, identity, buildVersion, peerWritesEnabled, handshakeFeatures),
 		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv(), monitorURLFromEnv()),
 		"/peer/stats":           peerStatsHandler(peerSecret, identity),
 		"/peer/services":        peerServicesHandler(peerSecret, identity, dc, onboarded, ic, autoUpdateBlocks),

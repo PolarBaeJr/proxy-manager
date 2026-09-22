@@ -224,7 +224,7 @@ func newPeerServicesServerOnboarded(t *testing.T, containers []dockerContainer, 
 
 func newTestPeerRegistry(peerURL string, writes bool) *PeerRegistry {
 	reg := newPeerRegistry([]string{peerURL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerURL, true, "dashboard-b", "dev", writes)
+	reg.recordResult(peerURL, true, "dashboard-b", "dev", writes, nil)
 	return reg
 }
 
@@ -2049,7 +2049,7 @@ func TestServicesDuplicateForwardsToOwningPeer(t *testing.T) {
 	}})
 	ownerOnb := newTestOnboardedStore(t)
 	ownerReg := newPeerRegistry([]string{finalSrv.URL}, "s3cret", "dashboard-b", "dev", 0, nil)
-	ownerReg.recordResult(finalSrv.URL, true, "dashboard-c", "dev", true)
+	ownerReg.recordResult(finalSrv.URL, true, "dashboard-c", "dev", true, nil)
 	ownerRoutesPath := filepath.Join(t.TempDir(), "routes.json")
 	ownerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", ownerDC, ownerOnb, newImageChecker(ownerDC), ownerReg, ownerRoutesPath, noopProxyStub(t), true, nil))
 	t.Cleanup(ownerSrv.Close)
@@ -2108,7 +2108,7 @@ func TestServicesDuplicateRefusesSingleton(t *testing.T) {
 	}})
 	onb := newTestOnboardedStore(t)
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true, nil)
 	routesPath := filepath.Join(t.TempDir(), "routes.json")
 
 	_, err := runServiceDuplicate(context.Background(), dc, reg, onb, routesPath, "app",

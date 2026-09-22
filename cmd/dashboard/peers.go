@@ -48,6 +48,10 @@ type peerStatus struct {
 	// handlers re-check their own writesEnabled regardless of what this
 	// says.
 	Writes bool `json:"writes,omitempty"`
+	// Features is the capability list the peer advertised on its last
+	// successful handshake (e.g. "central-env/1"). Nil for a peer that
+	// predates the field. Status() hands out copies — never share the slice.
+	Features []string `json:"features,omitempty"`
 }
 
 type PeerRegistry struct {
@@ -139,24 +143,25 @@ func (p *PeerRegistry) send(ctx context.Context, peer string) {
 	resp, err := p.client.Do(req)
 	if err != nil {
 		// Peer unreachable — expected during restarts / network blips. Silent.
-		p.recordResult(peer, false, "", "", false)
+		p.recordResult(peer, false, "", "", false, nil)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// Auth failure or malformed request: worth surfacing so misconfig is visible.
 		log.Printf("dashboard peer handshake: %s → %s", url, resp.Status)
-		p.recordResult(peer, false, "", "", false)
+		p.recordResult(peer, false, "", "", false, nil)
 		return
 	}
 	var body struct {
-		Peer    string `json:"peer"`
-		OK      bool   `json:"ok"`
-		Version string `json:"version"`
-		Writes  bool   `json:"writes"`
+		Peer     string   `json:"peer"`
+		OK       bool     `json:"ok"`
+		Version  string   `json:"version"`
+		Writes   bool     `json:"writes"`
+		Features []string `json:"features"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&body)
-	p.recordResult(peer, true, body.Peer, body.Version, body.Writes)
+	p.recordResult(peer, true, body.Peer, body.Version, body.Writes, body.Features)
 }
 
 // recordResult only overwrites Identity/Version/Writes on a successful
@@ -164,8 +169,10 @@ func (p *PeerRegistry) send(ctx context.Context, peer string) {
 // blanking them. Identity/Version are additionally guarded on non-empty
 // (their own zero value means "unknown", not "changed to empty"); Writes has
 // no such ambiguity — false is a meaningful, intentional value — so it's
-// simply copied whenever ok.
-func (p *PeerRegistry) recordResult(peer string, ok bool, identity, version string, writes bool) {
+// simply copied whenever ok. Features follows Writes: replaced (with a copy,
+// nil included) on every success so a downgraded peer loses a capability it
+// no longer has, preserved on failure.
+func (p *PeerRegistry) recordResult(peer string, ok bool, identity, version string, writes bool, features []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	st := p.status[peer]
@@ -182,6 +189,7 @@ func (p *PeerRegistry) recordResult(peer string, ok bool, identity, version stri
 	}
 	if ok {
 		st.Writes = writes
+		st.Features = append([]string(nil), features...)
 	}
 	p.status[peer] = st
 }
@@ -192,6 +200,7 @@ func (p *PeerRegistry) Status() map[string]peerStatus {
 	defer p.mu.Unlock()
 	out := make(map[string]peerStatus, len(p.status))
 	for k, v := range p.status {
+		v.Features = append([]string(nil), v.Features...)
 		out[k] = v
 	}
 	return out
@@ -308,7 +317,10 @@ func (p *PeerRegistry) refreshMeshFloor(ctx context.Context) {
 // writesEnabled lets a peer's UI show write controls only where the target
 // actually accepts them (peerStatus.Writes / ui.go's peerWritable);
 // purely advisory, the /peer/images/* handlers re-check it themselves.
-func peerHandshakeHandler(secret, identity, version string, writesEnabled bool) http.Handler {
+// features (e.g. "central-env/1" when CENTRAL_ENV is on) is only included
+// when non-empty, so a host with nothing to advertise answers byte-for-byte
+// as before.
+func peerHandshakeHandler(secret, identity, version string, writesEnabled bool, features []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if secret == "" {
 			http.NotFound(w, r)
@@ -325,7 +337,11 @@ func peerHandshakeHandler(secret, identity, version string, writesEnabled bool) 
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"peer": identity, "ok": true, "version": version, "writes": writesEnabled})
+		body := map[string]any{"peer": identity, "ok": true, "version": version, "writes": writesEnabled}
+		if len(features) > 0 {
+			body["features"] = features
+		}
+		_ = json.NewEncoder(w).Encode(body)
 	})
 }
 
@@ -1531,7 +1547,8 @@ type peerView struct {
 	Behind      bool      `json:"behind,omitempty"`
 	// Writes mirrors peerStatus.Writes — the frontend's only signal for
 	// whether to show write controls for this peer (ui.go's peerWritable).
-	Writes bool `json:"writes,omitempty"`
+	Writes   bool     `json:"writes,omitempty"`
+	Features []string `json:"features,omitempty"`
 }
 
 // peersStatusHandler serves this host's own identity+version, each
@@ -1555,7 +1572,7 @@ func peersStatusHandler(registry *PeerRegistry) http.HandlerFunc {
 				resp.MeshFloor = &floor
 			}
 			for url, st := range registry.Status() {
-				v := peerView{URL: url, Identity: st.Identity, Version: st.Version, OK: st.OK, LastAttempt: st.LastAttempt, LastSuccess: st.LastSuccess, Writes: st.Writes}
+				v := peerView{URL: url, Identity: st.Identity, Version: st.Version, OK: st.OK, LastAttempt: st.LastAttempt, LastSuccess: st.LastSuccess, Writes: st.Writes, Features: st.Features}
 				if floorOK {
 					if n, err := strconv.Atoi(st.Version); err == nil && n < floor {
 						v.Behind = true

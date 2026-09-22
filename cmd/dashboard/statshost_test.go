@@ -18,7 +18,7 @@ func TestStatsEndpointHostParamForwardsToPeer(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false, nil)
 
 	mux := newLogsTestMux(t, dc, reg)
 
@@ -43,7 +43,7 @@ func TestStatsEndpointHostParamUnknownHost(t *testing.T) {
 		json.NewEncoder(w).Encode([]dockerContainer{})
 	}))
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false)
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false, nil)
 
 	mux := newLogsTestMux(t, dc, reg)
 
@@ -83,7 +83,7 @@ func TestStatsEndpointHostParamPeerUnreachable(t *testing.T) {
 	peerSrv.Close() // guarantees connection-refused without hardcoding a port
 
 	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(url, true, "dashboard-b", "dev", false)
+	reg.recordResult(url, true, "dashboard-b", "dev", false, nil)
 
 	mux := newLogsTestMux(t, dc, reg)
 

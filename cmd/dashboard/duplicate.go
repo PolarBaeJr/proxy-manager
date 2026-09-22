@@ -163,6 +163,11 @@ func runServiceDuplicate(ctx context.Context, dc *dockerClient, registry *PeerRe
 		return DuplicateServiceResponse{}, fmt.Errorf("service %q has no live replicas", name)
 	}
 	tpl := existing[0]
+	// A duplicate is an independent fork with its own copy of env — the
+	// opposite of what central env is for.
+	if err := dc.refuseCentrallyManaged(name, tpl.Labels, "use spread, which carries its central env"); err != nil {
+		return DuplicateServiceResponse{}, err
+	}
 
 	env, err := dc.inspectEnv(ctx, tpl.ID)
 	if err != nil {
@@ -384,6 +389,18 @@ func peerDuplicateHandler(secret, identity string, dc *dockerClient, writesEnabl
 				http.Error(w, "volume_mounts entries must be type=volume", http.StatusBadRequest)
 				return
 			}
+		}
+
+		// Same refusal as the sending side, enforced here too: a duplicate
+		// carries the sender's local env, which a centrally managed service
+		// on this host must never be created from.
+		svcName := req.Service
+		if svcName == "" {
+			svcName = req.Name
+		}
+		if err := dc.refuseCentrallyManaged(svcName, nil, "use spread, which carries its central env"); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
 		}
 
 		existing, err := dc.listAll(r.Context(), fmt.Sprintf(`{"name":["%s"]}`, req.Name))

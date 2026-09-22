@@ -105,7 +105,7 @@ func TestImagesMarkUnmarkForwardToPeer(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true, nil)
 
 	localRS, localIH, localOnb := imagesWriteTestStores(t)
 	ic := newImageChecker(localDC)
@@ -171,7 +171,7 @@ func TestImagesDeleteForwardsToPeer(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true, nil)
 
 	localRS, localIH, localOnb := imagesWriteTestStores(t)
 	ic := newImageChecker(localDC)
@@ -213,7 +213,7 @@ func TestImagesDeletePeerRejectsUnsafeClaim(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true, nil)
 
 	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]dockerContainer{})
@@ -258,7 +258,7 @@ func TestImagesPruneForwardsToPeer(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true, nil)
 
 	localRS, localIH, localOnb := imagesWriteTestStores(t)
 	ic := newImageChecker(localDC)
@@ -309,7 +309,7 @@ func TestImagesMutationPeerWritesDisabled(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false, nil)
 
 	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]dockerContainer{})
@@ -355,7 +355,7 @@ func TestImagesMutationUnknownHost(t *testing.T) {
 	setInternalToken(t)
 
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", true)
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", true, nil)
 
 	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil, nil)
 
@@ -410,7 +410,7 @@ func TestImagesMutationPeerUnreachable(t *testing.T) {
 	peerSrv.Close() // guarantees connection-refused without hardcoding a port
 
 	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(url, true, "dashboard-b", "dev", true)
+	reg.recordResult(url, true, "dashboard-b", "dev", true, nil)
 
 	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil, nil)
 
@@ -444,7 +444,7 @@ func TestImagesMutationPeerAuthRejected(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true, nil)
 
 	mux := newDashboardMux(localDC, nil, auth, newRateLimiter(), ic, "", nil, localOnb, localRS, nil, localIH, nil, nil, reg, nil, nil, nil)
 
@@ -566,7 +566,7 @@ func TestImagesMutationForwardsActorAssertion(t *testing.T) {
 	t.Cleanup(peerSrv.Close)
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", true, nil)
 
 	localDC := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode([]dockerContainer{})
