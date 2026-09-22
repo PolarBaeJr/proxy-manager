@@ -515,7 +515,7 @@ func TestServicesSpreadForwardsToOwningPeer(t *testing.T) {
 	ownerDC := spreadDockerStub(t, calls, spreadAppContainers(), nil, nil)
 	ownerOnb := newTestOnboardedStore(t)
 	ownerReg := newPeerRegistry([]string{finalSrv.URL}, "s3cret", "dashboard-b", "dev", 0, nil)
-	ownerReg.recordResult(finalSrv.URL, true, "dashboard-c", "dev", true)
+	ownerReg.recordResult(finalSrv.URL, true, "dashboard-c", "dev", true, nil)
 	ownerSrv := httptest.NewServer(peerServicesMutateHandler("s3cret", "dashboard-b", ownerDC, ownerOnb, newImageChecker(ownerDC), ownerReg, filepath.Join(t.TempDir(), "routes.json"), noopProxyStub(t), true, nil))
 	t.Cleanup(ownerSrv.Close)
 

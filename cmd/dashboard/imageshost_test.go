@@ -65,7 +65,7 @@ func TestImagesEndpointHostParamForwardsToPeer(t *testing.T) {
 	}
 
 	reg := newPeerRegistry([]string{peerSrv.URL}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false)
+	reg.recordResult(peerSrv.URL, true, "dashboard-b", "dev", false, nil)
 
 	rs, err := loadReleasesStore(filepath.Join(t.TempDir(), "releases.json"))
 	if err != nil {
@@ -194,7 +194,7 @@ func TestImagesEndpointHostParamUnknownHost(t *testing.T) {
 	t.Cleanup(func() { internalToken = prev })
 
 	reg := newPeerRegistry([]string{"http://peer-b:8098"}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false)
+	reg.recordResult("http://peer-b:8098", true, "dashboard-b", "dev", false, nil)
 
 	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil, nil)
 
@@ -255,7 +255,7 @@ func TestImagesEndpointHostParamPeerUnreachable(t *testing.T) {
 	peerSrv.Close() // guarantees connection-refused without hardcoding a port
 
 	reg := newPeerRegistry([]string{url}, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(url, true, "dashboard-b", "dev", false)
+	reg.recordResult(url, true, "dashboard-b", "dev", false, nil)
 
 	mux := newDashboardMux(dc, nil, auth, newRateLimiter(), ic, "", nil, onb, nil, nil, nil, nil, nil, reg, nil, nil, nil)
 

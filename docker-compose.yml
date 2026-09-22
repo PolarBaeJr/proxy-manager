@@ -172,6 +172,13 @@ services:
       MAINT_DIR:            /etc/maint.d            # nginx maintenance flag files
       MAINT_PAGE_DIR:       /var/www/maint-pages    # per-host custom 503 pages
       SECRETS_DIR:          /etc/secrets            # ref:NAME env values, one file per service (see mount above)
+      # Central per-service env: one authoritative env per adopted service,
+      # owned by the dashboard it was adopted on; every replica on every host
+      # is created from it. Empty => off, create paths clone env from a local
+      # template container exactly as before. State lives under /data
+      # (central-env/ + central-env-cache/, overridable via CENTRAL_ENV_DIR /
+      # CENTRAL_ENV_CACHE_DIR).
+      CENTRAL_ENV:          ${CENTRAL_ENV:-}
       # Shared cross-peer state — auth's redis-backed user sync and the
       # peer-registry's version ratchet/mesh-floor tracking. -redis-addr is
       # passed as a command-line flag (see command: below); the password

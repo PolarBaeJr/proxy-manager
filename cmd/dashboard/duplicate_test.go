@@ -86,7 +86,7 @@ func TestRunServiceDuplicateRejectsBindMount(t *testing.T) {
 		}
 	}))
 	reg := newPeerRegistry(nil, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "peer-b", "dev", true)
+	reg.recordResult("http://peer-b:8098", true, "peer-b", "dev", true, nil)
 	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
 
 	_, err := runServiceDuplicate(context.Background(), dc, reg, nil, filepath.Join(t.TempDir(), "routes.json"), "app", DuplicateServiceRequest{Target: "peer-b"}, "")
@@ -105,7 +105,7 @@ func TestRunServiceDuplicateRequiresPeerSecret(t *testing.T) {
 		}})
 	}))
 	reg := newPeerRegistry(nil, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult("http://peer-b:8098", true, "peer-b", "dev", true)
+	reg.recordResult("http://peer-b:8098", true, "peer-b", "dev", true, nil)
 	t.Setenv("DASHBOARD_PEER_SECRET", "")
 
 	_, err := runServiceDuplicate(context.Background(), dc, reg, nil, filepath.Join(t.TempDir(), "routes.json"), "app", DuplicateServiceRequest{Target: "peer-b"}, "")
@@ -305,7 +305,7 @@ func TestRunServiceDuplicateSeparatesPortAndPublishPort(t *testing.T) {
 	defer peer.Close()
 
 	reg := newPeerRegistry(nil, "s3cret", "dashboard-a", "dev", 0, nil)
-	reg.recordResult(peer.URL, true, "peer-b", "dev", true)
+	reg.recordResult(peer.URL, true, "peer-b", "dev", true, nil)
 	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
 
 	routesPath := filepath.Join(t.TempDir(), "routes.json")

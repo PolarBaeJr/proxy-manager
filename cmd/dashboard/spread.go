@@ -97,6 +97,13 @@ type peerSpreadRequest struct {
 	// most often — not baked into the image) so the seed replica's own
 	// recreate-based rolling health gate isn't decorative from the start.
 	Healthcheck *healthcheckSpec `json:"healthcheck,omitempty"`
+	// CentralOrigin/CentralVersion are set only for a centrally managed
+	// service: Env is then the origin's central env already resolved for the
+	// TARGET's identity, and the receiver caches it and stamps its replicas'
+	// provenance labels from these two typed fields. A pre-central-env peer
+	// ignores both and behaves exactly as before.
+	CentralOrigin  string `json:"central_origin,omitempty"`
+	CentralVersion uint64 `json:"central_version,omitempty"`
 }
 
 type peerSpreadResponse struct {
@@ -303,9 +310,28 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 	}
 	tpl := preferRunning(existing)[0]
 
-	env, err := dc.inspectEnv(ctx, tpl.ID)
-	if err != nil {
-		return SpreadServiceResponse{}, fmt.Errorf("inspect template env: %w", err)
+	// A centrally managed service ships its central env as resolved for the
+	// TARGET host (its per-host overrides, not ours) — which only the origin
+	// can produce, so a non-origin host refuses rather than forward its own
+	// cached copy. Every env check below then runs on what the target will
+	// actually get.
+	var env []string
+	var central centralEnvResult
+	var isCentral bool
+	if dc.central != nil && dc.central.Enabled() && dc.central.Managed(name, tpl.Labels) {
+		res, owned, err := dc.central.ResolveForPeer(name, req.Target)
+		if err != nil {
+			return SpreadServiceResponse{}, err
+		}
+		if !owned {
+			return SpreadServiceResponse{}, errEnvCentrallyManaged{Service: name, Hint: "spread it from its central env origin (" + tpl.Labels[labelEnvOrigin] + ")"}
+		}
+		env, central, isCentral = res.Env, res, true
+	} else {
+		env, err = dc.inspectEnv(ctx, tpl.ID)
+		if err != nil {
+			return SpreadServiceResponse{}, fmt.Errorf("inspect template env: %w", err)
+		}
 	}
 	clone, err := dc.inspectCloneSpec(ctx, tpl.ID)
 	if err != nil {
@@ -412,6 +438,10 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 		Replicas:    replicas,
 		Healthcheck: clone.Healthcheck,
 	}
+	if isCentral {
+		peerReq.CentralOrigin = central.Origin
+		peerReq.CentralVersion = central.Version
+	}
 	reqBody, err := json.Marshal(peerReq)
 	if err != nil {
 		return SpreadServiceResponse{}, err
@@ -514,6 +544,20 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 			http.Error(w, fmt.Sprintf("weight must be between 1 and %d", maxServiceWeight), http.StatusBadRequest)
 			return
 		}
+		if req.CentralOrigin != "" {
+			if !validHostname(req.CentralOrigin) || req.CentralVersion == 0 {
+				http.Error(w, "invalid central_origin/central_version", http.StatusBadRequest)
+				return
+			}
+			// Refuse rather than create replicas stamped with a provenance
+			// this host can't honor: with central env off here there is no
+			// cache to hold the env, and a later flag flip would find
+			// replicas labeled with an origin and nothing to create from.
+			if dc.central == nil || !dc.central.Enabled() {
+				http.Error(w, fmt.Sprintf("%q is centrally managed but central env is not enabled on this host", req.Service), http.StatusConflict)
+				return
+			}
+		}
 
 		all, err := dc.listAll(r.Context(), fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, req.Service))
 		if err != nil {
@@ -544,6 +588,31 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 				"this host already runs containers for %q that spread did not place (no %s label) — remove or relabel them first, or use the existing duplicate flow",
 				req.Service, labelSpread), http.StatusConflict)
 			return
+		}
+
+		// A spread WITHOUT a central env (an older or flag-off origin) must not
+		// seed a service this host already treats as centrally managed: the
+		// seed below would be created from the sender's local env.
+		if req.CentralOrigin == "" {
+			var here map[string]string
+			if len(liveHere) > 0 {
+				here = liveHere[0].Labels
+			}
+			if err := dc.refuseCentrallyManaged(req.Service, here, "this spread carries no central env; spread it from its origin"); err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+		}
+
+		// Cache the shipped central env BEFORE creating anything, so the seed
+		// replica and every scaleService clone after it resolve the same
+		// version. Accept refuses an older version than already cached and
+		// refuses outright when this host is itself the origin.
+		if req.CentralOrigin != "" {
+			if err := dc.central.Accept(req.Service, req.CentralOrigin, req.CentralVersion, req.Env); err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 		}
 
 		live := len(liveHere)
@@ -611,6 +680,9 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 			// same convention as setWeightLabel.
 			if req.Weight > 1 {
 				labels[labelWeight] = strconv.Itoa(req.Weight)
+			}
+			if req.CentralOrigin != "" {
+				labels = stampEnvLabels(labels, centralEnvResult{Origin: req.CentralOrigin, Version: req.CentralVersion})
 			}
 
 			// No PortBindings and no Mounts, unlike peerDuplicateHandler:

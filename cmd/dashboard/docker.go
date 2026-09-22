@@ -60,6 +60,11 @@ type dockerClient struct {
 	// test that builds a dockerClient by hand) and until main.go attaches
 	// it — nil means every list goes straight to Docker.
 	cache *containerCache
+	// central resolves a service's central env (centralenv.go) for every
+	// create path. Nil when CENTRAL_ENV is off (and in every test that
+	// builds a dockerClient by hand) — nil means env is cloned from a local
+	// template container, exactly as before the feature existed.
+	central centralEnvResolver
 }
 
 func newDockerClient() *dockerClient {
@@ -797,6 +802,86 @@ func (c *dockerClient) inspectImageOverridable(ctx context.Context, imageID stri
 	return resp.Config.Cmd, resp.Config.Entrypoint, nil
 }
 
+// inspectImageEnv returns an image's own Config.Env — the baseline
+// subtractImageEnv diffs a container's env against, so adopting a service
+// into central env doesn't capture variables it merely inherited from its
+// image (PATH, language-runtime defaults, ...).
+func (c *dockerClient) inspectImageEnv(ctx context.Context, imageID string) ([]string, error) {
+	body, err := c.get(ctx, "/images/"+url.PathEscape(imageID)+"/json")
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	var resp struct {
+		Config struct {
+			Env []string `json:"Env"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		return nil, err
+	}
+	return resp.Config.Env, nil
+}
+
+// templateClone is everything a recreate/scale-up copies from a template
+// container: its env, its labels, and the host/network config cloneSpec
+// carries. For a centrally managed service (managed=true) env is the
+// central env and labels are the template's with the central-env
+// provenance stamped (stampEnvLabels) — the template's own env is never
+// read. Otherwise env and labels are the template's own, untouched (labels
+// is then the template's shared map: copy before writing to it).
+type templateClone struct {
+	env     []string
+	labels  map[string]string
+	clone   cloneSpec
+	managed bool
+	central centralEnvResult
+}
+
+// cloneEnvAndSpec is the ONE place every create path gets its env from. When
+// central env is on and says svc is managed, the replica's env comes only
+// from it — and if it can't be produced, the create is refused outright
+// rather than falling back to the template's local env (which is exactly the
+// drift this feature exists to stop). A stale-cache warning names only the
+// service/origin/version, so it is safe to log.
+func (c *dockerClient) cloneEnvAndSpec(ctx context.Context, name string, tpl dockerContainer) (templateClone, error) {
+	if c.central != nil && c.central.Enabled() {
+		res, managed, err := c.central.Resolve(ctx, name, tpl.Labels)
+		if err != nil {
+			return templateClone{}, err
+		}
+		if managed {
+			if res.Warning != "" {
+				log.Printf("%s", res.Warning)
+			}
+			clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+			if err != nil {
+				return templateClone{}, fmt.Errorf("inspect template %s clone spec: %w", tpl.name(), err)
+			}
+			return templateClone{env: res.Env, labels: stampEnvLabels(tpl.Labels, res), clone: clone, managed: true, central: res}, nil
+		}
+	}
+	env, err := c.inspectEnv(ctx, tpl.ID)
+	if err != nil {
+		return templateClone{}, fmt.Errorf("inspect template %s env: %w", tpl.name(), err)
+	}
+	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+	if err != nil {
+		return templateClone{}, fmt.Errorf("inspect template %s clone spec: %w", tpl.name(), err)
+	}
+	return templateClone{env: env, labels: tpl.Labels, clone: clone}, nil
+}
+
+// refuseCentrallyManaged is the guard for paths that have no way to honor a
+// central env (duplicate, the onboarded flows): nil unless central env is on
+// and svc is managed. Network-free — it never asks an origin anything.
+func (c *dockerClient) refuseCentrallyManaged(name string, labels map[string]string, hint string) error {
+	if c.central != nil && c.central.Enabled() && c.central.Managed(name, labels) {
+		return errEnvCentrallyManaged{Service: name, Hint: hint}
+	}
+	return nil
+}
+
 // ---- Service-level operations ----
 
 type Service struct {
@@ -1102,18 +1187,18 @@ func (c *dockerClient) scaleService(ctx context.Context, name string, desired in
 	case current < desired:
 		// Pull the template's env so replicas get the same runtime config
 		// (DATABASE_URL, API keys, etc.) — the listAll summary doesn't include Env.
-		env, err := c.inspectEnv(ctx, tpl.ID)
+		// For a centrally managed service it's the central env instead.
+		tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
 		if err != nil {
-			return fmt.Errorf("inspect template %s: %w", tpl.name(), err)
-		}
-		clone, err := c.inspectCloneSpec(ctx, tpl.ID)
-		if err != nil {
-			return fmt.Errorf("inspect template %s: %w", tpl.name(), err)
+			return err
 		}
 		for i := 0; i < desired-current; i++ {
 			n := nextReplicaIndex(existing, name) + i
 			cname := fmt.Sprintf("goproxy-%s-%d", name, n)
-			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
+			id, err := c.createContainer(ctx, cname, createBody{
+				Image: tpl.Image, Labels: tc.labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+				ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
+			})
 			if err != nil {
 				return fmt.Errorf("create %s: %w", cname, err)
 			}
@@ -1349,29 +1434,35 @@ func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, 
 
 	// Resolve env by merging any edits onto what the template is running.
 	// Read unconditionally: the merge needs the current values to compare
-	// against, not just as a fallback when no edits were sent.
-	base, err := c.inspectEnv(ctx, tpl.ID)
-	if err != nil {
-		return nil, fmt.Errorf("inspect template env: %w", err)
-	}
-	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
-	if err != nil {
-		return nil, fmt.Errorf("inspect template clone spec: %w", err)
-	}
-	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
+	// against, not just as a fallback when no edits were sent. A centrally
+	// managed service takes its central env as-is and refuses per-request
+	// edits — those would silently fork one host's replicas from it.
+	tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
 	if err != nil {
 		return nil, err
 	}
-	env, err := mergeEnv(base, edits, req.EnvAck)
-	if err != nil {
-		return nil, redactRefConflicts(err, refs)
+	env := tc.env
+	if tc.managed {
+		if len(req.Env) > 0 {
+			return nil, errEnvCentrallyManaged{Service: name, Hint: "env edits must go through its central env, not a replace/stage request"}
+		}
+	} else {
+		edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
+		if err != nil {
+			return nil, err
+		}
+		env, err = mergeEnv(tc.env, edits, req.EnvAck)
+		if err != nil {
+			return nil, redactRefConflicts(err, refs)
+		}
 	}
+	clone := tc.clone
 
 	c.pullImage(ctx, req.Image)
 
 	// Stamp the new containers' labels with the previous image for one-click rollback.
 	newLabels := map[string]string{}
-	for k, v := range tpl.Labels {
+	for k, v := range tc.labels {
 		// org.opencontainers.image.* describes the IMAGE, not the container —
 		// carrying the old image's copy forward would override (not merely
 		// shadow) the new image's own labels of the same key at create time,
@@ -1629,17 +1720,13 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	tplSet := preferRunning(existing)
 	tpl := tplSet[0]
 
-	env, err := c.inspectEnv(ctx, tpl.ID)
+	tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
 	if err != nil {
-		return fmt.Errorf("inspect template env: %w", err)
-	}
-	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
-	if err != nil {
-		return fmt.Errorf("inspect template clone spec: %w", err)
+		return err
 	}
 
 	newLabels := map[string]string{}
-	for k, v := range tpl.Labels {
+	for k, v := range tc.labels {
 		if strings.HasPrefix(k, ociImageLabelPrefix) {
 			continue
 		}
@@ -1658,11 +1745,13 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:       tpl.Image,
-			Labels:      newLabels,
-			Env:         env,
-			Healthcheck: clone.Healthcheck,
-			HostConfig:  hostConfig{Mounts: clone.Mounts},
+			Image:          tpl.Image,
+			Labels:         newLabels,
+			Env:            tc.env,
+			Healthcheck:    tc.clone.Healthcheck,
+			HostConfig:     hostConfig{Mounts: tc.clone.Mounts},
+			ManagedAliases: tc.clone.ManagedAliases,
+			ExtraNetworks:  tc.clone.ExtraNetworks,
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1713,17 +1802,13 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 	tplSet := preferRunning(existing)
 	tpl := tplSet[0]
 
-	env, err := c.inspectEnv(ctx, tpl.ID)
+	tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
 	if err != nil {
-		return fmt.Errorf("inspect template env: %w", err)
-	}
-	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
-	if err != nil {
-		return fmt.Errorf("inspect template clone spec: %w", err)
+		return err
 	}
 
 	newLabels := map[string]string{}
-	for k, v := range tpl.Labels {
+	for k, v := range tc.labels {
 		if strings.HasPrefix(k, ociImageLabelPrefix) {
 			continue
 		}
@@ -1742,11 +1827,13 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:       tpl.Image,
-			Labels:      newLabels,
-			Env:         env,
-			Healthcheck: clone.Healthcheck,
-			HostConfig:  hostConfig{Mounts: clone.Mounts},
+			Image:          tpl.Image,
+			Labels:         newLabels,
+			Env:            tc.env,
+			Healthcheck:    tc.clone.Healthcheck,
+			HostConfig:     hostConfig{Mounts: tc.clone.Mounts},
+			ManagedAliases: tc.clone.ManagedAliases,
+			ExtraNetworks:  tc.clone.ExtraNetworks,
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1822,17 +1909,13 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	tplSet := preferRunning(existing)
 	tpl := tplSet[0]
 
-	env, err := c.inspectEnv(ctx, tpl.ID)
+	tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
 	if err != nil {
-		return fmt.Errorf("inspect template env: %w", err)
-	}
-	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
-	if err != nil {
-		return fmt.Errorf("inspect template clone spec: %w", err)
+		return err
 	}
 
 	newLabels := map[string]string{}
-	for k, v := range tpl.Labels {
+	for k, v := range tc.labels {
 		if strings.HasPrefix(k, ociImageLabelPrefix) {
 			continue
 		}
@@ -1854,11 +1937,13 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:       tpl.Image,
-			Labels:      newLabels,
-			Env:         env,
-			Healthcheck: clone.Healthcheck,
-			HostConfig:  hostConfig{Mounts: clone.Mounts},
+			Image:          tpl.Image,
+			Labels:         newLabels,
+			Env:            tc.env,
+			Healthcheck:    tc.clone.Healthcheck,
+			HostConfig:     hostConfig{Mounts: tc.clone.Mounts},
+			ManagedAliases: tc.clone.ManagedAliases,
+			ExtraNetworks:  tc.clone.ExtraNetworks,
 		})
 		if err != nil {
 			for _, oid := range newIDs {
@@ -1911,25 +1996,30 @@ func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, re
 	// replaceService's identical tplSet comment.
 	tpl := preferRunning(live)[0]
 
-	base, err := c.inspectEnv(ctx, tpl.ID)
-	if err != nil {
-		return fmt.Errorf("inspect template env: %w", err)
-	}
-	clone, err := c.inspectCloneSpec(ctx, tpl.ID)
-	if err != nil {
-		return fmt.Errorf("inspect template clone spec: %w", err)
-	}
-	edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
+	tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
 	if err != nil {
 		return err
 	}
-	env, err := mergeEnv(base, edits, req.EnvAck)
-	if err != nil {
-		return redactRefConflicts(err, refs)
+	env := tc.env
+	if tc.managed {
+		// Same refusal as prepareReplaceTemplate: a staged canary with its
+		// own env edits would be a per-host fork of the central env.
+		if len(req.Env) > 0 {
+			return errEnvCentrallyManaged{Service: name, Hint: "env edits must go through its central env, not a replace/stage request"}
+		}
+	} else {
+		edits, refs, err := resolveSecretRefs(name, req.Env, c.secrets)
+		if err != nil {
+			return err
+		}
+		env, err = mergeEnv(tc.env, edits, req.EnvAck)
+		if err != nil {
+			return redactRefConflicts(err, refs)
+		}
 	}
 
 	canaryLabels := map[string]string{}
-	for k, v := range tpl.Labels {
+	for k, v := range tc.labels {
 		canaryLabels[k] = v
 	}
 	canaryLabels[labelCanary] = "true"
@@ -1940,7 +2030,8 @@ func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, re
 	for i := 0; i < count; i++ {
 		cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image: req.Image, Labels: canaryLabels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image: req.Image, Labels: canaryLabels, Env: env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+			ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
 		})
 		if err != nil {
 			return fmt.Errorf("create canary %s: %w", cname, err)
@@ -2010,18 +2101,17 @@ func (c *dockerClient) scaleCanary(ctx context.Context, name string, target int)
 	case current == target:
 		return nil
 	case current < target:
-		env, err := c.inspectEnv(ctx, tpl.ID)
+		tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
 		if err != nil {
-			return fmt.Errorf("inspect canary template %s: %w", tpl.name(), err)
-		}
-		clone, err := c.inspectCloneSpec(ctx, tpl.ID)
-		if err != nil {
-			return fmt.Errorf("inspect canary template %s: %w", tpl.name(), err)
+			return err
 		}
 		startIdx := nextCanaryReplicaIndex(all, name)
 		for i := 0; i < target-current; i++ {
 			cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
-			id, err := c.createContainer(ctx, cname, createBody{Image: tpl.Image, Labels: tpl.Labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
+			id, err := c.createContainer(ctx, cname, createBody{
+				Image: tpl.Image, Labels: tc.labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+				ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
+			})
 			if err != nil {
 				return fmt.Errorf("create canary %s: %w", cname, err)
 			}
@@ -2066,18 +2156,16 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 		return fmt.Errorf("promote %s: %w", name, err)
 	}
 	// Recreate each canary container WITHOUT the canary label (Docker doesn't allow
-	// label edits on running containers). Same env, same image, new name.
+	// label edits on running containers). Same env, same image, new name —
+	// except a centrally managed service, which is promoted onto the CURRENT
+	// central env rather than the canary's stage-time snapshot of it.
 	for _, ct := range canary {
-		env, err := c.inspectEnv(ctx, ct.ID)
+		tc, err := c.cloneEnvAndSpec(ctx, name, ct)
 		if err != nil {
-			return fmt.Errorf("inspect canary env: %w", err)
-		}
-		clone, err := c.inspectCloneSpec(ctx, ct.ID)
-		if err != nil {
-			return fmt.Errorf("inspect canary clone spec: %w", err)
+			return err
 		}
 		labels := map[string]string{}
-		for k, v := range ct.Labels {
+		for k, v := range tc.labels {
 			if k == labelCanary {
 				continue
 			}
@@ -2085,7 +2173,10 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 		}
 		startIdx := nextReplicaIndex(all, name)
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx)
-		id, err := c.createContainer(ctx, cname, createBody{Image: ct.Image, Labels: labels, Env: env, Healthcheck: clone.Healthcheck, HostConfig: hostConfig{Mounts: clone.Mounts}})
+		id, err := c.createContainer(ctx, cname, createBody{
+			Image: ct.Image, Labels: labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+			ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
+		})
 		if err != nil {
 			return fmt.Errorf("create promoted %s: %w", cname, err)
 		}
