@@ -94,7 +94,7 @@ func TestReplaceServiceRollingNeverDropsCapacityBelowOriginal(t *testing.T) {
 		}
 	}))
 
-	if err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil); err != nil {
+	if err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil, rollingOpts{}); err != nil {
 		t.Fatalf("replaceServiceRolling: %v", err)
 	}
 
@@ -193,7 +193,7 @@ func TestReplaceServiceRollingMidLoopFailureLeavesFirstSwapped(t *testing.T) {
 	// Original replicas occupy indices 1-3, so nextReplicaIndex starts the
 	// replacement set at 4: goproxy-app-4 replaces -1 (succeeds), -5 replaces
 	// -2 (the injected failure), -6 replaces -3 (never attempted).
-	err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil)
+	err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil, rollingOpts{})
 	if err == nil {
 		t.Fatal("expected an error from the failed 2nd create")
 	}
@@ -286,7 +286,7 @@ func TestWaitReplicaReadyTimesOutOnStuckHealthStarting(t *testing.T) {
 		}
 	}))
 
-	err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil)
+	err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil, rollingOpts{})
 	if err == nil {
 		t.Fatal("expected the stuck health-starting replica to fail the gate")
 	}
@@ -374,7 +374,7 @@ func TestWaitReplicaReadyPassesOnceHealthy(t *testing.T) {
 		}
 	}))
 
-	if err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil); err != nil {
+	if err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, nil, rollingOpts{}); err != nil {
 		t.Fatalf("replaceServiceRolling: %v", err)
 	}
 	mu.Lock()

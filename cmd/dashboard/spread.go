@@ -326,6 +326,12 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 		if !owned {
 			return SpreadServiceResponse{}, errEnvCentrallyManaged{Service: name, Hint: "spread it from its central env origin (" + tpl.Labels[labelEnvOrigin] + ")"}
 		}
+		// A target without central env would silently drop the provenance
+		// and run the replica as an unmanaged fork — never propagated to
+		// again. Only the handshake says what the target supports.
+		if !hasFeature(registry.Status()[peerURL].Features, centralEnvFeature) {
+			return SpreadServiceResponse{}, errEnvCentrallyManaged{Service: name, Hint: fmt.Sprintf("target %s does not support central env (%s) — enable CENTRAL_ENV there first", req.Target, centralEnvFeature)}
+		}
 		env, central, isCentral = res.Env, res, true
 	} else {
 		env, err = dc.inspectEnv(ctx, tpl.ID)
@@ -609,7 +615,7 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 		// version. Accept refuses an older version than already cached and
 		// refuses outright when this host is itself the origin.
 		if req.CentralOrigin != "" {
-			if err := dc.central.Accept(req.Service, req.CentralOrigin, req.CentralVersion, req.Env); err != nil {
+			if err := dc.central.Accept(req.Service, req.CentralOrigin, req.CentralVersion, req.Env, req.Healthcheck); err != nil {
 				http.Error(w, err.Error(), http.StatusConflict)
 				return
 			}
@@ -714,7 +720,7 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 		// satisfies the request — scaleService would otherwise re-list purely
 		// to conclude it has nothing to do.
 		if live != req.Replicas {
-			if err := dc.scaleService(r.Context(), req.Service, req.Replicas); err != nil {
+			if err := dc.scaleServiceWithHealthcheck(r.Context(), req.Service, req.Replicas, req.Healthcheck); err != nil {
 				httpx.WriteErr(w, err)
 				return
 			}

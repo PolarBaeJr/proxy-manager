@@ -149,8 +149,19 @@ func main() {
 	// never written while something else reads it. Keyed by the same identity
 	// the peer mesh uses: per-host overrides and replica provenance labels
 	// name hosts by it. Logs counts only, never a service's env.
+	// Constructed ahead of central env: its origin fetcher resolves an
+	// origin identity to a peer URL through this registry.
+	//
+	// Separate trust boundary from PMGR_PEER_SECRET (proxy mesh) and
+	// PMGR_ACTOR_SECRET (audit attribution) — never read, share, or fall back
+	// between them.
+	peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
+	peerList := splitAndTrim(*peers)
+	registry := newPeerRegistry(peerList, peerSecret, identity, buildVersion, *peerSyncInterval, redisClient)
+
 	centralEnvOn := isTrue(os.Getenv("CENTRAL_ENV"))
 	var handshakeFeatures []string
+	var centralEnvState *centralEnv
 	if centralEnvOn {
 		store, err := loadCentralEnvStore(firstNonEmpty(strings.TrimSpace(os.Getenv("CENTRAL_ENV_DIR")), defaultCentralEnvDir))
 		if err != nil {
@@ -160,7 +171,9 @@ func main() {
 		if err != nil {
 			log.Fatalf("central env cache: %v", err)
 		}
-		dc.central = &centralEnv{enabled: true, identity: identity, store: store, cache: cache, secrets: secrets}
+		centralEnvState = &centralEnv{enabled: true, identity: identity, store: store, cache: cache, secrets: secrets,
+			fetchFromOrigin: newOriginFetcher(registry, peerSecret)}
+		dc.central = centralEnvState
 		handshakeFeatures = []string{centralEnvFeature}
 		owned, broken := store.Counts()
 		log.Printf("central env enabled as %q: %d service(s) owned, %d broken (fail closed), %d cached from peers", identity, owned, broken, cache.Len())
@@ -237,6 +250,11 @@ func main() {
 	// flight for that same service.
 	rm := newRolloutManager(dc, onboarded, *staticConfig, proxyURLFromEnv())
 	rom := newRollingOpManager(dc)
+	// The propagation manager needs rm/rom (it defers to, and rolls through,
+	// them); set on centralEnvState before any handler or loop can read it.
+	if centralEnvState != nil {
+		centralEnvState.sync = newEnvSyncManager(dc, centralEnvState, rm, rom, registry, peerSecret, proxyURLFromEnv())
+	}
 
 	// Background: poll registries every 10 min for newer image digests, then
 	// let the auto-updater act on any opted-in service with a newer digest.
@@ -300,13 +318,6 @@ func main() {
 		go maintPages.SyncLoop(ctx, dc)
 	}
 
-	// Separate trust boundary from PMGR_PEER_SECRET (proxy mesh) and
-	// PMGR_ACTOR_SECRET (audit attribution) — never read, share, or fall back
-	// between them.
-	peerSecret := strings.TrimSpace(os.Getenv("DASHBOARD_PEER_SECRET"))
-	peerList := splitAndTrim(*peers)
-	registry := newPeerRegistry(peerList, peerSecret, identity, buildVersion, *peerSyncInterval, redisClient)
-
 	mux := newDashboardMux(dc, cf, auth, limiter, ic, *staticConfig, pm, onboarded, releases, prefs, imageHistory, maint, maintPages, registry, rm, autoUpdateBlocks, rom)
 
 	// MCP on its own port, proxied at mcp.<domain>/mcp/dashboard. Separate from
@@ -331,6 +342,11 @@ func main() {
 	if len(peerList) > 0 || redisClient != nil {
 		go registry.Run(ctx)
 	}
+	// Background: the central env safety net — secret rotation, lagging
+	// replicas here or on a peer, a newer version on the origin.
+	if centralEnvState != nil {
+		go centralEnvState.sync.reconcileLoop(ctx)
+	}
 	peerHandlers := map[string]http.Handler{
 		"/peer/handshake":       peerHandshakeHandler(peerSecret, identity, buildVersion, peerWritesEnabled, handshakeFeatures),
 		"/peer/service-status":  peerServiceStatusHandler(peerSecret, identity, dc, proxyURLFromEnv(), monitorURLFromEnv()),
@@ -345,6 +361,7 @@ func main() {
 		"/peer/logs/":           peerLogsHandler(peerSecret, identity, dc),
 		"/peer/duplicate":       peerDuplicateHandler(peerSecret, identity, dc, peerWritesEnabled),
 		"/peer/spread":          peerSpreadHandler(peerSecret, identity, dc, peerWritesEnabled),
+		"/peer/central-env/":    peerCentralEnvHandler(peerSecret, centralEnvState, dc, peerWritesEnabled),
 	}
 	writesMsg := "(writes disabled)"
 	if peerWritesEnabled {

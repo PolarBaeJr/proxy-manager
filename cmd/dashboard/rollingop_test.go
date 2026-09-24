@@ -182,7 +182,7 @@ func TestReplaceServiceRollingTracksPerReplicaProgress(t *testing.T) {
 		}
 		got = append(got, rollingOpReplica{Name: replicaName, Verdict: verdict})
 	}
-	if err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, progress); err != nil {
+	if err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, progress, rollingOpts{}); err != nil {
 		t.Fatalf("replaceServiceRolling: %v", err)
 	}
 
@@ -221,7 +221,7 @@ func TestReplaceServiceRollingProgressStopsAtFailure(t *testing.T) {
 		}
 		got = append(got, rollingOpReplica{Name: replicaName, Verdict: verdict})
 	}
-	err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, progress)
+	err := dc.replaceServiceRolling(context.Background(), "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, progress, rollingOpts{})
 	if err == nil {
 		t.Fatal("want an error when a mid-swap create fails")
 	}

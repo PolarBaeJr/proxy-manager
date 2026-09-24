@@ -42,6 +42,80 @@ func rollingOpActive(status string) bool {
 	return status == rollingOpStatusRunning
 }
 
+// serviceClaims is a per-service "who is recreating this right now" marker
+// for the two unattended mutators that would otherwise interleave on the
+// same containers: the auto-updater's plain replaceService and the central
+// env propagation job. Each claims before touching a service and defers
+// (never fails) when the other holds it. Per dockerClient, i.e. per host.
+// The zero value is ready to use.
+type serviceClaims struct {
+	mu    sync.Mutex
+	owner map[string]string
+}
+
+// tryClaim takes svc for owner. True if it was free or already owner's.
+func (c *serviceClaims) tryClaim(svc, owner string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cur, ok := c.owner[svc]; ok && cur != owner {
+		return false
+	}
+	if c.owner == nil {
+		c.owner = map[string]string{}
+	}
+	c.owner[svc] = owner
+	return true
+}
+
+func (c *serviceClaims) release(svc, owner string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.owner[svc] == owner {
+		delete(c.owner, svc)
+	}
+}
+
+func (c *serviceClaims) holder(svc string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.owner[svc]
+}
+
+// rollingOpts adjusts a rolling replace for the central-env propagation job
+// (centralenv_sync.go). The zero value is exactly the operator-initiated
+// rolling replace.
+type rollingOpts struct {
+	// pinnedEnv, when non-nil, is the exact env every new replica gets —
+	// resolved once by the job rather than re-resolved per create — and
+	// pinnedLabels (the pmgr.env.* provenance) are stamped over the
+	// template's labels, compose labels dropped. pinnedHealthcheck fills in
+	// a template that has none (the origin's, for a spread replica).
+	pinnedEnv         []string
+	pinnedLabels      map[string]string
+	pinnedHealthcheck *healthcheckSpec
+	// removeOnGateFailure removes a new replica that fails its health gate
+	// instead of leaving it running next to the predecessor it didn't
+	// replace — the job then rolls back or reverts deliberately.
+	removeOnGateFailure bool
+	// skipPull keeps an env-only rollout from pulling (and so silently
+	// upgrading to) a newer digest for the service's tag.
+	skipPull bool
+	// done, if non-nil, receives the job's final error (nil on success)
+	// exactly once. Must be buffered: the job never blocks on it.
+	done chan error
+}
+
+// errReplicaGateFailed is replaceServiceRolling's "a new replica never became
+// healthy" failure, distinct from every other error (Docker create/start, no
+// live replicas, ...) — only this one is evidence against the env or image
+// being rolled, so it's the only one the central-env job reverts on.
+type errReplicaGateFailed struct {
+	err error
+}
+
+func (e errReplicaGateFailed) Error() string { return e.err.Error() }
+func (e errReplicaGateFailed) Unwrap() error { return e.err }
+
 // rollingOpState is one service's in-flight (or most-recently-finished)
 // rolling replace.
 type rollingOpState struct {
@@ -103,6 +177,14 @@ func (m *rollingOpManager) update(name string, fn func(*rollingOpState)) {
 // the same mutex hold so two concurrent POSTs for the same service can't
 // both pass the guard and race each other onto the same containers.
 func (m *rollingOpManager) start(name string, req ReplaceServiceRequest) (*rollingOpState, error) {
+	return m.startWith(name, req, rollingOpts{})
+}
+
+// startWith is start with rollingOpts. Going through the same map (rather
+// than calling replaceServiceRolling directly) is what makes a central-env
+// propagation visible to every existing "one mutation at a time" guard —
+// the API's, the auto-updater's, and a second propagation's.
+func (m *rollingOpManager) startWith(name string, req ReplaceServiceRequest, opts rollingOpts) (*rollingOpState, error) {
 	m.mu.Lock()
 	if existing, ok := m.ops[name]; ok && rollingOpActive(existing.Status) {
 		m.mu.Unlock()
@@ -140,15 +222,20 @@ func (m *rollingOpManager) start(name string, req ReplaceServiceRequest) (*rolli
 					s.Replicas = append(s.Replicas, rollingOpReplica{Name: replicaName, Verdict: verdict})
 				}
 			})
-		})
+		}, opts)
 		m.update(name, func(s *rollingOpState) {
 			if err != nil {
 				s.Status = rollingOpStatusFailed
-				s.LastError = err.Error()
+				// Values of the env this job was given never reach the
+				// status (API, MCP, UI) even if a Docker error echoed one.
+				s.LastError = scrubEnvValues(err.Error(), opts.pinnedEnv, envMapToSlice(req.Env))
 				return
 			}
 			s.Status = rollingOpStatusCompleted
 		})
+		if opts.done != nil {
+			opts.done <- err
+		}
 	}()
 
 	return &cp, nil
