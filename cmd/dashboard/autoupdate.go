@@ -17,6 +17,8 @@ import (
 
 const autoUpdateMaxFailures = 3 // stop retrying a service after this many consecutive failures
 
+const autoUpdateClaimOwner = "autoupdate"
+
 // autoUpdateGap is a var (not const), same seam as docker.go's
 // replaceSettleDelay, so tests exercising multiple runOnce cycles don't pay
 // the real gap in wall-clock time.
@@ -259,6 +261,13 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 				log.Printf("autoupdate: %s — active rolling replace in progress, deferring", svc.Name)
 				continue
 			}
+			// A central env propagation holds the claim for its whole
+			// local roll, including the gaps between its rolling replaces
+			// where rom alone would look idle.
+			if !a.dc.claims.tryClaim(svc.Name, autoUpdateClaimOwner) {
+				log.Printf("autoupdate: %s — central env propagation in progress, deferring", svc.Name)
+				continue
+			}
 		}
 		if st.UpdateAvailable {
 			log.Printf("autoupdate: %s — newer digest for %s, replacing", svc.Name, svc.Image)
@@ -273,6 +282,7 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 			}
 		} else {
 			uerr = a.dc.replaceService(ctx, svc.Name, ReplaceServiceRequest{Image: svc.Image})
+			a.dc.claims.release(svc.Name, autoUpdateClaimOwner)
 		}
 		if uerr != nil {
 			a.failures[svc.Name]++

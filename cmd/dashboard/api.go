@@ -673,6 +673,18 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			http.NotFound(w, req)
 			return
 		}
+		// Central env is dispatched ahead of ?host= forwarding: it has one
+		// owner whichever host the request lands on (a non-origin forwards
+		// to the origin itself), and it is exempt from the rollout guard
+		// below — an env edit while a rollout runs is queued by the sync
+		// manager, which defers until the rollout is done.
+		if len(parts) == 2 && (parts[1] == "env" || parts[1] == "env/sync") {
+			if serveCentralEnvAPI(w, req, dc, auth, name, parts[1]) {
+				return
+			}
+			http.NotFound(w, req)
+			return
+		}
 		// Forwarding must be checked BEFORE the self-guard below: a local
 		// service that happens to share a name with an unrelated peer
 		// service (a common case — see buildManagedServices) must never be
@@ -751,6 +763,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				httpx.WriteErr(w, err)
 				return
 			}
+			if interceptCentralEnvReplace(w, req, dc, name, body, auditActor(auth, req)) {
+				return
+			}
 			if _, ok := onb.Get(name); ok {
 				if err := dc.replaceOnboarded(req.Context(), name, body, onb, routesConfigPath); err != nil {
 					writeServiceErr(w, err)
@@ -784,6 +799,9 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			}
 			if body.Image == "" {
 				http.Error(w, "image is required", http.StatusBadRequest)
+				return
+			}
+			if interceptCentralEnvReplace(w, req, dc, name, body, auditActor(auth, req)) {
 				return
 			}
 			if _, ok := onb.Get(name); ok {
@@ -954,7 +972,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				case errors.Is(err, errSpreadNotFound):
 					http.Error(w, "service not found", http.StatusNotFound)
 				default:
-					http.Error(w, err.Error(), http.StatusBadRequest)
+					writeServiceErr(w, err)
 				}
 				return
 			}
@@ -990,7 +1008,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				}
 				proxyRefresh(proxyURLFromEnv())
 			} else if err := dc.promoteCanary(req.Context(), name); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				writeServiceErr(w, err)
 				return
 			}
 			audit(req, sessionUser(info), "service.promote", name)
@@ -1855,6 +1873,15 @@ func sessionFromReq(auth *AuthStore, r *http.Request) *sessionInfo {
 	return info
 }
 
+// auditActor is the session user, or for a token-authenticated call the
+// principal the auth wrapper resolved.
+func auditActor(auth *AuthStore, r *http.Request) string {
+	if actor := sessionUser(sessionFromReq(auth, r)); actor != "" {
+		return actor
+	}
+	return principalFrom(r)
+}
+
 func sessionUser(info *sessionInfo) string {
 	if info == nil {
 		return ""
@@ -1873,6 +1900,10 @@ func writeServiceErr(w http.ResponseWriter, err error) {
 			"error":     err.Error(),
 			"conflicts": ce.Conflicts,
 		})
+		return
+	}
+	if isCentralEnvErr(err) {
+		writeCentralEnvErr(w, err)
 		return
 	}
 	http.Error(w, err.Error(), http.StatusBadRequest)

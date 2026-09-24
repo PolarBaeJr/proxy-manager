@@ -273,6 +273,31 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		},
 	})
 
+	s.Register(Tool{
+		Name:  "get_service_env",
+		Title: "Get a service's central env",
+		Description: "Show a centrally managed service's env by KEY NAME only (values are never returned): " +
+			"its origin host, current version, state, which keys are \"ref:NAME\" secret references, " +
+			"per-host override keys, each host's version and convergence, the last propagation job, and " +
+			"last_failure — the most recent propagation that did not converge (reverted, rolled back, " +
+			"partial, degraded), kept even after later jobs. " +
+			"managed=false means the service's env is still per-host.",
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+		}, "service"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "GET", "/api/services/"+url.PathEscape(name)+"/env", nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
 	if !allowWrites {
 		return
 	}
@@ -1078,4 +1103,176 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			return pretty(b), nil
 		},
 	})
+
+	// A central env edit restarts the service on EVERY host it runs on, so it
+	// needs the cross-host opt-in on top of MCP_ALLOW_WRITES.
+	if !allowPeerWrites {
+		return
+	}
+
+	s.Register(Tool{
+		Name:  "set_service_env",
+		Title: "Edit a service's central env",
+		Description: "Edit a centrally managed service's env (see get_service_env). The change lands on its " +
+			"origin as a new version and then rolls every replica on every host, health-gated one at " +
+			"a time: the origin first, then each peer. A failing origin reverts automatically; a " +
+			"failing peer rolls back just that host. Pass if_version from get_service_env — a stale " +
+			"one is refused with the current version. Credential-looking keys (TOKEN, SECRET, " +
+			"PASSWORD, KEY, ...) must be given as \"ref:NAME\", never a literal value. Returns key names " +
+			"and the new version only.",
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service":    prop("string", "Service name from list_services."),
+			"if_version": prop("number", "The version this edit is based on, from get_service_env."),
+			"request_id": prop("string", "Optional idempotency key. Reuse the same one to retry a call whose outcome was unknown (timeout) — it is applied at most once."),
+			"set": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description": "Keys to set (name -> value) for every host. For a real secret pass \"ref:NAME\"; " +
+					"the dashboard resolves NAME from the service's secrets file server-side.",
+			},
+			"unset": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"},
+				"description": "Key names to remove for every host.",
+			},
+			"host_overrides": map[string]any{
+				"type": "object",
+				"additionalProperties": map[string]any{
+					"type": "object", "additionalProperties": map[string]any{"type": "string"},
+				},
+				"description": "Per-host overrides: host identity -> {name -> value}, layered over the shared keys on that host only.",
+			},
+			"unset_host_overrides": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"description":          "Per-host override keys to drop: host identity -> [names].",
+			},
+		}, "service", "if_version"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			ifVersion, err := argInt(args, "if_version")
+			if err != nil {
+				return "", err
+			}
+			if ifVersion < 1 {
+				return "", fmt.Errorf("if_version must be >= 1")
+			}
+			requestID, err := argOptionalString(args, "request_id")
+			if err != nil {
+				return "", err
+			}
+			set, err := argEnvEdits(args, "set")
+			if err != nil {
+				return "", err
+			}
+			unset, err := argStringSlice(args, "unset")
+			if err != nil {
+				return "", err
+			}
+			overrides, err := argHostEnvEdits(args, "host_overrides")
+			if err != nil {
+				return "", err
+			}
+			unsetOverrides, err := argHostKeyLists(args, "unset_host_overrides")
+			if err != nil {
+				return "", err
+			}
+			if err := refuseLiteralCredentials(set); err != nil {
+				return "", err
+			}
+			for _, kv := range overrides {
+				if err := refuseLiteralCredentials(kv); err != nil {
+					return "", err
+				}
+			}
+			body := centralEnvSetRequest{RequestID: requestID, IfVersion: uint64(ifVersion), Set: set, Unset: unset,
+				HostOverrides: overrides, UnsetHostOverrides: unsetOverrides}
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/env", body)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
+		Name:        "sync_service_env",
+		Title:       "Re-sync a service's central env",
+		Description: "Re-run propagation of a centrally managed service's current env version to every host (a no-op for hosts already converged). Use after a host was down or a peer rolled back. Watch progress with get_service_env.",
+		Mutating:    true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+		}, "service"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/env/sync", nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+}
+
+// refuseLiteralCredentials rejects a literal value for any key that looks
+// like a credential: through MCP it would sit in the model's transcript.
+// Names only in the error.
+func refuseLiteralCredentials(edits map[string]string) error {
+	for k, v := range edits {
+		if strings.HasPrefix(v, secretRefPrefix) {
+			continue
+		}
+		if len(credentialEnvKeys([]string{k + "="})) > 0 {
+			return fmt.Errorf("%s looks like a credential — pass \"ref:NAME\" (resolved server-side from the service's secrets file), never the literal value", k)
+		}
+	}
+	return nil
+}
+
+// argHostEnvEdits reads {host: {name: value}}.
+func argHostEnvEdits(args map[string]any, key string) (map[string]map[string]string, error) {
+	v, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("argument %q must be an object", key)
+	}
+	out := make(map[string]map[string]string, len(m))
+	for host, raw := range m {
+		edits, err := argEnvEdits(map[string]any{key: raw}, key)
+		if err != nil {
+			return nil, fmt.Errorf("%s (host %s)", err, host)
+		}
+		out[strings.TrimSpace(host)] = edits
+	}
+	return out, nil
+}
+
+// argHostKeyLists reads {host: [name, ...]}.
+func argHostKeyLists(args map[string]any, key string) (map[string][]string, error) {
+	v, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("argument %q must be an object", key)
+	}
+	out := make(map[string][]string, len(m))
+	for host, raw := range m {
+		keys, err := argStringSlice(map[string]any{key: raw}, key)
+		if err != nil {
+			return nil, fmt.Errorf("%s (host %s)", err, host)
+		}
+		out[strings.TrimSpace(host)] = keys
+	}
+	return out, nil
 }

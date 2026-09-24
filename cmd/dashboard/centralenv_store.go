@@ -335,6 +335,74 @@ func (s *centralEnvStore) Revert(svc, reason string) (uint64, error) {
 	return next.Version, nil
 }
 
+// Services lists every service this store owns, broken records included —
+// the reconcile loop walks them (a broken one just fails its resolve).
+func (s *centralEnvStore) Services() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.items)+len(s.broken))
+	for svc := range s.items {
+		out = append(out, svc)
+	}
+	for svc := range s.broken {
+		out = append(out, svc)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Touch bumps svc's version without changing its content — for a "ref:NAME"
+// whose resolved value changed underneath an unchanged record (a rotated
+// secret): every replica must be recreated to pick it up, and only a version
+// move tells the other hosts so. The previous content is snapshotted like any
+// other change, so a Revert after a Touch is a content no-op.
+func (s *centralEnvStore) Touch(svc, actor string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken[svc] {
+		return 0, errCentralEnvBroken{Service: svc}
+	}
+	cur := s.items[svc]
+	if cur == nil {
+		return 0, errCentralEnvNotFound
+	}
+	next := copyCentralEnvRecord(cur)
+	next.Prev = &centralEnvSnapshot{Version: cur.Version, Base: copyStringMap(cur.Base), Overrides: copyOverrides(cur.Overrides)}
+	next.Version = cur.Version + 1
+	next.State = centralEnvStateActive
+	next.UpdatedAt = time.Now().Unix()
+	next.UpdatedBy = actor
+	if err := s.persist(&next); err != nil {
+		return 0, err
+	}
+	s.items[svc] = &next
+	return next.Version, nil
+}
+
+// MarkDegraded records that svc's propagation could not be brought back to a
+// healthy state (a revert that itself failed its health gate). Content and
+// version are untouched; the state is what stops any further automatic
+// attempt until an operator acts.
+func (s *centralEnvStore) MarkDegraded(svc string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broken[svc] {
+		return errCentralEnvBroken{Service: svc}
+	}
+	cur := s.items[svc]
+	if cur == nil {
+		return errCentralEnvNotFound
+	}
+	next := copyCentralEnvRecord(cur)
+	next.State = centralEnvStateDegraded
+	next.UpdatedAt = time.Now().Unix()
+	if err := s.persist(&next); err != nil {
+		return err
+	}
+	s.items[svc] = &next
+	return nil
+}
+
 // Delete drops svc's record, broken or not. A missing file is not an error.
 // Deleting is NOT by itself a way out for a service whose replicas still
 // carry pmgr.env.origin=<this host>: Resolve fails closed on that (labels

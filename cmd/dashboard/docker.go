@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,6 +66,9 @@ type dockerClient struct {
 	// builds a dockerClient by hand) — nil means env is cloned from a local
 	// template container, exactly as before the feature existed.
 	central centralEnvResolver
+	// claims serializes the auto-updater and central env propagation per
+	// service (rollingop.go).
+	claims serviceClaims
 }
 
 func newDockerClient() *dockerClient {
@@ -329,6 +333,16 @@ func (c *dockerClient) createContainer(ctx context.Context, name string, body cr
 	}
 	resp, err := c.do(ctx, "POST", "/containers/create?name="+url.QueryEscape(name), body)
 	if err != nil {
+		// Docker's create errors can quote the config they were given. For a
+		// replica built from a central env that would carry its values into
+		// every caller's error — API bodies, rolling-op/job status, the
+		// auto-updater's log, audit and block reason — so scrub here, once.
+		// Only the message is rewritten, and only when it quoted a value.
+		if body.Labels[labelEnvOrigin] != "" {
+			if msg := scrubEnvValues(err.Error(), body.Env); msg != err.Error() {
+				return "", errors.New(msg)
+			}
+		}
 		return "", err
 	}
 	var out struct {
@@ -858,6 +872,12 @@ func (c *dockerClient) cloneEnvAndSpec(ctx context.Context, name string, tpl doc
 			if err != nil {
 				return templateClone{}, fmt.Errorf("inspect template %s clone spec: %w", tpl.name(), err)
 			}
+			// A replica here whose template lost (or never had) its
+			// healthcheck — spread replicas that predate carrying it — takes
+			// the origin's, so every recreate on this host is health-gated.
+			if healthcheckMissing(clone.Healthcheck) && res.Healthcheck != nil {
+				clone.Healthcheck = copyHealthcheck(res.Healthcheck)
+			}
 			return templateClone{env: res.Env, labels: stampEnvLabels(tpl.Labels, res), clone: clone, managed: true, central: res}, nil
 		}
 	}
@@ -1159,6 +1179,14 @@ func (c *dockerClient) guardUnscalable(ctx context.Context, name string, desired
 }
 
 func (c *dockerClient) scaleService(ctx context.Context, name string, desired int) error {
+	return c.scaleServiceWithHealthcheck(ctx, name, desired, nil)
+}
+
+// scaleServiceWithHealthcheck is scaleService where a scaled-up replica
+// whose template has no healthcheck of its own takes fallbackHC instead — a
+// spread target's replicas get the origin's health gate even when the local
+// template predates carrying it.
+func (c *dockerClient) scaleServiceWithHealthcheck(ctx context.Context, name string, desired int, fallbackHC *healthcheckSpec) error {
 	if desired < 0 {
 		return fmt.Errorf("replicas must be >= 0")
 	}
@@ -1191,6 +1219,9 @@ func (c *dockerClient) scaleService(ctx context.Context, name string, desired in
 		tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
 		if err != nil {
 			return err
+		}
+		if healthcheckMissing(tc.clone.Healthcheck) && fallbackHC != nil {
+			tc.clone.Healthcheck = copyHealthcheck(fallbackHC)
 		}
 		for i := 0; i < desired-current; i++ {
 			n := nextReplicaIndex(existing, name) + i
@@ -1394,7 +1425,7 @@ type replaceTemplate struct {
 // an index still held by an unreleased container and 409 on create) — so
 // replaceService and replaceServiceRolling share one source of truth instead
 // of two copies that could drift.
-func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, req ReplaceServiceRequest) (*replaceTemplate, error) {
+func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, req ReplaceServiceRequest, opts rollingOpts) (*replaceTemplate, error) {
 	if req.Image == "" {
 		return nil, fmt.Errorf("image is required")
 	}
@@ -1403,6 +1434,20 @@ func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, 
 		return nil, err
 	}
 	existing := liveOnly(all)
+	if opts.pinnedEnv != nil {
+		// A central-env propagation roll only ever touches members created
+		// from central env (stamped pmgr.env.origin). An unstamped member —
+		// a compose original, most plausibly — is reported by the job and
+		// left alone: recreating it would strip its compose labels and let
+		// the next `docker compose up` start a duplicate beside it.
+		stamped := existing[:0:0]
+		for _, ct := range existing {
+			if ct.Labels[labelEnvOrigin] != "" {
+				stamped = append(stamped, ct)
+			}
+		}
+		existing = stamped
+	}
 	if len(existing) == 0 {
 		return nil, fmt.Errorf("service %q not found (no live replicas)", name)
 	}
@@ -1437,9 +1482,40 @@ func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, 
 	// against, not just as a fallback when no edits were sent. A centrally
 	// managed service takes its central env as-is and refuses per-request
 	// edits — those would silently fork one host's replicas from it.
-	tc, err := c.cloneEnvAndSpec(ctx, name, tpl)
-	if err != nil {
-		return nil, err
+	var tc templateClone
+	if opts.pinnedEnv != nil {
+		// A central-env propagation job (centralenv_sync.go) rolls one exact
+		// version it resolved up front. Deliberately NOT cloneEnvAndSpec:
+		// Resolve can reach the origin and rotate this host's cache mid-job,
+		// which would both change what's being rolled and destroy the
+		// rollback target the job captured.
+		if len(req.Env) > 0 {
+			return nil, errEnvCentrallyManaged{Service: name, Hint: "a pinned central env rollout takes no env edits"}
+		}
+		clone, err := c.inspectCloneSpec(ctx, tpl.ID)
+		if err != nil {
+			return nil, fmt.Errorf("inspect template clone spec: %w", err)
+		}
+		if healthcheckMissing(clone.Healthcheck) && opts.pinnedHealthcheck != nil {
+			clone.Healthcheck = copyHealthcheck(opts.pinnedHealthcheck)
+		}
+		labels := make(map[string]string, len(tpl.Labels)+len(opts.pinnedLabels))
+		for k, v := range tpl.Labels {
+			if strings.HasPrefix(k, composeLabelPrefix) {
+				continue
+			}
+			labels[k] = v
+		}
+		for k, v := range opts.pinnedLabels {
+			labels[k] = v
+		}
+		tc = templateClone{env: opts.pinnedEnv, labels: labels, clone: clone, managed: true}
+	} else {
+		var err error
+		tc, err = c.cloneEnvAndSpec(ctx, name, tpl)
+		if err != nil {
+			return nil, err
+		}
 	}
 	env := tc.env
 	if tc.managed {
@@ -1458,7 +1534,9 @@ func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, 
 	}
 	clone := tc.clone
 
-	c.pullImage(ctx, req.Image)
+	if !opts.skipPull {
+		c.pullImage(ctx, req.Image)
+	}
 
 	// Stamp the new containers' labels with the previous image for one-click rollback.
 	newLabels := map[string]string{}
@@ -1497,7 +1575,7 @@ func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, 
 }
 
 func (c *dockerClient) replaceService(ctx context.Context, name string, req ReplaceServiceRequest) error {
-	tpl, err := c.prepareReplaceTemplate(ctx, name, req)
+	tpl, err := c.prepareReplaceTemplate(ctx, name, req, rollingOpts{})
 	if err != nil {
 		return err
 	}
@@ -1637,9 +1715,12 @@ func (c *dockerClient) waitReplicaReady(ctx context.Context, name, id string) er
 // swap sees the real total instead of a zero value indistinguishable from
 // "nothing planned"), then again after each replica is confirmed healthy and
 // swapped in, this time with that replica's container name and a short
-// verdict string.
-func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, req ReplaceServiceRequest, progress func(done, total int, replicaName, verdict string)) error {
-	tpl, err := c.prepareReplaceTemplate(ctx, name, req)
+// verdict string. opts is zero for every operator-initiated rolling replace;
+// the central-env propagation job pins env/labels and asks for a replica
+// that fails its health gate to be removed rather than left running (see
+// rollingOpts). A health-gate failure is returned as errReplicaGateFailed.
+func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, req ReplaceServiceRequest, progress func(done, total int, replicaName, verdict string), opts rollingOpts) error {
+	tpl, err := c.prepareReplaceTemplate(ctx, name, req, opts)
 	if err != nil {
 		return err
 	}
@@ -1668,7 +1749,15 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 			return fmt.Errorf("replaced %d/%d replicas, then failed on %s: start: %w", i, total, cname, err)
 		}
 		if err := c.waitReplicaReady(ctx, name, id); err != nil {
-			return fmt.Errorf("replaced %d/%d replicas, then failed on %s: %w", i, total, cname, err)
+			if opts.removeOnGateFailure {
+				// Its predecessor is still running and serving — the failed
+				// new one would only add a broken backend to the pool.
+				_ = c.stopContainer(ctx, id)
+				if rmErr := c.removeContainer(ctx, id); rmErr != nil {
+					log.Printf("rolling-replace %s: failed to remove unhealthy new %s: %v", name, cname, rmErr)
+				}
+			}
+			return errReplicaGateFailed{err: fmt.Errorf("replaced %d/%d replicas, then failed on %s: %w", i, total, cname, err)}
 		}
 
 		_ = c.stopContainer(ctx, old.ID)
@@ -2143,6 +2232,21 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 	live := liveOnly(all)
 	if len(canary) == 0 {
 		return fmt.Errorf("no canary to promote for %q", name)
+	}
+	// A canary is health-tested on the central env version it was staged
+	// with; promoting it after that version moved on would put an env
+	// nothing has health-tested into live. Restage instead. A version
+	// unknown here (managed only by a replica's label, nothing stored or
+	// cached) falls through: cloneEnvAndSpec below fails closed for exactly
+	// that case with the accurate error.
+	if c.central != nil && c.central.Managed(name, canary[0].Labels) {
+		if cur, ok := c.central.Version(name); ok {
+			for _, ct := range canary {
+				if ct.Labels[labelEnvVersion] != strconv.FormatUint(cur, 10) {
+					return errEnvCentrallyManaged{Service: name, Hint: fmt.Sprintf("its canary was staged on central env v%s but the current version is v%d — discard and restage it", ct.Labels[labelEnvVersion], cur)}
+				}
+			}
+		}
 	}
 	// Health-gate BEFORE any recreate: once a canary container is recreated
 	// without labelCanary below, it can no longer be found by anything that

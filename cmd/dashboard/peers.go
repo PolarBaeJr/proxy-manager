@@ -792,6 +792,10 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 				http.Error(w, fmt.Sprintf("%q is an onboarded service — rolling replace only supports label-managed services", name), http.StatusBadRequest)
 				return
 			}
+			if err := refuseManagedRollingEnv(r.Context(), dc, name, body); err != nil {
+				writeServiceErr(w, err)
+				return
+			}
 			if err := ensureRollingReplaceCapacity(r.Context(), dc, registry, secret, name); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -844,7 +848,7 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 				}
 				proxyRefresh(proxyURL)
 			} else if err := dc.promoteCanary(r.Context(), name); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				writeServiceErr(w, err)
 				return
 			}
 			audit(r, "peer-mesh", "service.promote", name)
@@ -922,7 +926,7 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 				case errors.Is(err, errSpreadNotFound):
 					http.Error(w, "service not found", http.StatusNotFound)
 				default:
-					http.Error(w, err.Error(), http.StatusBadRequest)
+					writeServiceErr(w, err)
 				}
 				return
 			}

@@ -28,13 +28,32 @@ type cenvFakeDocker struct {
 	inspect  map[string]cenvInspect
 	creates  []cenvCreate
 	connects []string
+	// unhealthy, when set, marks a created container "(unhealthy)" in its
+	// list Status if it returns true for the create body — how the
+	// propagation tests fail a health gate.
+	unhealthy func(body createBody) bool
+	// onCreate, when set, is called (outside the lock) with every created
+	// container's name — the mesh tests' cross-host ordering log.
+	onCreate func(name string)
+	// createErr, when set and returning non-empty, fails a create with that
+	// text as Docker's error body — how the leak test makes a Docker error
+	// echo env.
+	createErr func(body createBody) string
+	// imageID is what the (single) tag resolves to locally: stamped on
+	// every created container and served by /images/{ref}/json. pullTo,
+	// when set, is what a pull moves it to. pulls counts pulls.
+	imageID string
+	pullTo  string
+	pulls   int
 }
 
 type cenvInspect struct {
-	env      []string
-	health   *healthcheckSpec
-	edge     []string
-	networks map[string][]string
+	// configImage overrides Config.Image (default: the list Image).
+	configImage string
+	env         []string
+	health      *healthcheckSpec
+	edge        []string
+	networks    map[string][]string
 }
 
 type cenvCreate struct {
@@ -125,7 +144,7 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 		p := r.URL.Path
 		switch {
 		case r.Method == http.MethodGet && strings.HasSuffix(p, "/containers/json"):
-			json.NewEncoder(w).Encode(f.list())
+			json.NewEncoder(w).Encode(filterByLabels(f.list(), r.URL.Query().Get("filters")))
 		case r.Method == http.MethodPost && strings.HasSuffix(p, "/containers/create"):
 			var body createBody
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -133,13 +152,28 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 			}
 			name := r.URL.Query().Get("name")
 			f.mu.Lock()
+			if f.createErr != nil {
+				if msg := f.createErr(body); msg != "" {
+					f.mu.Unlock()
+					http.Error(w, msg, http.StatusInternalServerError)
+					return
+				}
+			}
 			f.seq++
 			id := fmt.Sprintf("gen-%d", f.seq)
 			aliases := body.NetworkingConfig.EndpointsConfig[managedNetwork].Aliases
 			f.creates = append(f.creates, cenvCreate{name: name, body: body, aliases: aliases})
-			f.items[id] = dockerContainer{ID: id, Names: []string{"/" + name}, Image: body.Image, State: "running", Labels: body.Labels}
+			ct := dockerContainer{ID: id, Names: []string{"/" + name}, Image: body.Image, ImageID: f.imageID, State: "running", Status: "Up 1 second", Labels: body.Labels}
+			if f.unhealthy != nil && f.unhealthy(body) {
+				ct.Status = "Up 1 second (unhealthy)"
+			}
+			f.items[id] = ct
 			f.inspect[id] = cenvInspect{env: body.Env, health: body.Healthcheck, edge: aliases, networks: map[string][]string{}}
+			onCreate := f.onCreate
 			f.mu.Unlock()
+			if onCreate != nil {
+				onCreate(name)
+			}
 			json.NewEncoder(w).Encode(map[string]string{"Id": id})
 		case r.Method == http.MethodPost && strings.Contains(p, "/networks/") && strings.HasSuffix(p, "/connect"):
 			var body struct {
@@ -184,6 +218,10 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 				http.Error(w, "no such container", http.StatusNotFound)
 				return
 			}
+			configImage := ct.Image
+			if in.configImage != "" {
+				configImage = in.configImage
+			}
 			nets := map[string]any{managedNetwork: map[string]any{"Aliases": in.edge}}
 			for n, a := range in.networks {
 				nets[n] = map[string]any{"Aliases": a}
@@ -192,16 +230,54 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 				"Name":            "/" + ct.name(),
 				"Image":           "sha256:abc",
 				"RestartCount":    0,
-				"Config":          map[string]any{"Env": in.env, "Healthcheck": in.health},
+				"Config":          map[string]any{"Env": in.env, "Healthcheck": in.health, "Image": configImage},
 				"HostConfig":      map[string]any{"Mounts": []mountSpec{}},
 				"NetworkSettings": map[string]any{"Networks": nets},
 			})
 		case strings.Contains(p, "/images/create"):
+			f.mu.Lock()
+			f.pulls++
+			if f.pullTo != "" {
+				f.imageID = f.pullTo
+			}
+			f.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.Contains(p, "/images/") && strings.HasSuffix(p, "/json"):
+			f.mu.Lock()
+			id := f.imageID
+			f.mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]string{"Id": id})
 		default:
 			w.Write([]byte("{}"))
 		}
 	}))
+}
+
+// filterByLabels applies a Docker list filter's "label" clauses (key or
+// key=value) the way the daemon does; other filter kinds are ignored.
+func filterByLabels(in []dockerContainer, raw string) []dockerContainer {
+	var filters struct {
+		Label []string `json:"label"`
+	}
+	if raw == "" || json.Unmarshal([]byte(raw), &filters) != nil || len(filters.Label) == 0 {
+		return in
+	}
+	out := []dockerContainer{}
+	for _, c := range in {
+		ok := true
+		for _, l := range filters.Label {
+			k, v, hasV := strings.Cut(l, "=")
+			got, present := c.Labels[k]
+			if !present || (hasV && got != v) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // withFastRecreate zeroes the settle/health delays for the duration of a
@@ -346,7 +422,9 @@ func TestCreatePathsManagedUseCentralEnv(t *testing.T) {
 			f := newCenvFakeDocker()
 			f.seedTemplate(nil)
 			if p.canary {
-				f.seedCanary("ghcr.io/org/app:v2", nil)
+				// Staged on the current central version — promoteCanary
+				// refuses a canary staged on any other.
+				f.seedCanary("ghcr.io/org/app:v2", map[string]string{labelEnvOrigin: "dashboard-a", labelEnvVersion: "1"})
 			}
 			dc := f.client(t)
 			dc.central = cenvOrigin(t)
@@ -462,7 +540,7 @@ func TestCreatePathsManagedRefuseEnvEdits(t *testing.T) {
 	runs := map[string]func(dc *dockerClient) error{
 		"replaceService": func(dc *dockerClient) error { return dc.replaceService(context.Background(), "app", edit) },
 		"replaceServiceRolling": func(dc *dockerClient) error {
-			return dc.replaceServiceRolling(context.Background(), "app", edit, nil)
+			return dc.replaceServiceRolling(context.Background(), "app", edit, nil, rollingOpts{})
 		},
 		"createCanaryReplicas": func(dc *dockerClient) error { return dc.createCanaryReplicas(context.Background(), "app", edit, 1) },
 		"stageCanary":          func(dc *dockerClient) error { return dc.stageCanary(context.Background(), "app", edit) },
@@ -527,7 +605,7 @@ func TestSpreadManagedShipsTargetEnvAndStamps(t *testing.T) {
 	dc := origin.client(t)
 	dc.central = cenvOrigin(t)
 
-	rec := postSpread(t, dc, srv, `{"target":"dashboard-b","replicas":2}`)
+	rec := postCentralSpread(t, dc, srv, `{"target":"dashboard-b","replicas":2}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
 	}
@@ -574,9 +652,22 @@ func TestSpreadManagedRefusals(t *testing.T) {
 		origin.seedTemplate(nil)
 		dc := origin.client(t)
 		dc.central = cenvOrigin(t)
-		rec := postSpread(t, dc, srv, `{"target":"dashboard-b"}`)
+		rec := postCentralSpread(t, dc, srv, `{"target":"dashboard-b"}`)
 		if rec.Code == http.StatusOK || len(tf.createsSnapshot()) != 0 {
 			t.Fatalf("status = %d, creates = %d", rec.Code, len(tf.createsSnapshot()))
+		}
+	})
+	t.Run("target-not-advertising-central-env", func(t *testing.T) {
+		// The target has central env on, but its handshake didn't say so
+		// (an older dashboard would silently drop the provenance).
+		srv, tf := newCentralSpreadTarget(t, newTestCentralEnv(t, "dashboard-b"))
+		origin := newCenvFakeDocker()
+		origin.seedTemplate(nil)
+		dc := origin.client(t)
+		dc.central = cenvOrigin(t)
+		rec := postSpread(t, dc, srv, `{"target":"dashboard-b"}`)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), centralEnvFeature) || len(tf.createsSnapshot()) != 0 {
+			t.Fatalf("status = %d body %s creates %d", rec.Code, rec.Body.String(), len(tf.createsSnapshot()))
 		}
 	})
 	t.Run("non-origin-spreader", func(t *testing.T) {
@@ -587,7 +678,7 @@ func TestSpreadManagedRefusals(t *testing.T) {
 		ce := newTestCentralEnv(t, "dashboard-a")
 		ce.cache.Put("app", "dashboard-z", 2, []string{"A=z"})
 		dc.central = ce
-		rec := postSpread(t, dc, srv, `{"target":"dashboard-b"}`)
+		rec := postCentralSpread(t, dc, srv, `{"target":"dashboard-b"}`)
 		if rec.Code == http.StatusOK || !strings.Contains(rec.Body.String(), "centrally managed") || len(tf.createsSnapshot()) != 0 {
 			t.Fatalf("status = %d body %s", rec.Code, rec.Body.String())
 		}
@@ -600,7 +691,7 @@ func TestSpreadManagedRefusals(t *testing.T) {
 		origin.seedTemplate(nil)
 		dc := origin.client(t)
 		dc.central = cenvOrigin(t)
-		rec := postSpread(t, dc, srv, `{"target":"dashboard-b"}`)
+		rec := postCentralSpread(t, dc, srv, `{"target":"dashboard-b"}`)
 		if rec.Code == http.StatusOK || len(tf.createsSnapshot()) != 0 {
 			t.Fatalf("status = %d, creates = %d", rec.Code, len(tf.createsSnapshot()))
 		}

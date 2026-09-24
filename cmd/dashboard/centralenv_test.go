@@ -146,7 +146,7 @@ func TestCentralEnvResolveOrigin(t *testing.T) {
 	if err != nil || !owned || !reflect.DeepEqual(peer.Env, []string{"A=peer", "T=tok"}) {
 		t.Fatalf("ResolveForPeer = %+v, %v, %v", peer, owned, err)
 	}
-	if err := ce.Accept("app", "dashboard-b", 9, []string{"A=x"}); err == nil {
+	if err := ce.Accept("app", "dashboard-b", 9, []string{"A=x"}, nil); err == nil {
 		t.Fatal("origin accepted a peer-supplied copy of its own service")
 	}
 }
@@ -154,9 +154,9 @@ func TestCentralEnvResolveOrigin(t *testing.T) {
 func TestCentralEnvResolveNonOriginFetchOK(t *testing.T) {
 	ce := newTestCentralEnv(t, "dashboard-b")
 	var gotFor string
-	ce.fetchFromOrigin = func(_ context.Context, origin, svc, forIdentity string) ([]string, uint64, error) {
+	ce.fetchFromOrigin = func(_ context.Context, origin, svc, forIdentity string) (centralEnvFetched, error) {
 		gotFor = origin + "/" + svc + "/" + forIdentity
-		return []string{"A=fresh"}, 4, nil
+		return centralEnvFetched{Env: []string{"A=fresh"}, Version: 4}, nil
 	}
 	res, managed, err := ce.Resolve(context.Background(), "app", map[string]string{labelEnvOrigin: "dashboard-a"})
 	if err != nil || !managed || res.Stale || res.Version != 4 || !reflect.DeepEqual(res.Env, []string{"A=fresh"}) {
@@ -173,8 +173,8 @@ func TestCentralEnvResolveNonOriginFetchOK(t *testing.T) {
 func TestCentralEnvResolveFetchFailUsesStaleCache(t *testing.T) {
 	ce := newTestCentralEnv(t, "dashboard-b")
 	ce.cache.Put("app", "dashboard-a", 3, []string{"A=cached"})
-	ce.fetchFromOrigin = func(context.Context, string, string, string) ([]string, uint64, error) {
-		return nil, 0, errors.New("dial tcp: connection refused")
+	ce.fetchFromOrigin = func(context.Context, string, string, string) (centralEnvFetched, error) {
+		return centralEnvFetched{}, errors.New("dial tcp: connection refused")
 	}
 	// No origin label (pre-stamp replica): the cache alone marks it managed.
 	res, managed, err := ce.Resolve(context.Background(), "app", nil)
@@ -190,8 +190,8 @@ func TestCentralEnvResolveFetchFailUsesStaleCache(t *testing.T) {
 		t.Fatalf("nil fetcher Resolve = %+v, %v", res, err)
 	}
 	// An origin answering with an OLDER version than cached doesn't roll back.
-	ce.fetchFromOrigin = func(context.Context, string, string, string) ([]string, uint64, error) {
-		return []string{"A=old"}, 1, nil
+	ce.fetchFromOrigin = func(context.Context, string, string, string) (centralEnvFetched, error) {
+		return centralEnvFetched{Env: []string{"A=old"}, Version: 1}, nil
 	}
 	if res, _, err := ce.Resolve(context.Background(), "app", nil); err != nil || res.Version != 3 {
 		t.Fatalf("older fetch Resolve = %+v, %v", res, err)
@@ -282,13 +282,13 @@ func TestCentralEnvNeverLeaksValues(t *testing.T) {
 	// Non-origin: stale warning and older-version cache refusal.
 	peer := newTestCentralEnv(t, "dashboard-b")
 	peer.cache.Put("app", "dashboard-a", 5, []string{"P=" + sentinel})
-	peer.fetchFromOrigin = func(context.Context, string, string, string) ([]string, uint64, error) {
-		return nil, 0, errors.New("upstream said " + sentinel)
+	peer.fetchFromOrigin = func(context.Context, string, string, string) (centralEnvFetched, error) {
+		return centralEnvFetched{}, errors.New("upstream said " + sentinel)
 	}
 	res, _, err := peer.Resolve(context.Background(), "app", nil)
 	collect("stale", err)
 	outputs = append(outputs, "warning: "+res.Warning)
-	collect("older", peer.Accept("app", "dashboard-a", 1, []string{"P=" + sentinel}))
+	collect("older", peer.Accept("app", "dashboard-a", 1, []string{"P=" + sentinel}, nil))
 	collect("unavailable", func() error {
 		_, _, err := peer.Resolve(context.Background(), "other", map[string]string{labelEnvOrigin: "dashboard-a"})
 		return err
@@ -307,6 +307,9 @@ func TestCentralEnvNeverLeaksValues(t *testing.T) {
 	peerDC := f.client(t)
 	peerDC.central = peer
 	collect("peer scale", peerDC.scaleService(context.Background(), "app", 3))
+
+	// PR-B: peer endpoints, propagation, reconcile, API and MCP.
+	outputs = append(outputs, centralEnvPropagationOutputs(t, sentinel)...)
 
 	logMu.Lock()
 	outputs = append(outputs, "log: "+logBuf.String())

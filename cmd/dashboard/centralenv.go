@@ -42,6 +42,20 @@ type centralEnvResult struct {
 	Origin  string
 	Stale   bool
 	Warning string
+	// Healthcheck is the origin template's healthcheck, set only on a
+	// non-origin host (fetched or cached). cloneEnvAndSpec uses it when the
+	// local template has none, so a replica recreated here is health-gated
+	// the same as the origin's.
+	Healthcheck *healthcheckSpec
+}
+
+// centralEnvFetched is one answer from the origin's
+// GET /peer/central-env/{svc}: svc's env resolved for the asking host, the
+// version it was built from, and the origin template's healthcheck.
+type centralEnvFetched struct {
+	Env         []string
+	Version     uint64
+	Healthcheck *healthcheckSpec
 }
 
 // centralEnvResolver is what dockerClient's create paths and the spread
@@ -53,7 +67,10 @@ type centralEnvResolver interface {
 	Resolve(ctx context.Context, svc string, existingLabels map[string]string) (centralEnvResult, bool, error)
 	Managed(svc string, existingLabels map[string]string) bool
 	ResolveForPeer(svc, identity string) (centralEnvResult, bool, error)
-	Accept(svc, origin string, version uint64, env []string) error
+	Accept(svc, origin string, version uint64, env []string, hc *healthcheckSpec) error
+	// Version is svc's current central version as known on this host
+	// (store on the origin, cache elsewhere) — network-free.
+	Version(svc string) (uint64, bool)
 }
 
 // errCentralEnvUnavailable: svc is centrally managed from origin, but this
@@ -66,6 +83,19 @@ type errCentralEnvUnavailable struct {
 
 func (e errCentralEnvUnavailable) Error() string {
 	return fmt.Sprintf("central env for %q is unavailable (origin %s unreachable and nothing cached) — refusing to create replicas from local env", e.Service, e.Origin)
+}
+
+// errCentralEnvFailedHere: the only env this host has for svc is a version
+// that failed its health gate here, with nothing earlier to fall back to.
+// Creates are refused until the origin publishes a newer version (or a
+// sync retries it).
+type errCentralEnvFailedHere struct {
+	Service string
+	Version uint64
+}
+
+func (e errCentralEnvFailedHere) Error() string {
+	return fmt.Sprintf("central env for %q: version %d failed its health gate on this host and there is no earlier version to use — refusing to create replicas until the origin publishes a newer one", e.Service, e.Version)
 }
 
 // errEnvCentrallyManaged refuses an operation that would bypass a service's
@@ -87,9 +117,13 @@ type centralEnv struct {
 	cache    *centralEnvCache
 	secrets  *secretsStore
 	// fetchFromOrigin asks the origin dashboard for svc's env as resolved
-	// for forIdentity. Nil (PR-A: not wired yet) behaves exactly like an
-	// unreachable origin.
-	fetchFromOrigin func(ctx context.Context, origin, svc, forIdentity string) (env []string, version uint64, err error)
+	// for forIdentity (main.go wires newOriginFetcher). Nil behaves exactly
+	// like an unreachable origin.
+	fetchFromOrigin func(ctx context.Context, origin, svc, forIdentity string) (centralEnvFetched, error)
+	// sync propagates a changed env to every replica on every host
+	// (centralenv_sync.go). Nil when nothing wired it (tests that only
+	// exercise resolution) — the API and peer handlers then refuse.
+	sync *envSyncManager
 }
 
 func (ce *centralEnv) Enabled() bool { return ce != nil && ce.enabled }
@@ -137,24 +171,40 @@ func (ce *centralEnv) Resolve(ctx context.Context, svc string, existingLabels ma
 	}
 
 	if ce.fetchFromOrigin != nil {
-		env, version, err := ce.fetchFromOrigin(ctx, origin, svc, ce.identity)
+		got, err := ce.fetchFromOrigin(ctx, origin, svc, ce.identity)
 		if err == nil {
-			putErr := ce.cache.Put(svc, origin, version, env)
+			putErr := ce.cache.PutWithHealthcheck(svc, origin, got.Version, got.Env, got.Healthcheck)
+			hc := got.Healthcheck
+			if hc == nil && hasCache {
+				hc = cached.Healthcheck
+			}
 			var older errCentralEnvCacheOlder
+			var failed errCentralEnvCacheFailed
 			switch {
 			case putErr == nil:
-				return centralEnvResult{Env: env, Version: version, Origin: origin}, true, nil
+				return centralEnvResult{Env: got.Env, Version: got.Version, Origin: origin, Healthcheck: hc}, true, nil
+			case errors.As(putErr, &failed):
+				// The origin's current version already failed here — never
+				// re-create it; the rolled-back copy below is the one to use.
+				if hasCache && cached.usable() {
+					return centralEnvResult{Env: cached.Env, Version: cached.Version, Origin: origin, Healthcheck: cached.Healthcheck,
+						Warning: fmt.Sprintf("central env for %q: version %d failed its health gate on this host — using version %d until the origin publishes a newer one", svc, got.Version, cached.Version)}, true, nil
+				}
+				return centralEnvResult{}, true, errCentralEnvFailedHere{Service: svc, Version: got.Version}
 			case !errors.As(putErr, &older):
-				return centralEnvResult{Env: env, Version: version, Origin: origin,
-					Warning: fmt.Sprintf("central env for %q: fetched version %d from %s but could not cache it", svc, version, origin)}, true, nil
+				return centralEnvResult{Env: got.Env, Version: got.Version, Origin: origin, Healthcheck: hc,
+					Warning: fmt.Sprintf("central env for %q: fetched version %d from %s but could not cache it", svc, got.Version, origin)}, true, nil
 			}
 			// An origin answering with an older version than we already
 			// hold falls through to the cached copy below.
 		}
 	}
+	if hasCache && !cached.usable() {
+		return centralEnvResult{}, true, errCentralEnvFailedHere{Service: svc, Version: cached.Version}
+	}
 	if hasCache {
 		return centralEnvResult{
-			Env: cached.Env, Version: cached.Version, Origin: origin, Stale: true,
+			Env: cached.Env, Version: cached.Version, Origin: origin, Stale: true, Healthcheck: cached.Healthcheck,
 			Warning: fmt.Sprintf("central env for %q: origin %s unreachable — using cached version %d fetched %s",
 				svc, origin, cached.Version, time.Unix(cached.FetchedAt, 0).UTC().Format(time.RFC3339)),
 		}, true, nil
@@ -180,14 +230,34 @@ func (ce *centralEnv) ResolveForPeer(svc, identity string) (centralEnvResult, bo
 // Accept caches an env the origin shipped to this host (spread's seed). It
 // refuses for a service this host is itself the origin of — a peer must
 // never overwrite the authoritative copy through the cache.
-func (ce *centralEnv) Accept(svc, origin string, version uint64, env []string) error {
+func (ce *centralEnv) Accept(svc, origin string, version uint64, env []string, hc *healthcheckSpec) error {
 	if !ce.Enabled() {
 		return fmt.Errorf("central env is not enabled on this host")
 	}
 	if origin == ce.identity || ce.store.Has(svc) {
 		return fmt.Errorf("this host is the central env origin for %q — refusing a peer-supplied copy", svc)
 	}
-	return ce.cache.Put(svc, origin, version, env)
+	return ce.cache.PutWithHealthcheck(svc, origin, version, env, hc)
+}
+
+func (ce *centralEnv) Version(svc string) (uint64, bool) {
+	if !ce.Enabled() {
+		return 0, false
+	}
+	if rec, ok, err := ce.store.Get(svc); ok && err == nil {
+		return rec.Version, true
+	}
+	if cached, ok := ce.cache.Get(svc); ok {
+		return cached.Version, true
+	}
+	return 0, false
+}
+
+// healthcheckMissing reports whether a template carries no usable
+// healthcheck of its own — nil or an empty Test. An explicit ["NONE"] is a
+// deliberate choice and counts as present.
+func healthcheckMissing(h *healthcheckSpec) bool {
+	return h == nil || len(h.Test) == 0
 }
 
 // stampEnvLabels returns a COPY of src with the central-env provenance

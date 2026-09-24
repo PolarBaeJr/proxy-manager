@@ -1989,6 +1989,7 @@ async function renderServices() {
              // starts one, and re-painted here after every re-render so an
              // in-flight or failed job never silently disappears.
              +    '<div data-rollout-key="' + esc(mKey) + '"></div>'
+             +    (unitCentralOrigin(agg) ? '<div class="meta" style="padding:0 0 10px" data-central-svc="' + sn + '" data-central-origin="' + esc(unitCentralOrigin(agg)) + '"></div>' : '')
              +  '</div>';
       } else {
         const replicaSummary = '<span class="meta" style="margin-left:auto;display:flex;align-items:center;gap:8px">'
@@ -2051,6 +2052,56 @@ async function renderServices() {
   // the rest of the old DOM — repaint any in-flight (or still-unacknowledged
   // failed) unit rollout so it doesn't silently vanish on this tick's re-render.
   for (const ukey in _rollingJobs) paintUnitJobStatus(ukey);
+  paintCentralEnvLines().catch(() => {});
+}
+
+// ---- Central env status line ----
+// One GET /api/services/{svc}/env per managed merged card (names and
+// versions only — the API never returns a value), cached briefly so the 5s
+// re-render doesn't hammer every host's status endpoint. /api/services/ is
+// elevated-only, so a non-elevated viewer just sees the origin from the
+// replica label — and this uses a plain fetch, never api(), so a lapsed
+// session can't pop a sign-in/2FA dialog on every re-render.
+let _centralEnvView = {};
+async function paintCentralEnvLines() {
+  const els = document.querySelectorAll('[data-central-svc]');
+  for (const el of els) {
+    const svc = el.dataset.centralSvc;
+    if (!isElevated()) {
+      el.innerHTML = I.layers + 'Central env · origin <b>' + esc(el.dataset.centralOrigin || '') + '</b>';
+      continue;
+    }
+    let c = _centralEnvView[svc];
+    if (!c || Date.now() - c.at > 10000) {
+      try {
+        const r = await fetch('/api/services/' + encodeURIComponent(svc) + '/env');
+        c = r.ok ? { at: Date.now(), view: await r.json() } : { at: Date.now(), error: 'status ' + r.status };
+      } catch (e) {
+        c = { at: Date.now(), error: e.message };
+      }
+      _centralEnvView[svc] = c;
+    }
+    el.innerHTML = centralEnvLineHTML(c);
+  }
+}
+function centralEnvLineHTML(c) {
+  if (c.error) return '<span class="pill warn">' + I.alert + 'Central env status unavailable: ' + esc(c.error) + '</span>';
+  const v = c.view;
+  if (!v || !v.managed) return '';
+  const hosts = v.hosts || [];
+  const conv = hosts.filter(h => h.converged).length;
+  let html = I.layers + 'Central env · origin <b>' + esc(v.origin) + '</b> · v' + v.version + ' · converged ' + conv + '/' + hosts.length;
+  if (v.job && (v.job.status === 'running' || v.job.status === 'pending')) html += ' <span class="pill muted">syncing</span>';
+  if (v.stale) html += ' <span class="pill warn">stale</span>';
+  if (v.job && v.job.status === 'partial') html += ' <span class="pill warn">partial</span>';
+  if (v.state === 'degraded') html += ' <span class="pill bad">degraded</span>';
+  const lf = v.last_failure;
+  if (lf) {
+    const cls = (lf.status === 'failed_reverted' || lf.status === 'degraded') ? 'bad' : 'warn';
+    html += ' <span class="pill ' + cls + '" title="' + esc(lf.at || '') + '">last failure: v' + lf.version + ' ' + esc(lf.status) + '</span>';
+  }
+  for (const w of (v.warnings || [])) html += '<div class="meta" style="color:var(--yellow)">' + esc(w) + '</div>';
+  return html;
 }
 
 // Cache last per-host stats so re-render uses prior data instantly — kills
@@ -2689,10 +2740,16 @@ async function applyUnitTarget(wrap, endpoint, key, n, verb) {
 // a canary, not a replace) so it always fans out over the existing
 // synchronous /stage — see submitUnitReplace/fanOutHosts/pullUpdateUnit for
 // the actual dispatch logic this only wires buttons to.
+// unitCentralOrigin is the pmgr.env.origin any replica in the unit carries
+// ('' when its env is still per-host) — a centrally managed service's Add
+// env becomes ONE edit of its central env instead of a per-host fan-out.
+function unitCentralOrigin(agg) {
+  return agg.instances.map(i => (i.s.labels || {})['pmgr.env.origin']).find(Boolean) || '';
+}
 function unitActionButtons(agg, svcName) {
   const dis = unitWriteAttr(agg);
   const lkHtml = unitWriteLk(agg);
-  const hostsAttr = ' data-unit-hosts="' + esc(JSON.stringify(unitHostList(agg))) + '" data-svc-name="' + esc(svcName) + '" data-current-image="' + esc(agg.host1.s.image || '') + '"';
+  const hostsAttr = ' data-unit-hosts="' + esc(JSON.stringify(unitHostList(agg))) + '" data-svc-name="' + esc(svcName) + '" data-current-image="' + esc(agg.host1.s.image || '') + '" data-central-origin="' + esc(unitCentralOrigin(agg)) + '"';
   let html = '';
   if (agg.anyUpdateAvailable) {
     html += '<button class="btn primary" ' + dis + hostsAttr + ' onclick="pullUpdateUnit(this)">' + I.arrowup + 'Pull update + restart' + lkHtml + '</button>';
@@ -3003,6 +3060,7 @@ function openAddEnvUnit(btn) {
   clearEnvChoices();
   f.dataset.mode = 'env';
   f.dataset.host = '';
+  f.dataset.central = btn.dataset.centralOrigin || '';
   f.dataset.unitHosts = btn.dataset.unitHosts;
   f.dataset.unitKey = mergeKeyFromForm(name, btn);
   setReplaceDialogMode('env', name);
@@ -3018,6 +3076,7 @@ function openReplaceUnit(btn) {
   clearEnvChoices();
   f.dataset.mode = 'replace';
   f.dataset.host = '';
+  f.dataset.central = '';
   f.dataset.unitHosts = btn.dataset.unitHosts;
   f.dataset.unitKey = mergeKeyFromForm(name, btn);
   setReplaceDialogMode('replace', name);
@@ -3033,6 +3092,7 @@ function openStageUnit(btn) {
   clearEnvChoices();
   f.dataset.mode = 'stage';
   f.dataset.host = '';
+  f.dataset.central = '';
   f.dataset.unitHosts = btn.dataset.unitHosts;
   f.dataset.unitKey = mergeKeyFromForm(name, btn);
   setReplaceDialogMode('stage', name);
@@ -3134,6 +3194,10 @@ async function fanOutHosts(svcName, hostsList, mode, buildBody) {
 //     last_error), which paintUnitJobStatus keeps visible rather than
 //     silently clearing.
 async function submitUnitReplace(f, mode, envOnly, env, ackFromPicker) {
+  if (envOnly && f.dataset.central) {
+    await submitCentralEnv(f, env);
+    return;
+  }
   const hosts = JSON.parse(f.dataset.unitHosts);
   const ukey = f.dataset.unitKey;
   const svcName = f.serviceName.value;
@@ -3200,6 +3264,43 @@ async function submitUnitReplace(f, mode, envOnly, env, ackFromPicker) {
     f.dataset.unitKey = '';
   } catch (e) {
     toast(e.message, 'err');
+  } finally {
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; }
+  }
+}
+
+// submitCentralEnv is Add env for a centrally managed unit: ONE POST to the
+// service's central env (whichever host this dashboard is; a non-origin
+// forwards it to the origin), which then rolls every host itself — the
+// origin first, health-gated, then each peer. No per-host fan-out, no
+// conflict picker: the central env is the one source of truth, so an edit
+// simply sets the key.
+async function submitCentralEnv(f, env) {
+  const svcName = f.serviceName.value;
+  const submitBtn = f.querySelector('button[type="submit"]');
+  const original = submitBtn ? submitBtn.innerHTML : '';
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Working…'; }
+  try {
+    const view = await api('/api/services/' + encodeURIComponent(svcName) + '/env');
+    if (!view.managed) throw new Error(svcName + ' is not centrally managed');
+    const r = await api('/api/services/' + encodeURIComponent(svcName) + '/env', {
+      method: 'POST', body: JSON.stringify({ if_version: view.version, set: env }),
+    });
+    clearEnvChoices();
+    $('#dlg-replace-service').close();
+    f.dataset.unitHosts = '';
+    f.dataset.central = '';
+    toast(r.no_op ? 'No change — ' + svcName + ' already has that env (v' + r.version + ')'
+                  : 'Central env v' + r.version + ' saved (' + (r.changed_keys || []).join(', ') + ') — rolling every host, origin first', 'ok');
+    delete _centralEnvView[svcName];
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) {
+    if (e.status === 409 && e.data && e.data.current_version) {
+      toast('Central env for ' + svcName + ' changed meanwhile (now v' + e.data.current_version + ') — reopen and try again', 'err');
+    } else {
+      toast(e.message, 'err');
+    }
   } finally {
     if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; }
   }
