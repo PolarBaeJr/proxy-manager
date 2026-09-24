@@ -619,6 +619,7 @@ footer.app code{color:var(--muted)}
 <dialog id="dlg-prompt"></dialog>
 <dialog id="dlg-duplicate-service"></dialog>
 <dialog id="dlg-spread-service"></dialog>
+<dialog id="dlg-adopt-env"></dialog>
 
 <div id="toasts"></div>
 
@@ -1891,7 +1892,8 @@ async function renderServices() {
               // ONE load-balanced service via the proxy-level peer mesh —
               // distinct from Duplicate, which creates an independent second
               // service. Same onboarded/unscalable gates as Duplicate.
-              + (s.onboarded ? '' : '<button ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>');
+              + (s.onboarded ? '' : '<button ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>')
+              + ((s.onboarded || foreignSvc(s)) ? '' : centralEnvButtons(s.name, (s.labels || {})['pmgr.env.origin'] || ''));
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
     // replica AND no stopped members (saves card height for the common case).
@@ -2761,7 +2763,19 @@ function unitActionButtons(agg, svcName) {
     + (agg.anyStopped
         ? '<button disabled title="Start every host in this unit first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
         : '<button ' + dis + hostsAttr + ' onclick="openAddEnvUnit(this)">' + I.plus + 'Add env…' + lkHtml + '</button>');
+  if (agg.hasLocal && !agg.instances.some(i => i.onboarded)) html += centralEnvButtons(svcName, unitCentralOrigin(agg));
   return html;
+}
+// centralEnvButtons offers Adopt on a label-managed service whose env is
+// still per-host, and Release when THIS host is its central-env origin —
+// both run on the origin, so neither shows for another host's service.
+// Elevated sessions only: adopt/release restart the service on every host.
+function centralEnvButtons(svcName, origin) {
+  if (!isElevated()) return '';
+  const sn = esc(svcName);
+  if (!origin) return '<button onclick="openAdoptEnv(\'' + sn + '\')">' + I.layers + 'Adopt central env…</button>';
+  if (origin === _selfIdentity) return '<button onclick="releaseCentralEnv(\'' + sn + '\')">' + I.layers + 'Release central env…</button>';
+  return '';
 }
 
 function toggleMenu(e, id) {
@@ -3489,6 +3503,131 @@ function showDuplicateHint(hint) {
     + '<button class="btn" style="margin-top:12px" onclick="copyText(document.getElementById(\'tr-raw\').textContent,this)">' + I.copy + 'Copy' + '</button>'
     + '</div><div class="dialog-actions"><button class="btn primary" onclick="document.getElementById(\'dlg-token-reveal\').close()">' + I.check + 'Done</button></div></div>';
   d.showModal();
+}
+/* ---------- Central env adopt / release ---------- */
+// Adopt runs a dry run first and shows its report — key NAMES only, the API
+// never returns a value — then executes with that run's fingerprint, the
+// acks ticked here, and a decision for every peer-only key (import it as base
+// or as that host's override, or accept it being dropped). A 409 re-renders
+// with the fresh report: something moved since the dry run.
+const ADOPT_ACK_TEXT = {
+  ack_no_health: 'No healthcheck — only "container stays up" gates each replica during the roll',
+  ack_compose: 'Compose labels are stripped; I will never run docker compose up/down/pull for these services again',
+  ack_restart_policy: 'Restart policies are normalized to unless-stopped',
+  ack_image_update: 'The roll also moves replicas onto the newer image already pulled on that host',
+};
+let _adopt = null;
+async function openAdoptEnv(svc) {
+  _adopt = { svc, requestId: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)) };
+  try {
+    const rep = await api('/api/services/' + encodeURIComponent(svc) + '/env/adopt', { method: 'POST', body: JSON.stringify({ dry_run: true }) });
+    renderAdoptDialog(rep, '');
+    document.getElementById('dlg-adopt-env').showModal();
+  } catch (e) { toast(e.message, 'err'); }
+}
+function adoptList(title, items, color) {
+  if (!items || !items.length) return '';
+  return '<div class="th-row" style="margin-top:12px">' + esc(title) + '</div>'
+    + items.map(x => '<div class="meta" style="white-space:pre-wrap' + (color ? ';color:' + color : '') + '">' + esc(x) + '</div>').join('');
+}
+function renderAdoptDialog(rep, notice) {
+  _adopt.report = rep;
+  const d = document.getElementById('dlg-adopt-env');
+  const hosts = (rep.env && rep.env.hosts) || {};
+  let body = notice ? '<div class="meta" style="color:var(--red)">' + esc(notice) + '</div>' : '';
+  // adoptable reflects THIS dry run's (empty) acks and imports; what this
+  // dialog can't fix from here are the blockers.
+  const blocked = (rep.blockers || []).length > 0;
+  body += '<div class="meta">' + (blocked ? 'Not adoptable yet — fix the blockers below and check again.' : 'Adoptable once every acknowledgement is ticked and every peer-only key has a choice.') + '</div>';
+  body += adoptList('Blockers', rep.blockers, 'var(--red)');
+  body += adoptList('Warnings', rep.warnings, 'var(--yellow)');
+  body += adoptList('Info', rep.info, '');
+  const acks = rep.required_acks || [];
+  if (acks.length) {
+    body += '<div class="th-row" style="margin-top:12px">Acknowledge</div>';
+    for (const a of acks) body += '<label class="meta" style="display:flex;gap:8px;align-items:flex-start"><input type="checkbox" data-adopt-ack="' + esc(a) + '"><span>' + esc(ADOPT_ACK_TEXT[a] || a) + '</span></label>';
+  }
+  body += '<div class="th-row" style="margin-top:12px">Env (names only)</div>'
+    + '<div class="meta">Origin ' + esc(rep.origin) + ': ' + ((rep.env && rep.env.origin_keys || []).length ? esc(rep.env.origin_keys.join(', ')) : 'no keys') + '</div>';
+  for (const h of Object.keys(hosts).sort()) {
+    const diff = hosts[h];
+    body += '<div class="meta" style="margin-top:8px"><b>' + esc(machineLabel(h)) + '</b></div>';
+    if ((diff.origin_only || []).length) body += '<div class="meta">Will gain: ' + esc(diff.origin_only.join(', ')) + '</div>';
+    if ((diff.differs || []).length) body += '<div class="meta">Value differs (origin wins unless imported as override): ' + esc(diff.differs.join(', ')) + '</div>';
+    if ((diff.unreachable || []).length) body += '<div class="meta" style="color:var(--yellow)">Unreachable: ' + esc(diff.unreachable.join(', ')) + '</div>';
+    for (const k of (diff.peer_only || []).concat(diff.differs || [])) {
+      const peerOnly = (diff.peer_only || []).includes(k);
+      body += '<div class="meta" style="display:flex;gap:8px;align-items:center"><code>' + esc(k) + '</code>'
+        + '<select data-adopt-host="' + esc(h) + '" data-adopt-key="' + esc(k) + '" data-adopt-peer-only="' + (peerOnly ? '1' : '') + '">'
+        + (peerOnly ? '<option value="">— choose —</option>' : '<option value="">use origin\'s value</option>')
+        + (peerOnly ? '<option value="base">import as base (every host)</option>' : '')
+        + '<option value="override">keep as this host\'s override</option>'
+        + (peerOnly ? '<option value="drop">accept dropped</option>' : '')
+        + '</select></div>';
+    }
+  }
+  body += adoptList('After adopting, retire the compose definitions', rep.retire_steps, '');
+  d.innerHTML = '<div class="dlg"><div class="dlg-head"><div class="di">' + I.layers + '</div>'
+    + '<div><h3>Adopt central env — ' + esc(rep.service || _adopt.svc) + '</h3><div class="dsub">Recreates every replica on every host, origin first, health-gated</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-adopt-env\').close()">' + I.x + '</button></div>'
+    + '<div class="dlg-body" style="max-height:60vh;overflow:auto">' + body + '</div>'
+    + '<div class="dialog-actions">'
+    + '<button class="btn" type="button" onclick="document.getElementById(\'dlg-adopt-env\').close()">Cancel</button>'
+    + '<button class="btn" type="button" onclick="recheckAdoptEnv()">' + I.refresh + 'Check again</button>'
+    + '<button class="btn primary" type="button" id="adopt-exec" ' + (blocked ? 'disabled' : '') + ' onclick="executeAdoptEnv()">' + I.check + 'Adopt</button>'
+    + '</div></div>';
+}
+async function recheckAdoptEnv() {
+  try {
+    const rep = await api('/api/services/' + encodeURIComponent(_adopt.svc) + '/env/adopt', { method: 'POST', body: JSON.stringify({ dry_run: true }) });
+    renderAdoptDialog(rep, '');
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function executeAdoptEnv() {
+  const d = document.getElementById('dlg-adopt-env');
+  const req = { dry_run: false, fingerprint: _adopt.report.fingerprint, request_id: _adopt.requestId, import: {}, accept_dropped: [] };
+  const missingAcks = [];
+  d.querySelectorAll('[data-adopt-ack]').forEach(cb => { if (cb.checked) req[cb.dataset.adoptAck] = true; else missingAcks.push(cb.dataset.adoptAck); });
+  if (missingAcks.length) { toast('tick every acknowledgement first', 'err'); return; }
+  const undecided = [];
+  d.querySelectorAll('[data-adopt-key]').forEach(sel => {
+    const h = sel.dataset.adoptHost, k = sel.dataset.adoptKey, v = sel.value;
+    if (!v) { if (sel.dataset.adoptPeerOnly) undecided.push(k); return; }
+    if (v === 'drop') { if (!req.accept_dropped.includes(k)) req.accept_dropped.push(k); return; }
+    // One import entry per host carries one "as"; a host mixing base and
+    // override keys is refused server-side with a clear message.
+    const cur = req.import[h] || (req.import[h] = { keys: [], as: v });
+    if (cur.as !== v) { cur.mixed = true; }
+    cur.keys.push(k);
+  });
+  if (undecided.length) { toast('choose import or drop for: ' + undecided.join(', '), 'err'); return; }
+  for (const h of Object.keys(req.import)) {
+    if (req.import[h].mixed) { toast('one host can import as base OR as override in a single adopt, not both — adopt, then add the rest with Edit env', 'err'); return; }
+  }
+  const btn = document.getElementById('adopt-exec');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api('/api/services/' + encodeURIComponent(_adopt.svc) + '/env/adopt', { method: 'POST', body: JSON.stringify(req) });
+    d.close();
+    toast('adopting ' + _adopt.svc + (res && res.replayed ? ' (already accepted)' : '') + ' — rolling origin first');
+    delete _centralEnvView[_adopt.svc];
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) {
+    if (e.status === 409 && e.data && e.data.report) { renderAdoptDialog(e.data.report, e.message); return; }
+    toast(e.message, 'err');
+    if (btn) btn.disabled = false;
+  }
+}
+async function releaseCentralEnv(svc) {
+  if (!(await confirmDialog('Release ' + svc + ' from central env? Every replica on every host is recreated from its current env without the central stamp, peers drop their cached copy, and the central record is deleted — env becomes per-host again. If a host fails, the service stays "releasing" and releasing again resumes.', {title: 'Release central env', danger: true, okLabel: 'Release'}))) return;
+  try {
+    await api('/api/services/' + encodeURIComponent(svc) + '/env/release', { method: 'POST', body: '{}' });
+    toast('releasing ' + svc + ' — rolling origin first');
+    delete _centralEnvView[svc];
+    _lastServicesHash = '';
+    renderActive();
+  } catch (e) { toast(e.message, 'err'); }
 }
 async function promoteCanary(name, host) {
   if (!(await confirmDialog('Promote canary to live? Old replicas will be removed.', {title: 'Promote canary'}))) return;

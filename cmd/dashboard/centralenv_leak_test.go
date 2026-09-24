@@ -136,6 +136,9 @@ func centralEnvPropagationOutputs(t *testing.T, sentinel string) []string {
 	a.waitJob(t, "app")
 	b.waitJob(t, "app")
 	jobs("final")
+	// A direct peer /release is refused while the origin isn't releasing
+	// (A: it is the origin; B: A's record is active). The origin-driven
+	// release is covered by centralEnvAdoptOutputs.
 	for _, n := range []*meshNode{a, b} {
 		rec := peerDo(t, n.peerMux, "POST", "/peer/central-env/app/release", "s3cret", "")
 		add(n.identity+" peer release", rec.Body.String())
@@ -214,7 +217,7 @@ func centralEnvPropagationOutputs(t *testing.T, sentinel string) []string {
 	for _, e := range entries {
 		actions[e["action"].(string)] = true
 	}
-	for _, want := range []string{"service.env_set", "service.env_sync_start", "service.env_sync_done", "service.env_sync_failed", "service.env_revert", "service.env_secret_rotated", "service.env_release"} {
+	for _, want := range []string{"service.env_set", "service.env_sync_start", "service.env_sync_done", "service.env_sync_failed", "service.env_revert", "service.env_secret_rotated"} {
 		if !actions[want] {
 			t.Errorf("audit never recorded %s (got %v)", want, actions)
 		}

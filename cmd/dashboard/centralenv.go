@@ -31,6 +31,11 @@ const (
 	// centralEnvFeature is the peer-handshake capability string a dashboard
 	// advertises when CENTRAL_ENV is on.
 	centralEnvFeature = "central-env/1"
+	// centralEnvAdoptFeature is advertised alongside it by a dashboard that
+	// can take part in an adopt (live-keys / live-env) and in a release
+	// (an un-stamping /release). A central-env/1-only peer would drop its
+	// cache on /release without recreating its stamped replicas.
+	centralEnvAdoptFeature = "central-env-adopt/1"
 )
 
 // centralEnvResult is a resolved env for one replica on this host. Warning is

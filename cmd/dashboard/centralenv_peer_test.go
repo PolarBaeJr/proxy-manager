@@ -182,11 +182,13 @@ func TestPeerCentralEnvRelease(t *testing.T) {
 	h := newSyncHost(t, "dashboard-b", nil, "s3cret")
 	h.ce.cache.Put("app", "dashboard-a", 1, []string{"A=1"})
 	handler := peerCentralEnvHandler("s3cret", h.ce, h.dc, true)
-	if rec := peerDo(t, handler, "POST", "/peer/central-env/app/release", "s3cret", ""); rec.Code != http.StatusOK {
+	// No mesh here, so the origin can't confirm it is releasing: refused,
+	// cache kept (the accepted path is TestMeshPeerReleaseNeedsOriginReleasing).
+	if rec := peerDo(t, handler, "POST", "/peer/central-env/app/release", "s3cret", ""); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("release = %d", rec.Code)
 	}
-	if _, ok := h.ce.cache.Get("app"); ok {
-		t.Fatal("cache survived release")
+	if _, ok := h.ce.cache.Get("app"); !ok {
+		t.Fatal("cache dropped without the origin's confirmation")
 	}
 	origin := newSyncHost(t, "dashboard-a", nil, "s3cret")
 	origin.ce.store.Create("app", "dashboard-a", map[string]string{"A": "1"}, nil, "test", "")

@@ -75,6 +75,19 @@ func (c *serviceClaims) release(svc, owner string) {
 	}
 }
 
+// transfer hands svc from one owner to another in one step, so nothing
+// (the auto-updater, most importantly) can take it in between. False if
+// from doesn't hold it.
+func (c *serviceClaims) transfer(svc, from, to string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.owner[svc] != from {
+		return false
+	}
+	c.owner[svc] = to
+	return true
+}
+
 func (c *serviceClaims) holder(svc string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -100,6 +113,14 @@ type rollingOpts struct {
 	// skipPull keeps an env-only rollout from pulling (and so silently
 	// upgrading to) a newer digest for the service's tag.
 	skipPull bool
+	// includeForeign (adopt) also rolls members with no pmgr.env.* stamp —
+	// the compose/spread originals an adopt exists to bring under central
+	// env. Without it a pinned roll only ever touches stamped members.
+	includeForeign bool
+	// unstamp (release / un-adopt) recreates the stamped members WITHOUT
+	// the pmgr.env.* labels, from pinnedEnv, so afterwards nothing claims
+	// the service is centrally managed. pinnedLabels must be nil with it.
+	unstamp bool
 	// done, if non-nil, receives the job's final error (nil on success)
 	// exactly once. Must be buffered: the job never blocks on it.
 	done chan error

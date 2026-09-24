@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,10 +113,10 @@ func newMesh(t *testing.T, bCapable bool) (a, b *meshNode, order *orderLog) {
 
 	var bFeatures []string
 	if bCapable {
-		bFeatures = []string{centralEnvFeature}
+		bFeatures = []string{centralEnvFeature, centralEnvAdoptFeature}
 	}
 	regA := newTestPeerRegistryFeatures("dashboard-a", b.url, "dashboard-b", true, bFeatures)
-	regB := newTestPeerRegistryFeatures("dashboard-b", a.url, "dashboard-a", true, []string{centralEnvFeature})
+	regB := newTestPeerRegistryFeatures("dashboard-b", a.url, "dashboard-a", true, []string{centralEnvFeature, centralEnvAdoptFeature})
 	a.syncHost = newSyncHost(t, "dashboard-a", regA, "s3cret")
 	b.syncHost = newSyncHost(t, "dashboard-b", regB, "s3cret")
 	a.ce.fetchFromOrigin = newOriginFetcher(regA, "s3cret")
@@ -511,5 +512,63 @@ func TestMeshPeerWithoutFeatureIsUnsupported(t *testing.T) {
 	}
 	if len(b.f.createsSnapshot()) != 0 || len(b.notifyLog()) != 0 {
 		t.Fatal("an unsupported peer was touched")
+	}
+}
+
+// TestMeshAdoptImportsPeerKeysAsBase: the dry run classifies every key by
+// name only; the execute imports B's Y,Z as base; both hosts converge on
+// X,Y,Z (+SHARED, and A's DIFF), stamped and compose-free; B's replicas get
+// A's healthcheck.
+func TestMeshAdoptImportsPeerKeysAsBase(t *testing.T) {
+	withFastSync(t)
+	a, b := adoptMesh(t)
+	rec := apiDo(t, a.mux, "POST", "/api/services/app/env/adopt", `{}`)
+	for _, v := range []string{"x-val", "y-val", "z-val", "from-a", "from-b", "shared-val"} {
+		if strings.Contains(rec.Body.String(), v) {
+			t.Fatalf("dry run leaked a value: %s", rec.Body.String())
+		}
+	}
+	var rep centralEnvAdoptReport
+	json.Unmarshal(rec.Body.Bytes(), &rep)
+	d := rep.Env.Hosts["dashboard-b"]
+	if d == nil || !reflect.DeepEqual(d.PeerOnly, []string{"Y", "Z"}) || !reflect.DeepEqual(d.OriginOnly, []string{"X"}) || !reflect.DeepEqual(d.Differs, []string{"DIFF"}) {
+		t.Fatalf("diff = %+v", d)
+	}
+	if !reflect.DeepEqual(rep.Unresolved["dashboard-b"], []string{"Y", "Z"}) || rep.Adoptable {
+		t.Fatalf("unresolved = %v adoptable=%v", rep.Unresolved, rep.Adoptable)
+	}
+	if !anyContains(rep.Info, "dashboard-b: no healthcheck on stack-app-1") || containsString(rep.RequiredAcks, adoptAckNoHealth) {
+		t.Fatalf("health info=%q acks=%v", rep.Info, rep.RequiredAcks)
+	}
+	if rep.Compose["dashboard-b"] == nil || !reflect.DeepEqual(rep.Members["dashboard-b"], []string{"stack-app-1"}) {
+		t.Fatalf("compose=%v members=%v", rep.Compose, rep.Members)
+	}
+
+	adoptMeshExecute(t, a, `,"import":{"dashboard-b":{"keys":["Y","Z"],"as":"base"}}`)
+	if j := a.waitJob(t, "app"); j.Status != envSyncStatusConverged {
+		t.Fatalf("A job = %+v", j)
+	}
+	b.waitJob(t, "app")
+	r, _, _ := a.ce.store.Get("app")
+	if r.Adopting || !reflect.DeepEqual(sortedKeys(r.Base), []string{"DIFF", "SHARED", "X", "Y", "Z"}) || len(r.Overrides) != 0 {
+		t.Fatalf("record = %+v", r)
+	}
+	want := []string{"DIFF=from-a", "SHARED=shared-val", "X=x-val", "Y=y-val", "Z=z-val"}
+	for _, n := range []*meshNode{a, b} {
+		members := n.f.appMembers()
+		if len(members) != 1 {
+			t.Fatalf("%s members = %v", n.identity, members)
+		}
+		for name, mb := range members {
+			env := append([]string(nil), mb.env...)
+			sort.Strings(env)
+			if name == "stack-app-1" || mb.labels[labelEnvOrigin] != "dashboard-a" || mb.labels[labelEnvVersion] != "1" || hasComposeLabel(mb.labels) || !reflect.DeepEqual(env, want) {
+				t.Fatalf("%s %s = %+v", n.identity, name, mb)
+			}
+		}
+	}
+	assertCreatesCarryOriginHealthcheck(t, b)
+	if _, ok := b.ce.cache.Get("app"); !ok {
+		t.Fatal("B has no cache after the adopt")
 	}
 }

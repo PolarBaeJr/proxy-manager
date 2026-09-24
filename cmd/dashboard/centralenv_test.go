@@ -310,6 +310,8 @@ func TestCentralEnvNeverLeaksValues(t *testing.T) {
 
 	// PR-B: peer endpoints, propagation, reconcile, API and MCP.
 	outputs = append(outputs, centralEnvPropagationOutputs(t, sentinel)...)
+	// PR-C: adopt (dry run, import, un-adopt, execute), live-keys, release, MCP.
+	outputs = append(outputs, centralEnvAdoptOutputs(t, sentinel)...)
 
 	logMu.Lock()
 	outputs = append(outputs, "log: "+logBuf.String())

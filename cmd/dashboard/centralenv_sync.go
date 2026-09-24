@@ -49,6 +49,9 @@ const (
 	envSyncStatusFailedReverted   = "failed_reverted"
 	envSyncStatusFailedRolledBack = "failed_rolled_back"
 	envSyncStatusDegraded         = "degraded"
+	// envSyncStatusAdoptUndone: an adopt's first origin roll failed, so the
+	// adopt was undone — the record is gone and the replicas are unstamped.
+	envSyncStatusAdoptUndone = "failed_adopt_undone"
 
 	envSyncHostConverged   = "converged"
 	envSyncHostUnsupported = "unsupported"
@@ -58,6 +61,9 @@ const (
 
 	envSyncRoleOrigin = "origin"
 	envSyncRolePeer   = "peer"
+	// envSyncRoleRelease is a job that un-adopts svc on this host: its
+	// stamped replicas are recreated without the stamp.
+	envSyncRoleRelease = "release"
 
 	// envSyncAuditUser is the audit "user" for everything the background
 	// job does on its own — audit(nil, "", ...) would otherwise fall
@@ -116,7 +122,7 @@ type envSyncFailure struct {
 
 func envSyncFailed(status string) bool {
 	switch status {
-	case envSyncStatusFailed, envSyncStatusFailedReverted, envSyncStatusFailedRolledBack, envSyncStatusPartial, envSyncStatusDegraded:
+	case envSyncStatusFailed, envSyncStatusFailedReverted, envSyncStatusFailedRolledBack, envSyncStatusPartial, envSyncStatusDegraded, envSyncStatusAdoptUndone:
 		return true
 	}
 	return false
@@ -154,7 +160,10 @@ type envSyncResolvedMark struct {
 }
 
 type envSyncManager struct {
-	dc       *dockerClient
+	dc *dockerClient
+	// onb is consulted by adopt's preflight (an onboarded record blocks it);
+	// main.go sets it after construction. Nil in tests that don't need it.
+	onb      *OnboardedStore
 	ce       *centralEnv
 	rm       *rolloutManager
 	rom      *rollingOpManager
@@ -181,7 +190,14 @@ type envSyncManager struct {
 	// (The peer-side twin of peerFailed — a version THIS host failed —
 	// lives in the cache, centralEnvCacheEntry.FailedVersion, so it
 	// survives a restart and Resolve honors it.)
-	retry       map[string]bool
+	retry map[string]bool
+	// peerAdopt / peerRelease (non-origin side) are what the origin asked
+	// of the next local job beyond a version: roll foreign members too
+	// (adopt), or un-stamp and drop the cache (release, keyed to the
+	// origin that asked). Kept apart from peerTarget, which a same-version
+	// request never rewrites.
+	peerAdopt   map[string]bool
+	peerRelease map[string]string
 	lastFailure map[string]*envSyncFailure
 	resolved    map[string]envSyncResolvedMark
 	originSeen  map[string]time.Time
@@ -197,6 +213,8 @@ func newEnvSyncManager(dc *dockerClient, ce *centralEnv, rm *rolloutManager, rom
 		peerTarget:  map[string]envSyncPeerTarget{},
 		peerFailed:  map[string]map[string]uint64{},
 		retry:       map[string]bool{},
+		peerAdopt:   map[string]bool{},
+		peerRelease: map[string]string{},
 		lastFailure: map[string]*envSyncFailure{},
 		resolved:    map[string]envSyncResolvedMark{},
 		originSeen:  map[string]time.Time{},
@@ -264,6 +282,8 @@ func (m *envSyncManager) loop(svc string) {
 		origin := m.ce.store.Has(svc)
 		if origin {
 			target = m.runOrigin(svc)
+		} else if releaseFrom := m.takePeerRelease(svc); releaseFrom != "" {
+			m.runPeerRelease(svc, releaseFrom)
 		} else {
 			m.runPeer(svc)
 		}
@@ -386,6 +406,10 @@ func (m *envSyncManager) runOrigin(svc string) uint64 {
 	retry := m.takeRetry(svc)
 	rec, ok, err := m.ce.store.Get(svc)
 	if err != nil || !ok {
+		// An adopt hands its claim straight to this job (serviceClaims.
+		// transfer); every return before waitIdle must give it back or the
+		// auto-updater would defer on svc forever.
+		m.releaseClaim(svc)
 		m.begin(svc, envSyncRoleOrigin, 0)
 		msg := "no central env record"
 		if err != nil {
@@ -395,8 +419,14 @@ func (m *envSyncManager) runOrigin(svc string) uint64 {
 		return 0
 	}
 	target := rec.Version
+	if rec.State == centralEnvStateReleasing {
+		m.begin(svc, envSyncRoleRelease, target)
+		m.runRelease(ctx, svc)
+		return target
+	}
 	m.begin(svc, envSyncRoleOrigin, target)
 	if rec.State == centralEnvStateDegraded {
+		m.releaseClaim(svc)
 		m.finish(svc, envSyncStatusDegraded, fmt.Sprintf("central env for %q is degraded (a revert failed its health gate) — fix it and set a new version", svc))
 		return target
 	}
@@ -431,11 +461,17 @@ func (m *envSyncManager) runOrigin(svc string) uint64 {
 	audit(nil, envSyncAuditUser, "service.env_sync_start", fmt.Sprintf("%s v%d", svc, target))
 
 	m.update(svc, func(j *envSyncJob) { j.Phase = envSyncRoleOrigin })
-	warnings, err := m.rollLocal(ctx, svc, env, m.ce.identity, target, nil)
+	warnings, err := m.rollLocal(ctx, svc, env, m.ce.identity, target, nil, envRollMode{adopt: rec.Adopting})
 	m.addWarnings(svc, warnings)
 	if err != nil {
 		msg := scrubEnvValues(err.Error(), env)
 		m.addHost(svc, envSyncHostResult{Host: m.ce.identity, Status: envSyncHostFailed, Version: target, Error: msg})
+		if rec.Adopting && rec.Prev == nil {
+			// The adopt's very first roll: there is nothing to revert to and
+			// no peer has heard of the record yet — undo the adopt instead.
+			m.unAdopt(svc, env, target, msg)
+			return target
+		}
 		var gate errReplicaGateFailed
 		if errors.As(err, &gate) {
 			m.handleOriginGateFailure(svc, rec, target, msg)
@@ -449,11 +485,18 @@ func (m *envSyncManager) runOrigin(svc string) uint64 {
 	m.releaseClaim(svc)
 	claimed = false
 
-	partial := m.syncPeers(ctx, svc, target, retry)
+	partial := m.syncPeers(ctx, svc, target, retry, rec.Adopting)
 	if partial {
 		m.finish(svc, envSyncStatusPartial, "")
 		audit(nil, envSyncAuditUser, "service.env_sync_failed", fmt.Sprintf("%s v%d partial", svc, target))
 		return target
+	}
+	if rec.Adopting {
+		if err := m.ce.store.FinishAdopt(svc); err != nil {
+			log.Printf("central env: %s: adopt converged but could not clear the adopting flag: %v", svc, err)
+		} else {
+			audit(nil, envSyncAuditUser, "service.env_adopt_done", fmt.Sprintf("%s v%d", svc, target))
+		}
 	}
 	m.finish(svc, envSyncStatusConverged, "")
 	audit(nil, envSyncAuditUser, "service.env_sync_done", fmt.Sprintf("%s v%d", svc, target))
@@ -521,14 +564,28 @@ func (m *envSyncManager) localMembers(ctx context.Context, svc string) ([]docker
 	return live, out, nil
 }
 
+// envRollMode selects which members a rollLocal targets and how it labels
+// the replacements. The zero value is a normal propagation roll.
+type envRollMode struct {
+	// adopt also rolls foreign (unstamped) members, and only counts the
+	// host done once none are left.
+	adopt bool
+	// unstamp rolls the STAMPED members onto env without the pmgr.env.*
+	// labels (release / un-adopt), and counts the host done once none carry
+	// a stamp any more.
+	unstamp bool
+}
+
 // rollLocal recreates svc's replicas on this host from exactly env/version
 // (health-gated, surge-of-one, through rom so every existing guard sees it)
 // until every stamped member carries version — one bounded re-run for
 // stragglers (e.g. a scale that raced the first pass). Members with no
 // pmgr.env.* stamp (created outside central env — a compose recreate, most
-// plausibly) are reported, never targeted on their own. No live replicas
-// here is not an error: there is nothing to roll.
-func (m *envSyncManager) rollLocal(ctx context.Context, svc string, env []string, origin string, version uint64, hc *healthcheckSpec) ([]string, error) {
+// plausibly) are reported, never targeted on their own, unless mode.adopt.
+// mode.unstamp instead targets every stamped member and recreates it
+// without the stamp. No live replicas here is not an error: there is
+// nothing to roll.
+func (m *envSyncManager) rollLocal(ctx context.Context, svc string, env []string, origin string, version uint64, hc *healthcheckSpec, mode envRollMode) ([]string, error) {
 	var warnings []string
 	for rolls := 0; ; {
 		live, members, err := m.localMembers(ctx, svc)
@@ -541,6 +598,12 @@ func (m *envSyncManager) rollLocal(ctx context.Context, svc string, env []string
 		var stale, foreign []string
 		for _, mb := range members {
 			switch {
+			case mode.unstamp:
+				if !mb.Foreign {
+					stale = append(stale, mb.Name)
+				}
+			case mb.Foreign && mode.adopt:
+				stale = append(stale, mb.Name)
 			case mb.Foreign:
 				foreign = append(foreign, mb.Name)
 			case mb.EnvVersion != version:
@@ -554,6 +617,11 @@ func (m *envSyncManager) rollLocal(ctx context.Context, svc string, env []string
 			return warnings, nil
 		}
 		if rolls == 2 {
+			if mode.unstamp || mode.adopt {
+				// Release and adopt are only done when nothing is left in the
+				// other camp — a straggler here is a failure, not a warning.
+				return warnings, fmt.Errorf("member(s) on %s still not recreated after a re-run: %s", m.ce.identity, strings.Join(stale, ", "))
+			}
 			warnings = append(warnings, fmt.Sprintf("member(s) on %s still not at v%d after a re-run: %s", m.ce.identity, version, strings.Join(stale, ", ")))
 			return warnings, nil
 		}
@@ -573,20 +641,26 @@ func (m *envSyncManager) rollLocal(ctx context.Context, svc string, env []string
 				warnings = append(warnings, fmt.Sprintf("%s on %s: local tag %s points to a newer pulled image than the running replicas — this env roll also moves them onto it", svc, m.ce.identity, image))
 			}
 		}
-		done := make(chan error, 1)
-		// No ensureRollingReplaceCapacity here, deliberately: that guard
-		// exists because an operator's rolling replace of a 1-replica
-		// service would briefly be its only copy; surge-of-one never drops
-		// THIS host below its current count either way, and an env change
-		// must reach singleton services too.
-		_, err = m.rom.startWith(svc, ReplaceServiceRequest{Image: image}, rollingOpts{
+		opts := rollingOpts{
 			pinnedEnv:           env,
 			pinnedLabels:        map[string]string{labelEnvOrigin: origin, labelEnvVersion: strconv.FormatUint(version, 10)},
 			pinnedHealthcheck:   hc,
 			removeOnGateFailure: true,
 			skipPull:            true,
-			done:                done,
-		})
+			includeForeign:      mode.adopt,
+		}
+		if mode.unstamp {
+			opts.pinnedLabels = nil
+			opts.unstamp = true
+		}
+		done := make(chan error, 1)
+		opts.done = done
+		// No ensureRollingReplaceCapacity here, deliberately: that guard
+		// exists because an operator's rolling replace of a 1-replica
+		// service would briefly be its only copy; surge-of-one never drops
+		// THIS host below its current count either way, and an env change
+		// must reach singleton services too.
+		_, err = m.rom.startWith(svc, ReplaceServiceRequest{Image: image}, opts)
 		if err != nil {
 			// Something else claimed svc between waitIdle and here — defer
 			// again rather than fail.
@@ -621,6 +695,7 @@ type peerCentralEnvStatus struct {
 	Origin    string      `json:"origin,omitempty"`
 	Version   uint64      `json:"version"`
 	State     string      `json:"state,omitempty"`
+	Adopting  bool        `json:"adopting,omitempty"`
 	FetchedAt int64       `json:"fetched_at,omitempty"`
 	Stale     bool        `json:"stale,omitempty"`
 	Members   []envMember `json:"members"`
@@ -649,6 +724,24 @@ func (ps peerCentralEnvStatus) atLeast(version uint64) bool {
 	return true
 }
 
+// convergedFor is atLeast for a job: during an adopt a host still running
+// foreign (unstamped) members is not done, whatever its version says.
+func (ps peerCentralEnvStatus) convergedFor(version uint64, adopt bool) bool {
+	if !ps.atLeast(version) {
+		return false
+	}
+	return !adopt || !hasForeign(ps.Members)
+}
+
+func hasForeign(members []envMember) bool {
+	for _, mb := range members {
+		if mb.Foreign {
+			return true
+		}
+	}
+	return false
+}
+
 func (ps peerCentralEnvStatus) runsOrCaches() bool {
 	return len(ps.Members) > 0 || ps.Version > 0
 }
@@ -667,6 +760,9 @@ type envSyncPeer struct {
 	url      string
 	identity string
 	capable  bool
+	// adoptCapable: the peer also serves adopt's live-keys/live-env and
+	// the un-stamping /release (centralEnvAdoptFeature).
+	adoptCapable bool
 }
 
 // peers lists every peer with a known identity, sorted so notification
@@ -681,7 +777,8 @@ func (m *envSyncManager) peers() []envSyncPeer {
 		if st.Identity == "" || st.Identity == m.ce.identity {
 			continue
 		}
-		out = append(out, envSyncPeer{url: u, identity: st.Identity, capable: hasFeature(st.Features, centralEnvFeature)})
+		out = append(out, envSyncPeer{url: u, identity: st.Identity, capable: hasFeature(st.Features, centralEnvFeature),
+			adoptCapable: hasFeature(st.Features, centralEnvAdoptFeature)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].identity < out[j].identity })
 	return out
@@ -721,7 +818,7 @@ func (m *envSyncManager) peerRunsService(ctx context.Context, peerURL, svc strin
 // syncPeers notifies each capable peer that runs or caches svc, strictly one
 // at a time, waiting for each to finish before the next. Reports whether
 // any peer ended up not converged.
-func (m *envSyncManager) syncPeers(ctx context.Context, svc string, target uint64, retry bool) (partial bool) {
+func (m *envSyncManager) syncPeers(ctx context.Context, svc string, target uint64, retry, adopt bool) (partial bool) {
 	if m.secret == "" {
 		return false
 	}
@@ -748,7 +845,7 @@ func (m *envSyncManager) syncPeers(ctx context.Context, svc string, target uint6
 			partial = true
 			continue
 		}
-		r := m.syncOnePeer(ctx, p, svc, target, retry)
+		r := m.syncOnePeer(ctx, p, svc, target, retry, adopt)
 		if r.Status == "" {
 			continue
 		}
@@ -772,7 +869,7 @@ func (m *envSyncManager) syncPeers(ctx context.Context, svc string, target uint6
 
 // syncOnePeer notifies one capable peer and waits for it. An empty Status
 // means the peer neither runs nor caches svc — nothing to do there.
-func (m *envSyncManager) syncOnePeer(ctx context.Context, p envSyncPeer, svc string, target uint64, retry bool) envSyncHostResult {
+func (m *envSyncManager) syncOnePeer(ctx context.Context, p envSyncPeer, svc string, target uint64, retry, adopt bool) envSyncHostResult {
 	res := envSyncHostResult{Host: p.identity, Version: target}
 	ps, code, err := m.peerStatus(ctx, p.url, svc)
 	switch {
@@ -784,13 +881,18 @@ func (m *envSyncManager) syncOnePeer(ctx context.Context, p envSyncPeer, svc str
 		return res
 	case !ps.runsOrCaches():
 		return envSyncHostResult{}
-	case ps.atLeast(target):
+	case ps.convergedFor(target, adopt):
 		res.Status = envSyncHostConverged
 		return res
 	}
 	notice := map[string]any{"origin": m.ce.identity, "version": target}
 	if retry {
 		notice["retry"] = true
+	}
+	if adopt {
+		// Roll this host's foreign members too — without it the peer
+		// would only ever touch stamped ones, and an adopt has none yet.
+		notice["adopt"] = true
 	}
 	body, _ := json.Marshal(notice)
 	code, _, err = peerMutate(ctx, m.client, p.url, m.secret, http.MethodPost, "/peer/central-env/"+url.PathEscape(svc)+"/notify", 10*time.Second, bytes.NewReader(body), nil, "")
@@ -823,17 +925,19 @@ func (m *envSyncManager) syncOnePeer(ctx context.Context, p envSyncPeer, svc str
 			// state.
 			if j := ps.Job; j != nil && j.Target >= target && envSyncTerminal(j.Status) {
 				res.Version = j.Target
-				switch j.Status {
-				case envSyncStatusConverged:
+				switch {
+				case j.Status == envSyncStatusConverged && adopt && hasForeign(ps.Members):
+					res.Status, res.Error = envSyncHostFailed, "converged but unstamped members remain (adopt not applied there)"
+				case j.Status == envSyncStatusConverged:
 					res.Status = envSyncHostConverged
-				case envSyncStatusFailedRolledBack:
+				case j.Status == envSyncStatusFailedRolledBack:
 					res.Status, res.Error = envSyncHostRolledBack, j.LastError
 				default:
 					res.Status, res.Error = envSyncHostFailed, j.LastError
 				}
 				return res
 			}
-			if (ps.Job == nil || envSyncTerminal(ps.Job.Status)) && ps.atLeast(target) {
+			if (ps.Job == nil || envSyncTerminal(ps.Job.Status)) && ps.convergedFor(target, adopt) {
 				res.Status = envSyncHostConverged
 				return res
 			}
@@ -855,6 +959,8 @@ func (m *envSyncManager) runPeer(svc string) {
 	defer cancel()
 	m.mu.Lock()
 	t := m.peerTarget[svc]
+	adopt := m.peerAdopt[svc]
+	delete(m.peerAdopt, svc)
 	m.mu.Unlock()
 	m.begin(svc, envSyncRolePeer, t.version)
 	if t.origin == "" {
@@ -913,7 +1019,7 @@ func (m *envSyncManager) runPeer(svc string) {
 	m.update(svc, func(j *envSyncJob) { j.Target = version })
 	audit(nil, envSyncAuditUser, "service.env_sync_start", fmt.Sprintf("%s v%d from %s", svc, version, t.origin))
 
-	warnings, err := m.rollLocal(ctx, svc, env, t.origin, version, hc)
+	warnings, err := m.rollLocal(ctx, svc, env, t.origin, version, hc, envRollMode{adopt: adopt})
 	m.addWarnings(svc, warnings)
 	if err == nil && refused > 0 {
 		// Still on the rolled-back version, as it should be — but the
@@ -948,7 +1054,7 @@ func (m *envSyncManager) runPeer(svc string) {
 		return
 	}
 	m.update(svc, func(j *envSyncJob) { j.Phase = "rollback" })
-	rbWarnings, rbErr := m.rollLocal(ctx, svc, prevEnv, t.origin, prevVersion, hc)
+	rbWarnings, rbErr := m.rollLocal(ctx, svc, prevEnv, t.origin, prevVersion, hc, envRollMode{})
 	m.addWarnings(svc, rbWarnings)
 	// Whatever the rollback's outcome, future creates here (scale, a
 	// label flip) must never use the version that just failed.
@@ -1029,7 +1135,7 @@ func (m *envSyncManager) status(ctx context.Context, svc string) (peerCentralEnv
 			ps.State = "broken"
 			return ps, nil
 		}
-		ps.Version, ps.State = rec.Version, rec.State
+		ps.Version, ps.State, ps.Adopting = rec.Version, rec.State, rec.Adopting
 		ps.Keys, ps.Refs, ps.Overrides = centralEnvNames(rec)
 		return ps, nil
 	}
@@ -1115,7 +1221,9 @@ func (m *envSyncManager) reconcileOnce(ctx context.Context) {
 
 func (m *envSyncManager) reconcileOrigin(ctx context.Context, svc string) {
 	rec, ok, err := m.ce.store.Get(svc)
-	if err != nil || !ok || rec.State == centralEnvStateDegraded || m.busy(svc) {
+	// A release only ever resumes on an explicit retry: re-running it every
+	// tick against a peer that keeps failing would churn its replicas.
+	if err != nil || !ok || rec.State == centralEnvStateDegraded || rec.State == centralEnvStateReleasing || m.busy(svc) {
 		return
 	}
 	if h, err := m.resolvedHash(svc, rec); err == nil {
@@ -1142,7 +1250,7 @@ func (m *envSyncManager) reconcileOrigin(ctx context.Context, svc string) {
 	_, members, err := m.localMembers(ctx, svc)
 	if err == nil {
 		for _, mb := range members {
-			if !mb.Foreign && mb.EnvVersion != rec.Version {
+			if (!mb.Foreign && mb.EnvVersion != rec.Version) || (mb.Foreign && rec.Adopting) {
 				m.request(svc)
 				return
 			}
@@ -1165,7 +1273,7 @@ func (m *envSyncManager) reconcileOrigin(ctx context.Context, svc string) {
 		if err != nil || !ps.runsOrCaches() || ps.Role == envSyncRoleOrigin {
 			continue
 		}
-		if !ps.atLeast(rec.Version) {
+		if !ps.convergedFor(rec.Version, rec.Adopting) {
 			m.request(svc)
 			return
 		}

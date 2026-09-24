@@ -34,6 +34,10 @@ const (
 	centralEnvStateActive   = "active"
 	centralEnvStateReverted = "reverted"
 	centralEnvStateDegraded = "degraded"
+	// releasing: un-adopt in progress. Creates keep resolving from the record
+	// (so a scale or recreate mid-release still works) while every replica is
+	// recreated without the pmgr.env.* stamp; the record is deleted last.
+	centralEnvStateReleasing = "releasing"
 
 	// centralEnvRequestRing bounds how many recent request ids a record
 	// remembers for replay — enough to absorb any realistic retry storm
@@ -74,6 +78,12 @@ type centralEnvRecord struct {
 	UpdatedAt    int64  `json:"updated_at"`
 	UpdatedBy    string `json:"updated_by,omitempty"`
 	AdoptedFrom  string `json:"adopted_from,omitempty"`
+	// Adopting: the record was seeded from a live service whose replicas
+	// (unstamped, often compose-created) are still being rolled onto it, so
+	// the propagation job rolls foreign members too. Cleared once every host
+	// converged. A flag, not a State, so revert/degrade keep their meaning
+	// while an adopt is still finishing.
+	Adopting bool `json:"adopting,omitempty"`
 }
 
 // centralEnvChange is a full desired-content write (PUT semantics, not a
@@ -210,6 +220,17 @@ func (s *centralEnvStore) Get(svc string) (centralEnvRecord, bool, error) {
 
 // Create writes svc's first record at version 1.
 func (s *centralEnvStore) Create(svc, origin string, base map[string]string, overrides map[string]map[string]string, actor, adoptedFrom string) (uint64, error) {
+	return s.create(svc, origin, base, overrides, actor, adoptedFrom, false, "")
+}
+
+// CreateAdopted is Create for an adopt: the record starts Adopting and
+// remembers requestID, so a retried adopt replays instead of refusing on its
+// own record.
+func (s *centralEnvStore) CreateAdopted(svc, origin string, base map[string]string, overrides map[string]map[string]string, actor, adoptedFrom, requestID string) (uint64, error) {
+	return s.create(svc, origin, base, overrides, actor, adoptedFrom, true, requestID)
+}
+
+func (s *centralEnvStore) create(svc, origin string, base map[string]string, overrides map[string]map[string]string, actor, adoptedFrom string, adopting bool, requestID string) (uint64, error) {
 	if !validServiceName(svc) {
 		return 0, fmt.Errorf("invalid service name %q", svc)
 	}
@@ -234,6 +255,10 @@ func (s *centralEnvStore) Create(svc, origin string, base map[string]string, ove
 		UpdatedAt:   time.Now().Unix(),
 		UpdatedBy:   actor,
 		AdoptedFrom: adoptedFrom,
+		Adopting:    adopting,
+	}
+	if requestID != "" {
+		rec.LastRequestIDs = appendRequestID(nil, requestID, 1)
 	}
 	rec.ResolvedHash = centralEnvContentHash(rec.Base, rec.Overrides)
 	if err := s.persist(rec); err != nil {
@@ -289,7 +314,7 @@ func (s *centralEnvStore) Apply(svc string, change centralEnvChange, actor strin
 	next.Base = copyStringMap(change.Base)
 	next.Overrides = copyOverrides(change.Overrides)
 	next.ResolvedHash = hash
-	next.State = centralEnvStateActive
+	next.State = keepTransitionState(cur.State)
 	next.UpdatedAt = time.Now().Unix()
 	next.UpdatedBy = actor
 	if change.RequestID != "" {
@@ -369,7 +394,7 @@ func (s *centralEnvStore) Touch(svc, actor string) (uint64, error) {
 	next := copyCentralEnvRecord(cur)
 	next.Prev = &centralEnvSnapshot{Version: cur.Version, Base: copyStringMap(cur.Base), Overrides: copyOverrides(cur.Overrides)}
 	next.Version = cur.Version + 1
-	next.State = centralEnvStateActive
+	next.State = keepTransitionState(cur.State)
 	next.UpdatedAt = time.Now().Unix()
 	next.UpdatedBy = actor
 	if err := s.persist(&next); err != nil {
@@ -379,11 +404,53 @@ func (s *centralEnvStore) Touch(svc, actor string) (uint64, error) {
 	return next.Version, nil
 }
 
+// keepTransitionState is the state a content change leaves behind: active,
+// unless a release is in flight — a rotated secret mid-release must not
+// flip the record back to active and make the next job re-stamp.
+func keepTransitionState(cur string) string {
+	if cur == centralEnvStateReleasing {
+		return cur
+	}
+	return centralEnvStateActive
+}
+
 // MarkDegraded records that svc's propagation could not be brought back to a
 // healthy state (a revert that itself failed its health gate). Content and
 // version are untouched; the state is what stops any further automatic
 // attempt until an operator acts.
 func (s *centralEnvStore) MarkDegraded(svc string) error {
+	return s.SetState(svc, centralEnvStateDegraded)
+}
+
+// SetState records svc's lifecycle state (e.g. → releasing) without
+// touching content or version.
+func (s *centralEnvStore) SetState(svc, state string) error {
+	return s.mutateMeta(svc, func(r *centralEnvRecord) { r.State = state })
+}
+
+// FinishAdopt clears the Adopting flag: every host converged onto the record.
+func (s *centralEnvStore) FinishAdopt(svc string) error {
+	return s.mutateMeta(svc, func(r *centralEnvRecord) { r.Adopting = false })
+}
+
+// HasRequestID reports whether svc's record remembers requestID — how a
+// retried adopt recognizes the record it created itself.
+func (s *centralEnvStore) HasRequestID(svc, requestID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.items[svc]
+	if cur == nil || requestID == "" {
+		return false
+	}
+	for _, r := range cur.LastRequestIDs {
+		if r.RequestID == requestID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *centralEnvStore) mutateMeta(svc string, fn func(*centralEnvRecord)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.broken[svc] {
@@ -394,7 +461,7 @@ func (s *centralEnvStore) MarkDegraded(svc string) error {
 		return errCentralEnvNotFound
 	}
 	next := copyCentralEnvRecord(cur)
-	next.State = centralEnvStateDegraded
+	fn(&next)
 	next.UpdatedAt = time.Now().Unix()
 	if err := s.persist(&next); err != nil {
 		return err

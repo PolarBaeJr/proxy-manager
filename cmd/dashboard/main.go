@@ -174,7 +174,7 @@ func main() {
 		centralEnvState = &centralEnv{enabled: true, identity: identity, store: store, cache: cache, secrets: secrets,
 			fetchFromOrigin: newOriginFetcher(registry, peerSecret)}
 		dc.central = centralEnvState
-		handshakeFeatures = []string{centralEnvFeature}
+		handshakeFeatures = []string{centralEnvFeature, centralEnvAdoptFeature}
 		owned, broken := store.Counts()
 		log.Printf("central env enabled as %q: %d service(s) owned, %d broken (fail closed), %d cached from peers", identity, owned, broken, cache.Len())
 	}
@@ -254,6 +254,7 @@ func main() {
 	// them); set on centralEnvState before any handler or loop can read it.
 	if centralEnvState != nil {
 		centralEnvState.sync = newEnvSyncManager(dc, centralEnvState, rm, rom, registry, peerSecret, proxyURLFromEnv())
+		centralEnvState.sync.onb = onboarded
 	}
 
 	// Background: poll registries every 10 min for newer image digests, then
