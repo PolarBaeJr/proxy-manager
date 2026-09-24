@@ -1434,12 +1434,13 @@ func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, 
 		return nil, err
 	}
 	existing := liveOnly(all)
-	if opts.pinnedEnv != nil {
+	if opts.pinnedEnv != nil && !opts.includeForeign {
 		// A central-env propagation roll only ever touches members created
 		// from central env (stamped pmgr.env.origin). An unstamped member —
 		// a compose original, most plausibly — is reported by the job and
 		// left alone: recreating it would strip its compose labels and let
-		// the next `docker compose up` start a duplicate beside it.
+		// the next `docker compose up` start a duplicate beside it. Adopt
+		// (includeForeign) is the one deliberate exception.
 		stamped := existing[:0:0]
 		for _, ct := range existing {
 			if ct.Labels[labelEnvOrigin] != "" {
@@ -1505,6 +1506,10 @@ func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, 
 				continue
 			}
 			labels[k] = v
+		}
+		if opts.unstamp {
+			delete(labels, labelEnvOrigin)
+			delete(labels, labelEnvVersion)
 		}
 		for k, v := range opts.pinnedLabels {
 			labels[k] = v

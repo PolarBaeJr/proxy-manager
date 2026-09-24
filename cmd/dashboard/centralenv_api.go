@@ -3,6 +3,9 @@
 //	GET  /api/services/{svc}/env       names-only view (any host)
 //	POST /api/services/{svc}/env       set/unset keys and host overrides
 //	POST /api/services/{svc}/env/sync  kick propagation + one reconcile pass
+//	POST /api/services/{svc}/env/adopt   preflight (dry run, the default) or
+//	                                      adopt onto this host (origin)
+//	POST /api/services/{svc}/env/release un-adopt (origin only)
 //
 // Dispatched ahead of ?host= forwarding: a central env has one owner no
 // matter which host the request lands on, so a non-origin host forwards the
@@ -172,6 +175,7 @@ type centralEnvView struct {
 	Role      string               `json:"role,omitempty"`
 	Version   uint64               `json:"version,omitempty"`
 	State     string               `json:"state,omitempty"`
+	Adopting  bool                 `json:"adopting,omitempty"`
 	Stale     bool                 `json:"stale,omitempty"`
 	Keys      []string             `json:"keys"`
 	Refs      map[string]string    `json:"refs,omitempty"`
@@ -210,6 +214,12 @@ func buildCentralEnvView(ctx context.Context, ce *centralEnv, svc string) (centr
 		labels = tpl.Labels
 	}
 	if !ce.Managed(svc, labels) {
+		// An adopt that was undone, or a finished release, leaves no record
+		// — its job and failure must still be visible here.
+		if j, ok := ce.sync.get(svc); ok {
+			view.Job = j
+		}
+		view.LastFailure = ce.sync.failure(svc)
 		return view, nil
 	}
 	view.Managed = true
@@ -223,7 +233,7 @@ func buildCentralEnvView(ctx context.Context, ce *centralEnv, svc string) (centr
 	if view.Origin == ce.identity {
 		view.Role = envSyncRoleOrigin
 		view.LastFailure = self.LastFailure
-		view.Version, view.State = self.Version, self.State
+		view.Version, view.State, view.Adopting = self.Version, self.State, self.Adopting
 		view.Keys, view.Refs, view.Overrides = self.Keys, self.Refs, self.Overrides
 	} else {
 		view.Role = envSyncRolePeer
@@ -239,7 +249,7 @@ func buildCentralEnvView(ctx context.Context, ce *centralEnv, svc string) (centr
 		if reached {
 			m.markOriginSeen(svc)
 			view.LastFailure = ps.LastFailure
-			view.Version, view.State = ps.Version, ps.State
+			view.Version, view.State, view.Adopting = ps.Version, ps.State, ps.Adopting
 			view.Keys, view.Refs, view.Overrides = ps.Keys, ps.Refs, ps.Overrides
 			self, _ = m.status(ctx, svc)
 		} else {
@@ -383,6 +393,70 @@ func serveCentralEnvAPI(w http.ResponseWriter, r *http.Request, dc *dockerClient
 		}
 		audit(r, actor, "service.env_sync_start", svc+" (manual)")
 		httpx.WriteJSON(w, http.StatusAccepted, map[string]string{"status": "sync requested"})
+	case sub == "env/adopt" && r.Method == http.MethodPost:
+		var req centralEnvAdoptRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return true
+		}
+		if req.dryRun() {
+			rep, _, err := ce.sync.adoptPreflight(r.Context(), svc, req, "")
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return true
+			}
+			httpx.WriteJSON(w, http.StatusOK, rep)
+			return true
+		}
+		if req.RequestID == "" {
+			req.RequestID = newCentralEnvRequestID()
+		}
+		res, err := ce.sync.adoptExecute(r.Context(), r, svc, req, actor)
+		var refused errAdoptRefused
+		switch {
+		case errors.As(err, &refused):
+			body := map[string]any{"error": refused.reason, "request_id": req.RequestID}
+			if refused.report.Service != "" {
+				body["report"] = refused.report
+			}
+			httpx.WriteJSON(w, http.StatusConflict, body)
+		case err != nil:
+			writeCentralEnvErr(w, err)
+		default:
+			httpx.WriteJSON(w, http.StatusAccepted, res)
+		}
+	case sub == "env/release" && r.Method == http.MethodPost:
+		if !ce.store.Has(svc) {
+			tpl, hasTpl, err := centralEnvServiceTemplate(r.Context(), dc, svc)
+			if err != nil {
+				httpx.WriteErr(w, err)
+				return true
+			}
+			var labels map[string]string
+			if hasTpl {
+				labels = tpl.Labels
+			}
+			if ce.Managed(svc, labels) {
+				http.Error(w, fmt.Sprintf("release %q on its origin %s", svc, centralEnvOriginFor(ce, svc, labels)), http.StatusConflict)
+				return true
+			}
+			http.Error(w, fmt.Sprintf("%q is not centrally managed", svc), http.StatusNotFound)
+			return true
+		}
+		rec, _, err := ce.store.Get(svc)
+		if err != nil {
+			writeCentralEnvErr(w, err)
+			return true
+		}
+		if rec.State != centralEnvStateReleasing {
+			if err := ce.store.SetState(svc, centralEnvStateReleasing); err != nil {
+				writeCentralEnvErr(w, err)
+				return true
+			}
+		}
+		ce.sync.requestRelease(svc)
+		audit(r, actor, "service.env_release_start", fmt.Sprintf("%s v%d", svc, rec.Version))
+		httpx.WriteJSON(w, http.StatusAccepted, map[string]any{"status": "releasing", "version": rec.Version, "job": "GET /api/services/" + svc + "/env"})
 	default:
 		http.NotFound(w, r)
 	}
@@ -492,5 +566,5 @@ func isCentralEnvErr(err error) bool {
 	var cacheFailed errCentralEnvCacheFailed
 	return errors.As(err, &conflict) || errors.As(err, &managed) || errors.As(err, &unavailable) ||
 		errors.As(err, &broken) || errors.As(err, &unknown) || errors.As(err, &relay) ||
-		errors.As(err, &failedHere) || errors.As(err, &cacheFailed)
+		errors.As(err, &failedHere) || errors.As(err, &cacheFailed) || errors.Is(err, errCentralEnvReleasing)
 }

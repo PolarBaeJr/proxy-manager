@@ -678,7 +678,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		// to the origin itself), and it is exempt from the rollout guard
 		// below — an env edit while a rollout runs is queued by the sync
 		// manager, which defers until the rollout is done.
-		if len(parts) == 2 && (parts[1] == "env" || parts[1] == "env/sync") {
+		if len(parts) == 2 && (parts[1] == "env" || parts[1] == "env/sync" || parts[1] == "env/adopt" || parts[1] == "env/release") {
 			if serveCentralEnvAPI(w, req, dc, auth, name, parts[1]) {
 				return
 			}

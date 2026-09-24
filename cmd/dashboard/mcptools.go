@@ -298,6 +298,68 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		},
 	})
 
+	// Registered read-only: its default (and, without both write opt-ins,
+	// only) mode is a dry run that changes nothing. Executing is refused in
+	// the handler unless MCP_ALLOW_WRITES and MCP_ALLOW_PEER_WRITES are both
+	// on — an adopt recreates the service on every host.
+	s.Register(Tool{
+		Name:     "adopt_service_env",
+		Title:    "Adopt a service into central env",
+		Mutating: allowWrites && allowPeerWrites,
+		Description: "Bring a label-managed service (often compose-created) under central env management, with THIS " +
+			"dashboard's host as its origin. Defaults to a DRY RUN that changes nothing and returns a report by KEY NAME " +
+			"only (values are never returned): blockers, warnings, required_acks/missing_acks, a per-host env diff " +
+			"(peer_only keys a peer would lose, origin_only keys it would gain, keys whose values differ, host-local " +
+			"looking keys), members per host, compose ownership + retire_steps, and a fingerprint. To execute, pass " +
+			"dry_run:false with that fingerprint, every required ack, and every peer_only key either in import " +
+			"({host:{keys:[...], as:\"base\"|\"override\"}}) or accept_dropped. Execution needs MCP_ALLOW_WRITES and " +
+			"MCP_ALLOW_PEER_WRITES, recreates every replica on every host (origin first, health-gated), strips compose " +
+			"labels, and is undone automatically if the origin's first roll fails. Watch it with get_service_env.",
+		InputSchema: schema(map[string]any{
+			"service":            prop("string", "Service name from list_services."),
+			"dry_run":            prop("boolean", "Default true. false executes the adopt."),
+			"fingerprint":        prop("string", "The fingerprint from the dry run this execute is based on (required to execute)."),
+			"request_id":         prop("string", "Optional idempotency key; reuse it to retry an execute whose outcome was unknown."),
+			"ack_no_health":      prop("boolean", "Acknowledge the service has no healthcheck (only the container staying up gates the roll)."),
+			"ack_compose":        prop("boolean", "Acknowledge the compose_owned warning (compose labels are stripped; never compose up/down/pull those services again)."),
+			"ack_restart_policy": prop("boolean", "Acknowledge restart policies are normalized to unless-stopped."),
+			"ack_image_update":   prop("boolean", "Acknowledge the roll also moves replicas onto a newer, already-pulled image."),
+			"import": map[string]any{
+				"type": "object",
+				"additionalProperties": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"keys": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"as":   map[string]any{"type": "string", "enum": []string{"base", "override"}},
+					},
+				},
+				"description": "Per peer host: key NAMES to take from that host's live env — as base (every host) or override (that host only). Values are fetched server-side, never through the model.",
+			},
+			"accept_dropped": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"},
+				"description": "peer_only key names you accept will be dropped from the peers that have them.",
+			},
+		}, "service"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			req, err := argAdoptRequest(args)
+			if err != nil {
+				return "", err
+			}
+			if !req.dryRun() && (!allowWrites || !allowPeerWrites) {
+				return "", fmt.Errorf("executing an adopt restarts %s on every host — it needs MCP_ALLOW_WRITES=true and MCP_ALLOW_PEER_WRITES=true (a dry run works without them)", name)
+			}
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/env/adopt", req)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
 	if !allowWrites {
 		return
 	}
@@ -1199,6 +1261,31 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 	})
 
 	s.Register(Tool{
+		Name:  "release_service_env",
+		Title: "Release a service from central env",
+		Description: "Undo an adopt: on the service's origin, recreate every replica on every host (origin first, " +
+			"health-gated) from its current env but without the central-env stamp, drop each peer's cached copy, then " +
+			"delete the central record — the service's env is per-host again. If any host fails, the service stays " +
+			"\"releasing\" (creates keep working) and calling this again resumes. Watch it with get_service_env. " +
+			"Must be called on the origin's dashboard.",
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+		}, "service"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/env/release", nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
 		Name:        "sync_service_env",
 		Title:       "Re-sync a service's central env",
 		Description: "Re-run propagation of a centrally managed service's current env version to every host (a no-op for hosts already converged). Use after a host was down or a peer rolled back. Watch progress with get_service_env.",
@@ -1218,6 +1305,48 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			return pretty(b), nil
 		},
 	})
+}
+
+// argAdoptRequest reads adopt_service_env's arguments. dry_run defaults to
+// true: only an explicit false executes.
+func argAdoptRequest(args map[string]any) (centralEnvAdoptRequest, error) {
+	var req centralEnvAdoptRequest
+	dry := true
+	if _, ok := args["dry_run"]; ok {
+		v, err := argBool(args, "dry_run")
+		if err != nil {
+			return req, err
+		}
+		dry = v
+	}
+	req.DryRun = &dry
+	var err error
+	if req.Fingerprint, err = argOptionalString(args, "fingerprint"); err != nil {
+		return req, err
+	}
+	if req.RequestID, err = argOptionalString(args, "request_id"); err != nil {
+		return req, err
+	}
+	for key, dst := range map[string]*bool{"ack_no_health": &req.AckNoHealth, "ack_compose": &req.AckCompose,
+		"ack_restart_policy": &req.AckRestartPolicy, "ack_image_update": &req.AckImageUpdate} {
+		if _, ok := args[key]; ok {
+			if *dst, err = argBool(args, key); err != nil {
+				return req, err
+			}
+		}
+	}
+	if req.AcceptDropped, err = argStringSlice(args, "accept_dropped"); err != nil {
+		return req, err
+	}
+	if raw, ok := args["import"]; ok {
+		b, _ := json.Marshal(raw)
+		dec := json.NewDecoder(strings.NewReader(string(b)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req.Import); err != nil {
+			return req, fmt.Errorf("argument \"import\" must be {host: {keys: [names], as: \"base\"|\"override\"}}")
+		}
+	}
+	return req, nil
 }
 
 // refuseLiteralCredentials rejects a literal value for any key that looks

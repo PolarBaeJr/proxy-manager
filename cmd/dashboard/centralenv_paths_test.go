@@ -45,6 +45,9 @@ type cenvFakeDocker struct {
 	imageID string
 	pullTo  string
 	pulls   int
+	// imageConfig is served as the image's Config (Env, User, WorkingDir…)
+	// — what adopt subtracts and compares against.
+	imageConfig map[string]any
 }
 
 type cenvInspect struct {
@@ -54,6 +57,11 @@ type cenvInspect struct {
 	health      *healthcheckSpec
 	edge        []string
 	networks    map[string][]string
+	// restart is HostConfig.RestartPolicy.Name; config and hostConfig are
+	// extra Config/HostConfig fields (the adopt-strict ones).
+	restart    string
+	config     map[string]any
+	hostConfig map[string]any
 }
 
 type cenvCreate struct {
@@ -168,7 +176,7 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 				ct.Status = "Up 1 second (unhealthy)"
 			}
 			f.items[id] = ct
-			f.inspect[id] = cenvInspect{env: body.Env, health: body.Healthcheck, edge: aliases, networks: map[string][]string{}}
+			f.inspect[id] = cenvInspect{env: body.Env, health: body.Healthcheck, edge: aliases, networks: map[string][]string{}, restart: body.HostConfig.RestartPolicy.Name}
 			onCreate := f.onCreate
 			f.mu.Unlock()
 			if onCreate != nil {
@@ -226,12 +234,20 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 			for n, a := range in.networks {
 				nets[n] = map[string]any{"Aliases": a}
 			}
+			config := map[string]any{"Env": in.env, "Healthcheck": in.health, "Image": configImage}
+			for k, v := range in.config {
+				config[k] = v
+			}
+			hostConfig := map[string]any{"Mounts": []mountSpec{}, "RestartPolicy": map[string]any{"Name": in.restart}}
+			for k, v := range in.hostConfig {
+				hostConfig[k] = v
+			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"Name":            "/" + ct.name(),
 				"Image":           "sha256:abc",
 				"RestartCount":    0,
-				"Config":          map[string]any{"Env": in.env, "Healthcheck": in.health, "Image": configImage},
-				"HostConfig":      map[string]any{"Mounts": []mountSpec{}},
+				"Config":          config,
+				"HostConfig":      hostConfig,
 				"NetworkSettings": map[string]any{"Networks": nets},
 			})
 		case strings.Contains(p, "/images/create"):
@@ -244,9 +260,9 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodGet && strings.Contains(p, "/images/") && strings.HasSuffix(p, "/json"):
 			f.mu.Lock()
-			id := f.imageID
+			id, cfg := f.imageID, f.imageConfig
 			f.mu.Unlock()
-			json.NewEncoder(w).Encode(map[string]string{"Id": id})
+			json.NewEncoder(w).Encode(map[string]any{"Id": id, "Config": cfg})
 		default:
 			w.Write([]byte("{}"))
 		}

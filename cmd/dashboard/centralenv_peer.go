@@ -4,19 +4,25 @@
 //	POST {svc}/set             origin only — apply a set/unset edit
 //	POST {svc}/notify          non-origin — "version N exists, go fetch it"
 //	GET  {svc}/status          any host — role, version, members, job
-//	POST {svc}/release         non-origin — drop this host's cached copy
+//	POST {svc}/release         non-origin — recreate stamped replicas without
+//	                           the stamp, then drop this host's cached copy
+//	GET  {svc}/live-keys       adopt preflight — this host's facts, env by
+//	                           name + HMAC(nonce, value) only
+//	POST {svc}/live-env        adopt execute — values of ONLY the named keys
+//	                           of this host's live (unmanaged) template
 //
 // Every endpoint answers 404 unless DASHBOARD_PEER_SECRET is set AND
 // CENTRAL_ENV is on here, so a pre-central-env peer and a feature-off peer
 // look identical to a caller (both "unsupported"). Everything but /status
-// additionally needs -peer-writes. The first GET is the only thing in the
-// whole feature that puts resolved values on the wire; it is never logged,
-// and its audit entry names the service, the asking host and the version.
+// additionally needs -peer-writes. The first GET and live-env are the only
+// things in the whole feature that put values on the wire; neither is ever
+// logged, and their audit entries carry names and versions only.
 package main
 
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,6 +81,9 @@ func applyCentralEnvSet(ce *centralEnv, svc string, req centralEnvSetRequest, ac
 	}
 	if !ok {
 		return centralEnvSetResponse{}, errCentralEnvNotFound
+	}
+	if rec.State == centralEnvStateReleasing {
+		return centralEnvSetResponse{}, errCentralEnvReleasing
 	}
 	base := copyStringMap(rec.Base)
 	if base == nil {
@@ -268,6 +277,10 @@ func peerCentralEnvHandler(secret string, ce *centralEnv, dc *dockerClient, writ
 			p.status(w, r, svc)
 		case action == "release" && r.Method == http.MethodPost:
 			p.release(w, r, svc)
+		case action == "live-keys" && r.Method == http.MethodGet:
+			p.liveKeys(w, r, svc)
+		case action == "live-env" && r.Method == http.MethodPost:
+			p.liveEnv(w, r, svc)
 		default:
 			// Auth first so an unauthenticated caller can't map which
 			// action names exist.
@@ -340,6 +353,9 @@ func (p *centralEnvPeer) notify(w http.ResponseWriter, r *http.Request, svc stri
 		// Retry: an operator's explicit sync — forget a version this host
 		// failed (and rolled back from) and try it again.
 		Retry bool `json:"retry,omitempty"`
+		// Adopt: the origin is still adopting svc — roll this host's
+		// foreign (unstamped) members onto the central env too.
+		Adopt bool `json:"adopt,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil || body.Origin == "" || body.Version == 0 {
 		http.Error(w, "origin and version are required", http.StatusBadRequest)
@@ -362,10 +378,15 @@ func (p *centralEnvPeer) notify(w http.ResponseWriter, r *http.Request, svc stri
 		p.ce.sync.clearFailures(svc)
 	}
 	if hasCache && cached.Version >= body.Version && !p.ce.sync.busy(svc) {
-		if _, members, err := p.ce.sync.localMembers(r.Context(), svc); err == nil && membersAtLeast(members, body.Version) {
+		if _, members, err := p.ce.sync.localMembers(r.Context(), svc); err == nil && membersAtLeast(members, body.Version) && !(body.Adopt && hasForeign(members)) {
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "converged", "version": cached.Version})
 			return
 		}
+	}
+	if body.Adopt {
+		p.ce.sync.mu.Lock()
+		p.ce.sync.peerAdopt[svc] = true
+		p.ce.sync.mu.Unlock()
 	}
 	p.ce.sync.requestPeer(svc, body.Origin, body.Version)
 	audit(r, "peer-mesh", "service.env_sync_start", fmt.Sprintf("%s v%d from %s", svc, body.Version, body.Origin))
@@ -397,10 +418,13 @@ func (p *centralEnvPeer) status(w http.ResponseWriter, r *http.Request, svc stri
 	httpx.WriteJSON(w, http.StatusOK, st)
 }
 
-// release drops this host's cached copy of svc's env. Replicas already
-// carrying pmgr.env.origin stay managed (Resolve re-fetches from the
-// origin on the next create), so this is for a host that no longer runs svc
-// at all, or ahead of an un-adopt.
+// release un-adopts svc on this host: every replica stamped from its origin
+// is recreated without the stamp (a background job — 202, the origin polls
+// /status), then the cache is dropped. With nothing stamped here the cache
+// just goes (200). Unstamped:true in either answer is how the origin tells
+// this from a pre-adopt dashboard, whose /release only dropped the cache.
+// Nothing is touched unless the origin confirms (via its /status) that its
+// record is releasing or gone: 409 if it isn't, 503 if it can't be asked.
 func (p *centralEnvPeer) release(w http.ResponseWriter, r *http.Request, svc string) {
 	if !p.peerAuth(w, r, true) {
 		return
@@ -409,12 +433,157 @@ func (p *centralEnvPeer) release(w http.ResponseWriter, r *http.Request, svc str
 		http.Error(w, "this host is the central env origin for "+svc, http.StatusConflict)
 		return
 	}
+	if p.ce.sync == nil {
+		http.Error(w, "central env propagation is not running", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		Origin string `json:"origin"`
+	}
+	// An empty body (a pre-adopt origin) is fine: the cached origin is used.
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body)
+	cached, hasCache := p.ce.cache.Get(svc)
+	origin := body.Origin
+	if origin == "" && hasCache {
+		origin = cached.Origin
+	}
+	if hasCache && origin != cached.Origin {
+		http.Error(w, fmt.Sprintf("%s is managed from %s here, not %s", svc, cached.Origin, origin), http.StatusConflict)
+		return
+	}
+	live, members, err := p.ce.sync.localMembers(r.Context(), svc)
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	stamped := !hasForeignOnly(members)
+	if stamped {
+		for _, ct := range live {
+			if o := ct.Labels[labelEnvOrigin]; origin == "" && o != "" {
+				origin = o
+			}
+		}
+		if origin == "" {
+			http.Error(w, "stamped replicas but no known origin", http.StatusConflict)
+			return
+		}
+	}
+	// Only the origin decides a release: without this, a direct call would
+	// unstamp replicas (or drop the cache) the origin still manages.
+	if origin != "" {
+		releasing, err := p.ce.sync.originReleasing(r.Context(), origin, svc)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("cannot confirm with origin %s that %s is being released: %v", origin, svc, err), http.StatusServiceUnavailable)
+			return
+		}
+		if !releasing {
+			http.Error(w, fmt.Sprintf("origin %s is not releasing %s", origin, svc), http.StatusConflict)
+			return
+		}
+	}
+	if stamped {
+		p.ce.sync.requestPeerRelease(svc, origin)
+		audit(r, "peer-mesh", "service.env_release_start", svc+" from "+origin)
+		httpx.WriteJSON(w, http.StatusAccepted, peerCentralEnvReleaseResponse{Status: "accepted", Unstamped: true})
+		return
+	}
 	if err := p.ce.cache.Delete(svc); err != nil {
 		httpx.WriteErr(w, err)
 		return
 	}
+	p.ce.sync.forget(svc)
 	audit(r, "peer-mesh", "service.env_release", svc)
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"status": "released"})
+	httpx.WriteJSON(w, http.StatusOK, peerCentralEnvReleaseResponse{Status: "released", Unstamped: true})
+}
+
+// adoptRefuseInfra keeps live-keys/live-env away from the dashboard's own
+// service and the fixed infra containers — their env holds the mesh's own
+// secrets, and no adopt may ever target them.
+func (p *centralEnvPeer) adoptRefuseInfra(w http.ResponseWriter, r *http.Request, svc string) bool {
+	if infraContainerNames[svc] {
+		http.Error(w, "infrastructure service", http.StatusForbidden)
+		return true
+	}
+	if self, err := p.dc.serviceContainsSelfByName(r.Context(), svc); err != nil || self {
+		http.Error(w, "refusing: this dashboard's own service (or it could not be checked)", http.StatusForbidden)
+		return true
+	}
+	return false
+}
+
+// liveKeys is an adopt preflight's question to this host: what does svc
+// look like here? Names, facts and HMAC(nonce, value) per key — the nonce is
+// the asking origin's per-request random salt, so the answer is useless
+// for any other comparison and no value can be read back from it.
+func (p *centralEnvPeer) liveKeys(w http.ResponseWriter, r *http.Request, svc string) {
+	if !p.peerAuth(w, r, true) {
+		return
+	}
+	if p.adoptRefuseInfra(w, r, svc) {
+		return
+	}
+	if p.ce.sync == nil {
+		http.Error(w, "central env propagation is not running", http.StatusServiceUnavailable)
+		return
+	}
+	nonce, err := hex.DecodeString(r.URL.Query().Get("nonce"))
+	if err != nil || len(nonce) < adoptNonceBytes {
+		http.Error(w, "nonce (hex, 32+ bytes) is required", http.StatusBadRequest)
+		return
+	}
+	facts, _, err := adoptLocalFacts(r.Context(), p.ce.sync, svc, nonce, "")
+	if err != nil {
+		// Docker errors name containers and fields, never env.
+		httpx.WriteErr(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, facts)
+}
+
+// liveEnv hands an adopting origin the VALUES of exactly the keys it names,
+// from this host's live template (after image-ENV subtraction) — only for a
+// service not yet centrally managed here. Never logged; the audit entry names
+// the keys.
+func (p *centralEnvPeer) liveEnv(w http.ResponseWriter, r *http.Request, svc string) {
+	if !p.peerAuth(w, r, true) {
+		return
+	}
+	if p.adoptRefuseInfra(w, r, svc) {
+		return
+	}
+	if p.ce.sync == nil {
+		http.Error(w, "central env propagation is not running", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		Keys []string `json:"keys"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil || len(body.Keys) == 0 || len(body.Keys) > adoptLiveEnvMaxKeys {
+		http.Error(w, "keys (1-256 names) are required", http.StatusBadRequest)
+		return
+	}
+	facts, env, err := adoptLocalFacts(r.Context(), p.ce.sync, svc, nil, "")
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	if facts.Managed {
+		http.Error(w, svc+" is already centrally managed here", http.StatusConflict)
+		return
+	}
+	if len(facts.Members) == 0 {
+		http.Error(w, "no live replica of "+svc+" here", http.StatusNotFound)
+		return
+	}
+	out := make(map[string]string, len(body.Keys))
+	for _, k := range body.Keys {
+		if v, ok := env[k]; ok {
+			out[k] = v
+		}
+	}
+	names := sortedKeys(out)
+	audit(r, "peer-mesh", "service.env_adopt_fetch", fmt.Sprintf("%s keys=%s", svc, strings.Join(names, ",")))
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"values": out})
 }
 
 // writeCentralEnvErr maps a central-env error onto its status. Bodies carry
@@ -442,7 +611,7 @@ func writeCentralEnvErr(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	case errors.Is(err, errCentralEnvNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
-	case errors.As(err, &broken), errors.As(err, &failedHere), errors.As(err, &cacheFailed):
+	case errors.As(err, &broken), errors.As(err, &failedHere), errors.As(err, &cacheFailed), errors.Is(err, errCentralEnvReleasing):
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.As(err, &badRef):
 		http.Error(w, err.Error(), http.StatusBadRequest)
