@@ -677,9 +677,10 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		// owner whichever host the request lands on (a non-origin forwards
 		// to the origin itself), and it is exempt from the rollout guard
 		// below — an env edit while a rollout runs is queued by the sync
-		// manager, which defers until the rollout is done. Adopt and release
-		// read ?host= themselves: for adopt it is the origin to create, for
-		// release only an assertion of which host the origin is.
+		// manager, which defers until the rollout is done. Every central env
+		// route reads ?host= itself: for env and env/sync it is the host to
+		// ask, for adopt the origin to create, for release only an assertion
+		// of which host the origin is.
 		if len(parts) == 2 && (parts[1] == "env" || parts[1] == "env/sync" || parts[1] == "env/adopt" || parts[1] == "env/release") {
 			if serveCentralEnvAPI(w, req, dc, auth, name, parts[1]) {
 				return

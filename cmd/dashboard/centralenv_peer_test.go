@@ -56,6 +56,13 @@ func TestPeerCentralEnvAuthGates(t *testing.T) {
 		{"release-request needs writes", peerCentralEnvHandler("s3cret", h.ce, h.dc, false), "POST", "/peer/central-env/app/release-request", "s3cret", http.StatusNotFound},
 		{"adopt wrong bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "POST", "/peer/central-env/app/adopt", "nope", http.StatusUnauthorized},
 		{"release-request no bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "POST", "/peer/central-env/app/release-request", "", http.StatusUnauthorized},
+		{"view without writes", peerCentralEnvHandler("s3cret", h.ce, h.dc, false), "GET", "/peer/central-env/app/view", "s3cret", http.StatusOK},
+		{"view no bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "GET", "/peer/central-env/app/view", "", http.StatusUnauthorized},
+		{"view feature off", peerCentralEnvHandler("s3cret", disabled, h.dc, true), "GET", "/peer/central-env/app/view", "s3cret", http.StatusNotFound},
+		{"set-request needs writes", peerCentralEnvHandler("s3cret", h.ce, h.dc, false), "POST", "/peer/central-env/app/set-request", "s3cret", http.StatusNotFound},
+		{"set-request wrong bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "POST", "/peer/central-env/app/set-request", "nope", http.StatusUnauthorized},
+		{"sync-request needs writes", peerCentralEnvHandler("s3cret", h.ce, h.dc, false), "POST", "/peer/central-env/app/sync-request", "s3cret", http.StatusNotFound},
+		{"sync-request wrong bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "POST", "/peer/central-env/app/sync-request", "nope", http.StatusUnauthorized},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

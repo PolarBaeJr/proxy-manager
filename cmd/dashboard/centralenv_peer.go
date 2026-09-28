@@ -13,11 +13,16 @@
 //	POST {svc}/adopt           a peer's forwarded adopt — this host becomes
 //	                           the origin
 //	POST {svc}/release-request origin only — a peer's forwarded release
+//	GET  {svc}/view            any host — this host's names-only GET /env view
+//	POST {svc}/set-request     any host — a peer's forwarded API set, run as
+//	                           if it had been made here
+//	POST {svc}/sync-request    any host — a peer's forwarded API sync
 //
 // Every endpoint answers 404 unless DASHBOARD_PEER_SECRET is set AND
 // CENTRAL_ENV is on here, so a pre-central-env peer and a feature-off peer
 // look identical to a caller (both "unsupported"). Everything but /status
-// additionally needs -peer-writes. The first GET and live-env are the only
+// and /view additionally needs -peer-writes. None of the forwarded actions
+// ever forwards again (no ?host=, no discovery). The first GET and live-env are the only
 // things in the whole feature that put values on the wire; neither is ever
 // logged, and their audit entries carry names and versions only.
 package main
@@ -288,6 +293,12 @@ func peerCentralEnvHandler(secret string, ce *centralEnv, dc *dockerClient, writ
 			p.adopt(w, r, svc)
 		case action == "release-request" && r.Method == http.MethodPost:
 			p.releaseRequest(w, r, svc)
+		case action == "view" && r.Method == http.MethodGet:
+			p.view(w, r, svc)
+		case action == "set-request" && r.Method == http.MethodPost:
+			p.setRequest(w, r, svc)
+		case action == "sync-request" && r.Method == http.MethodPost:
+			p.syncRequest(w, r, svc)
 		default:
 			// Auth first so an unauthenticated caller can't map which
 			// action names exist.
@@ -655,6 +666,63 @@ func (p *centralEnvPeer) releaseRequest(w http.ResponseWriter, r *http.Request, 
 	default:
 		httpx.WriteJSON(w, http.StatusAccepted, body)
 	}
+}
+
+// view is this host's own GET /env view of svc, for a peer's discovery or
+// forwarded GET. Names only; never asks further peers.
+func (p *centralEnvPeer) view(w http.ResponseWriter, r *http.Request, svc string) {
+	if !p.peerAuth(w, r, false) {
+		return
+	}
+	if p.ce.sync == nil {
+		http.Error(w, "central env propagation is not running", http.StatusServiceUnavailable)
+		return
+	}
+	view, err := buildCentralEnvView(r.Context(), p.ce, svc)
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, view)
+}
+
+// setRequest is a peer's forwarded API set, run exactly as the API would
+// here — including forwarding on to the origin if this host isn't it — but
+// never discovering or forwarding to another peer. Every 404 the local set
+// can answer goes out as 409 (see conflictFor404).
+func (p *centralEnvPeer) setRequest(w http.ResponseWriter, r *http.Request, svc string) {
+	if !p.peerAuth(w, r, true) {
+		return
+	}
+	if p.ce.sync == nil {
+		http.Error(w, "central env propagation is not running", http.StatusServiceUnavailable)
+		return
+	}
+	serveCentralEnvSetLocal(conflictFor404{w}, r, p.ce, svc, "peer-mesh", nil)
+}
+
+// syncRequest is a peer's forwarded API sync, run as the API would here.
+func (p *centralEnvPeer) syncRequest(w http.ResponseWriter, r *http.Request, svc string) {
+	if !p.peerAuth(w, r, true) {
+		return
+	}
+	if p.ce.sync == nil {
+		http.Error(w, "central env propagation is not running", http.StatusServiceUnavailable)
+		return
+	}
+	serveCentralEnvSyncLocal(conflictFor404{w}, r, p.ce, svc, "peer-mesh", nil)
+}
+
+// conflictFor404 answers a forwarded action's own 404s (not managed here, a
+// record gone mid-call, an origin's relayed 404) as 409: on the peer wire
+// 404 only ever means "unsupported" to a forwarder.
+type conflictFor404 struct{ http.ResponseWriter }
+
+func (w conflictFor404) WriteHeader(code int) {
+	if code == http.StatusNotFound {
+		code = http.StatusConflict
+	}
+	w.ResponseWriter.WriteHeader(code)
 }
 
 // writeCentralEnvErr maps a central-env error onto its status. Bodies carry

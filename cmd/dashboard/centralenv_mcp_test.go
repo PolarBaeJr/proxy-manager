@@ -196,3 +196,52 @@ func TestCentralEnvMCPAdoptOntoPeer(t *testing.T) {
 		t.Fatalf("report origin=%s b calls=%d", rep.Origin, b.adoptCalls.Load())
 	}
 }
+
+// TestCentralEnvMCPEnvToolsHost: get/set/sync_service_env pass host through
+// as ?host=, and only with MCP_ALLOW_PEER_WRITES (set and sync aren't even
+// registered without it).
+func TestCentralEnvMCPEnvToolsHost(t *testing.T) {
+	for _, peerWrites := range []bool{true, false} {
+		c, calls := stubDash(t, 200, `{}`)
+		s := NewServer("t", "v")
+		registerMCPTools(s, c, true, peerWrites)
+		call := func(name, args string) map[string]any {
+			res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"`+name+`","arguments":`+args+`}}`)
+			r, _ := res["result"].(map[string]any)
+			return r
+		}
+		r := call("get_service_env", `{"service":"app","host":"dashboard-b"}`)
+		if !peerWrites {
+			if r["isError"] != true || len(*calls) != 0 {
+				t.Fatalf("host without peer writes = %v, calls %v", r, *calls)
+			}
+			continue
+		}
+		call("set_service_env", `{"service":"app","host":"dashboard-b","if_version":1,"set":{"A":"1"}}`)
+		call("sync_service_env", `{"service":"app","host":"dashboard-b"}`)
+		want := []string{"GET /api/services/app/env?host=dashboard-b", "POST /api/services/app/env?host=dashboard-b", "POST /api/services/app/env/sync?host=dashboard-b"}
+		if strings.Join(*calls, "|") != strings.Join(want, "|") {
+			t.Fatalf("calls = %v, want %v", *calls, want)
+		}
+	}
+}
+
+// TestCentralEnvMCPGetFindsPeerOnlyService: the production bug — an MCP
+// server on a host that doesn't run the service. No host arg, no peer
+// writes: get_service_env still finds the peer that manages it.
+func TestCentralEnvMCPGetFindsPeerOnlyService(t *testing.T) {
+	withFastSync(t)
+	a, _ := peerOnlyMesh(t)
+	s := NewServer("t", "v")
+	registerMCPTools(s, &apiCaller{mux: a.mux}, false, false)
+	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_service_env","arguments":{"service":"app"}}}`)
+	r, _ := res["result"].(map[string]any)
+	if r["isError"] == true {
+		t.Fatalf("get_service_env = %v", r)
+	}
+	var v centralEnvView
+	json.Unmarshal([]byte(r["content"].([]any)[0].(map[string]any)["text"].(string)), &v)
+	if !v.Managed || v.Origin != "dashboard-b" || v.Version != 1 {
+		t.Fatalf("view = %+v", v)
+	}
+}
