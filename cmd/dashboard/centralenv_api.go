@@ -4,14 +4,18 @@
 //	POST /api/services/{svc}/env       set/unset keys and host overrides
 //	POST /api/services/{svc}/env/sync  kick propagation + one reconcile pass
 //	POST /api/services/{svc}/env/adopt   preflight (dry run, the default) or
-//	                                      adopt onto this host (origin)
-//	POST /api/services/{svc}/env/release un-adopt (origin only)
+//	                                      adopt; the origin is this host, or
+//	                                      ?host=<identity> (forwarded there)
+//	POST /api/services/{svc}/env/release un-adopt; runs on the origin — a
+//	                                      non-origin forwards it there
 //
 // Dispatched ahead of ?host= forwarding: a central env has one owner no
 // matter which host the request lands on, so a non-origin host forwards the
 // edit to the origin itself (one write, one version) rather than to whatever
-// host the UI happened to name. Responses carry key names, versions and
-// counts — never a value.
+// host the UI happened to name. Adopt and release read ?host= themselves:
+// for adopt it names the origin to create, for release it is only an
+// assertion of which host the origin is. Responses carry key names, versions
+// and counts — never a value.
 package main
 
 import (
@@ -35,6 +39,26 @@ import (
 // centralEnvForwardTimeout bounds a non-origin host's forwarded set. A var so
 // tests can shrink it.
 var centralEnvForwardTimeout = 10 * time.Second
+
+// centralEnvAdoptForwardTimeout bounds an adopt forwarded to the origin it
+// names. Longer than a set: the origin's preflight asks every peer's
+// live-keys (adoptPeerCallTimeout each, the forwarding host included), and
+// an execute also fetches live-env. A var so tests can shrink it.
+var centralEnvAdoptForwardTimeout = 45 * time.Second
+
+// centralEnvAdoptForwardClient carries forwarded adopts. No Timeout of its
+// own: m.client's 15s would cut a slow-but-healthy preflight short, so
+// peerMutate's context deadline (centralEnvAdoptForwardTimeout) governs.
+var centralEnvAdoptForwardClient = &http.Client{}
+
+// errCentralEnvPeerForward is a forwarded adopt/release that got no usable
+// answer from the host it was sent to — Status is what this host answers.
+type errCentralEnvPeerForward struct {
+	Status int
+	Msg    string
+}
+
+func (e errCentralEnvPeerForward) Error() string { return e.Msg }
 
 // errCentralEnvOutcomeUnknown: a forwarded set was sent but no answer came
 // back in time — the origin may or may not have applied it. Retrying with
@@ -152,6 +176,140 @@ func submitCentralEnvSet(ctx context.Context, r *http.Request, ce *centralEnv, s
 func isDialError(err error) bool {
 	var oe *net.OpError
 	return errors.As(err, &oe) && oe.Op == "dial"
+}
+
+// writePeerRelay writes a peer's answer through as-is.
+func writePeerRelay(w http.ResponseWriter, code int, body []byte) {
+	if json.Valid(body) {
+		w.Header().Set("Content-Type", "application/json")
+	} else {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	}
+	w.WriteHeader(code)
+	w.Write(body)
+}
+
+// forwardCentralEnvAdopt runs an adopt (dry run or execute) on target, which
+// becomes the origin. Never retries: an execute's request_id is minted
+// before the forward, so an operator's retry after an unknown outcome
+// replays on target instead of adopting twice. The peer's 401/403 are never
+// relayed as-is — to the UI they mean "session expired" / "2FA required".
+func forwardCentralEnvAdopt(w http.ResponseWriter, r *http.Request, ce *centralEnv, svc, target string, req centralEnvAdoptRequest, actor string) {
+	m := ce.sync
+	if !validHostIdentity(target) {
+		http.Error(w, fmt.Sprintf("invalid host %q", target), http.StatusBadRequest)
+		return
+	}
+	if m.registry == nil || m.secret == "" {
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusServiceUnavailable, Msg: "peer mesh not configured here — cannot adopt onto " + target})
+		return
+	}
+	peerURL, ok := m.registry.URLForIdentity(target)
+	if !ok {
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusNotFound, Msg: "unknown host " + target})
+		return
+	}
+	body, _ := json.Marshal(req)
+	code, respBody, err := peerMutate(r.Context(), centralEnvAdoptForwardClient, peerURL, m.secret, http.MethodPost, "/peer/central-env/"+url.PathEscape(svc)+"/adopt", centralEnvAdoptForwardTimeout, bytes.NewReader(body), nil, mintForwardedActor(r, actor))
+	if err != nil {
+		switch {
+		case code == 0 && isDialError(err):
+			writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusServiceUnavailable, Msg: target + " is unreachable — nothing was sent"})
+		case req.dryRun():
+			writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusGatewayTimeout, Msg: target + " did not answer the adopt dry run in time — a dry run changes nothing; retry"})
+		default:
+			writeCentralEnvErr(w, errCentralEnvOutcomeUnknown{Service: svc, Origin: target, RequestID: req.RequestID})
+		}
+		return
+	}
+	peerText := strings.TrimSpace(string(respBody))
+	switch code {
+	case http.StatusOK, http.StatusAccepted, http.StatusBadRequest, http.StatusConflict:
+		writePeerRelay(w, code, respBody)
+	case http.StatusNotFound:
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusConflict, Msg: "peer " + target + " does not support forwarded adopt — deploy the new dashboard there (and enable -peer-writes)"})
+	case http.StatusUnauthorized:
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusBadGateway, Msg: "peer " + target + " rejected mesh credentials"})
+	case http.StatusForbidden:
+		httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": peerText})
+	default:
+		// A definitive failure: nothing runs after CreateAdopted errors, so
+		// this is not an unknown outcome.
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusBadGateway, Msg: "adopt on " + target + " failed: " + peerText})
+	}
+}
+
+// serveCentralEnvAdoptLocal runs an adopt with this host as the origin —
+// shared by the API and the peer /adopt, so a forwarded adopt answers
+// exactly like a local one.
+func serveCentralEnvAdoptLocal(w http.ResponseWriter, r *http.Request, ce *centralEnv, svc string, req centralEnvAdoptRequest, actor string) {
+	if req.dryRun() {
+		rep, _, err := ce.sync.adoptPreflight(r.Context(), svc, req, "")
+		if err != nil {
+			httpx.WriteErr(w, err)
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, rep)
+		return
+	}
+	if req.RequestID == "" {
+		req.RequestID = newCentralEnvRequestID()
+	}
+	res, err := ce.sync.adoptExecute(r.Context(), r, svc, req, actor)
+	var refused errAdoptRefused
+	switch {
+	case errors.As(err, &refused):
+		body := map[string]any{"error": refused.reason, "request_id": req.RequestID}
+		if refused.report.Service != "" {
+			body["report"] = refused.report
+		}
+		httpx.WriteJSON(w, http.StatusConflict, body)
+	case errors.Is(err, errCentralEnvNotFound):
+		// 404 on the peer wire means "unsupported" to a forwarder.
+		http.Error(w, err.Error(), http.StatusConflict)
+	case err != nil:
+		writeCentralEnvErr(w, err)
+	default:
+		httpx.WriteJSON(w, http.StatusAccepted, res)
+	}
+}
+
+// forwardCentralEnvRelease asks origin to start releasing svc. Releasing
+// again is always safe (it resumes), so an unanswered forward says so.
+func forwardCentralEnvRelease(w http.ResponseWriter, r *http.Request, ce *centralEnv, svc, origin, actor string) {
+	m := ce.sync
+	if !validHostIdentity(origin) {
+		http.Error(w, fmt.Sprintf("invalid origin %q", origin), http.StatusBadRequest)
+		return
+	}
+	if m.registry == nil || m.secret == "" {
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusServiceUnavailable, Msg: "peer mesh not configured here — cannot reach origin " + origin})
+		return
+	}
+	peerURL, ok := m.registry.URLForIdentity(origin)
+	if !ok {
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusServiceUnavailable, Msg: "origin " + origin + " is not a known peer"})
+		return
+	}
+	code, respBody, err := peerMutate(r.Context(), m.client, peerURL, m.secret, http.MethodPost, "/peer/central-env/"+url.PathEscape(svc)+"/release-request", centralEnvForwardTimeout, nil, nil, mintForwardedActor(r, actor))
+	if err != nil {
+		if code == 0 && isDialError(err) {
+			writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusServiceUnavailable, Msg: "origin " + origin + " is unreachable — release not started"})
+			return
+		}
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusGatewayTimeout, Msg: "origin " + origin + " did not answer in time — the release may or may not have started; releasing again is safe (it resumes)"})
+		return
+	}
+	switch code {
+	case http.StatusAccepted, http.StatusConflict:
+		writePeerRelay(w, code, respBody)
+	case http.StatusNotFound:
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusConflict, Msg: "origin " + origin + " does not support forwarded release — deploy the new dashboard there (and enable -peer-writes), or release on " + origin + " directly"})
+	case http.StatusUnauthorized, http.StatusForbidden:
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusBadGateway, Msg: "origin " + origin + " rejected mesh credentials"})
+	default:
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusBadGateway, Msg: "release on " + origin + " failed: " + strings.TrimSpace(string(respBody))})
+	}
 }
 
 // centralEnvHostView is one host's convergence in the GET /env view.
@@ -399,64 +557,50 @@ func serveCentralEnvAPI(w http.ResponseWriter, r *http.Request, dc *dockerClient
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return true
 		}
-		if req.dryRun() {
-			rep, _, err := ce.sync.adoptPreflight(r.Context(), svc, req, "")
-			if err != nil {
-				httpx.WriteErr(w, err)
-				return true
-			}
-			httpx.WriteJSON(w, http.StatusOK, rep)
+		target := strings.TrimSpace(r.URL.Query().Get("host"))
+		if target == "" || target == ce.identity {
+			serveCentralEnvAdoptLocal(w, r, ce, svc, req, actor)
 			return true
 		}
-		if req.RequestID == "" {
+		if !req.dryRun() && req.RequestID == "" {
 			req.RequestID = newCentralEnvRequestID()
 		}
-		res, err := ce.sync.adoptExecute(r.Context(), r, svc, req, actor)
-		var refused errAdoptRefused
-		switch {
-		case errors.As(err, &refused):
-			body := map[string]any{"error": refused.reason, "request_id": req.RequestID}
-			if refused.report.Service != "" {
-				body["report"] = refused.report
-			}
-			httpx.WriteJSON(w, http.StatusConflict, body)
-		case err != nil:
-			writeCentralEnvErr(w, err)
-		default:
-			httpx.WriteJSON(w, http.StatusAccepted, res)
-		}
+		forwardCentralEnvAdopt(w, r, ce, svc, target, req, actor)
 	case sub == "env/release" && r.Method == http.MethodPost:
+		// The origin decides from its own record alone, so a Docker hiccup
+		// can't block a release there; only a non-origin needs the labels.
+		var labels map[string]string
 		if !ce.store.Has(svc) {
 			tpl, hasTpl, err := centralEnvServiceTemplate(r.Context(), dc, svc)
 			if err != nil {
 				httpx.WriteErr(w, err)
 				return true
 			}
-			var labels map[string]string
 			if hasTpl {
 				labels = tpl.Labels
 			}
-			if ce.Managed(svc, labels) {
-				http.Error(w, fmt.Sprintf("release %q on its origin %s", svc, centralEnvOriginFor(ce, svc, labels)), http.StatusConflict)
-				return true
-			}
-			http.Error(w, fmt.Sprintf("%q is not centrally managed", svc), http.StatusNotFound)
+		}
+		managed := ce.Managed(svc, labels)
+		origin := centralEnvOriginFor(ce, svc, labels)
+		if want := strings.TrimSpace(r.URL.Query().Get("host")); want != "" && managed && want != origin {
+			http.Error(w, fmt.Sprintf("%q's central env origin is %s, not %s — release always runs on the origin", svc, origin, want), http.StatusConflict)
 			return true
 		}
-		rec, _, err := ce.store.Get(svc)
-		if err != nil {
-			writeCentralEnvErr(w, err)
-			return true
-		}
-		if rec.State != centralEnvStateReleasing {
-			if err := ce.store.SetState(svc, centralEnvStateReleasing); err != nil {
+		switch {
+		case ce.store.Has(svc):
+			body, err := startCentralEnvRelease(r, ce, svc, actor)
+			if err != nil {
 				writeCentralEnvErr(w, err)
 				return true
 			}
+			httpx.WriteJSON(w, http.StatusAccepted, body)
+		case managed && (origin == "" || origin == ce.identity):
+			http.Error(w, fmt.Sprintf("release %q on its origin %s", svc, origin), http.StatusConflict)
+		case managed:
+			forwardCentralEnvRelease(w, r, ce, svc, origin, actor)
+		default:
+			http.Error(w, fmt.Sprintf("%q is not centrally managed", svc), http.StatusNotFound)
 		}
-		ce.sync.requestRelease(svc)
-		audit(r, actor, "service.env_release_start", fmt.Sprintf("%s v%d", svc, rec.Version))
-		httpx.WriteJSON(w, http.StatusAccepted, map[string]any{"status": "releasing", "version": rec.Version, "job": "GET /api/services/" + svc + "/env"})
 	default:
 		http.NotFound(w, r)
 	}
@@ -564,7 +708,9 @@ func isCentralEnvErr(err error) bool {
 	var relay errCentralEnvRelay
 	var failedHere errCentralEnvFailedHere
 	var cacheFailed errCentralEnvCacheFailed
+	var fwd errCentralEnvPeerForward
 	return errors.As(err, &conflict) || errors.As(err, &managed) || errors.As(err, &unavailable) ||
 		errors.As(err, &broken) || errors.As(err, &unknown) || errors.As(err, &relay) ||
-		errors.As(err, &failedHere) || errors.As(err, &cacheFailed) || errors.Is(err, errCentralEnvReleasing)
+		errors.As(err, &failedHere) || errors.As(err, &cacheFailed) || errors.As(err, &fwd) ||
+		errors.Is(err, errCentralEnvReleasing)
 }

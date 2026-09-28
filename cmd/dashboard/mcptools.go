@@ -306,8 +306,9 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		Name:     "adopt_service_env",
 		Title:    "Adopt a service into central env",
 		Mutating: allowWrites && allowPeerWrites,
-		Description: "Bring a label-managed service (often compose-created) under central env management, with THIS " +
-			"dashboard's host as its origin. Defaults to a DRY RUN that changes nothing and returns a report by KEY NAME " +
+		Description: "Bring a label-managed service (often compose-created) under central env management. Its origin " +
+			"is the host arg, or THIS dashboard's host if omitted; the adopt runs on that host, which must run the " +
+			"service. Defaults to a DRY RUN that changes nothing and returns a report by KEY NAME " +
 			"only (values are never returned): blockers, warnings, required_acks/missing_acks, a per-host env diff " +
 			"(peer_only keys a peer would lose, origin_only keys it would gain, keys whose values differ, host-local " +
 			"looking keys), members per host, compose ownership + retire_steps, and a fingerprint. To execute, pass " +
@@ -317,6 +318,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			"labels, and is undone automatically if the origin's first roll fails. Watch it with get_service_env.",
 		InputSchema: schema(map[string]any{
 			"service":            prop("string", "Service name from list_services."),
+			"host":               prop("string", "Optional host identity (see \"machine\" in list_services) to become the ORIGIN instead of this dashboard's host. Use the SAME host for the dry run and the execute — a fingerprint is only valid on the origin that produced it. Requires MCP_ALLOW_PEER_WRITES."),
 			"dry_run":            prop("boolean", "Default true. false executes the adopt."),
 			"fingerprint":        prop("string", "The fingerprint from the dry run this execute is based on (required to execute)."),
 			"request_id":         prop("string", "Optional idempotency key; reuse it to retry an execute whose outcome was unknown."),
@@ -345,6 +347,10 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			if err != nil {
 				return "", err
 			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
 			req, err := argAdoptRequest(args)
 			if err != nil {
 				return "", err
@@ -352,7 +358,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			if !req.dryRun() && (!allowWrites || !allowPeerWrites) {
 				return "", fmt.Errorf("executing an adopt restarts %s on every host — it needs MCP_ALLOW_WRITES=true and MCP_ALLOW_PEER_WRITES=true (a dry run works without them)", name)
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/env/adopt", req)
+			b, err := a.call(ctx, "POST", withHost("/api/services/"+url.PathEscape(name)+"/env/adopt", host), req)
 			if err != nil {
 				return "", err
 			}
@@ -1267,17 +1273,22 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			"health-gated) from its current env but without the central-env stamp, drop each peer's cached copy, then " +
 			"delete the central record — the service's env is per-host again. If any host fails, the service stays " +
 			"\"releasing\" (creates keep working) and calling this again resumes. Watch it with get_service_env. " +
-			"Must be called on the origin's dashboard.",
+			"Runs on the service's origin; called on any other host it is forwarded there automatically.",
 		Mutating: true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
+			"host":    prop("string", "Optional: the origin you expect. Refused (409) if it isn't the service's origin; never redirects."),
 		}, "service"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/env/release", nil)
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "POST", withHost("/api/services/"+url.PathEscape(name)+"/env/release", host), nil)
 			if err != nil {
 				return "", err
 			}

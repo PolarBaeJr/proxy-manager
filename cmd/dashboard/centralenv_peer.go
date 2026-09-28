@@ -10,6 +10,9 @@
 //	                           name + HMAC(nonce, value) only
 //	POST {svc}/live-env        adopt execute — values of ONLY the named keys
 //	                           of this host's live (unmanaged) template
+//	POST {svc}/adopt           a peer's forwarded adopt — this host becomes
+//	                           the origin
+//	POST {svc}/release-request origin only — a peer's forwarded release
 //
 // Every endpoint answers 404 unless DASHBOARD_PEER_SECRET is set AND
 // CENTRAL_ENV is on here, so a pre-central-env peer and a feature-off peer
@@ -281,6 +284,10 @@ func peerCentralEnvHandler(secret string, ce *centralEnv, dc *dockerClient, writ
 			p.liveKeys(w, r, svc)
 		case action == "live-env" && r.Method == http.MethodPost:
 			p.liveEnv(w, r, svc)
+		case action == "adopt" && r.Method == http.MethodPost:
+			p.adopt(w, r, svc)
+		case action == "release-request" && r.Method == http.MethodPost:
+			p.releaseRequest(w, r, svc)
 		default:
 			// Auth first so an unauthenticated caller can't map which
 			// action names exist.
@@ -586,6 +593,70 @@ func (p *centralEnvPeer) liveEnv(w http.ResponseWriter, r *http.Request, svc str
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"values": out})
 }
 
+// adopt is a peer's forwarded adopt (dry run or execute) with THIS host as
+// the origin. It never forwards again (it reads no ?host=), and a 404 from
+// here only ever means "unsupported" to the forwarder — so a missing record
+// answers 409 (see serveCentralEnvAdoptLocal). The actor is the literal
+// "peer-mesh": the audit entry resolves the forwarded person from the
+// assertion, but the store record's actor reads "peer-mesh".
+func (p *centralEnvPeer) adopt(w http.ResponseWriter, r *http.Request, svc string) {
+	if !p.peerAuth(w, r, true) {
+		return
+	}
+	if p.adoptRefuseInfra(w, r, svc) {
+		return
+	}
+	if p.ce.sync == nil {
+		http.Error(w, "central env propagation is not running", http.StatusServiceUnavailable)
+		return
+	}
+	var req centralEnvAdoptRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	tpl, hasTpl, err := centralEnvServiceTemplate(r.Context(), p.dc, svc)
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	var labels map[string]string
+	if hasTpl {
+		labels = tpl.Labels
+	}
+	if o := centralEnvOriginFor(p.ce, svc, labels); o != "" && o != p.ce.identity {
+		http.Error(w, fmt.Sprintf("%s is centrally managed from %s — release it there before adopting it here", svc, o), http.StatusConflict)
+		return
+	}
+	serveCentralEnvAdoptLocal(w, r, p.ce, svc, req, "peer-mesh")
+}
+
+// releaseRequest is a peer's forwarded release: start releasing svc here,
+// its origin. Distinct from /release (the origin telling a peer to unstamp
+// its replicas); never forwards again.
+func (p *centralEnvPeer) releaseRequest(w http.ResponseWriter, r *http.Request, svc string) {
+	if !p.peerAuth(w, r, true) {
+		return
+	}
+	if p.ce.sync == nil {
+		http.Error(w, "central env propagation is not running", http.StatusServiceUnavailable)
+		return
+	}
+	if !p.ce.store.Has(svc) {
+		http.Error(w, "not this host's central env", http.StatusConflict)
+		return
+	}
+	body, err := startCentralEnvRelease(r, p.ce, svc, "peer-mesh")
+	switch {
+	case errors.Is(err, errCentralEnvNotFound):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case err != nil:
+		writeCentralEnvErr(w, err)
+	default:
+		httpx.WriteJSON(w, http.StatusAccepted, body)
+	}
+}
+
 // writeCentralEnvErr maps a central-env error onto its status. Bodies carry
 // names and versions only — every one of these errors is built that way.
 func writeCentralEnvErr(w http.ResponseWriter, err error) {
@@ -598,6 +669,7 @@ func writeCentralEnvErr(w http.ResponseWriter, err error) {
 	var relay errCentralEnvRelay
 	var failedHere errCentralEnvFailedHere
 	var cacheFailed errCentralEnvCacheFailed
+	var fwd errCentralEnvPeerForward
 	switch {
 	case errors.As(err, &unknown):
 		httpx.WriteJSON(w, http.StatusGatewayTimeout, map[string]any{"error": err.Error(), "request_id": unknown.RequestID})
@@ -615,6 +687,8 @@ func writeCentralEnvErr(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.As(err, &badRef):
 		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.As(err, &fwd):
+		http.Error(w, err.Error(), fwd.Status)
 	default:
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	}

@@ -33,9 +33,32 @@ type meshNode struct {
 	// setDelay stalls /set before handling it — an origin that applies a
 	// forwarded write but answers too late.
 	setDelay atomic.Int64
-	mu       sync.Mutex
-	notifies []string
-	peerMux  http.Handler
+	// adoptDelay holds a forwarded adopt's answer back AFTER handling it —
+	// a new origin that adopts but answers too late.
+	adoptDelay      atomic.Int64
+	adoptCalls      atomic.Int32
+	releaseReqCalls atomic.Int32
+	mu              sync.Mutex
+	notifies        []string
+	peerMux         http.Handler
+}
+
+// peerMuxFor is the node's peer-mesh server: the real /peer/central-env/
+// handler (writes as given) plus a /peer/services that lists "app".
+func (n *meshNode) peerMuxFor(ce *centralEnv, writes bool) http.Handler {
+	identity := n.identity
+	pm := http.NewServeMux()
+	pm.Handle("/peer/central-env/", peerCentralEnvHandler("s3cret", ce, n.dc, writes))
+	pm.HandleFunc("/peer/services", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(peerServicesResp{Identity: identity, Services: []Service{{Name: "app"}}})
+	})
+	return pm
+}
+
+func (n *meshNode) setPeerMux(h http.Handler) {
+	n.mu.Lock()
+	n.peerMux = h
+	n.mu.Unlock()
 }
 
 func (n *meshNode) notifyLog() []string {
@@ -78,7 +101,31 @@ func (n *meshNode) serve(w http.ResponseWriter, r *http.Request) {
 			time.Sleep(time.Duration(d))
 		}
 	}
-	n.peerMux.ServeHTTP(w, r)
+	n.mu.Lock()
+	pm := n.peerMux
+	n.mu.Unlock()
+	if strings.HasSuffix(r.URL.Path, "/release-request") {
+		n.releaseReqCalls.Add(1)
+	}
+	if strings.HasSuffix(r.URL.Path, "/adopt") {
+		n.adoptCalls.Add(1)
+		if d := n.adoptDelay.Load(); d > 0 {
+			// Handle first, then sleep: sleeping before would let the
+			// forwarder hang up and cancel r.Context() — which the
+			// preflight's own peer calls run on — mid-adopt. Detached so
+			// the adopt completes even once the forwarder gives up.
+			rec := httptest.NewRecorder()
+			pm.ServeHTTP(rec, r.WithContext(context.WithoutCancel(r.Context())))
+			time.Sleep(time.Duration(d))
+			for k, v := range rec.Header() {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(rec.Code)
+			w.Write(rec.Body.Bytes())
+			return
+		}
+	}
+	pm.ServeHTTP(w, r)
 }
 
 // orderLog records creates across both hosts, in the order they happened.
@@ -131,13 +178,7 @@ func newMesh(t *testing.T, bCapable bool) (a, b *meshNode, order *orderLog) {
 		if n == b && !bCapable {
 			ce = nil
 		}
-		identity := n.identity
-		pm := http.NewServeMux()
-		pm.Handle("/peer/central-env/", peerCentralEnvHandler("s3cret", ce, n.dc, true))
-		pm.HandleFunc("/peer/services", func(w http.ResponseWriter, r *http.Request) {
-			json.NewEncoder(w).Encode(peerServicesResp{Identity: identity, Services: []Service{{Name: "app"}}})
-		})
-		n.peerMux = pm
+		n.setPeerMux(n.peerMuxFor(ce, true))
 		auth, _ := newConfirmedStore(t, "alice", "correct horse")
 		reg := regA
 		if n == b {

@@ -555,9 +555,6 @@ func TestMeshReleaseUnstampsEverywhere(t *testing.T) {
 	a, b, _ := newMesh(t, true)
 	seedConverged(a, b)
 
-	if rec := apiDo(t, b.mux, "POST", "/api/services/app/env/release", ""); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "on its origin dashboard-a") {
-		t.Fatalf("release on B = %d %s", rec.Code, rec.Body.String())
-	}
 	rec := apiDo(t, a.mux, "POST", "/api/services/app/env/release", "")
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("release = %d %s", rec.Code, rec.Body.String())
@@ -757,6 +754,8 @@ func centralEnvAdoptOutputs(t *testing.T, sentinel string) []string {
 		add(n.identity+" "+method+" "+path, rec.Body.String())
 		return rec.Body.String()
 	}
+	// A dry run forwarded from B to A, while nothing is managed yet.
+	api(b, "POST", "/api/services/app/env/adopt?host=dashboard-a", `{}`)
 	jobs := func(what string) {
 		for _, n := range []*meshNode{a, b} {
 			j, _ := n.m.get("app")
