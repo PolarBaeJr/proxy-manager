@@ -284,13 +284,18 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			"managed=false means the service's env is still per-host.",
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
+			"host":    prop("string", "Optional host identity (see \"machine\" in list_services) to ask instead of this dashboard. If omitted and this dashboard doesn't know the service, peers are asked automatically. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
 			}
-			b, err := a.call(ctx, "GET", "/api/services/"+url.PathEscape(name)+"/env", nil)
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "GET", withHost("/api/services/"+url.PathEscape(name)+"/env", host), nil)
 			if err != nil {
 				return "", err
 			}
@@ -1191,6 +1196,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		Mutating: true,
 		InputSchema: schema(map[string]any{
 			"service":    prop("string", "Service name from list_services."),
+			"host":       prop("string", "Optional host identity (see \"machine\" in list_services) to ask instead of this dashboard. If omitted and this dashboard doesn't know the service, peers are asked automatically. Requires MCP_ALLOW_PEER_WRITES."),
 			"if_version": prop("number", "The version this edit is based on, from get_service_env."),
 			"request_id": prop("string", "Optional idempotency key. Reuse the same one to retry a call whose outcome was unknown (timeout) — it is applied at most once."),
 			"set": map[string]any{
@@ -1218,6 +1224,10 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		}, "service", "if_version"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
 			if err != nil {
 				return "", err
 			}
@@ -1258,7 +1268,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			}
 			body := centralEnvSetRequest{RequestID: requestID, IfVersion: uint64(ifVersion), Set: set, Unset: unset,
 				HostOverrides: overrides, UnsetHostOverrides: unsetOverrides}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/env", body)
+			b, err := a.call(ctx, "POST", withHost("/api/services/"+url.PathEscape(name)+"/env", host), body)
 			if err != nil {
 				return "", err
 			}
@@ -1303,13 +1313,18 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		Mutating:    true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
+			"host":    prop("string", "Optional host identity (see \"machine\" in list_services) to ask instead of this dashboard. If omitted and this dashboard doesn't know the service, peers are asked automatically. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service"),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			name, err := argString(args, "service")
 			if err != nil {
 				return "", err
 			}
-			b, err := a.call(ctx, "POST", "/api/services/"+url.PathEscape(name)+"/env/sync", nil)
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "POST", withHost("/api/services/"+url.PathEscape(name)+"/env/sync", host), nil)
 			if err != nil {
 				return "", err
 			}

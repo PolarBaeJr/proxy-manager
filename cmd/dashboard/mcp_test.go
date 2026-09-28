@@ -737,7 +737,7 @@ func TestOnboardServiceRequiresHostAndPort(t *testing.T) {
 	}
 }
 
-// The 13 tools that support peer targeting, and the argument key each one
+// The 16 tools that support peer targeting, and the argument key each one
 // reads it under. onboard_service alone uses "peer_host" — its own "host"
 // key already means the hostname to ROUTE.
 var peerTargetableTools = map[string]string{
@@ -754,6 +754,9 @@ var peerTargetableTools = map[string]string{
 	"restart_replica":         "host",
 	"adopt_service_env":       "host",
 	"release_service_env":     "host",
+	"get_service_env":         "host",
+	"set_service_env":         "host",
+	"sync_service_env":        "host",
 }
 
 // spread_service is peer-targeted by construction — its "target" is not

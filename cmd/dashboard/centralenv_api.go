@@ -3,6 +3,8 @@
 //	GET  /api/services/{svc}/env       names-only view (any host)
 //	POST /api/services/{svc}/env       set/unset keys and host overrides
 //	POST /api/services/{svc}/env/sync  kick propagation + one reconcile pass
+//	                                    (all three: ?host=<identity> asks
+//	                                    that host instead)
 //	POST /api/services/{svc}/env/adopt   preflight (dry run, the default) or
 //	                                      adopt; the origin is this host, or
 //	                                      ?host=<identity> (forwarded there)
@@ -11,11 +13,13 @@
 //
 // Dispatched ahead of ?host= forwarding: a central env has one owner no
 // matter which host the request lands on, so a non-origin host forwards the
-// edit to the origin itself (one write, one version) rather than to whatever
-// host the UI happened to name. Adopt and release read ?host= themselves:
-// for adopt it names the origin to create, for release it is only an
-// assertion of which host the origin is. Responses carry key names, versions
-// and counts — never a value.
+// edit to the origin itself (one write, one version). Every route reads
+// ?host= itself: for env and env/sync it names the host to ask (which may
+// be a peer that knows a service this host doesn't run), for adopt the
+// origin to create, for release only an assertion of which host the origin
+// is. With no ?host=, env and env/sync on a service this host doesn't know
+// ask the peers and forward to the first that manages it. Responses carry
+// key names, versions and counts — never a value.
 package main
 
 import (
@@ -26,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -312,6 +317,201 @@ func forwardCentralEnvRelease(w http.ResponseWriter, r *http.Request, ce *centra
 	}
 }
 
+// serveCentralEnvSetLocal runs a set against this host's knowledge of svc —
+// shared by the API and the peer /set-request, so a forwarded set answers
+// exactly like a local one. discover (nil on the peer, and for ?host=self)
+// gets a service this host doesn't know before the 404, and reports
+// whether it answered.
+func serveCentralEnvSetLocal(w http.ResponseWriter, r *http.Request, ce *centralEnv, svc, actor string, discover func(centralEnvSetRequest) bool) {
+	dc := ce.sync.dc
+	if self, err := dc.serviceContainsSelfByName(r.Context(), svc); err == nil && self {
+		http.Error(w, "refusing to manage the dashboard's own service from within itself — use docker compose on the host", http.StatusForbidden)
+		return
+	}
+	var req centralEnvSetRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	tpl, hasTpl, err := centralEnvServiceTemplate(r.Context(), dc, svc)
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	var labels map[string]string
+	if hasTpl {
+		labels = tpl.Labels
+	}
+	// Minted before any forward, so a retry after an unknown outcome
+	// replays wherever it lands.
+	if req.RequestID == "" {
+		req.RequestID = newCentralEnvRequestID()
+	}
+	if !ce.Managed(svc, labels) {
+		// Discovery only for a service this host doesn't run at all: a local
+		// unmanaged service that shares a name with a peer's managed one
+		// must not have its edit land on the peer's instead.
+		if discover != nil && !hasTpl && discover(req) {
+			return
+		}
+		http.Error(w, fmt.Sprintf("%q is not centrally managed", svc), http.StatusNotFound)
+		return
+	}
+	origin := centralEnvOriginFor(ce, svc, labels)
+	res, err := submitCentralEnvSet(r.Context(), r, ce, svc, origin, req, actor)
+	if err != nil {
+		writeCentralEnvErr(w, err)
+		return
+	}
+	if !res.NoOp && !res.Replayed {
+		audit(r, actor, "service.env_set", fmt.Sprintf("%s v%d keys=%s via %s", svc, res.Version, strings.Join(res.ChangedKeys, ","), origin))
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"version": res.Version, "changed_keys": res.ChangedKeys, "no_op": res.NoOp, "replayed": res.Replayed,
+		"request_id": req.RequestID, "origin": origin,
+	})
+}
+
+// serveCentralEnvSyncLocal kicks propagation of svc from this host — shared
+// by the API and the peer /sync-request. discover as for a set.
+func serveCentralEnvSyncLocal(w http.ResponseWriter, r *http.Request, ce *centralEnv, svc, actor string, discover func() bool) {
+	tpl, hasTpl, err := centralEnvServiceTemplate(r.Context(), ce.sync.dc, svc)
+	if err != nil {
+		httpx.WriteErr(w, err)
+		return
+	}
+	var labels map[string]string
+	if hasTpl {
+		labels = tpl.Labels
+	}
+	if !ce.Managed(svc, labels) {
+		if discover != nil && !hasTpl && discover() {
+			return
+		}
+		http.Error(w, fmt.Sprintf("%q is not centrally managed", svc), http.StatusNotFound)
+		return
+	}
+	m := ce.sync
+	m.clearFailures(svc)
+	if ce.store.Has(svc) {
+		m.request(svc)
+	} else {
+		origin := centralEnvOriginFor(ce, svc, labels)
+		v, _ := ce.Version(svc)
+		// A floor, not a target: the job always fetches the origin's
+		// newest, and reconcilePeer below raises it if the origin is
+		// already past what's cached.
+		m.reconcilePeer(r.Context(), svc)
+		m.requestPeer(svc, origin, v)
+	}
+	audit(r, actor, "service.env_sync_start", svc+" (manual)")
+	httpx.WriteJSON(w, http.StatusAccepted, map[string]string{"status": "sync requested"})
+}
+
+// centralEnvDiscoverTimeout bounds asking one peer whether it knows a
+// service this host doesn't. A var so tests can shrink it.
+var centralEnvDiscoverTimeout = 5 * time.Second
+
+// discoverCentralEnvPeer asks each central-env peer for its names-only view
+// of svc and returns the first that manages it, with that view. A peer that
+// errors, times out or has no /view (an older dashboard) is skipped.
+func discoverCentralEnvPeer(ctx context.Context, ce *centralEnv, svc string) (identity string, view []byte, ok bool) {
+	m := ce.sync
+	if m.registry == nil || m.secret == "" {
+		return "", nil, false
+	}
+	for _, p := range m.peers() {
+		if !p.capable {
+			continue
+		}
+		var v struct {
+			Managed bool `json:"managed"`
+		}
+		code, body, err := peerMutate(ctx, m.client, p.url, m.secret, http.MethodGet, "/peer/central-env/"+url.PathEscape(svc)+"/view", centralEnvDiscoverTimeout, nil, &v, "")
+		if err == nil && code == http.StatusOK && v.Managed {
+			return p.identity, body, true
+		}
+	}
+	return "", nil, false
+}
+
+// A GET /env, set or sync run on another host.
+const (
+	centralEnvOpView = "view"
+	centralEnvOpSet  = "set"
+	centralEnvOpSync = "sync"
+)
+
+// forwardCentralEnvOp runs op on target's peer /view, /set-request or
+// /sync-request — which act on target's own knowledge of svc and never
+// forward again (a set still goes on to the origin if target isn't it) —
+// and relays the answer. A set's request_id is minted before this, so a
+// retry after an unknown outcome replays. The peer's 401/403 are never
+// relayed as-is — to the UI they mean "session expired" / "2FA required".
+func forwardCentralEnvOp(w http.ResponseWriter, r *http.Request, ce *centralEnv, svc, target, op string, body []byte, requestID, actor string) {
+	m := ce.sync
+	if !validHostIdentity(target) {
+		http.Error(w, fmt.Sprintf("invalid host %q", target), http.StatusBadRequest)
+		return
+	}
+	if m.registry == nil || m.secret == "" {
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusServiceUnavailable, Msg: "peer mesh not configured here — cannot reach " + target})
+		return
+	}
+	peerURL, ok := m.registry.URLForIdentity(target)
+	if !ok {
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusNotFound, Msg: "unknown host " + target})
+		return
+	}
+	method, action := http.MethodPost, op+"-request"
+	if op == centralEnvOpView {
+		method, action = http.MethodGet, "view"
+	}
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	code, respBody, err := peerMutate(r.Context(), m.client, peerURL, m.secret, method, "/peer/central-env/"+url.PathEscape(svc)+"/"+action, centralEnvForwardTimeout, rdr, nil, mintForwardedActor(r, actor))
+	if err != nil {
+		switch {
+		case code == 0 && isDialError(err):
+			writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusServiceUnavailable, Msg: target + " is unreachable — nothing was sent"})
+		case op == centralEnvOpSet:
+			writeCentralEnvErr(w, errCentralEnvOutcomeUnknown{Service: svc, Origin: target, RequestID: requestID})
+		case op == centralEnvOpSync:
+			writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusGatewayTimeout, Msg: target + " did not answer in time — the sync may or may not have started; syncing again is safe"})
+		default:
+			writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusGatewayTimeout, Msg: target + " did not answer in time — retry"})
+		}
+		return
+	}
+	peerText := strings.TrimSpace(string(respBody))
+	switch code {
+	case http.StatusOK, http.StatusAccepted, http.StatusBadRequest, http.StatusConflict, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		// 503: target couldn't reach the origin — nothing written. 504: a
+		// set target forwarded on had an unknown outcome; its body carries
+		// the request_id.
+		writePeerRelay(w, code, respBody)
+	case http.StatusNotFound:
+		msg := "peer " + target + " does not support forwarded env " + op + " — deploy the new dashboard there"
+		if op != centralEnvOpView {
+			msg += " (and enable -peer-writes)"
+		}
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusConflict, Msg: msg})
+	case http.StatusUnauthorized:
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusBadGateway, Msg: "peer " + target + " rejected mesh credentials"})
+	case http.StatusForbidden:
+		// peerAuth never answers 403: this is target's own-service guard.
+		httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": peerText})
+	default:
+		if op == centralEnvOpSet {
+			writeCentralEnvErr(w, errCentralEnvOutcomeUnknown{Service: svc, Origin: target, RequestID: requestID})
+			return
+		}
+		writeCentralEnvErr(w, errCentralEnvPeerForward{Status: http.StatusBadGateway, Msg: "env " + op + " on " + target + " failed: " + peerText})
+	}
+}
+
 // centralEnvHostView is one host's convergence in the GET /env view.
 type centralEnvHostView struct {
 	Identity  string `json:"identity"`
@@ -477,80 +677,69 @@ func serveCentralEnvAPI(w http.ResponseWriter, r *http.Request, dc *dockerClient
 	}
 	switch {
 	case sub == "env" && r.Method == http.MethodGet:
+		host := strings.TrimSpace(r.URL.Query().Get("host"))
+		if host != "" && host != ce.identity {
+			forwardCentralEnvOp(w, r, ce, svc, host, centralEnvOpView, nil, "", actor)
+			return true
+		}
 		view, err := buildCentralEnvView(r.Context(), ce, svc)
 		if err != nil {
 			httpx.WriteErr(w, err)
 			return true
 		}
+		if !view.Managed && host == "" {
+			if _, body, ok := discoverCentralEnvPeer(r.Context(), ce, svc); ok {
+				writePeerRelay(w, http.StatusOK, body)
+				return true
+			}
+		}
 		httpx.WriteJSON(w, http.StatusOK, view)
 	case sub == "env" && r.Method == http.MethodPost:
-		if self, err := dc.serviceContainsSelfByName(r.Context(), svc); err == nil && self {
-			http.Error(w, "refusing to manage the dashboard's own service from within itself — use docker compose on the host", http.StatusForbidden)
+		host := strings.TrimSpace(r.URL.Query().Get("host"))
+		if host != "" && host != ce.identity {
+			// No local self-guard: the peer runs its own against its own
+			// Docker state (see the ?host= forwarding in api.go).
+			var req centralEnvSetRequest
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+				http.Error(w, "invalid request body", http.StatusBadRequest)
+				return true
+			}
+			if req.RequestID == "" {
+				req.RequestID = newCentralEnvRequestID()
+			}
+			body, _ := json.Marshal(req)
+			forwardCentralEnvOp(w, r, ce, svc, host, centralEnvOpSet, body, req.RequestID, actor)
 			return true
 		}
-		var req centralEnvSetRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-			http.Error(w, "invalid request body", http.StatusBadRequest)
-			return true
+		var discover func(centralEnvSetRequest) bool
+		if host == "" {
+			discover = func(req centralEnvSetRequest) bool {
+				target, _, ok := discoverCentralEnvPeer(r.Context(), ce, svc)
+				if ok {
+					body, _ := json.Marshal(req)
+					forwardCentralEnvOp(w, r, ce, svc, target, centralEnvOpSet, body, req.RequestID, actor)
+				}
+				return ok
+			}
 		}
-		tpl, hasTpl, err := centralEnvServiceTemplate(r.Context(), dc, svc)
-		if err != nil {
-			httpx.WriteErr(w, err)
-			return true
-		}
-		var labels map[string]string
-		if hasTpl {
-			labels = tpl.Labels
-		}
-		if !ce.Managed(svc, labels) {
-			http.Error(w, fmt.Sprintf("%q is not centrally managed", svc), http.StatusNotFound)
-			return true
-		}
-		if req.RequestID == "" {
-			req.RequestID = newCentralEnvRequestID()
-		}
-		origin := centralEnvOriginFor(ce, svc, labels)
-		res, err := submitCentralEnvSet(r.Context(), r, ce, svc, origin, req, actor)
-		if err != nil {
-			writeCentralEnvErr(w, err)
-			return true
-		}
-		if !res.NoOp && !res.Replayed {
-			audit(r, actor, "service.env_set", fmt.Sprintf("%s v%d keys=%s via %s", svc, res.Version, strings.Join(res.ChangedKeys, ","), origin))
-		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{
-			"version": res.Version, "changed_keys": res.ChangedKeys, "no_op": res.NoOp, "replayed": res.Replayed,
-			"request_id": req.RequestID, "origin": origin,
-		})
+		serveCentralEnvSetLocal(w, r, ce, svc, actor, discover)
 	case sub == "env/sync" && r.Method == http.MethodPost:
-		tpl, hasTpl, err := centralEnvServiceTemplate(r.Context(), dc, svc)
-		if err != nil {
-			httpx.WriteErr(w, err)
+		host := strings.TrimSpace(r.URL.Query().Get("host"))
+		if host != "" && host != ce.identity {
+			forwardCentralEnvOp(w, r, ce, svc, host, centralEnvOpSync, nil, "", actor)
 			return true
 		}
-		var labels map[string]string
-		if hasTpl {
-			labels = tpl.Labels
+		var discover func() bool
+		if host == "" {
+			discover = func() bool {
+				target, _, ok := discoverCentralEnvPeer(r.Context(), ce, svc)
+				if ok {
+					forwardCentralEnvOp(w, r, ce, svc, target, centralEnvOpSync, nil, "", actor)
+				}
+				return ok
+			}
 		}
-		if !ce.Managed(svc, labels) {
-			http.Error(w, fmt.Sprintf("%q is not centrally managed", svc), http.StatusNotFound)
-			return true
-		}
-		m := ce.sync
-		m.clearFailures(svc)
-		if ce.store.Has(svc) {
-			m.request(svc)
-		} else {
-			origin := centralEnvOriginFor(ce, svc, labels)
-			v, _ := ce.Version(svc)
-			// A floor, not a target: the job always fetches the origin's
-			// newest, and reconcilePeer below raises it if the origin is
-			// already past what's cached.
-			m.reconcilePeer(r.Context(), svc)
-			m.requestPeer(svc, origin, v)
-		}
-		audit(r, actor, "service.env_sync_start", svc+" (manual)")
-		httpx.WriteJSON(w, http.StatusAccepted, map[string]string{"status": "sync requested"})
+		serveCentralEnvSyncLocal(w, r, ce, svc, actor, discover)
 	case sub == "env/adopt" && r.Method == http.MethodPost:
 		var req centralEnvAdoptRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
