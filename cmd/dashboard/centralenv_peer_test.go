@@ -52,6 +52,10 @@ func TestPeerCentralEnvAuthGates(t *testing.T) {
 		{"wrong bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "GET", "/peer/central-env/app?for=dashboard-b", "nope", http.StatusUnauthorized},
 		{"no bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "GET", "/peer/central-env/app/status", "", http.StatusUnauthorized},
 		{"unknown action", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "GET", "/peer/central-env/app/adopt", "s3cret", http.StatusNotFound},
+		{"adopt needs writes", peerCentralEnvHandler("s3cret", h.ce, h.dc, false), "POST", "/peer/central-env/app/adopt", "s3cret", http.StatusNotFound},
+		{"release-request needs writes", peerCentralEnvHandler("s3cret", h.ce, h.dc, false), "POST", "/peer/central-env/app/release-request", "s3cret", http.StatusNotFound},
+		{"adopt wrong bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "POST", "/peer/central-env/app/adopt", "nope", http.StatusUnauthorized},
+		{"release-request no bearer", peerCentralEnvHandler("s3cret", h.ce, h.dc, true), "POST", "/peer/central-env/app/release-request", "", http.StatusUnauthorized},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -194,6 +198,62 @@ func TestPeerCentralEnvRelease(t *testing.T) {
 	origin.ce.store.Create("app", "dashboard-a", map[string]string{"A": "1"}, nil, "test", "")
 	if rec := peerDo(t, peerCentralEnvHandler("s3cret", origin.ce, origin.dc, true), "POST", "/peer/central-env/app/release", "s3cret", ""); rec.Code != http.StatusConflict {
 		t.Fatalf("release on origin = %d", rec.Code)
+	}
+}
+
+// TestPeerCentralEnvAdoptAndReleaseRequest: the forwarded-adopt and
+// forwarded-release endpoints act on this host only — as the new origin,
+// or as the origin being asked to release — and never answer 404 for
+// anything but "unsupported".
+func TestPeerCentralEnvAdoptAndReleaseRequest(t *testing.T) {
+	withFastSync(t)
+	h := newSyncHost(t, "dashboard-a", nil, "s3cret")
+	h.f.seedAdoptee("c1", "stack-app-1", []string{"X=x-val"}, cenvTemplateHealth, nil)
+	handler := peerCentralEnvHandler("s3cret", h.ce, h.dc, true)
+
+	if rec := peerDo(t, handler, "POST", "/peer/central-env/app/adopt", "s3cret", "not json"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad body = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := peerDo(t, handler, "POST", "/peer/central-env/proxy/adopt", "s3cret", "{}"); rec.Code != http.StatusForbidden {
+		t.Fatalf("infra adopt = %d %s", rec.Code, rec.Body.String())
+	}
+	peer := newSyncHost(t, "dashboard-b", nil, "s3cret")
+	peer.ce.cache.Put("app", "dashboard-a", 1, []string{"X=x-val"})
+	peerHandler := peerCentralEnvHandler("s3cret", peer.ce, peer.dc, true)
+	if rec := peerDo(t, peerHandler, "POST", "/peer/central-env/app/adopt", "s3cret", "{}"); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "centrally managed from dashboard-a") {
+		t.Fatalf("adopt of another origin's service = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := peerDo(t, peerHandler, "POST", "/peer/central-env/app/release-request", "s3cret", ""); rec.Code != http.StatusConflict {
+		t.Fatalf("release-request with only a cache = %d %s", rec.Code, rec.Body.String())
+	}
+	noSync := peerCentralEnvHandler("s3cret", newTestCentralEnv(t, "dashboard-a"), h.dc, true)
+	for _, action := range []string{"adopt", "release-request"} {
+		if rec := peerDo(t, noSync, "POST", "/peer/central-env/app/"+action, "s3cret", "{}"); rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s without sync = %d %s", action, rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := peerDo(t, handler, "POST", "/peer/central-env/app/adopt", "s3cret", "{}")
+	var rep centralEnvAdoptReport
+	json.Unmarshal(rec.Body.Bytes(), &rep)
+	if rec.Code != http.StatusOK || rep.Origin != "dashboard-a" || rep.Fingerprint == "" || h.ce.store.Has("app") {
+		t.Fatalf("dry run = %d %s", rec.Code, rec.Body.String())
+	}
+	rec = peerDo(t, handler, "POST", "/peer/central-env/app/adopt", "s3cret", `{"dry_run":false,"ack_compose":true,"request_id":"r-peer","fingerprint":"`+rep.Fingerprint+`"}`)
+	if rec.Code != http.StatusAccepted || !h.ce.store.HasRequestID("app", "r-peer") {
+		t.Fatalf("execute = %d %s", rec.Code, rec.Body.String())
+	}
+	h.waitJob(t, "app")
+
+	rec = peerDo(t, handler, "POST", "/peer/central-env/app/release-request", "s3cret", "")
+	if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"status":"releasing"`) {
+		t.Fatalf("release-request = %d %s", rec.Code, rec.Body.String())
+	}
+	if j := h.waitJob(t, "app"); j.Status != envSyncStatusConverged || h.ce.store.Has("app") {
+		t.Fatalf("release job = %+v", j)
+	}
+	if rec := peerDo(t, handler, "POST", "/peer/central-env/app/release-request", "s3cret", ""); rec.Code != http.StatusConflict {
+		t.Fatalf("release-request on an unmanaged service = %d %s", rec.Code, rec.Body.String())
 	}
 }
 

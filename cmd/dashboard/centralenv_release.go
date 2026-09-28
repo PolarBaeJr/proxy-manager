@@ -39,6 +39,27 @@ func (m *envSyncManager) requestRelease(svc string) {
 	m.request(svc)
 }
 
+// startCentralEnvRelease marks svc's record releasing (if it isn't already)
+// and starts the release job — shared by the origin's own API and a peer's
+// forwarded /release-request. Returns the 202 body.
+func startCentralEnvRelease(r *http.Request, ce *centralEnv, svc, actor string) (map[string]any, error) {
+	rec, ok, err := ce.store.Get(svc)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errCentralEnvNotFound
+	}
+	if rec.State != centralEnvStateReleasing {
+		if err := ce.store.SetState(svc, centralEnvStateReleasing); err != nil {
+			return nil, err
+		}
+	}
+	ce.sync.requestRelease(svc)
+	audit(r, actor, "service.env_release_start", fmt.Sprintf("%s v%d", svc, rec.Version))
+	return map[string]any{"status": "releasing", "version": rec.Version, "job": "GET /api/services/" + svc + "/env"}, nil
+}
+
 // requestPeerRelease is the non-origin side: recreate this host's stamped
 // replicas of svc without the stamp, then drop the cache.
 func (m *envSyncManager) requestPeerRelease(svc, origin string) {

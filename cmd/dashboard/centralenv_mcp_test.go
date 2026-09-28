@@ -147,3 +147,52 @@ func TestCentralEnvMCPAdoptGatesExecute(t *testing.T) {
 		}
 	}
 }
+
+// TestCentralEnvMCPAdoptReleaseHost: adopt's host names the origin and
+// release's host is an assertion — both pass through as ?host=, and only
+// with MCP_ALLOW_PEER_WRITES.
+func TestCentralEnvMCPAdoptReleaseHost(t *testing.T) {
+	for _, peerWrites := range []bool{true, false} {
+		c, calls := stubDash(t, 200, `{}`)
+		s := NewServer("t", "v")
+		registerMCPTools(s, c, true, peerWrites)
+		call := func(name, args string) map[string]any {
+			res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"`+name+`","arguments":`+args+`}}`)
+			r, _ := res["result"].(map[string]any)
+			return r
+		}
+		r := call("adopt_service_env", `{"service":"app","host":"dashboard-b"}`)
+		if !peerWrites {
+			if r["isError"] != true || len(*calls) != 0 {
+				t.Fatalf("host without peer writes = %v, calls %v", r, *calls)
+			}
+			continue
+		}
+		if r["isError"] == true || len(*calls) != 1 || (*calls)[0] != "POST /api/services/app/env/adopt?host=dashboard-b" {
+			t.Fatalf("adopt with host = %v, calls %v", r, *calls)
+		}
+		call("release_service_env", `{"service":"app","host":"dashboard-a"}`)
+		if len(*calls) != 2 || (*calls)[1] != "POST /api/services/app/env/release?host=dashboard-a" {
+			t.Fatalf("release with host: calls %v", *calls)
+		}
+	}
+}
+
+// TestCentralEnvMCPAdoptOntoPeer drives adopt_service_env with a host
+// through the real API: the dry run's origin is that peer.
+func TestCentralEnvMCPAdoptOntoPeer(t *testing.T) {
+	withFastSync(t)
+	a, b := adoptMesh(t)
+	s := NewServer("t", "v")
+	registerMCPTools(s, &apiCaller{mux: a.mux}, false, true)
+	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"adopt_service_env","arguments":{"service":"app","host":"dashboard-b"}}}`)
+	r, _ := res["result"].(map[string]any)
+	if r["isError"] == true {
+		t.Fatalf("adopt onto peer = %v", r)
+	}
+	var rep centralEnvAdoptReport
+	json.Unmarshal([]byte(r["content"].([]any)[0].(map[string]any)["text"].(string)), &rep)
+	if rep.Origin != "dashboard-b" || b.adoptCalls.Load() != 1 || a.ce.store.Has("app") || b.ce.store.Has("app") {
+		t.Fatalf("report origin=%s b calls=%d", rep.Origin, b.adoptCalls.Load())
+	}
+}

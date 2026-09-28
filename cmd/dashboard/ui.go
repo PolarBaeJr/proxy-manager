@@ -2763,19 +2763,26 @@ function unitActionButtons(agg, svcName) {
     + (agg.anyStopped
         ? '<button disabled title="Start every host in this unit first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
         : '<button ' + dis + hostsAttr + ' onclick="openAddEnvUnit(this)">' + I.plus + 'Add env…' + lkHtml + '</button>');
-  if (agg.hasLocal && !agg.instances.some(i => i.onboarded)) html += centralEnvButtons(svcName, unitCentralOrigin(agg));
+  if (agg.hasLocal && !agg.instances.some(i => i.onboarded)) {
+    const envHosts = [];
+    for (const i of agg.instances) {
+      const h = i.writable ? (i.machine || _selfIdentity) : '';
+      if (h && !envHosts.includes(h)) envHosts.push(h);
+    }
+    html += centralEnvButtons(svcName, unitCentralOrigin(agg), envHosts);
+  }
   return html;
 }
 // centralEnvButtons offers Adopt on a label-managed service whose env is
-// still per-host, and Release when THIS host is its central-env origin —
-// both run on the origin, so neither shows for another host's service.
-// Elevated sessions only: adopt/release restart the service on every host.
-function centralEnvButtons(svcName, origin) {
+// still per-host — onto any writable host running it, which becomes the
+// origin — and Release on a managed one, which the API forwards to the
+// origin wherever it is. Elevated sessions only: adopt/release restart the
+// service on every host.
+function centralEnvButtons(svcName, origin, hosts) {
   if (!isElevated()) return '';
   const sn = esc(svcName);
-  if (!origin) return '<button onclick="openAdoptEnv(\'' + sn + '\')">' + I.layers + 'Adopt central env…</button>';
-  if (origin === _selfIdentity) return '<button onclick="releaseCentralEnv(\'' + sn + '\')">' + I.layers + 'Release central env…</button>';
-  return '';
+  if (!origin) return '<button data-svc-name="' + sn + '" data-adopt-hosts="' + esc(JSON.stringify(hosts || [])) + '" onclick="openAdoptEnv(this.dataset.svcName, JSON.parse(this.dataset.adoptHosts))">' + I.layers + 'Adopt central env…</button>';
+  return '<button data-svc-name="' + sn + '" data-central-origin="' + esc(origin) + '" onclick="releaseCentralEnv(this.dataset.svcName, this.dataset.centralOrigin)">' + I.layers + 'Release central env…</button>';
 }
 
 function toggleMenu(e, id) {
@@ -3517,10 +3524,18 @@ const ADOPT_ACK_TEXT = {
   ack_image_update: 'The roll also moves replicas onto the newer image already pulled on that host',
 };
 let _adopt = null;
-async function openAdoptEnv(svc) {
-  _adopt = { svc, requestId: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)) };
+function adoptReqId() { return crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2); }
+// adoptUrl names the origin (?host=) only when it isn't this host — the API
+// forwards the adopt there. Dry run and execute must go to the same origin:
+// a fingerprint is only valid on the host that produced it.
+function adoptUrl() {
+  const q = _adopt.target && _adopt.target !== _selfIdentity ? '?host=' + encodeURIComponent(_adopt.target) : '';
+  return '/api/services/' + encodeURIComponent(_adopt.svc) + '/env/adopt' + q;
+}
+async function openAdoptEnv(svc, hosts) {
+  _adopt = { svc, hosts: hosts || [], target: _selfIdentity || '', requestId: adoptReqId() };
   try {
-    const rep = await api('/api/services/' + encodeURIComponent(svc) + '/env/adopt', { method: 'POST', body: JSON.stringify({ dry_run: true }) });
+    const rep = await api(adoptUrl(), { method: 'POST', body: JSON.stringify({ dry_run: true }) });
     renderAdoptDialog(rep, '');
     document.getElementById('dlg-adopt-env').showModal();
   } catch (e) { toast(e.message, 'err'); }
@@ -3535,6 +3550,12 @@ function renderAdoptDialog(rep, notice) {
   const d = document.getElementById('dlg-adopt-env');
   const hosts = (rep.env && rep.env.hosts) || {};
   let body = notice ? '<div class="meta" style="color:var(--red)">' + esc(notice) + '</div>' : '';
+  if (_adopt.hosts.length > 1) {
+    body += '<div class="meta" style="display:flex;gap:8px;align-items:center">Origin host'
+      + '<select id="adopt-origin" onchange="changeAdoptOrigin(this.value)">'
+      + _adopt.hosts.map(h => '<option value="' + esc(h) + '"' + (h === _adopt.target ? ' selected' : '') + '>' + esc(machineLabel(h)) + '</option>').join('')
+      + '</select></div>';
+  }
   // adoptable reflects THIS dry run's (empty) acks and imports; what this
   // dialog can't fix from here are the blockers.
   const blocked = (rep.blockers || []).length > 0;
@@ -3579,12 +3600,20 @@ function renderAdoptDialog(rep, notice) {
 }
 async function recheckAdoptEnv() {
   try {
-    const rep = await api('/api/services/' + encodeURIComponent(_adopt.svc) + '/env/adopt', { method: 'POST', body: JSON.stringify({ dry_run: true }) });
+    const rep = await api(adoptUrl(), { method: 'POST', body: JSON.stringify({ dry_run: true }) });
     renderAdoptDialog(rep, '');
   } catch (e) { toast(e.message, 'err'); }
 }
+// changeAdoptOrigin re-runs the dry run on the newly chosen origin, with a
+// fresh request id — an execute sent to the old origin must not replay.
+function changeAdoptOrigin(h) {
+  _adopt.target = h;
+  _adopt.requestId = adoptReqId();
+  recheckAdoptEnv();
+}
 async function executeAdoptEnv() {
   const d = document.getElementById('dlg-adopt-env');
+  if (_adopt.target && _adopt.report.origin !== _adopt.target) { toast('check again — the report is for a different origin', 'err'); return; }
   const req = { dry_run: false, fingerprint: _adopt.report.fingerprint, request_id: _adopt.requestId, import: {}, accept_dropped: [] };
   const missingAcks = [];
   d.querySelectorAll('[data-adopt-ack]').forEach(cb => { if (cb.checked) req[cb.dataset.adoptAck] = true; else missingAcks.push(cb.dataset.adoptAck); });
@@ -3607,9 +3636,9 @@ async function executeAdoptEnv() {
   const btn = document.getElementById('adopt-exec');
   if (btn) btn.disabled = true;
   try {
-    const res = await api('/api/services/' + encodeURIComponent(_adopt.svc) + '/env/adopt', { method: 'POST', body: JSON.stringify(req) });
+    const res = await api(adoptUrl(), { method: 'POST', body: JSON.stringify(req) });
     d.close();
-    toast('adopting ' + _adopt.svc + (res && res.replayed ? ' (already accepted)' : '') + ' — rolling origin first');
+    toast('adopting ' + _adopt.svc + ' onto ' + machineLabel(_adopt.target || (res && res.origin)) + (res && res.replayed ? ' (already accepted)' : '') + ' — rolling origin first');
     delete _centralEnvView[_adopt.svc];
     _lastServicesHash = '';
     renderActive();
@@ -3619,8 +3648,8 @@ async function executeAdoptEnv() {
     if (btn) btn.disabled = false;
   }
 }
-async function releaseCentralEnv(svc) {
-  if (!(await confirmDialog('Release ' + svc + ' from central env? Every replica on every host is recreated from its current env without the central stamp, peers drop their cached copy, and the central record is deleted — env becomes per-host again. If a host fails, the service stays "releasing" and releasing again resumes.', {title: 'Release central env', danger: true, okLabel: 'Release'}))) return;
+async function releaseCentralEnv(svc, origin) {
+  if (!(await confirmDialog('Release ' + svc + ' from central env? Every replica on every host is recreated from its current env without the central stamp, peers drop their cached copy, and the central record is deleted — env becomes per-host again. If a host fails, the service stays "releasing" and releasing again resumes. It runs on its origin (' + machineLabel(origin) + ').', {title: 'Release central env', danger: true, okLabel: 'Release'}))) return;
   try {
     await api('/api/services/' + encodeURIComponent(svc) + '/env/release', { method: 'POST', body: '{}' });
     toast('releasing ' + svc + ' — rolling origin first');

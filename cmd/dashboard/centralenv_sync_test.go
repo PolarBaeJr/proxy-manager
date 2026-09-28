@@ -20,7 +20,7 @@ func withFastSync(t *testing.T) {
 	t.Helper()
 	oldSettle, oldReady, oldPoll := replaceSettleDelay, rollingReadyTimeout, canaryPromoteHealthPoll
 	oldRetry, oldPeerPoll, oldPeerTimeout := envSyncRetryInterval, envSyncPeerPollInterval, envSyncPeerTimeout
-	oldReconcile, oldForward := envSyncReconcileInterval, centralEnvForwardTimeout
+	oldReconcile, oldForward, oldAdoptForward := envSyncReconcileInterval, centralEnvForwardTimeout, centralEnvAdoptForwardTimeout
 	replaceSettleDelay = 0
 	rollingReadyTimeout = 40 * time.Millisecond
 	canaryPromoteHealthPoll = 5 * time.Millisecond
@@ -31,7 +31,7 @@ func withFastSync(t *testing.T) {
 	t.Cleanup(func() {
 		replaceSettleDelay, rollingReadyTimeout, canaryPromoteHealthPoll = oldSettle, oldReady, oldPoll
 		envSyncRetryInterval, envSyncPeerPollInterval, envSyncPeerTimeout = oldRetry, oldPeerPoll, oldPeerTimeout
-		envSyncReconcileInterval, centralEnvForwardTimeout = oldReconcile, oldForward
+		envSyncReconcileInterval, centralEnvForwardTimeout, centralEnvAdoptForwardTimeout = oldReconcile, oldForward, oldAdoptForward
 	})
 }
 
