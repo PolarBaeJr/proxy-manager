@@ -1421,6 +1421,13 @@ type staticConfig struct {
 // Service-name backfill to a route it only knows about from a peer — see
 // PeerRouteStore.overlay's localBackendsByService parameter.
 func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([]*RouteGroup, map[string][]*Backend, error) {
+	return assembleGroupsWithOverlay(ctx, dc, configPath, nil)
+}
+
+// assembleGroupsWithOverlay is assembleGroups with the central-labels
+// overlay (labeloverlay.go) applied to the container list before anything
+// reads it. nil = container labels only.
+func assembleGroupsWithOverlay(ctx context.Context, dc *dockerClient, configPath string, ov *labelOverlay) ([]*RouteGroup, map[string][]*Backend, error) {
 	groupsByKey := map[string]*RouteGroup{}
 
 	if configPath != "" {
@@ -1474,6 +1481,9 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 	if err != nil {
 		return nil, nil, err
 	}
+	// Before abScan: the overlay never touches proxy.ab.*, but A/B and
+	// every route field below must see the same effective labels.
+	containers = applyLabelOverlay(containers, ov)
 	abs := abScan(containers, time.Now())
 	for _, c := range containers {
 		name := c.name()

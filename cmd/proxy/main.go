@@ -31,6 +31,7 @@ func main() {
 	peers := flag.String("peers", "", "comma-separated peer proxy base URLs for the discovery handshake, e.g. http://100.83.62.68:8094 (empty = disabled)")
 	peerSyncInterval := flag.Duration("peer-sync-interval", 5*time.Second, "how often to handshake with peers and push/resync learned routes (matches the proxy's health-check cadence)")
 	peerAdvertiseURL := flag.String("peer-advertise-url", "", "this proxy's own base URL as reachable by peers, e.g. http://100.83.62.68:8092 — empty disables route push")
+	labelsCache := flag.String("labels-cache", "/data/labels-overlay.json", "disk cache of the central-labels overlay, used when Redis is unreachable (only with -redis-addr)")
 	healthcheck := flag.Bool("healthcheck", false, "probe this binary's own /healthz endpoints and exit 0/1 (Docker HEALTHCHECK)")
 	flag.Parse()
 	selfCfg, selfOn := selfcheck.FromEnv("proxy", selfcheck.LoopbackURL(*addr, "/healthz"), selfcheck.LoopbackURL(*metricsAddr, "/healthz"))
@@ -58,11 +59,18 @@ func main() {
 	// auth gate is disabled, so parse the trusted-XFF CIDRs unconditionally.
 	router.xffTrusted = parseCIDRList(*authXFFTrustedCIDRs)
 	router.unroutedLimiter = newRateLimiter(defaultRateRPM)
+	// One client shared by the rate limiter and the central-labels overlay.
+	// Without -redis-addr the overlay is entirely off (om stays nil): no
+	// disk cache is read, so a stale file can't silently apply.
+	var om *overlayManager
 	if *redisAddr != "" {
 		redisClient := redis.NewClient(&redis.Options{
 			Addr:     *redisAddr,
+			Username: os.Getenv("REDIS_USERNAME"),
 			Password: os.Getenv("REDIS_PASSWORD"),
 		})
+		om = newOverlayManager(&redisOverlaySource{client: redisClient}, *labelsCache)
+		om.Init(ctx)
 		router.newLimiter = func(routeKey string, rpm int) limiter {
 			return newHybridLimiter(redisClient, routeKey, rpm, idleEvict)
 		}
@@ -106,7 +114,7 @@ func main() {
 	router.peerSyncInterval = *peerSyncInterval
 
 	refresh := func() {
-		groups, backendsByService, err := assembleGroups(ctx, dc, *staticConfig)
+		groups, backendsByService, err := assembleGroupsWithOverlay(ctx, dc, *staticConfig, om.Current())
 		if err != nil {
 			log.Printf("refresh: %v", err)
 			return
@@ -190,6 +198,14 @@ func main() {
 	// dashboard after it edits routes.json — saves a docker restart.
 	metricsSrv := metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot, router.ABReport, ph)
 	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
+	if mux, ok := metricsSrv.Handler.(*http.ServeMux); ok {
+		mux.HandleFunc("/labels", labelsHandler(om))
+	} else {
+		log.Printf("labels overlay: metrics handler is not a *http.ServeMux — /labels not registered")
+	}
+	if om != nil {
+		go om.Run(ctx, refresh)
+	}
 
 	go dc.streamEvents(ctx, func(ev dockerEvent) {
 		handleContainerEvent(router, refresh, ev)

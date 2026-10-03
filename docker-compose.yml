@@ -96,6 +96,8 @@ services:
       # .env.example. Empty = today's in-memory-only rate limiting, unchanged.
       REDIS_ADDR: ${REDIS_ADDR:-}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # Optional Redis ACL user (empty = the default user).
+      REDIS_USERNAME: ${REDIS_USERNAME:-}
       # Proxy-level peer mesh discovery handshake (see PMGR_PEERS in
       # .env.example). Empty = /peer/handshake disabled, unchanged behavior.
       PMGR_PEER_SECRET: ${PMGR_PEER_SECRET:-}

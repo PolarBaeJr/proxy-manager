@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/PolarBaeJr/proxy-manager/internal/labels"
 )
 
 // Bounds on the per-route micro-cache. It exists to absorb bursts of
@@ -278,24 +280,9 @@ func cloneStorableHeader(h http.Header) http.Header {
 	return out
 }
 
-// parseCacheTTL parses the proxy.cache label / routes.json "cache" value.
-// The off spellings mirror the boolean labels so "false" on a cache label
-// reads the way an operator expects.
-func parseCacheTTL(s string) (time.Duration, error) {
-	s = strings.TrimSpace(s)
-	switch strings.ToLower(s) {
-	case "", "0", "false", "off":
-		return 0, nil
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0, err
-	}
-	if d < 0 {
-		return 0, fmt.Errorf("negative duration %q", s)
-	}
-	return d, nil
-}
+// parseCacheTTL parses the proxy.cache label / routes.json "cache" value —
+// see labels.ParseCacheTTL, shared with the central-labels validator.
+func parseCacheTTL(s string) (time.Duration, error) { return labels.ParseCacheTTL(s) }
 
 // unionStrings is an order-preserving dedupe of a then b, trimming and
 // dropping empties. Returns nil (not an empty slice) when nothing survives,
