@@ -1139,7 +1139,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				return
 			}
 			if act == "stop" {
-				err = dc.stopContainer(req.Context(), targetID)
+				err = dc.stopContainerT(context.WithoutCancel(req.Context()), targetID, memberDrainSeconds(svc, targetID))
 			} else {
 				err = dc.startContainer(req.Context(), targetID)
 			}
@@ -2307,6 +2307,12 @@ func runServiceCheckImage(ctx context.Context, dc *dockerClient, ic *imageChecke
 	return map[string]any{"live": live, "canary": canary}, http.StatusOK, nil
 }
 
+// serviceMutationForwardTimeout bounds a forwarded service mutation. Stops
+// now drain first (proxy.drain, default 30s), so an app that ignores SIGTERM
+// can use the full grace on the peer; 55s stays under nginx's default 60s
+// proxy_read_timeout for the browser call wrapping this hop.
+var serviceMutationForwardTimeout = 55 * time.Second
+
 // forwardServiceMutation relays one mutating /api/services/{name}/<sub>
 // request to the peer identified by host, translating (parts, method) onto
 // its /peer/services/{name}/<sub> counterpart — the write-mesh sibling of
@@ -2407,9 +2413,9 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 			return
 		}
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: serviceMutationForwardTimeout}
 	code, respBody, mutErr := peerMutate(req.Context(), client, peerURL, peerSecret, method, peerPath,
-		10*time.Second, bytes.NewReader(reqBody), nil, mintForwardedActor(req, actor))
+		serviceMutationForwardTimeout, bytes.NewReader(reqBody), nil, mintForwardedActor(req, actor))
 	if mutErr != nil {
 		mapPeerMutationErr(w, 0, []byte(mutErr.Error()))
 		return

@@ -10,17 +10,15 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
+	"github.com/PolarBaeJr/proxy-manager/internal/graceful"
 	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
 	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 )
@@ -59,7 +57,6 @@ func main() {
 			*statePath, len(st.Targets), st.SavedAt.Format(time.RFC3339))
 	}
 	go persistLoop(ctx, *statePath, *stateInterval, store)
-	saveOnShutdown(*statePath, store)
 	scraper := NewScraper(targets, *interval, store)
 	go scraper.Run(ctx)
 
@@ -143,12 +140,30 @@ func main() {
 		})
 	})
 
+	watchdogCtx, stopWatchdog := context.WithCancel(ctx)
+	defer stopWatchdog()
 	if selfOn {
-		selfcheck.Start(ctx, selfCfg)
+		selfcheck.Start(watchdogCtx, selfCfg)
 	}
 
+	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	timeout, streamGrace := graceful.TimeoutFromEnv()
 	log.Printf("monitor on %s — scraping %d target(s) every %s", *addr, len(targets), *interval)
-	if err := http.ListenAndServe(*addr, mux); !errors.Is(err, http.ErrServerClosed) {
+	err := graceful.Run(graceful.Options{
+		Primary:     []*http.Server{srv},
+		Timeout:     timeout,
+		StreamGrace: streamGrace,
+		OnSignal:    []func(){stopWatchdog},
+		Hooks: []func(context.Context){
+			func(context.Context) {
+				if err := saveStoreState(*statePath, store); err != nil {
+					log.Printf("monitor state: shutdown save: %v", err)
+				}
+			},
+			func(context.Context) { cancel() },
+		},
+	})
+	if err != nil {
 		log.Fatal(err)
 	}
 }
@@ -226,17 +241,3 @@ func persistLoop(ctx context.Context, path string, interval time.Duration, s *St
 		}
 	}
 }
-
-// saveOnShutdown flushes one final snapshot on SIGTERM/interrupt, then exits.
-func saveOnShutdown(path string, s *Store) {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
-	go func() {
-		<-ch
-		if err := saveStoreState(path, s); err != nil {
-			log.Printf("monitor state: shutdown save: %v", err)
-		}
-		os.Exit(0)
-	}()
-}
-

@@ -649,7 +649,7 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 				return
 			}
 			if act == "stop" {
-				err = dc.stopContainer(r.Context(), targetID)
+				err = dc.stopContainerT(context.WithoutCancel(r.Context()), targetID, memberDrainSeconds(svc, targetID))
 			} else {
 				err = dc.startContainer(r.Context(), targetID)
 			}

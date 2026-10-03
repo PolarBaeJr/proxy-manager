@@ -112,11 +112,12 @@ func abOther(v string) string {
 }
 
 // hasVariant reports whether any pickable backend of variant v exists,
-// regardless of probe health (DockerUnhealthy ones are never pickable), so
-// the static-retry wrapper is skipped when a retry could never go anywhere.
+// regardless of probe health (DockerUnhealthy and draining ones are never
+// pickable), so the static-retry wrapper is skipped when a retry could
+// never go anywhere.
 func (g *RouteGroup) hasVariant(v string) bool {
 	for _, b := range g.Backends {
-		if b.inVariant(v) && !b.DockerUnhealthy {
+		if b.inVariant(v) && !b.DockerUnhealthy && !b.draining.Load() {
 			return true
 		}
 	}
@@ -1547,7 +1548,8 @@ func (r *Router) abProxyToGroup(w http.ResponseWriter, req *http.Request, group 
 	req = req.WithContext(context.WithValue(req.Context(), abStampedKey{}, true))
 	sw := &abStatusWriter{ResponseWriter: w}
 	isGetHead := req.Method == http.MethodGet || req.Method == http.MethodHead
-	staticRetry := d.static && isGetHead && group.hasVariant(abOther(d.variant))
+	retryable := prepareRetryBody(req)
+	staticRetry := retryable && d.static && isGetHead && group.hasVariant(abOther(d.variant))
 	tried := map[*Backend]bool{}
 	var last *Backend
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -1583,6 +1585,9 @@ func (r *Router) abProxyToGroup(w http.ResponseWriter, req *http.Request, group 
 			req.Header.Set(abVariantHeader, d.variant)
 			req.Header.Set(abFailoverHeader, "1")
 		}
+		if attempt > 0 {
+			rewindBody(req)
+		}
 		if staticRetry {
 			stw := &abStaticWriter{ResponseWriter: sw, h: http.Header{}}
 			if !tryProxy(stw, req, b) {
@@ -1598,6 +1603,13 @@ func (r *Router) abProxyToGroup(w http.ResponseWriter, req *http.Request, group 
 		} else if !tryProxy(sw, req, b) {
 			if b.Learned {
 				d.run.addHopError()
+			}
+			if !retryable {
+				if d.record && !b.Learned {
+					d.run.record(abIdx(d.recordVariant()), abTransport, 0, 0, r.clock())
+				}
+				serveBodyNotReplayable(w, group, reqHost, b)
+				return
 			}
 			continue
 		}
@@ -1665,6 +1677,7 @@ func (r *Router) abStaticFallback(w http.ResponseWriter, req *http.Request, grou
 		}
 		req.Header.Set(abVariantHeader, b.variantName())
 		req.Header.Del(abFailoverHeader)
+		rewindBody(req)
 		if tryProxy(w, req, b) {
 			return
 		}

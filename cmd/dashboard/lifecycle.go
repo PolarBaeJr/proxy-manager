@@ -16,7 +16,21 @@
 
 package main
 
-import "context"
+import (
+	"context"
+	"sync"
+)
+
+// memberDrainSeconds is the proxy.drain grace of the service member with
+// the given container ID (the default when it isn't found).
+func memberDrainSeconds(svc Service, id string) int {
+	for _, m := range svc.Members {
+		if m.ID == id {
+			return drainSeconds(m.Labels)
+		}
+	}
+	return defaultDrainSeconds
+}
 
 // findService loads the named service from listServices. Returns ok=false
 // if no service by that name has any containers (i.e. neither labeled nor
@@ -40,18 +54,31 @@ func findService(ctx context.Context, dc *dockerClient, name string) (Service, b
 // (acted, firstErr): acted counts how many containers we actually
 // touched (state was running pre-call), so the caller can distinguish
 // "everything was already stopped" (acted=0, err=nil) from real failures.
+// Members stop in parallel, each with its proxy.drain grace, detached from
+// ctx's cancellation so a disconnecting client can't cut a drain short.
 func stopServiceMembers(ctx context.Context, dc *dockerClient, svc Service) (int, error) {
+	ctx = context.WithoutCancel(ctx)
 	acted := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	var firstErr error
 	for _, m := range svc.MemberSummaries {
 		if m.IsCanary || m.State != "running" {
 			continue
 		}
 		acted++
-		if err := dc.stopContainer(ctx, m.ID); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			err := dc.stopContainerT(ctx, id, memberDrainSeconds(svc, id))
+			mu.Lock()
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			mu.Unlock()
+		}(m.ID)
 	}
+	wg.Wait()
 	return acted, firstErr
 }
 

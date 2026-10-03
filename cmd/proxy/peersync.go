@@ -155,7 +155,9 @@ func buildPeerPayload(router *Router, identity, advertise string) ([]byte, bool)
 	for _, g := range router.Snapshot() {
 		localCount, localWeight, bCount, bWeight := 0, 0, 0, 0
 		for _, b := range g.Backends {
-			if !b.Learned {
+			// A draining replica is about to exit; advertising it would
+			// keep peers hopping traffic here for it.
+			if !b.Learned && !b.draining.Load() {
 				localCount++
 				localWeight += b.Weight
 				if b.Variant == abVariantB {
