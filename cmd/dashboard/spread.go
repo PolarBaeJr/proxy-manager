@@ -382,6 +382,14 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 	rateRPM, _ := strconv.Atoi(tpl.Labels[labelRateRPM])
 	autoUpdate := tpl.Labels[labelAutoUpdate] == "true"
 	weight := parseWeightLabel(tpl.Labels[labelWeight])
+	// The replica's labels are built from the template's RAW labels, never
+	// the central overlay. For an adopted service autoupdate/weight are not
+	// carried at all: the central labels already apply to the new replica
+	// on the target (same Redis), and a container copy would only become
+	// stale drift.
+	if dc.labelsAdopted(name) {
+		autoUpdate, weight = false, 1
+	}
 
 	// proxy.name is a free-text display label everywhere else in this
 	// codebase (set once at creation, shown escaped in the UI, never itself
@@ -574,7 +582,7 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 		// this service a singleton on THIS host even though the origin didn't
 		// — refuse rather than let the two hosts disagree about it.
 		for _, ct := range all {
-			if ct.Labels[labelUnscalable] == "true" {
+			if dc.effectiveLabels(ct.Labels)[labelUnscalable] == "true" {
 				http.Error(w, fmt.Sprintf("%q is marked %s on this host", req.Service, labelUnscalable), http.StatusConflict)
 				return
 			}

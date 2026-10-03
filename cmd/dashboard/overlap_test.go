@@ -26,6 +26,7 @@ type overlapFake struct {
 	created   []createBody
 	inspect   string
 	newStatus string
+	newIP     string // "" = 10.10.0.<seq>
 }
 
 const overlapInspectHealthy = `{"Name":"/app","Image":"sha256:abc","Config":{"Env":["A=1"],"Image":"ghcr.io/org/app:v1","Healthcheck":{"Test":["CMD","true"]}},"HostConfig":{"Mounts":[]},"Mounts":[],"NetworkSettings":{"Networks":{"edge":{}}},"RestartCount":0}`
@@ -80,9 +81,13 @@ func newOverlapFake(t *testing.T, labels map[string]string) (*overlapFake, *dock
 			f.seq++
 			nid := fmt.Sprintf("gen-%d", f.seq)
 			nc := dockerContainer{ID: nid, Names: []string{"/" + name}, Image: body.Image, State: "running", Status: f.newStatus, Labels: body.Labels}
+			ip := fmt.Sprintf("10.10.0.%d", f.seq)
+			if f.newIP != "" {
+				ip = f.newIP
+			}
 			nc.NetworkSettings.Networks = map[string]struct {
 				IPAddress string `json:"IPAddress"`
-			}{managedNetwork: {IPAddress: fmt.Sprintf("10.10.0.%d", f.seq)}}
+			}{managedNetwork: {IPAddress: ip}}
 			f.items[nid] = nc
 			f.created = append(f.created, body)
 			f.calls = append(f.calls, "create "+name)

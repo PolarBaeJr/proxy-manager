@@ -688,6 +688,16 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			http.NotFound(w, req)
 			return
 		}
+		// Central labels (labels_api.go) also ahead of the generic ?host=
+		// forwarding and guards: they live in the shared Redis, so the
+		// handler runs its own self-guard first (refusing on a Docker error
+		// too) and then forwards ?host= itself. It skips the rollout guard
+		// on purpose — a label write recreates nothing — except proxy.weight
+		// while a canary is staged.
+		if len(parts) == 2 && parts[1] == "labels" {
+			serveLabelsAPI(w, req, dc, auth, registry, name)
+			return
+		}
 		// Forwarding must be checked BEFORE the self-guard below: a local
 		// service that happens to share a name with an unrelated peer
 		// service (a common case — see buildManagedServices) must never be
@@ -1154,7 +1164,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				return
 			}
 			if act == "stop" {
-				err = dc.stopContainerT(context.WithoutCancel(req.Context()), targetID, memberDrainSeconds(svc, targetID))
+				err = dc.stopContainerT(context.WithoutCancel(req.Context()), targetID, memberDrainSeconds(dc, svc, targetID))
 			} else {
 				err = dc.startContainer(req.Context(), targetID)
 			}

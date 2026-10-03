@@ -25,12 +25,12 @@ import (
 	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
 )
 
-// memberDrainSeconds is the proxy.drain grace of the service member with
-// the given container ID (the default when it isn't found).
-func memberDrainSeconds(svc Service, id string) int {
+// memberDrainSeconds is the effective proxy.drain grace of the service
+// member with the given container ID (the default when it isn't found).
+func memberDrainSeconds(dc *dockerClient, svc Service, id string) int {
 	for _, m := range svc.Members {
 		if m.ID == id {
-			return drainSeconds(m.Labels)
+			return dc.effectiveDrainSeconds(m.Labels)
 		}
 	}
 	return defaultDrainSeconds
@@ -74,7 +74,7 @@ func stopServiceMembers(ctx context.Context, dc *dockerClient, svc Service) (int
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			err := dc.stopContainerT(ctx, id, memberDrainSeconds(svc, id))
+			err := dc.stopContainerT(ctx, id, memberDrainSeconds(dc, svc, id))
 			mu.Lock()
 			if err != nil && firstErr == nil {
 				firstErr = err
@@ -127,8 +127,8 @@ func runReplicaRestart(ctx context.Context, w http.ResponseWriter, dc *dockerCli
 	_, onboarded := onb.Get(svc.Name)
 	// Overlap only for the one live copy of a singleton: a stopped member has
 	// nothing to keep serving, and more than one running isn't a singleton.
-	if ct.State != "running" || onboarded || !overlapEnabled(ct.Labels) || running != 1 {
-		if err := dc.stopContainerT(context.WithoutCancel(ctx), id, memberDrainSeconds(svc, id)); err != nil {
+	if ct.State != "running" || onboarded || !overlapEnabled(dc.effectiveLabels(ct.Labels)) || running != 1 {
+		if err := dc.stopContainerT(context.WithoutCancel(ctx), id, memberDrainSeconds(dc, svc, id)); err != nil {
 			httpx.WriteErr(w, err)
 			return ""
 		}

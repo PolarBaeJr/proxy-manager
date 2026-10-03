@@ -345,9 +345,10 @@ func adoptLocalFacts(ctx context.Context, m *envSyncManager, svc string, nonce [
 		return f, nil, nil
 	}
 	tpl := preferRunning(live)[0]
-	f.Unscalable = tpl.Labels[labelUnscalable] == "true"
+	eff := dc.effectiveLabels(tpl.Labels)
+	f.Unscalable = eff[labelUnscalable] == "true"
 	f.HasHost = tpl.Labels[labelHost] != ""
-	f.HealthLabel = tpl.Labels[labelHealth] != ""
+	f.HealthLabel = eff[labelHealth] != ""
 	logDriver := dc.daemonLogDriver(ctx)
 	var tplFacts adoptStrictFacts
 	for _, ct := range live {

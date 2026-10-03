@@ -90,36 +90,42 @@ open http://localhost:8093
 
 Drop these on any container you want routed:
 
-| Label | Required | Notes |
-|---|---|---|
-| `proxy.enable=true` | ✓ | opt in |
-| `proxy.host=foo.example` | ✓ | match against request `Host` |
-| `proxy.port=8080` | ✓ | container's **internal** port |
-| `proxy.path=/admin` |   | path prefix for fan-out |
-| `proxy.strip=true` |   | strip prefix before forwarding |
-| `proxy.weight=2` |   | weighted RR (default 1) |
-| `proxy.health=/healthz` |   | HTTP probe (default: TCP connect) |
-| `proxy.service=myapp` |   | group key — unlocks scale/replace/canary in dashboard |
-| `proxy.unscalable=true` |   | singleton (DB, bot, gateway) — disables scale buttons |
-| `proxy.overlap=true` |   | only with `proxy.unscalable=true` (no-op otherwise): restart, replace, auto-update and the dashboard's label toggles start a **new** copy, wait for it to pass its health check, then drain the old one — so the singleton never drops to zero. Both copies run side by side for a moment, so only use it for apps that tolerate that (not a DB holding an exclusive lock). Requires a Docker `HEALTHCHECK` or `proxy.health`, and refuses a container with anonymous volumes (a recreate would lose their data) — use named volumes. Refusals never fall back to stop/start; an overlap service without a health signal fails every auto-update until fixed. A restart recreates from the image reference the service already runs (whatever that tag points to locally — no pull). Not supported for onboarded (routes.json) services |
-| `proxy.drain=30` |   | seconds a replica gets to finish in-flight work when the dashboard retires it (default 30, max 300) — see [Graceful shutdown](#graceful-shutdown) |
-| `proxy.autoupdate=true` |   | opt-in unattended updates — dashboard re-pulls + replaces when a newer registry digest appears (10-min poll) |
-| `proxy.maintenance=/app/maintenance.html` |   | path **inside the image** to this app's own 503 page — served instead of the shared one while the host is in maintenance ([details](deploy/nginx/README.md#per-app-maintenance-pages)) |
-| `proxy.name=Friendly` |   | dashboard label |
-| `proxy.auth=true` |   | require SSO login (default: public, no auth) — see [Access control](#access-control-opt-in-sso) |
-| `proxy.auth.users=alice,bob` |   | optional allowlist; empty = any authenticated user |
-| `proxy.auth.mode=oauth` |   | bearer-only OAuth mode for MCP servers (default is cookie SSO) |
-| `proxy.ratelimit=true` |   | per-client-IP rate limit (default: off) — spoof-resistant client IP, `429` when exceeded. In-memory per-instance by default; shared across every proxy in the mesh when `REDIS_ADDR` is set (see `.env.example`) |
-| `proxy.ratelimit.rpm=60` |   | requests per minute per IP (default 60 if enabled without a value) |
-| `proxy.sticky=true` |   | cookie-based session affinity — pins a client to the backend it first hit for this route (default: off) |
-| `proxy.cache=5s` |   | opt-in micro-cache for whole `GET`/`HEAD` 200 responses for this TTL (default: off) — bypassed for any request carrying `Cookie`, `Authorization` or `Range`; never stores responses with `Set-Cookie`, `Cache-Control: private/no-store/no-cache`, a `Vary` other than `Accept-Encoding`, or a body over 1 MiB; concurrent misses for one URL are coalesced into a single backend hit; `X-Cache: HIT|MISS|BYPASS` on every response |
-| `proxy.cache.paths=/api/schedule,/standings` |   | optional comma-separated client-path prefixes eligible for caching (default: every path on the route) |
+| Label | Required | Live via Redis? | Notes |
+|---|---|---|---|
+| `proxy.enable=true` | ✓ |   | opt in |
+| `proxy.host=foo.example` | ✓ |   | match against request `Host` |
+| `proxy.port=8080` | ✓ |   | container's **internal** port |
+| `proxy.path=/admin` |   |   | path prefix for fan-out |
+| `proxy.strip=true` |   | ✓ | strip prefix before forwarding |
+| `proxy.weight=2` |   | ✓ | weighted RR (default 1) |
+| `proxy.health=/healthz` |   | ✓ | HTTP probe (default: TCP connect) |
+| `proxy.service=myapp` |   |   | group key — unlocks scale/replace/canary in dashboard |
+| `proxy.unscalable=true` |   | ✓ | singleton (DB, bot, gateway) — disables scale buttons |
+| `proxy.overlap=true` |   | ✓ | only with `proxy.unscalable=true` (no-op otherwise): restart, replace, auto-update and the dashboard's label toggles start a **new** copy, wait for it to pass its health check, then drain the old one — so the singleton never drops to zero. Both copies run side by side for a moment, so only use it for apps that tolerate that (not a DB holding an exclusive lock). Requires a Docker `HEALTHCHECK` or `proxy.health`, and refuses a container with anonymous volumes (a recreate would lose their data) — use named volumes. Refusals never fall back to stop/start; an overlap service without a health signal fails every auto-update until fixed. A restart recreates from the image reference the service already runs (whatever that tag points to locally — no pull). Not supported for onboarded (routes.json) services |
+| `proxy.drain=30` |   | ✓ | seconds a replica gets to finish in-flight work when the dashboard retires it (default 30, max 300) — see [Graceful shutdown](#graceful-shutdown) |
+| `proxy.autoupdate=true` |   | ✓ | opt-in unattended updates — dashboard re-pulls + replaces when a newer registry digest appears (10-min poll) |
+| `proxy.maintenance=/app/maintenance.html` |   | ✓ | path **inside the image** to this app's own 503 page — served instead of the shared one while the host is in maintenance ([details](deploy/nginx/README.md#per-app-maintenance-pages)) |
+| `proxy.name=Friendly` |   | ✓ | dashboard label |
+| `proxy.auth=true` |   |   | require SSO login (default: public, no auth) — see [Access control](#access-control-opt-in-sso) |
+| `proxy.auth.users=alice,bob` |   |   | optional allowlist; empty = any authenticated user |
+| `proxy.auth.mode=oauth` |   |   | bearer-only OAuth mode for MCP servers (default is cookie SSO) |
+| `proxy.ratelimit=true` |   | ✓ | per-client-IP rate limit (default: off) — spoof-resistant client IP, `429` when exceeded. In-memory per-instance by default; shared across every proxy in the mesh when `REDIS_ADDR` is set (see `.env.example`) |
+| `proxy.ratelimit.rpm=60` |   | ✓ | requests per minute per IP (default 60 if enabled without a value) |
+| `proxy.sticky=true` |   | ✓ | cookie-based session affinity — pins a client to the backend it first hit for this route (default: off) |
+| `proxy.cache=5s` |   | ✓ | opt-in micro-cache for whole `GET`/`HEAD` 200 responses for this TTL (default: off) — bypassed for any request carrying `Cookie`, `Authorization` or `Range`; never stores responses with `Set-Cookie`, `Cache-Control: private/no-store/no-cache`, a `Vary` other than `Accept-Encoding`, or a body over 1 MiB; concurrent misses for one URL are coalesced into a single backend hit; `X-Cache: HIT|MISS|BYPASS` on every response |
+| `proxy.cache.paths=/api/schedule,/standings` |   | ✓ | optional comma-separated client-path prefixes eligible for caching (default: every path on the route) |
 
 The cache never serves a personalized response: any request with cookies or auth goes straight to the backend, so an SSO-gated (`proxy.auth`) route is effectively uncached. The routes.json equivalents are `"cache"` and `"cache_paths"`.
 
-### Central labels (in progress)
+### Central labels
 
-Live-tunable labels (weight, health, cache, rate limit, sticky, drain, autoupdate, …) of an *adopted* service are moving into Redis so they can change without recreating containers — see [docs/CENTRAL_LABELS_PLAN.md](docs/CENTRAL_LABELS_PLAN.md). The proxy side is in: when `REDIS_ADDR` is set, each proxy overlays the adopted services' managed keys onto its local containers' labels (identity, `proxy.auth*` and `proxy.ab.*` labels always come from the container) and caches the overlay at `-labels-cache` (default `/data/labels-overlay.json`) so it keeps routing the same way through a Redis outage. `GET :8094/labels` reports `{version, source: redis|disk|none, loaded_at, redis_ok, services}`. `REDIS_USERNAME` (optional) selects a Redis ACL user. Nothing writes these keys yet — the dashboard side lands next — and with `REDIS_ADDR` unset the overlay is off entirely.
+An adopted service's live-tunable labels (✓ in the table above) live in Redis, so they change on every host within ~5s **without recreating any container** — see [docs/CENTRAL_LABELS_PLAN.md](docs/CENTRAL_LABELS_PLAN.md). Identity labels (`proxy.enable/service/host/port/path`), auth labels (`proxy.auth*`) and per-replica labels (`proxy.canary`, `proxy.ab.*`, …) always come from the container and are rejected centrally.
+
+- **Proxy:** with `REDIS_ADDR` set, each proxy overlays the adopted services' managed keys onto its local containers' labels and caches the overlay at `-labels-cache` (default `/data/labels-overlay.json`), so it keeps routing the same way through a Redis outage. `GET :8094/labels` reports `{version, source: redis|disk|none, loaded_at, redis_ok, services}`. Precedence: routes.json, then Redis (managed keys of adopted services), then container labels.
+- **Dashboard reads** (`LABELS_CENTRAL=true`, needs `-redis-addr`): the dashboard's own decisions — scaling guard, drain grace, overlap, the overlap health gate, autoupdate, grouping — use the same effective labels. New containers are still created from the RAW container labels; central values are never baked in. Until the dashboard has reached Redis once since start, auto-update skips non-onboarded services.
+- **Dashboard writes** (`LABELS_WRITES=true` too): `GET/POST /api/services/{svc}/labels[?host=]`. GET shows the central map, effective labels, raw `container_labels` per host/replica, `drift` (container values the central map overrides), `readonly_keys`, and `applied` (each host's proxy overlay version) — a change is live once every proxy's `applied.version` reaches the write's global version. POST takes `{if_version, request_id?, set, unset, allow_loosen?, resolve_conflicts?}`. The first POST (`if_version: 0`) adopts the service by importing its current container labels from every host; replicas that disagree return `409` with the conflicts until resolved. After adoption, compose/container edits to managed keys are **ignored** (shown as drift), and the dashboard's weight/autoupdate/unscalable toggles write Redis instead of recreating. A stale `if_version` is `409` with `current_version`; Redis down is `503` with no change made; the dashboard's own service is `403`. If Redis lost `pmgr:labels:version` (wiped), the next write first reseeds every adopted service from the local proxy's `/labels` (or the dashboard's last snapshot) and audits `labels_reseed_from_*`.
+- **MCP:** `get_service_labels` (read) and `set_service_labels` (needs `MCP_ALLOW_WRITES` **and** `MCP_ALLOW_PEER_WRITES`, because a write applies to every host).
+- `REDIS_USERNAME` (optional) selects a Redis ACL user for both proxy and dashboard. With `REDIS_ADDR` unset everything above is off.
 
 ### MCP servers
 

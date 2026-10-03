@@ -222,6 +222,8 @@ func (s *maintPageStore) Sync(ctx context.Context, dc *dockerClient) error {
 			continue
 		}
 		host := strings.ToLower(strings.TrimSpace(ct.Labels[labelHost]))
+		// proxy.maintenance is centrally settable: read the effective value.
+		ct.Labels = dc.effectiveLabels(ct.Labels)
 		src := strings.TrimSpace(ct.Labels[labelMaintPage])
 		if host == "" || src == "" || !validMaintHost(host) {
 			continue
