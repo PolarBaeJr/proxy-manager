@@ -71,6 +71,9 @@ type dockerClient struct {
 	// claims serializes the auto-updater and central env propagation per
 	// service (rollingop.go).
 	claims serviceClaims
+	// ab drives A/B tests (abmanager.go). Nil in every test that builds a
+	// dockerClient by hand; the §1.12 guards then still see B's labels.
+	ab *abManager
 }
 
 func newDockerClient() *dockerClient {
@@ -1081,6 +1084,9 @@ type Service struct {
 	// configured), set only on services merged in from a peer's
 	// /peer/services. Mirrors ServiceStatusGroup.Machine in servicestatus.go.
 	Machine string `json:"machine,omitempty"`
+	// ABTest summarizes the service's A/B test, if any — its canary is then
+	// B, managed only through the /ab endpoints.
+	ABTest *ServiceABTest `json:"ab_test,omitempty"`
 }
 
 // ServiceMember is one container's surface for the UI — name (DNS-routable),
@@ -1140,6 +1146,9 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 		if isCanary {
 			s.CanaryImage = ct.Image
 			s.CanaryReplicas++
+			if s.ABTest == nil && ct.Labels[labelABVariant] != "" {
+				s.ABTest = abTestFromLabels(ct)
+			}
 		} else {
 			port, _ := strconv.Atoi(ct.Labels[labelPort])
 			img := ct.Image
@@ -2182,7 +2191,10 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 // req.Image — the shared primitive behind stageCanary (which always wants
 // len(live), an immediate ~50/50 split) and a rollout's ramp steps (which
 // want a smaller, growing count).
-func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, req ReplaceServiceRequest, count int) error {
+//
+// extraLabels, if non-nil, are stamped over the cloned labels — the A/B
+// test's proxy.ab.* set (abtest.go); every other caller passes nil.
+func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, req ReplaceServiceRequest, count int, extraLabels map[string]string) error {
 	if req.Image == "" {
 		return fmt.Errorf("image is required")
 	}
@@ -2229,11 +2241,17 @@ func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, re
 	}
 	canaryLabels[labelCanary] = "true"
 	canaryLabels[labelPrevImage] = tpl.Image
+	for k, v := range extraLabels {
+		canaryLabels[k] = v
+	}
 
 	c.pullImage(ctx, req.Image)
 	startIdx := nextReplicaIndex(all, name)
 	for i := 0; i < count; i++ {
 		cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
+		if extraLabels[labelABVariant] != "" {
+			cname = abCanaryName(name, startIdx+i)
+		}
 		id, err := c.createContainer(ctx, cname, createBody{
 			Image: req.Image, Labels: canaryLabels, Env: env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
 			ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
@@ -2259,7 +2277,7 @@ func (c *dockerClient) stageCanary(ctx context.Context, name string, req Replace
 	// count prefers running live replicas — see replaceService's identical
 	// tplSet comment — so a stale exited "live" leftover doesn't inflate the
 	// canary pool created for the 50/50 split.
-	return c.createCanaryReplicas(ctx, name, req, len(preferRunning(liveOnly(all))))
+	return c.createCanaryReplicas(ctx, name, req, len(preferRunning(liveOnly(all))), nil)
 }
 
 // nextCanaryReplicaIndex mirrors nextReplicaIndex but keys off the
@@ -2354,7 +2372,13 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 	// unknown here (managed only by a replica's label, nothing stored or
 	// cached) falls through: cloneEnvAndSpec below fails closed for exactly
 	// that case with the accurate error.
-	if c.central != nil && c.central.Managed(name, canary[0].Labels) {
+	//
+	// An A/B test's B (abtest.go) is exempt: central env edits made during
+	// the test are deferred by design (§0.8), so a mismatch here is expected.
+	// B is promoted on the env it was tested with and the deferred
+	// propagation then moves it on, health-gated (abManager.afterFinalize).
+	isAB := isABCanary(canary)
+	if !isAB && c.central != nil && c.central.Managed(name, canary[0].Labels) {
 		if cur, ok := c.central.Version(name); ok {
 			for _, ct := range canary {
 				if ct.Labels[labelEnvVersion] != strconv.FormatUint(cur, 10) {
@@ -2379,13 +2403,19 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 	// except a centrally managed service, which is promoted onto the CURRENT
 	// central env rather than the canary's stage-time snapshot of it.
 	for _, ct := range canary {
-		tc, err := c.cloneEnvAndSpec(ctx, name, ct)
+		var tc templateClone
+		var err error
+		if isAB {
+			tc, err = c.cloneOwnEnvAndSpec(ctx, ct)
+		} else {
+			tc, err = c.cloneEnvAndSpec(ctx, name, ct)
+		}
 		if err != nil {
 			return err
 		}
 		labels := map[string]string{}
 		for k, v := range tc.labels {
-			if k == labelCanary {
+			if k == labelCanary || strings.HasPrefix(k, labelABPrefix) {
 				continue
 			}
 			labels[k] = v

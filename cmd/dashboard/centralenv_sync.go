@@ -52,12 +52,17 @@ const (
 	// envSyncStatusAdoptUndone: an adopt's first origin roll failed, so the
 	// adopt was undone — the record is gone and the replicas are unstamped.
 	envSyncStatusAdoptUndone = "failed_adopt_undone"
+	// envSyncStatusDeferred: svc has an A/B test, so the new version was
+	// stored but not rolled (§0.8) — not a failure; the test's finalize
+	// (abManager.afterFinalize) and the reconcile loop pick it up after.
+	envSyncStatusDeferred = "deferred_ab_test"
 
 	envSyncHostConverged   = "converged"
 	envSyncHostUnsupported = "unsupported"
 	envSyncHostUnreachable = "unreachable"
 	envSyncHostFailed      = "failed"
 	envSyncHostRolledBack  = "failed_rolled_back"
+	envSyncHostDeferred    = "deferred_ab_test"
 
 	envSyncRoleOrigin = "origin"
 	envSyncRolePeer   = "peer"
@@ -393,6 +398,26 @@ func (m *envSyncManager) waitIdle(ctx context.Context, svc string) bool {
 	}
 }
 
+// deferForABTest ends a job without rolling: svc has an A/B test (§0.8).
+func (m *envSyncManager) deferForABTest(svc string, target uint64) {
+	msg := fmt.Sprintf("env v%d pending — applies after the A/B test", target)
+	log.Printf("central env: %s: %s", svc, msg)
+	m.finish(svc, envSyncStatusDeferred, msg)
+}
+
+func (m *envSyncManager) jobHasHost(svc, status string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if j := m.jobs[svc]; j != nil {
+		for _, h := range j.Hosts {
+			if h.Status == status {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (m *envSyncManager) releaseClaim(svc string) {
 	m.dc.claims.release(svc, envSyncClaimOwner)
 }
@@ -432,6 +457,13 @@ func (m *envSyncManager) runOrigin(svc string) uint64 {
 	}
 	if !m.waitIdle(ctx, svc) {
 		m.finish(svc, envSyncStatusFailed, "timed out waiting for another rollout to finish")
+		return target
+	}
+	// Checked holding the claim, which an A/B start also needs — so no test
+	// can begin between this check and the roll.
+	if m.dc.abActive(ctx, svc) {
+		m.releaseClaim(svc)
+		m.deferForABTest(svc, target)
 		return target
 	}
 	// Held for the local roll only — released before the (possibly long)
@@ -489,6 +521,10 @@ func (m *envSyncManager) runOrigin(svc string) uint64 {
 	if partial {
 		m.finish(svc, envSyncStatusPartial, "")
 		audit(nil, envSyncAuditUser, "service.env_sync_failed", fmt.Sprintf("%s v%d partial", svc, target))
+		return target
+	}
+	if m.jobHasHost(svc, envSyncHostDeferred) {
+		m.deferForABTest(svc, target)
 		return target
 	}
 	if rec.Adopting {
@@ -851,7 +887,7 @@ func (m *envSyncManager) syncPeers(ctx context.Context, svc string, target uint6
 		}
 		m.addHost(svc, r)
 		switch r.Status {
-		case envSyncHostConverged, envSyncHostUnsupported:
+		case envSyncHostConverged, envSyncHostUnsupported, envSyncHostDeferred:
 		case envSyncHostRolledBack:
 			partial = true
 			m.mu.Lock()
@@ -932,6 +968,8 @@ func (m *envSyncManager) syncOnePeer(ctx context.Context, p envSyncPeer, svc str
 					res.Status = envSyncHostConverged
 				case j.Status == envSyncStatusFailedRolledBack:
 					res.Status, res.Error = envSyncHostRolledBack, j.LastError
+				case j.Status == envSyncStatusDeferred:
+					res.Status = envSyncHostDeferred
 				default:
 					res.Status, res.Error = envSyncHostFailed, j.LastError
 				}
@@ -972,6 +1010,10 @@ func (m *envSyncManager) runPeer(svc string) {
 		return
 	}
 	defer m.releaseClaim(svc)
+	if m.dc.abActive(ctx, svc) {
+		m.deferForABTest(svc, t.version)
+		return
+	}
 	if m.ce.fetchFromOrigin == nil {
 		m.finish(svc, envSyncStatusFailed, "no origin fetcher configured")
 		return

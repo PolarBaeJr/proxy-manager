@@ -33,6 +33,7 @@ func main() {
 	releasesFile := flag.String("releases", "/data/releases.json", "release marks (stable-tag pins) state file")
 	imageHistoryFile := flag.String("image-history", "/data/image-history.json", "per-service image version history state file")
 	prefsFile := flag.String("prefs", "/data/prefs.json", "per-user UI preferences state file")
+	abTestsFile := flag.String("abtests", "/data/abtests.json", "A/B test state file")
 	staticConfig := flag.String("routes-config", "/etc/proxy/routes.json", "static routes file (rw: dashboard appends onboarded routes here)")
 	serviceTokenDir := flag.String("service-token-dir", "/tokens", "directory to write auto-provisioned service credentials (e.g. statusbot's token) — a sibling container mounts this read-only")
 	redisAddr := flag.String("redis-addr", "", "shared Redis address for cross-peer user identity (passkeys/tokens/passwords), e.g. host:6379 (empty = local-file-only auth, today's behavior)")
@@ -256,6 +257,13 @@ func main() {
 	// flight for that same service.
 	rm := newRolloutManager(dc, onboarded, *staticConfig, proxyURLFromEnv())
 	rom := newRollingOpManager(dc)
+	// Set before any handler, au or env sync loop can read dc.ab — they all
+	// consult it (abActive) on their guarded paths.
+	abStore, err := loadABStore(*abTestsFile)
+	if err != nil {
+		log.Fatalf("A/B test store: %v", err)
+	}
+	dc.ab = newABManager(dc, abStore, onboarded, rm, rom, registry, peerSecret, proxyURLFromEnv())
 	// The propagation manager needs rm/rom (it defers to, and rolls through,
 	// them); set on centralEnvState before any handler or loop can read it.
 	if centralEnvState != nil {
@@ -300,6 +308,10 @@ func main() {
 	// Background: health-gate every service currently mid-rollout and
 	// auto-roll-back the moment a canary looks unhealthy between steps.
 	go rm.Run(ctx)
+
+	// Background: converge A/B tests — resume interrupted ops, latch a
+	// proxy auto-abort into B's labels, finalize drained promotes/discards.
+	go dc.ab.Run(ctx)
 
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
@@ -369,6 +381,7 @@ func main() {
 		"/peer/duplicate":       peerDuplicateHandler(peerSecret, identity, dc, peerWritesEnabled),
 		"/peer/spread":          peerSpreadHandler(peerSecret, identity, dc, peerWritesEnabled),
 		"/peer/central-env/":    peerCentralEnvHandler(peerSecret, centralEnvState, dc, peerWritesEnabled),
+		"/peer/ab":              peerABHandler(peerSecret, proxyURLFromEnv()),
 	}
 	writesMsg := "(writes disabled)"
 	if peerWritesEnabled {
@@ -377,10 +390,10 @@ func main() {
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
 		primary = append(primary, peerServer(*peerAddr, peerHandlers))
-		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, and /peer/stats on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
+		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, /peer/ab, and /peer/stats on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
 	case peerSecret != "":
 		primary = append(primary, peerServer(*peerAddr, peerHandlers))
-		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, and /peer/stats enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
+		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, /peer/ab, and /peer/stats enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}

@@ -303,7 +303,7 @@ func TestCentralEnvNeverLeaksValues(t *testing.T) {
 	collect("scale", dc.scaleService(context.Background(), "app", 2))
 	ce.store.Apply("app", centralEnvChange{IfVersion: 2, Base: map[string]string{"P": sentinel}}, "")
 	collect("replace edit", dc.replaceService(context.Background(), "app", ReplaceServiceRequest{Image: "x:2", Env: map[string]string{"P": sentinel}}))
-	collect("canary edit", dc.createCanaryReplicas(context.Background(), "app", ReplaceServiceRequest{Image: "x:2", Env: map[string]string{"P": sentinel}}, 1))
+	collect("canary edit", dc.createCanaryReplicas(context.Background(), "app", ReplaceServiceRequest{Image: "x:2", Env: map[string]string{"P": sentinel}}, 1, nil))
 	peerDC := f.client(t)
 	peerDC.central = peer
 	collect("peer scale", peerDC.scaleService(context.Background(), "app", 3))

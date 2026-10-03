@@ -735,7 +735,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		// GET, "check", and "duplicate" below) so it's exempt too; the POST
 		// that starts one is NOT exempt — it must still be blocked by (and
 		// block) an active rollout or rolling job like any other mutation.
-		exemptFromRolloutGuard := len(parts) == 2 && (parts[1] == "rollout" || parts[1] == "rollout/advance" || parts[1] == "rollout/abort" || parts[1] == "check" || parts[1] == "duplicate" || (parts[1] == "rolling-replace" && req.Method == "GET"))
+		exemptFromRolloutGuard := len(parts) == 2 && (parts[1] == "rollout" || parts[1] == "rollout/advance" || parts[1] == "rollout/abort" || parts[1] == "check" || parts[1] == "duplicate" || (parts[1] == "rolling-replace" && req.Method == "GET") || (parts[1] == "ab" && req.Method == "GET"))
 		if !exemptFromRolloutGuard {
 			if st, ok := rm.get(name); ok && rolloutActive(st.Status) {
 				http.Error(w, fmt.Sprintf("%q has an active rollout — advance or abort it before other mutations", name), http.StatusConflict)
@@ -745,6 +745,15 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 				http.Error(w, fmt.Sprintf("%q has an active rolling replace — wait for it to finish before other mutations", name), http.StatusConflict)
 				return
 			}
+		}
+		// A/B tests (abtest_api.go): its own routes, then the §1.12 guards
+		// on every generic action that would fight a running test.
+		if len(parts) == 2 && serveABAPI(w, req, dc, name, parts[1], auditActor(auth, req)) {
+			return
+		}
+		if err := abGuard(req, dc, name, parts); err != nil {
+			writeABErr(w, err)
+			return
 		}
 		if len(parts) == 2 && parts[1] == "scale" && req.Method == "POST" {
 			var body struct{ Replicas int }
@@ -1789,6 +1798,7 @@ func buildManagedServices(ctx context.Context, dc *dockerClient, onb *OnboardedS
 	// statusbot/Observability still reports the dashboard's own
 	// health.
 	svcs = excludeSelf(svcs)
+	dc.ab.overlaySummaries(svcs)
 	// NOTE: excludeSelf runs before the onboarded-merge dedupe
 	// below, which matches by name against svcs. In practice
 	// this never collides — the discovery/onboarding UI only
@@ -2376,6 +2386,9 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/duplicate"
 	case len(parts) == 2 && parts[1] == "spread" && req.Method == http.MethodPost:
 		method, peerPath = http.MethodPost, "/peer/services/"+url.PathEscape(name)+"/spread"
+	case len(parts) == 2 && isABRoute(parts[1]) && (req.Method == http.MethodPost || (req.Method == http.MethodGet && parts[1] == "ab")):
+		// GET ab is a read like rolling-replace's status poll above.
+		method, peerPath = req.Method, "/peer/services/"+url.PathEscape(name)+"/"+parts[1]
 	case len(parts) == 1 && req.Method == http.MethodDelete:
 		method, peerPath = http.MethodDelete, "/peer/services/"+url.PathEscape(name)
 	default:

@@ -257,7 +257,7 @@ func (m *rolloutManager) startRollout(ctx context.Context, name string, req Repl
 		}
 
 		canaryCount := ceilPct(orig, steps[0])
-		if err := m.dc.createCanaryReplicas(ctx, name, req, canaryCount); err != nil {
+		if err := m.dc.createCanaryReplicas(ctx, name, req, canaryCount, nil); err != nil {
 			return nil, err
 		}
 		if err := m.scaleLiveTo(ctx, name, orig-canaryCount); err != nil {
