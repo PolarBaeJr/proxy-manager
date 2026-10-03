@@ -1975,8 +1975,8 @@ func TestServicesDeletePartialTeardownMembersActed(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("decode body: %v, body=%s", err, rec.Body.String())
 		}
-		if body.MembersActed != 1 {
-			t.Fatalf("members_acted = %d, want 1 (only c1 removed before c2 failed)", body.MembersActed)
+		if body.MembersActed != 2 {
+			t.Fatalf("members_acted = %d, want 2 (c1 and c3 removed, c2 failed — members drain in parallel)", body.MembersActed)
 		}
 	})
 
@@ -2004,8 +2004,8 @@ func TestServicesDeletePartialTeardownMembersActed(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("decode body: %v, body=%s", err, rec.Body.String())
 		}
-		if body.MembersActed != 1 {
-			t.Fatalf("forwarded members_acted = %d, want 1 — the peer's partial-teardown count did not survive the hop", body.MembersActed)
+		if body.MembersActed != 2 {
+			t.Fatalf("forwarded members_acted = %d, want 2 — the peer's partial-teardown count did not survive the hop", body.MembersActed)
 		}
 	})
 }

@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PolarBaeJr/proxy-manager/internal/graceful"
 	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 	"github.com/redis/go-redis/v9"
 )
@@ -51,7 +51,6 @@ func main() {
 	defer cancel()
 
 	go persistLoop(ctx, *statePath, *stateInterval, metrics)
-	saveOnShutdown(*statePath, metrics)
 
 	dc := newDockerClient()
 	router := &Router{}
@@ -189,29 +188,97 @@ func main() {
 
 	// Pass refresh into the metrics server so /refresh can be hit by the
 	// dashboard after it edits routes.json — saves a docker restart.
-	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot, router.ABReport, ph)
+	metricsSrv := metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot, router.ABReport, ph)
 	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
-	go dc.streamEvents(ctx, func(action string) {
-		switch action {
-		case "start", "die", "destroy", "kill", "stop":
-			refresh()
-			return
-		}
-		if strings.HasPrefix(action, "health_status") {
-			refresh()
-		}
+	go dc.streamEvents(ctx, func(ev dockerEvent) {
+		handleContainerEvent(router, refresh, ev)
 	})
 	go runHealthChecks(ctx, router)
 	go router.runABEvaluator(ctx)
 
+	// The watchdog gets its own context so a drain can stop it first: a
+	// probe failing while the listener shuts down must not exit(1) mid-drain.
+	watchdogCtx, stopWatchdog := context.WithCancel(ctx)
+	defer stopWatchdog()
 	if selfOn {
-		selfcheck.Start(ctx, selfCfg)
+		selfcheck.Start(watchdogCtx, selfCfg)
 	}
 
+	// No Read/WriteTimeout: proxied uploads, downloads and streams are
+	// bounded by the backend, and a server-wide write deadline would cut
+	// long SSE/WebSocket sessions.
+	srv := &http.Server{Addr: *addr, Handler: mainHandler(router, metrics, access), ReadHeaderTimeout: 5 * time.Second}
+	timeout, streamGrace := graceful.TimeoutFromEnv()
 	log.Printf("proxy on %s", *addr)
-	if err := http.ListenAndServe(*addr, mainHandler(router, metrics, access)); !errors.Is(err, http.ErrServerClosed) {
+	err = graceful.Run(graceful.Options{
+		Primary:     []*http.Server{srv},
+		Aux:         []*http.Server{metricsSrv},
+		Timeout:     timeout,
+		StreamGrace: streamGrace,
+		OnSignal: []func(){
+			stopWatchdog,
+			func() {
+				log.Printf("proxy: draining in-flight requests")
+				// Early save: if the drain outlives the container's stop
+				// grace period, the latest snapshot is already on disk.
+				if err := saveMetricsState(*statePath, metrics); err != nil {
+					log.Printf("metrics state: shutdown save: %v", err)
+				}
+			},
+		},
+		// main's ctx stays alive through the drain (Docker events, health
+		// checks and peer sync keep routing correct) and is only cancelled
+		// once every request has finished.
+		Hooks: []func(context.Context){
+			func(context.Context) {
+				if err := saveMetricsState(*statePath, metrics); err != nil {
+					log.Printf("metrics state: shutdown save: %v", err)
+				}
+			},
+			func(context.Context) { cancel() },
+		},
+	})
+	if err != nil {
 		log.Fatal(err)
+	}
+}
+
+// drainSignals are the kill-event signals that mean "this container is
+// going away" (docker stop sends 15 then 9; compose/kill may name them).
+// Docker reports them numerically — observed live: {"signal":"15"} — the
+// names are accepted defensively. HUP/USR1/USR2/WINCH are app-level
+// reload/rotate signals and must not deroute a healthy replica.
+var drainSignals = map[string]bool{
+	"15": true, "2": true, "3": true, "9": true,
+	"SIGTERM": true, "SIGINT": true, "SIGQUIT": true, "SIGKILL": true,
+}
+
+// handleContainerEvent reacts to one Docker container event. A stop signal
+// marks the container draining BEFORE the refresh, because assembleGroups
+// still sees it as running until it actually exits.
+func handleContainerEvent(router *Router, refresh func(), ev dockerEvent) {
+	id := ev.Actor.ID
+	if id == "" {
+		id = ev.ID
+	}
+	switch ev.Action {
+	case "kill":
+		if drainSignals[strings.ToUpper(ev.Actor.Attributes["signal"])] {
+			router.markDraining(id)
+		}
+		refresh()
+		return
+	case "start", "die", "destroy":
+		router.clearDraining(id)
+		refresh()
+		return
+	case "stop":
+		refresh()
+		return
+	}
+	if strings.HasPrefix(ev.Action, "health_status") {
+		refresh()
 	}
 }
 

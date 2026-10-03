@@ -275,7 +275,7 @@ type peerHandlers struct {
 	Routes    http.Handler // POST /peer/routes — see peermerge.go
 }
 
-// metricsServer starts an HTTP server on addr exposing /metrics (JSON),
+// metricsServer builds the HTTP server for addr exposing /metrics (JSON),
 // /access (per-request log ring), /refresh (rebuild the router from
 // labels + routes.json on demand), /routes (currently routed hosts —
 // the auth binary uses it to validate login redirects), /ratelimit
@@ -283,7 +283,7 @@ type peerHandlers struct {
 // view reads this), /peer/handshake (bearer-gated peer-mesh handshake — see
 // peers.go), and /peer/routes (bearer-gated peer route push — see
 // peermerge.go). Bind to internal addresses only.
-func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot, abReport func(service string) abReport, peers peerHandlers) {
+func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot, abReport func(service string) abReport, peers peerHandlers) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -332,10 +332,7 @@ func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapsh
 		mux.Handle("/peer/routes", peers.Routes)
 	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			// metrics is non-fatal — log via the default logger and continue.
-		}
-	}()
+	// Not started here: graceful.Run serves it as an Aux server, so /metrics,
+	// /peer/* and /healthz keep answering until the main listener drains.
+	return &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 }

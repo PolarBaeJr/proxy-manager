@@ -7,9 +7,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"syscall"
 	"time"
 )
 
@@ -67,17 +65,4 @@ func persistLoop(ctx context.Context, path string, interval time.Duration, m *Me
 			}
 		}
 	}
-}
-
-// saveOnShutdown flushes one final snapshot on SIGTERM/interrupt, then exits.
-func saveOnShutdown(path string, m *Metrics) {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
-	go func() {
-		<-ch
-		if err := saveMetricsState(path, m); err != nil {
-			log.Printf("metrics state: shutdown save: %v", err)
-		}
-		os.Exit(0)
-	}()
 }

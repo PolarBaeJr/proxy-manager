@@ -488,8 +488,7 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 		composeFile := ct.Labels["com.docker.compose.project.config_files"]
 		log.Printf("onboarded %q away from compose — %s still defines this service; remove or comment that block or a future 'docker compose up -d' will recreate an unlabeled duplicate", name, composeFile)
 	}
-	_ = c.stopContainer(ctx, ct.ID)
-	if err := c.removeContainer(ctx, ct.ID); err != nil {
+	if err := c.drainStopRemove(ctx, *ct); err != nil {
 		return fmt.Errorf("onboard %q: new replicas are running but failed to remove the original %s: %w", name, ct.name(), err)
 	}
 	return nil
@@ -603,9 +602,11 @@ func (c *dockerClient) scaleOnboarded(ctx context.Context, name string, desired 
 		if len(clones) < toRemove {
 			return fmt.Errorf("can only scale down to %d (one is the original)", 1)
 		}
+		if err := c.derouteOnboarded(ctx, name, svc, routesPath, clones[:toRemove]); err != nil {
+			return err
+		}
 		for i := 0; i < toRemove; i++ {
-			_ = c.stopContainer(ctx, clones[i].ID)
-			if err := c.removeContainer(ctx, clones[i].ID); err != nil {
+			if err := c.drainStopRemove(ctx, clones[i]); err != nil {
 				return fmt.Errorf("remove %s: %w", clones[i].name(), err)
 			}
 		}
@@ -679,9 +680,11 @@ func (c *dockerClient) scaleOnboardedCanary(ctx context.Context, name string, ta
 	} else {
 		toRemove := current - target
 		sortByNameDesc(canary)
+		if err := c.derouteOnboarded(ctx, name, svc, routesPath, canary[:toRemove]); err != nil {
+			return err
+		}
 		for i := 0; i < toRemove; i++ {
-			_ = c.stopContainer(ctx, canary[i].ID)
-			if err := c.removeContainer(ctx, canary[i].ID); err != nil {
+			if err := c.drainStopRemove(ctx, canary[i]); err != nil {
 				return fmt.Errorf("remove %s: %w", canary[i].name(), err)
 			}
 		}
@@ -701,6 +704,38 @@ func (c *dockerClient) scaleOnboardedCanary(ctx context.Context, name string, ta
 // CanaryImage clears and the same container is treated as a regular live
 // backend — it IS the new live, just retained its original name.
 func rebuildOnboardedRoute(ctx context.Context, c *dockerClient, name string, svc OnboardedService, routesPath string) error {
+	return rebuildOnboardedRouteExcluding(ctx, c, name, svc, routesPath, nil)
+}
+
+// onboardedDerouteDelay is how long derouteOnboarded waits after the proxy
+// reload before the retiring clones are stopped. A var only so tests can
+// shrink it.
+var onboardedDerouteDelay = time.Second
+
+// derouteOnboarded takes the retiring clones out of the static route and
+// has the proxy reload it BEFORE they are stopped. Static backends carry no
+// container ID, so the proxy's kill-event drain can't deroute them itself;
+// without this, requests keep being sent to a clone that is shutting down.
+// svc is the service as it should be routed once the clones are gone.
+func (c *dockerClient) derouteOnboarded(ctx context.Context, name string, svc OnboardedService, routesPath string, retiring []dockerContainer) error {
+	if len(retiring) == 0 {
+		return nil
+	}
+	exclude := make(map[string]bool, len(retiring))
+	for _, ct := range retiring {
+		exclude[ct.ID] = true
+	}
+	if err := rebuildOnboardedRouteExcluding(ctx, c, name, svc, routesPath, exclude); err != nil {
+		return err
+	}
+	proxyRefresh(proxyURLFromEnv())
+	time.Sleep(onboardedDerouteDelay)
+	return nil
+}
+
+// rebuildOnboardedRouteExcluding is rebuildOnboardedRoute leaving out the
+// containers whose IDs are in exclude.
+func rebuildOnboardedRouteExcluding(ctx context.Context, c *dockerClient, name string, svc OnboardedService, routesPath string, exclude map[string]bool) error {
 	if svc.Host == "" {
 		return removeOnboardedRoute(routesPath, name)
 	}
@@ -716,7 +751,7 @@ func rebuildOnboardedRoute(ctx context.Context, c *dockerClient, name string, sv
 	cPrefix := fmt.Sprintf("goproxy-onb-%s-c", name)
 	// First pass: non-canary live backends.
 	for _, cl := range clones {
-		if canaryActive && strings.HasPrefix(cl.name(), cPrefix) {
+		if exclude[cl.ID] || (canaryActive && strings.HasPrefix(cl.name(), cPrefix)) {
 			continue
 		}
 		backends = append(backends, fmt.Sprintf("http://%s:%d", cl.name(), svc.Port))
@@ -724,7 +759,7 @@ func rebuildOnboardedRoute(ctx context.Context, c *dockerClient, name string, sv
 	// Second pass: canary backends (only while a canary is actively staged).
 	if canaryActive {
 		for _, cl := range clones {
-			if strings.HasPrefix(cl.name(), cPrefix) {
+			if !exclude[cl.ID] && strings.HasPrefix(cl.name(), cPrefix) {
 				backends = append(backends, fmt.Sprintf("http://%s:%d", cl.name(), svc.Port))
 			}
 		}
@@ -875,22 +910,27 @@ func (c *dockerClient) promoteOnboarded(ctx context.Context, name string, store 
 	if err != nil {
 		return fmt.Errorf("inspect canary env: %w", err)
 	}
-	// Tear down old (non-canary) clones first.
-	for _, cl := range all {
-		if strings.HasPrefix(cl.name(), cPrefix) {
-			continue
-		}
-		_ = c.stopContainer(ctx, cl.ID)
-		_ = c.removeContainer(ctx, cl.ID)
-	}
 	// Drop original from the route — user's container keeps running but isn't
 	// a backend anymore. They can stop it manually if they want.
-	svc.OriginalRouted = false
-	svc.PreviousImage = svc.Image
-	svc.Image = svc.CanaryImage
-	svc.Env = canaryEnv
-	svc.CanaryImage = ""
-	svc.CanaryReplicas = 0
+	promoted := svc
+	promoted.OriginalRouted = false
+	promoted.PreviousImage = svc.Image
+	promoted.Image = svc.CanaryImage
+	promoted.Env = canaryEnv
+	promoted.CanaryImage = ""
+	promoted.CanaryReplicas = 0
+	// Route only the canaries, then tear down the old (non-canary) clones.
+	var old []dockerContainer
+	for _, cl := range all {
+		if !strings.HasPrefix(cl.name(), cPrefix) {
+			old = append(old, cl)
+		}
+	}
+	if err := c.derouteOnboarded(ctx, name, promoted, routesPath, old); err != nil {
+		return err
+	}
+	_ = c.drainStopRemoveAll(ctx, old, nil)
+	svc = promoted
 	if err := store.Put(svc); err != nil {
 		return err
 	}
@@ -911,15 +951,20 @@ func (c *dockerClient) discardOnboarded(ctx context.Context, name string, store 
 	if err != nil {
 		return err
 	}
+	var canary []dockerContainer
 	for _, cl := range all {
-		if !strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
-			continue
+		if strings.HasPrefix(cl.name(), fmt.Sprintf("goproxy-onb-%s-c", name)) {
+			canary = append(canary, cl)
 		}
-		_ = c.stopContainer(ctx, cl.ID)
-		_ = c.removeContainer(ctx, cl.ID)
 	}
-	svc.CanaryImage = ""
-	svc.CanaryReplicas = 0
+	discarded := svc
+	discarded.CanaryImage = ""
+	discarded.CanaryReplicas = 0
+	if err := c.derouteOnboarded(ctx, name, discarded, routesPath, canary); err != nil {
+		return err
+	}
+	_ = c.drainStopRemoveAll(ctx, canary, nil)
+	svc = discarded
 	if err := store.Put(svc); err != nil {
 		return err
 	}
@@ -997,6 +1042,7 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 	if err != nil {
 		return err
 	}
+	var old []dockerContainer
 	for _, cl := range all {
 		n := cl.name()
 		isNew := false
@@ -1006,15 +1052,19 @@ func (c *dockerClient) replaceOnboarded(ctx context.Context, name string, req Re
 				break
 			}
 		}
-		if isNew {
-			continue
+		if !isNew {
+			old = append(old, cl)
 		}
-		_ = c.stopContainer(ctx, cl.ID)
-		_ = c.removeContainer(ctx, cl.ID)
 	}
-	svc.OriginalRouted = false
-	svc.PreviousImage = svc.Image
-	svc.Image = req.Image
+	replaced := svc
+	replaced.OriginalRouted = false
+	replaced.PreviousImage = svc.Image
+	replaced.Image = req.Image
+	if err := c.derouteOnboarded(ctx, name, replaced, routesPath, old); err != nil {
+		return err
+	}
+	_ = c.drainStopRemoveAll(ctx, old, nil)
+	svc = replaced
 	if err := store.Put(svc); err != nil {
 		return err
 	}
@@ -1094,10 +1144,7 @@ func (c *dockerClient) offboardContainer(ctx context.Context, name string, store
 	_ = svc // currently unused but useful for future logic
 	clones, err := c.listAll(ctx, fmt.Sprintf(`{"name":["goproxy-onb-%s-"]}`, name))
 	if err == nil {
-		for _, cl := range clones {
-			_ = c.stopContainer(ctx, cl.ID)
-			_ = c.removeContainer(ctx, cl.ID)
-		}
+		_ = c.drainStopRemoveAll(ctx, clones, nil)
 	}
 	// Disconnect the original from edge (best-effort; user may have already removed it).
 	originals, _ := c.listAll(ctx, fmt.Sprintf(`{"name":["%s"]}`, name))

@@ -33,6 +33,7 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-edge:${EDGE_TAG:-latest}
     container_name: edge
     restart: unless-stopped
+    stop_grace_period: 30s
     # Leak containment, not a reservation — see the proxy service.
     mem_limit: 256m
     memswap_limit: 256m
@@ -60,6 +61,10 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-proxy:${PROXY_TAG:-latest}
     container_name: proxy
     restart: unless-stopped
+    # Graceful shutdown: SIGTERM drains in-flight requests (SHUTDOWN_TIMEOUT,
+    # default 25s) then saves state. Keep this at SHUTDOWN_TIMEOUT + 5s or
+    # more, or Docker SIGKILLs mid-drain. Same on every service below.
+    stop_grace_period: 30s
     # Memory caps are leak containment, not reservations: a runaway leak gets
     # this container OOM-killed and restarted (restart: unless-stopped) instead
     # of starving the whole host. memswap_limit = mem_limit means no swap. Each
@@ -113,6 +118,7 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-dashboard:${DASHBOARD_TAG:-latest}
     container_name: dashboard
     restart: unless-stopped
+    stop_grace_period: 30s
     # Leak containment, not a reservation — see the proxy service.
     mem_limit: 512m
     memswap_limit: 512m
@@ -245,6 +251,7 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-monitor:${MONITOR_TAG:-latest}
     container_name: monitor
     restart: unless-stopped
+    stop_grace_period: 30s
     # Leak containment, not a reservation — see the proxy service.
     mem_limit: 256m
     memswap_limit: 256m
@@ -270,6 +277,7 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-auth:${AUTH_TAG:-latest}
     container_name: auth
     restart: unless-stopped
+    stop_grace_period: 30s
     # Leak containment, not a reservation — see the proxy service.
     mem_limit: 128m
     memswap_limit: 128m
@@ -303,6 +311,7 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-statusbot:${STATUSBOT_TAG:-latest}
     container_name: statusbot
     restart: unless-stopped
+    stop_grace_period: 30s
     # Leak containment, not a reservation — see the proxy service.
     mem_limit: 128m
     memswap_limit: 128m

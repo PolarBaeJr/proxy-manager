@@ -177,17 +177,16 @@ func (m *Metrics) Snapshot() map[string]any {
 	}
 }
 
-// metricsServer exposes /metrics on a separate listener, distinct from the
-// public dashboard port. Bind to internal addresses only.
-func metricsServer(addr string, m *Metrics) {
+// metricsServer builds the /metrics listener, distinct from the public
+// dashboard port; main.go serves it. Bind to internal addresses only.
+func metricsServer(addr string, m *Metrics) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(m.Snapshot())
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() { _ = srv.ListenAndServe() }()
+	return &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 }
 
 // withMetrics records per-request counters + latency for every request handled

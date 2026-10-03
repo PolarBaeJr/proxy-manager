@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,6 +39,7 @@ const (
 	labelCanary     = "proxy.canary"         // "true" → staged replicas, served alongside live
 	labelAutoUpdate = "proxy.autoupdate"     // "true" → engine replaces on newer registry digest
 	labelHealth     = "proxy.health"         // optional HTTP health-check path, e.g. "/healthz"
+	labelDrain      = "proxy.drain"          // seconds a replica gets to finish in-flight work on stop (default 30, max 300)
 	// labelMaintPage lives in maintpage.go, next to the sync that consumes it.
 
 	// ociImageLabelPrefix marks labels that describe the IMAGE (baked in by
@@ -216,6 +218,7 @@ type createBody struct {
 	Env              []string            `json:"Env,omitempty"`
 	ExposedPorts     map[string]struct{} `json:"ExposedPorts,omitempty"`
 	Healthcheck      *healthcheckSpec    `json:"Healthcheck,omitempty"`
+	StopTimeout      *int                `json:"StopTimeout,omitempty"`
 	HostConfig       hostConfig          `json:"HostConfig"`
 	NetworkingConfig struct {
 		EndpointsConfig map[string]endpointSettings `json:"EndpointsConfig"`
@@ -326,6 +329,14 @@ func (c *dockerClient) createVolume(ctx context.Context, name string) error {
 }
 
 func (c *dockerClient) createContainer(ctx context.Context, name string, body createBody) (string, error) {
+	// An explicit proxy.drain also becomes the container's own stop timeout,
+	// so a plain `docker stop` or a daemon shutdown gives it the same grace.
+	// Unlabeled containers keep Docker's default (and stay adoptable — see
+	// inspectAdoptStrict).
+	if _, ok := body.Labels[labelDrain]; ok {
+		t := drainSeconds(body.Labels)
+		body.StopTimeout = &t
+	}
 	body.HostConfig.NetworkMode = managedNetwork
 	body.HostConfig.RestartPolicy.Name = "unless-stopped"
 	body.NetworkingConfig.EndpointsConfig = map[string]endpointSettings{
@@ -418,6 +429,9 @@ func (c *dockerClient) stopContainer(ctx context.Context, id string) error {
 	return nil
 }
 
+// removeContainer force-removes (SIGKILL if still running). Only for
+// containers that never served traffic — a rollback of a just-created
+// replica — or as drainStopRemove's last resort.
 func (c *dockerClient) removeContainer(ctx context.Context, id string) error {
 	resp, err := c.do(ctx, "DELETE", "/containers/"+id+"?force=true", nil)
 	if err != nil {
@@ -425,6 +439,107 @@ func (c *dockerClient) removeContainer(ctx context.Context, id string) error {
 	}
 	resp.Close()
 	return nil
+}
+
+const (
+	defaultDrainSeconds = 30
+	maxDrainSeconds     = 300
+)
+
+// drainSeconds is a replica's stop grace from its proxy.drain label:
+// default 30, clamped to 0–300, unparseable → default.
+func drainSeconds(labels map[string]string) int {
+	v, ok := labels[labelDrain]
+	if !ok {
+		return defaultDrainSeconds
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return defaultDrainSeconds
+	}
+	return min(max(n, 0), maxDrainSeconds)
+}
+
+// stopContainerT is stopContainer with an explicit grace: Docker sends the
+// stop signal (the proxy deroutes the replica on that kill event), waits up
+// to t seconds for the app to finish, then SIGKILLs. 304/404 are success.
+func (c *dockerClient) stopContainerT(ctx context.Context, id string, t int) error {
+	resp, err := c.do(ctx, "POST", "/containers/"+id+"/stop?t="+strconv.Itoa(t), nil)
+	if err != nil {
+		if strings.Contains(err.Error(), ": 304 ") || strings.Contains(err.Error(), ": 404 ") {
+			return nil
+		}
+		return err
+	}
+	resp.Close()
+	return nil
+}
+
+// removeStopped removes an already-stopped container without force. A 409
+// (it is somehow running again) falls back to a force remove.
+func (c *dockerClient) removeStopped(ctx context.Context, id string) error {
+	resp, err := c.do(ctx, "DELETE", "/containers/"+id, nil)
+	if err != nil {
+		if strings.Contains(err.Error(), ": 409 ") {
+			return c.removeContainer(ctx, id)
+		}
+		return err
+	}
+	resp.Close()
+	return nil
+}
+
+// drainStopRemove retires a replica that may be serving traffic: stop with
+// its proxy.drain grace, then remove. It runs detached from ctx's
+// cancellation (bounded by the grace + 15s instead) so a caller giving up
+// — an HTTP client disconnecting mid-replace — can't leave a half-drained
+// container behind or cut the drain short. If the graceful stop fails it
+// still force-removes, as the old stop+force-remove pair always did.
+// Any new path that retires a serving replica must use this (or
+// drainStopRemoveAll) — including A/B test finalize (feat-ab-testing),
+// which retires the losing variant's replicas.
+func (c *dockerClient) drainStopRemove(ctx context.Context, ct dockerContainer) error {
+	t := drainSeconds(ct.Labels)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(t+15)*time.Second)
+	defer cancel()
+	if err := c.stopContainerT(ctx, ct.ID, t); err != nil {
+		log.Printf("drain-stop %s: %v — force-removing", ct.name(), err)
+		return c.removeContainer(ctx, ct.ID)
+	}
+	return c.removeStopped(ctx, ct.ID)
+}
+
+// drainStopRemoveParallelism bounds concurrent drains: each one is mostly
+// waiting on its app, so a few at once keeps a whole-service retire to
+// ~one drain period without stampeding the daemon.
+const drainStopRemoveParallelism = 4
+
+// drainStopRemoveAll drains cts concurrently and returns the first error
+// (after every drain has finished). onDone, if set, sees each result.
+func (c *dockerClient) drainStopRemoveAll(ctx context.Context, cts []dockerContainer, onDone func(dockerContainer, error)) error {
+	sem := make(chan struct{}, drainStopRemoveParallelism)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var first error
+	for _, ct := range cts {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ct dockerContainer) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := c.drainStopRemove(ctx, ct)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil && first == nil {
+				first = err
+			}
+			if onDone != nil {
+				onDone(ct, err)
+			}
+		}(ct)
+	}
+	wg.Wait()
+	return first
 }
 
 // ---- Local images (for the Images phase-out panel) ----
@@ -1265,8 +1380,7 @@ func (c *dockerClient) scaleServiceWithHealthcheck(ctx context.Context, name str
 			return fmt.Errorf("can only scale down to %d (the original is not removable)", current-len(ours))
 		}
 		for i := 0; i < toRemove; i++ {
-			_ = c.stopContainer(ctx, ours[i].ID)
-			if err := c.removeContainer(ctx, ours[i].ID); err != nil {
+			if err := c.drainStopRemove(ctx, ours[i]); err != nil {
 				return fmt.Errorf("remove %s: %w", ours[i].name(), err)
 			}
 		}
@@ -1618,12 +1732,11 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	// A package var only so tests can shrink it; nothing else reassigns it.
 	time.Sleep(replaceSettleDelay)
 
-	for _, ct := range tpl.existing {
-		_ = c.stopContainer(ctx, ct.ID)
-		if err := c.removeContainer(ctx, ct.ID); err != nil {
+	_ = c.drainStopRemoveAll(ctx, tpl.existing, func(ct dockerContainer, err error) {
+		if err != nil {
 			log.Printf("replace %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
 		}
-	}
+	})
 	return nil
 }
 
@@ -1765,8 +1878,7 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 			return errReplicaGateFailed{err: fmt.Errorf("replaced %d/%d replicas, then failed on %s: %w", i, total, cname, err)}
 		}
 
-		_ = c.stopContainer(ctx, old.ID)
-		if err := c.removeContainer(ctx, old.ID); err != nil {
+		if err := c.drainStopRemove(ctx, old); err != nil {
 			log.Printf("rolling-replace %s: failed to remove old %s: %v (new one is running)", name, old.name(), err)
 		}
 		replaced[old.ID] = true
@@ -1782,15 +1894,17 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 	// removal silently failed) — replaceService's all-at-once tail removes
 	// every member of existing unconditionally, and this rolling tail must
 	// leave the same end state.
+	var leftovers []dockerContainer
 	for _, ct := range tpl.existing {
-		if replaced[ct.ID] {
-			continue
-		}
-		_ = c.stopContainer(ctx, ct.ID)
-		if err := c.removeContainer(ctx, ct.ID); err != nil {
-			log.Printf("rolling-replace %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
+		if !replaced[ct.ID] {
+			leftovers = append(leftovers, ct)
 		}
 	}
+	_ = c.drainStopRemoveAll(ctx, leftovers, func(ct dockerContainer, err error) {
+		if err != nil {
+			log.Printf("rolling-replace %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
+		}
+	})
 	return nil
 }
 
@@ -1866,8 +1980,7 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	time.Sleep(replaceSettleDelay)
 
 	for _, ct := range existing {
-		_ = c.stopContainer(ctx, ct.ID)
-		if err := c.removeContainer(ctx, ct.ID); err != nil {
+		if err := c.drainStopRemove(ctx, ct); err != nil {
 			log.Printf("autoupdate label flip %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
 		}
 	}
@@ -1948,8 +2061,7 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 	time.Sleep(replaceSettleDelay)
 
 	for _, ct := range existing {
-		_ = c.stopContainer(ctx, ct.ID)
-		if err := c.removeContainer(ctx, ct.ID); err != nil {
+		if err := c.drainStopRemove(ctx, ct); err != nil {
 			log.Printf("unscalable label flip %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
 		}
 	}
@@ -2058,8 +2170,7 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	time.Sleep(replaceSettleDelay)
 
 	for _, ct := range existing {
-		_ = c.stopContainer(ctx, ct.ID)
-		if err := c.removeContainer(ctx, ct.ID); err != nil {
+		if err := c.drainStopRemove(ctx, ct); err != nil {
 			log.Printf("weight label set %s: failed to remove old %s: %v (new ones are running)", name, ct.name(), err)
 		}
 	}
@@ -2217,8 +2328,7 @@ func (c *dockerClient) scaleCanary(ctx context.Context, name string, target int)
 		toRemove := current - target
 		sort.Slice(existing, func(i, j int) bool { return existing[i].name() > existing[j].name() })
 		for i := 0; i < toRemove; i++ {
-			_ = c.stopContainer(ctx, existing[i].ID)
-			if err := c.removeContainer(ctx, existing[i].ID); err != nil {
+			if err := c.drainStopRemove(ctx, existing[i]); err != nil {
 				return fmt.Errorf("remove %s: %w", existing[i].name(), err)
 			}
 		}
@@ -2293,18 +2403,16 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 			return fmt.Errorf("start promoted %s: %w", cname, err)
 		}
 		// Now safe to drop the original canary container.
-		_ = c.stopContainer(ctx, ct.ID)
-		_ = c.removeContainer(ctx, ct.ID)
+		_ = c.drainStopRemove(ctx, ct)
 		// Refresh the all list so nextReplicaIndex sees the new container.
 		all = append(all, dockerContainer{ID: id, Names: []string{"/" + cname}})
 	}
 	// Tear down the old live.
-	for _, ct := range live {
-		_ = c.stopContainer(ctx, ct.ID)
-		if err := c.removeContainer(ctx, ct.ID); err != nil {
+	_ = c.drainStopRemoveAll(ctx, live, func(ct dockerContainer, err error) {
+		if err != nil {
 			log.Printf("promote %s: failed to remove old live %s: %v", name, ct.name(), err)
 		}
-	}
+	})
 	return nil
 }
 
@@ -2318,35 +2426,26 @@ func (c *dockerClient) discardCanary(ctx context.Context, name string) error {
 	if len(canary) == 0 {
 		return fmt.Errorf("no canary to discard for %q", name)
 	}
-	for _, ct := range canary {
-		_ = c.stopContainer(ctx, ct.ID)
-		if err := c.removeContainer(ctx, ct.ID); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.drainStopRemoveAll(ctx, canary, nil)
 }
 
 // deleteService permanently removes every container backing a label-managed
 // service. It returns how many members were actually torn down (membersActed)
 // alongside any error, so a partial failure partway through a multi-replica
 // service can be reported accurately instead of as a bare status string —
-// stopContainer is best-effort and deliberately NOT counted (only a
-// successful removeContainer increments membersActed), since a stop with no
-// matching remove leaves the container stopped but still present.
+// members drain in parallel and only a successful remove is counted, since
+// a stop with no matching remove leaves the container stopped but present.
 func (c *dockerClient) deleteService(ctx context.Context, name string) (membersActed int, err error) {
 	existing, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
 	if err != nil {
 		return 0, err
 	}
-	for _, ct := range existing {
-		_ = c.stopContainer(ctx, ct.ID)
-		if err := c.removeContainer(ctx, ct.ID); err != nil {
-			return membersActed, err
+	err = c.drainStopRemoveAll(ctx, existing, func(_ dockerContainer, err error) {
+		if err == nil {
+			membersActed++
 		}
-		membersActed++
-	}
-	return membersActed, nil
+	})
+	return membersActed, err
 }
 
 // ---- Routes view (independent of the proxy process) ----

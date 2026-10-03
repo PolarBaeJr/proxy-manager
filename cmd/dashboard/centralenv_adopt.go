@@ -218,12 +218,13 @@ func (c *dockerClient) inspectAdoptStrict(ctx context.Context, id, logDriver str
 	var resp struct {
 		Image  string `json:"Image"`
 		Config struct {
-			Env         []string         `json:"Env"`
-			User        string           `json:"User"`
-			WorkingDir  string           `json:"WorkingDir"`
-			StopSignal  string           `json:"StopSignal"`
-			StopTimeout *int             `json:"StopTimeout"`
-			Healthcheck *healthcheckSpec `json:"Healthcheck"`
+			Env         []string          `json:"Env"`
+			User        string            `json:"User"`
+			WorkingDir  string            `json:"WorkingDir"`
+			StopSignal  string            `json:"StopSignal"`
+			StopTimeout *int              `json:"StopTimeout"`
+			Healthcheck *healthcheckSpec  `json:"Healthcheck"`
+			Labels      map[string]string `json:"Labels"`
 		} `json:"Config"`
 		HostConfig struct {
 			LogConfig struct {
@@ -274,7 +275,10 @@ func (c *dockerClient) inspectAdoptStrict(ctx context.Context, id, logDriver str
 	add(cfg.User != "" && cfg.User != img.Config.User, "Config.User")
 	add(cfg.WorkingDir != "" && cfg.WorkingDir != img.Config.WorkingDir, "Config.WorkingDir")
 	add(cfg.StopSignal != "" && cfg.StopSignal != img.Config.StopSignal, "Config.StopSignal")
-	add(cfg.StopTimeout != nil, "Config.StopTimeout")
+	// createContainer re-derives StopTimeout from a proxy.drain label, so a
+	// value matching the label survives a recreate; any other is lost.
+	_, drainLabeled := cfg.Labels[labelDrain]
+	add(cfg.StopTimeout != nil && !(drainLabeled && *cfg.StopTimeout == drainSeconds(cfg.Labels)), "Config.StopTimeout")
 	add((hc.LogConfig.Type != "" && hc.LogConfig.Type != logDriver) || len(hc.LogConfig.Config) > 0, "HostConfig.LogConfig")
 	add(len(hc.Tmpfs) > 0, "HostConfig.Tmpfs")
 	add(len(hc.Ulimits) > 0, "HostConfig.Ulimits")

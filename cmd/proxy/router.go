@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -70,6 +72,14 @@ type Backend struct {
 	// and matches ours); "" otherwise. Only such a peer gets the hop
 	// protocol — session variant + abFailoverHeader, recorded by the peer.
 	peerTestID string
+
+	// ContainerID is the Docker container ID of a label-discovered local
+	// backend ("" for static and learned backends) — the key Docker kill
+	// events carry. draining is set once that container has been sent a
+	// stop signal (Router.markDraining): it takes no NEW requests, sticky
+	// or panic-mode included, while requests already on it finish.
+	ContainerID string
+	draining    atomic.Bool
 }
 
 // unhealthyAfterConsecutiveFails gates recordHealthCheck's failure side:
@@ -97,7 +107,9 @@ func (b *Backend) recordHealthCheck(ok bool) {
 }
 
 func (b *Backend) markHealthy(ok bool) { b.healthyFlag.Store(ok) }
-func (b *Backend) healthy() bool       { return !b.DockerUnhealthy && b.healthyFlag.Load() }
+func (b *Backend) healthy() bool {
+	return !b.DockerUnhealthy && !b.draining.Load() && b.healthyFlag.Load()
+}
 
 // excludedFrom is healthy()'s inverse, but lets pickAny's panic mode
 // (ignoreHealth=true) distrust only healthyFlag — the proxy's own probe
@@ -110,7 +122,7 @@ func (b *Backend) healthy() bool       { return !b.DockerUnhealthy && b.healthyF
 // a hang. So it stays load-bearing even when we've decided not to trust our
 // own probe anymore.
 func (b *Backend) excludedFrom(ignoreHealth bool) bool {
-	if b.DockerUnhealthy {
+	if b.DockerUnhealthy || b.draining.Load() {
 		return true
 	}
 	return !ignoreHealth && !b.healthyFlag.Load()
@@ -462,6 +474,75 @@ type Router struct {
 	// peerSyncInterval is the peer push cadence (-peer-sync-interval); A/B
 	// merged judging treats a peer as stale after three of them. 0 = 5s.
 	peerSyncInterval time.Duration
+
+	// drainSet holds container IDs that received a stop signal, with when.
+	// Guarded by mu. Set() re-applies it to freshly built backends, since a
+	// draining container still lists as running until it exits; entries
+	// clear on the container's start/die/destroy event or after drainTTL.
+	drainSet map[string]time.Time
+}
+
+// drainTTL bounds how long a stop signal keeps a container out of rotation
+// if no die/destroy event ever follows (an app that traps SIGTERM and keeps
+// running) — it rejoins rather than staying derouted forever.
+const drainTTL = 10 * time.Minute
+
+// markDraining takes container id out of rotation immediately. The ID is
+// recorded before flipping the live backends, under mu, so a concurrent
+// Set() either sees the entry or publishes groups this loop then flips.
+func (r *Router) markDraining(id string) {
+	if id == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.drainSet == nil {
+		r.drainSet = map[string]time.Time{}
+	}
+	r.drainSet[id] = r.clock()
+	n := 0
+	for _, g := range r.groups {
+		for _, b := range g.Backends {
+			if b.ContainerID == id {
+				b.draining.Store(true)
+				n++
+			}
+		}
+	}
+	if n > 0 {
+		log.Printf("proxy: container %.12s received a stop signal — draining %d backend(s)", id, n)
+	}
+}
+
+// clearDraining forgets id. Live backends are not un-flipped here: the
+// refresh that follows every clearing event rebuilds them.
+func (r *Router) clearDraining(id string) {
+	r.mu.Lock()
+	delete(r.drainSet, id)
+	r.mu.Unlock()
+}
+
+// applyDrainingLocked flips every backend whose container is in drainSet,
+// pruning entries older than drainTTL. Caller holds mu.
+func (r *Router) applyDrainingLocked(groups []*RouteGroup) {
+	if len(r.drainSet) == 0 {
+		return
+	}
+	now := r.clock()
+	for id, at := range r.drainSet {
+		if now.Sub(at) > drainTTL {
+			delete(r.drainSet, id)
+		}
+	}
+	for _, g := range groups {
+		for _, b := range g.Backends {
+			if b.ContainerID != "" {
+				if _, ok := r.drainSet[b.ContainerID]; ok {
+					b.draining.Store(true)
+				}
+			}
+		}
+	}
 }
 
 func (r *Router) Set(groups []*RouteGroup) {
@@ -530,6 +611,7 @@ func (r *Router) Set(groups []*RouteGroup) {
 		}
 	}
 	r.reconcileAB(groups)
+	r.applyDrainingLocked(groups)
 	r.groups = groups
 	r.mu.Unlock()
 
@@ -881,6 +963,7 @@ func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, group 
 // attribution still reaches the access-log writer underneath.
 func (r *Router) proxyToGroup(w http.ResponseWriter, req *http.Request, group *RouteGroup, reqHost string, hopped bool, stickyPin string) {
 	tried := map[*Backend]bool{}
+	retryable := prepareRetryBody(req)
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		var b *Backend
 		if stickyPin != "" {
@@ -923,7 +1006,14 @@ func (r *Router) proxyToGroup(w http.ResponseWriter, req *http.Request, group *R
 		if group.Sticky && !hopped {
 			setStickyCookie(w, group, b.stickyID)
 		}
+		if attempt > 0 {
+			rewindBody(req)
+		}
 		if tryProxy(w, req, b) {
+			return
+		}
+		if !retryable {
+			serveBodyNotReplayable(w, group, reqHost, b)
 			return
 		}
 	}
@@ -932,6 +1022,57 @@ func (r *Router) proxyToGroup(w http.ResponseWriter, req *http.Request, group *R
 	// hosts from the Top hosts / error-rate view via a toggle.
 	log.Printf("proxy: group %q (host %s) has no healthy backends — serving 503", group.Service, reqHost)
 	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
+}
+
+// maxReplayBody bounds how much of a request body is buffered so a failed
+// attempt can be replayed to another backend: 64 KiB per in-flight request.
+const maxReplayBody = 64 << 10
+
+// prepareRetryBody makes req safe to retry. The transport consumes and
+// closes the body on every attempt, so before this a retried POST reached
+// the next backend with an already-closed body — failing there too and
+// marking a healthy backend unhealthy. A body of at most maxReplayBody is
+// buffered and given a GetBody; a larger one streams through untouched and
+// the request is reported not retryable.
+func prepareRetryBody(req *http.Request) bool {
+	if req.Body == nil || req.Body == http.NoBody || req.GetBody != nil {
+		return true
+	}
+	if req.ContentLength > maxReplayBody {
+		return false
+	}
+	orig := req.Body
+	buf, err := io.ReadAll(io.LimitReader(orig, maxReplayBody+1))
+	if err != nil || len(buf) > maxReplayBody {
+		// Whatever was read goes back in front of the rest of the stream.
+		req.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(buf), orig), orig}
+		return false
+	}
+	_ = orig.Close()
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(buf)), nil }
+	req.Body, _ = req.GetBody()
+	return true
+}
+
+// rewindBody restores a buffered body before a retry.
+func rewindBody(req *http.Request) {
+	if req.GetBody == nil {
+		return
+	}
+	if body, err := req.GetBody(); err == nil {
+		req.Body = body
+	}
+}
+
+// serveBodyNotReplayable ends a request whose first attempt failed before
+// any response and whose body was too large to buffer: retrying would send
+// a truncated body (and blame the next backend for it), so it gets a 502.
+func serveBodyNotReplayable(w http.ResponseWriter, group *RouteGroup, reqHost string, b *Backend) {
+	log.Printf("proxy: group %q (host %s): backend %s failed and the request body is over %d bytes, too large to replay — serving 502", group.Service, reqHost, b.URL, maxReplayBody)
+	serveUnavailable(w, http.StatusBadGateway, reqHost, "Service unavailable at this time, try again later.")
 }
 
 // serveUnavailable writes a small styled HTML page with a 5-minute
@@ -1200,6 +1341,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 				backendURL := fmt.Sprintf("http://%s:%d", ip, port)
 				u, _ := url.Parse(backendURL)
 				backend = makeBackend(backendURL, weight, name, c.Labels[labelHealth], u, host)
+				backend.ContainerID = c.ID
 				backend.DockerUnhealthy = dockerUnhealthy(c.Status)
 				if backend.DockerUnhealthy {
 					log.Printf("backend %s (%s): Docker reports unhealthy — excluded from routing for %s%s", name, backend.URL, host, c.Labels[labelPath])

@@ -190,6 +190,7 @@ func TestAdoptPreflightStrictFields(t *testing.T) {
 		{field: "Config.WorkingDir", config: map[string]any{"WorkingDir": "/work"}},
 		{field: "Config.StopSignal", config: map[string]any{"StopSignal": "SIGINT"}},
 		{field: "Config.StopTimeout", config: map[string]any{"StopTimeout": 30}},
+		{field: "Config.StopTimeout", config: map[string]any{"StopTimeout": 20, "Labels": map[string]string{labelDrain: "45"}}},
 		{field: "HostConfig.LogConfig", hostConfig: map[string]any{"LogConfig": map[string]any{"Type": "syslog"}}},
 		{field: "HostConfig.LogConfig", hostConfig: map[string]any{"LogConfig": map[string]any{"Type": "json-file", "Config": map[string]string{"max-size": "10m"}}}},
 		{field: "HostConfig.Tmpfs", hostConfig: map[string]any{"Tmpfs": map[string]string{"/tmp": ""}}},
@@ -223,6 +224,20 @@ func TestAdoptPreflightStrictFields(t *testing.T) {
 		rep := adoptDryRun(t, mux, "app", `{"ack_compose":true}`)
 		if !rep.Adoptable || len(rep.Blockers) != 0 {
 			t.Fatalf("inherited values blocked the adopt: %q", rep.Blockers)
+		}
+	})
+
+	// createContainer re-derives StopTimeout from proxy.drain, so a value
+	// matching the label is carried, not dropped.
+	t.Run("stop timeout from proxy.drain", func(t *testing.T) {
+		withFastSync(t)
+		h, mux := newAdoptHost(t)
+		h.f.mutateInspect("c1", func(in *cenvInspect) {
+			in.config = map[string]any{"StopTimeout": 45, "Labels": map[string]string{labelDrain: "45"}}
+		})
+		rep := adoptDryRun(t, mux, "app", `{"ack_compose":true}`)
+		if !rep.Adoptable || len(rep.Blockers) != 0 {
+			t.Fatalf("drain-labeled StopTimeout blocked the adopt: %q", rep.Blockers)
 		}
 	})
 }

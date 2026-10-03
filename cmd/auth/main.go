@@ -8,7 +8,6 @@ package main
 import (
 	"context"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PolarBaeJr/proxy-manager/internal/graceful"
 	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 )
 
@@ -115,13 +115,21 @@ func main() {
 		log.Print("passkey support disabled")
 	}
 
+	watchdogCtx, stopWatchdog := context.WithCancel(context.Background())
+	defer stopWatchdog()
 	if selfOn {
-		selfcheck.Start(context.Background(), selfCfg)
+		selfcheck.Start(watchdogCtx, selfCfg)
 	}
 
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	timeout, streamGrace := graceful.TimeoutFromEnv()
 	log.Printf("auth on %s (cookie domains: %s)", *addr, strings.Join(s.domains, ", "))
-	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+	if err := graceful.Run(graceful.Options{
+		Primary:     []*http.Server{srv},
+		Timeout:     timeout,
+		StreamGrace: streamGrace,
+		OnSignal:    []func(){stopWatchdog},
+	}); err != nil {
 		log.Fatal(err)
 	}
 }

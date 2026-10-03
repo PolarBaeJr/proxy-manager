@@ -101,6 +101,7 @@ Drop these on any container you want routed:
 | `proxy.health=/healthz` |   | HTTP probe (default: TCP connect) |
 | `proxy.service=myapp` |   | group key — unlocks scale/replace/canary in dashboard |
 | `proxy.unscalable=true` |   | singleton (DB, bot, gateway) — disables scale buttons |
+| `proxy.drain=30` |   | seconds a replica gets to finish in-flight work when the dashboard retires it (default 30, max 300) — see [Graceful shutdown](#graceful-shutdown) |
 | `proxy.autoupdate=true` |   | opt-in unattended updates — dashboard re-pulls + replaces when a newer registry digest appears (10-min poll) |
 | `proxy.maintenance=/app/maintenance.html` |   | path **inside the image** to this app's own 503 page — served instead of the shared one while the host is in maintenance ([details](deploy/nginx/README.md#per-app-maintenance-pages)) |
 | `proxy.name=Friendly` |   | dashboard label |
@@ -270,6 +271,25 @@ Watchdog settings are env-only (the HEALTHCHECK exec inherits env, not compose `
 | `SELFCHECK_URLS` | the binary's own `/healthz` | comma-separated override, used by both the watchdog and `-healthcheck` |
 
 `/healthz` deliberately checks nothing but "the HTTP server answers" — never Docker, Redis or disk — so a flaky dependency can't crash-loop a healthy process.
+
+---
+
+## Graceful shutdown
+
+Restarts and deploys don't drop requests.
+
+- **The Go services drain on SIGTERM.** proxy, dashboard, monitor and auth stop accepting, let in-flight requests finish, cut WebSocket/SSE streams after a short grace, force-close anything left at the deadline, then save state (proxy metrics, monitor store) and exit 0. The proxy's internal `:8094` (metrics, peer sync, `/refresh`) stays up until the main listener has drained.
+- **Replicas are drained before they stop.** When the dashboard retires a replica (scale down, replace, rolling replace, promote, discard, delete), it stops it with a grace of `proxy.drain` seconds and only then removes it. The moment Docker sends the stop signal, the proxy takes that replica out of rotation (sticky and panic-mode routing included) while requests already on it finish. Replicas the dashboard creates with a `proxy.drain` label also get it as their Docker stop timeout.
+- **Small request bodies are replayable.** A request that fails before any response is retried on another backend; bodies up to 64 KiB are buffered so the retry sends the full body. A larger body is not retried — it gets a `502`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SHUTDOWN_TIMEOUT` | `25s` | hard deadline for the drain (clamped to 1s–120s) |
+| `SHUTDOWN_STREAM_GRACE` | `5s` | how long WebSocket/SSE streams may continue once draining starts |
+
+Keep compose's `stop_grace_period` (30s for every service here) at `SHUTDOWN_TIMEOUT` + 5s or more. The drain itself is capped at `SHUTDOWN_TIMEOUT`; shutting down the internal listeners and saving state normally takes well under a second after that, and the proxy already saved its metrics when the signal arrived, so a SIGKILL in that last window loses nothing.
+
+**Your app must handle SIGTERM too.** The proxy stops sending new requests to a stopping replica, but only the app itself can finish its own in-flight work: on SIGTERM, stop accepting and complete what's running (e.g. Go's `http.Server.Shutdown`, Node's `server.close()`), then exit. An app that ignores SIGTERM is killed after `proxy.drain` seconds.
 
 ---
 

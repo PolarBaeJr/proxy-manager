@@ -186,9 +186,14 @@ func (c *dockerClient) listEnabledContainers(ctx context.Context) ([]dockerConta
 type dockerEvent struct {
 	Type   string `json:"Type"`
 	Action string `json:"Action"`
+	ID     string `json:"id"`
+	Actor  struct {
+		ID         string            `json:"ID"`
+		Attributes map[string]string `json:"Attributes"`
+	} `json:"Actor"`
 }
 
-func (c *dockerClient) streamEvents(ctx context.Context, onAction func(string)) {
+func (c *dockerClient) streamEvents(ctx context.Context, onEvent func(dockerEvent)) {
 	for {
 		body, err := c.get(ctx, `/events?filters={"type":["container"]}`)
 		if err != nil {
@@ -204,7 +209,7 @@ func (c *dockerClient) streamEvents(ctx context.Context, onAction func(string)) 
 				log.Printf("event stream: %v — reconnecting", err)
 				break
 			}
-			onAction(ev.Action)
+			onEvent(ev)
 		}
 		select {
 		case <-ctx.Done():

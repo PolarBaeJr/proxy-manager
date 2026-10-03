@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"log"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PolarBaeJr/proxy-manager/internal/graceful"
 	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 	"github.com/redis/go-redis/v9"
 )
@@ -54,7 +54,7 @@ func main() {
 	peerWritesEnabled = *peerWrites
 
 	metrics := NewMetrics()
-	metricsServer(*metricsAddr, metrics)
+	metricsSrv := metricsServer(*metricsAddr, metrics)
 	log.Printf("metrics on %s/metrics", *metricsAddr)
 
 	auth, err := loadAuthStore(*authFile)
@@ -341,7 +341,7 @@ func main() {
 	mcpWrites := isTrue(os.Getenv("MCP_ALLOW_WRITES"))
 	mcpPeerWrites := isTrue(os.Getenv("MCP_ALLOW_PEER_WRITES"))
 	registerMCPTools(mcpSrv, &apiCaller{mux: mux}, mcpWrites, mcpPeerWrites)
-	serveMCP(*mcpAddr, mcpSrv, mcpWrites, mcpPeerWrites)
+	primary := []*http.Server{serveMCP(*mcpAddr, mcpSrv, mcpWrites, mcpPeerWrites)}
 
 	if redisClient != nil {
 		go registry.ratchetOwnVersion(ctx)
@@ -376,21 +376,37 @@ func main() {
 	}
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
-		peerServer(*peerAddr, peerHandlers)
+		primary = append(primary, peerServer(*peerAddr, peerHandlers))
 		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, and /peer/stats on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
 	case peerSecret != "":
-		peerServer(*peerAddr, peerHandlers)
+		primary = append(primary, peerServer(*peerAddr, peerHandlers))
 		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, and /peer/stats enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}
 
+	watchdogCtx, stopWatchdog := context.WithCancel(ctx)
+	defer stopWatchdog()
 	if selfOn {
-		selfcheck.Start(ctx, selfCfg)
+		selfcheck.Start(watchdogCtx, selfCfg)
 	}
 
+	srv := &http.Server{Addr: *addr, Handler: selfcheck.Handler(withMetrics(mux, metrics)), ReadHeaderTimeout: 5 * time.Second}
+	timeout, streamGrace := graceful.TimeoutFromEnv()
 	log.Printf("dashboard on %s", *addr)
-	if err := http.ListenAndServe(*addr, selfcheck.Handler(withMetrics(mux, metrics))); !errors.Is(err, http.ErrServerClosed) {
+	// Only HTTP requests are drained. Async jobs (rollouts, rolling ops,
+	// central-env propagation, the auto-updater) run on ctx and are NOT
+	// awaited: they stop when the Hooks below cancel it, exactly as they
+	// did on a hard exit before.
+	err = graceful.Run(graceful.Options{
+		Primary:     append([]*http.Server{srv}, primary...),
+		Aux:         []*http.Server{metricsSrv},
+		Timeout:     timeout,
+		StreamGrace: streamGrace,
+		OnSignal:    []func(){stopWatchdog},
+		Hooks:       []func(context.Context){func(context.Context) { cancel() }},
+	})
+	if err != nil {
 		log.Fatal(err)
 	}
 }
