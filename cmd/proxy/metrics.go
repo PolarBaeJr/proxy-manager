@@ -283,7 +283,7 @@ type peerHandlers struct {
 // view reads this), /peer/handshake (bearer-gated peer-mesh handshake — see
 // peers.go), and /peer/routes (bearer-gated peer route push — see
 // peermerge.go). Bind to internal addresses only.
-func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot, peers peerHandlers) {
+func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapshot func() []*RouteGroup, rlSnapshot func() []RouteRateLimitSnapshot, abReport func(service string) abReport, peers peerHandlers) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -313,6 +313,10 @@ func metricsServer(addr string, m *Metrics, a *AccessLog, refresh func(), snapsh
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"routes": rlSnapshot()})
 		})
+	}
+	if abReport != nil {
+		// Read-only A/B status (abtest.go); the dashboard relays it.
+		mux.HandleFunc("/ab", abHandler(abReport))
 	}
 	if refresh != nil {
 		mux.HandleFunc("/refresh", func(w http.ResponseWriter, _ *http.Request) {

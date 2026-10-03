@@ -128,6 +128,8 @@ func (p *PeerSync) tick(ctx context.Context) {
 	var routes []peerRouteInfo
 	for _, g := range p.router.Snapshot() {
 		localCount, localWeight := 0, 0
+		// PR2: B backends are counted here too, so a peer without the test
+		// can hop requests that land on B by uid hash with no pin.
 		for _, b := range g.Backends {
 			if !b.Learned {
 				localCount++
