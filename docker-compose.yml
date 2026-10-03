@@ -33,6 +33,9 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-edge:${EDGE_TAG:-latest}
     container_name: edge
     restart: unless-stopped
+    # Leak containment, not a reservation — see the proxy service.
+    mem_limit: 256m
+    memswap_limit: 256m
     profiles: [edge]                    # opt-in: docker compose --profile edge up -d
     networks: [edge]
     ports:
@@ -43,6 +46,7 @@ services:
     environment:
       EDGE_DOMAINS: ${EDGE_DOMAINS:-}   # e.g. foo.example.com,bar.example.com
       EDGE_PEER_SECRET: ${EDGE_PEER_SECRET:-}
+      GOMEMLIMIT: 220MiB
     command: >
       -tls-domains ${EDGE_DOMAINS:-}
       -backend http://proxy:8092
@@ -56,6 +60,13 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-proxy:${PROXY_TAG:-latest}
     container_name: proxy
     restart: unless-stopped
+    # Memory caps are leak containment, not reservations: a runaway leak gets
+    # this container OOM-killed and restarted (restart: unless-stopped) instead
+    # of starving the whole host. memswap_limit = mem_limit means no swap. Each
+    # service sets GOMEMLIMIT ~85% of its cap so the Go GC works harder before
+    # the kernel steps in.
+    mem_limit: 1g
+    memswap_limit: 1g
     networks: [edge]
     ports:
       # Loopback-only publish: host nginx proxies to 127.0.0.1:8092, but LAN /
@@ -83,6 +94,7 @@ services:
       # Proxy-level peer mesh discovery handshake (see PMGR_PEERS in
       # .env.example). Empty = /peer/handshake disabled, unchanged behavior.
       PMGR_PEER_SECRET: ${PMGR_PEER_SECRET:-}
+      GOMEMLIMIT: 850MiB
     # = form so empty env expansions don't swallow the next flag. Auth gating
     # stays OFF until AUTH_DOMAINS is set (e.g. polardev.org,the-aquarium.com);
     # all other proxy flags keep their built-in defaults.
@@ -101,6 +113,9 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-dashboard:${DASHBOARD_TAG:-latest}
     container_name: dashboard
     restart: unless-stopped
+    # Leak containment, not a reservation — see the proxy service.
+    mem_limit: 512m
+    memswap_limit: 512m
     networks: [edge]
     labels:
       # Private-only hostname: no public DNS record. Routed by the internal
@@ -214,6 +229,7 @@ services:
       # .env.example). Empty = /peer/handshake disabled, unchanged behavior.
       # Separate trust boundary from PMGR_PEER_SECRET/PMGR_ACTOR_SECRET above.
       DASHBOARD_PEER_SECRET: ${DASHBOARD_PEER_SECRET:-}
+      GOMEMLIMIT: 440MiB
     # = form so empty env expansions don't swallow the next flag.
     command: >
       -redis-addr=${REDIS_ADDR:-}
@@ -229,12 +245,17 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-monitor:${MONITOR_TAG:-latest}
     container_name: monitor
     restart: unless-stopped
+    # Leak containment, not a reservation — see the proxy service.
+    mem_limit: 256m
+    memswap_limit: 256m
     networks: [edge]
     # No host port — dashboard reaches it via the edge network.
     volumes:
       - ./cmd/monitor/data:/data          # store snapshots (persisted)
     extra_hosts:
       - "host.docker.internal:host-gateway"   # for TLS-probing nginx on the host
+    environment:
+      GOMEMLIMIT: 220MiB
     command: >
       -targets proxy=http://proxy:8094/metrics,edge=http://edge:8094/metrics,dashboard=http://dashboard:8094/metrics
       -interval 5s
@@ -249,6 +270,9 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-auth:${AUTH_TAG:-latest}
     container_name: auth
     restart: unless-stopped
+    # Leak containment, not a reservation — see the proxy service.
+    mem_limit: 128m
+    memswap_limit: 128m
     networks: [edge]
     # No host port — reached through the proxy (Host: auth.<domain>).
     # Sessions live in the signed cookie (no state). The only persisted state is
@@ -263,6 +287,7 @@ services:
       # https://auth.polardev.org,https://auth.the-aquarium.com). Empty ⇒
       # defaults to https://auth.<domain> for each passkey domain.
       PASSKEY_RP_ORIGINS: ${PASSKEY_RP_ORIGINS:-}
+      GOMEMLIMIT: 110MiB
     # = form so empty env expansions don't swallow the next flag. Passkeys stay
     # OFF until AUTH_PASSKEY_DOMAINS is set (e.g. polardev.org,the-aquarium.com).
     command: >
@@ -278,6 +303,9 @@ services:
     image: ghcr.io/polarbaejr/proxy-manager-statusbot:${STATUSBOT_TAG:-latest}
     container_name: statusbot
     restart: unless-stopped
+    # Leak containment, not a reservation — see the proxy service.
+    mem_limit: 128m
+    memswap_limit: 128m
     profiles: [statusbot]               # opt-in: docker compose --profile statusbot up -d
     networks: [edge]
     # No host port — not web-accessible, doesn't need proxy.* labels. Reaches
@@ -306,6 +334,7 @@ services:
       # mount above — no manual minting step needed. Set this only to point
       # at a token from elsewhere (e.g. a different dashboard instance).
       DASHBOARD_API_TOKEN:  ${DASHBOARD_API_TOKEN:-}
+      GOMEMLIMIT:           110MiB
     command: >
       -health-url=http://dashboard:8093/api/health
       -poll-interval=60s

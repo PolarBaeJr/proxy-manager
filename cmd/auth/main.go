@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -14,6 +15,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 )
 
 func main() {
@@ -25,7 +28,12 @@ func main() {
 	accessTTL := flag.Duration("access-token-ttl", time.Hour, "OAuth access token lifetime")
 	refreshTTL := flag.Duration("refresh-token-ttl", 720*time.Hour, "OAuth refresh token lifetime")
 	passkeyDomains := flag.String("passkey-rp-domains", "", "comma-separated cookie domains to enable WebAuthn passkeys for (empty = disabled)")
+	healthcheck := flag.Bool("healthcheck", false, "probe this binary's own /healthz endpoints and exit 0/1 (Docker HEALTHCHECK)")
 	flag.Parse()
+	selfCfg, selfOn := selfcheck.FromEnv("auth", selfcheck.LoopbackURL(*addr, "/healthz"))
+	if *healthcheck {
+		os.Exit(selfcheck.RunHealthcheck(selfCfg.URLs...))
+	}
 
 	envHex := strings.TrimSpace(os.Getenv("PMGR_AUTH_SECRET"))
 	if envHex == "" {
@@ -105,6 +113,10 @@ func main() {
 		}
 	} else {
 		log.Print("passkey support disabled")
+	}
+
+	if selfOn {
+		selfcheck.Start(context.Background(), selfCfg)
 	}
 
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}

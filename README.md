@@ -248,6 +248,31 @@ The dashboard's **Stats** tab proxies these through its auth boundary — monito
 
 ---
 
+## Self-healing
+
+A service that is OOM'd or hung restarts itself. Three things work together:
+
+- **Restart policy.** Every service is `restart: unless-stopped`, so any exit (including an OOM kill) brings the container straight back.
+- **Memory caps.** Each service has `mem_limit` / `memswap_limit` and a `GOMEMLIMIT` at ~85% of the cap. These contain leaks, not reserve memory: a leaking service gets OOM-killed and restarted instead of starving the host.
+- **Watchdog.** proxy, dashboard, monitor and auth probe their own `/healthz` over loopback; statusbot (no listener) watches a heartbeat from its poll loop. After N consecutive failures the process logs why, dumps goroutines to stderr, and exits 1 so Docker restarts it.
+
+The proxy, dashboard, monitor and auth images also declare a Docker `HEALTHCHECK` that runs `/<binary> -healthcheck` (probes the same `/healthz` endpoints, exits 0/1). Plain Docker only *marks* a container unhealthy — it does not restart it; the restart comes from the watchdog exiting. Note the proxy stops routing to any labeled container Docker reports `(unhealthy)`.
+
+Watchdog settings are env-only (the HEALTHCHECK exec inherits env, not compose `command:` flags):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SELFCHECK` | on | `0` / `false` / `off` / `no` disables the watchdog (the `-healthcheck` probe still works) |
+| `SELFCHECK_INTERVAL` | `15s` | probe interval (minimum 1s) |
+| `SELFCHECK_TIMEOUT` | `5s` | per-probe timeout |
+| `SELFCHECK_FAILURES` | `4` | consecutive failures before exiting (minimum 1) |
+| `SELFCHECK_GRACE` | `30s` | startup delay before the first probe |
+| `SELFCHECK_URLS` | the binary's own `/healthz` | comma-separated override, used by both the watchdog and `-healthcheck` |
+
+`/healthz` deliberately checks nothing but "the HTTP server answers" — never Docker, Redis or disk — so a flaky dependency can't crash-loop a healthy process.
+
+---
+
 ## Programmatic access
 
 Two ways to call the dashboard from external tools:

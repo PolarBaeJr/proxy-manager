@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -30,7 +31,12 @@ func main() {
 	peers := flag.String("peers", "", "comma-separated peer proxy base URLs for the discovery handshake, e.g. http://100.83.62.68:8094 (empty = disabled)")
 	peerSyncInterval := flag.Duration("peer-sync-interval", 5*time.Second, "how often to handshake with peers and push/resync learned routes (matches the proxy's health-check cadence)")
 	peerAdvertiseURL := flag.String("peer-advertise-url", "", "this proxy's own base URL as reachable by peers, e.g. http://100.83.62.68:8092 — empty disables route push")
+	healthcheck := flag.Bool("healthcheck", false, "probe this binary's own /healthz endpoints and exit 0/1 (Docker HEALTHCHECK)")
 	flag.Parse()
+	selfCfg, selfOn := selfcheck.FromEnv("proxy", selfcheck.LoopbackURL(*addr, "/healthz"), selfcheck.LoopbackURL(*metricsAddr, "/healthz"))
+	if *healthcheck {
+		os.Exit(selfcheck.RunHealthcheck(selfCfg.URLs...))
+	}
 	peerSecret := strings.TrimSpace(os.Getenv("PMGR_PEER_SECRET"))
 
 	metrics := NewMetrics()
@@ -199,11 +205,21 @@ func main() {
 	go runHealthChecks(ctx, router)
 	go router.runABEvaluator(ctx)
 
+	if selfOn {
+		selfcheck.Start(ctx, selfCfg)
+	}
+
 	log.Printf("proxy on %s", *addr)
-	handler := withAccessLog(withMetrics(router, metrics), access)
-	if err := http.ListenAndServe(*addr, handler); !errors.Is(err, http.ErrServerClosed) {
+	if err := http.ListenAndServe(*addr, mainHandler(router, metrics, access)); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+// mainHandler is the :8092 handler chain. selfcheck.Handler sits outermost so
+// the container's own loopback /healthz probes never reach the unrouted
+// limiter, metrics or access log.
+func mainHandler(router http.Handler, metrics *Metrics, access *AccessLog) http.Handler {
+	return selfcheck.Handler(withAccessLog(withMetrics(router, metrics), access))
 }
 
 // unroutedHost is the synthetic metrics bucket for requests that matched no

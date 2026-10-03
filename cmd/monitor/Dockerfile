@@ -9,3 +9,4 @@ RUN go mod tidy && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldf
 FROM gcr.io/distroless/static
 COPY --from=build /monitor /monitor
 ENTRYPOINT ["/monitor"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=6 CMD ["/monitor","-healthcheck"]

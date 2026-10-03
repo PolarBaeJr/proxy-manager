@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
+	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 )
 
 func main() {
@@ -34,7 +35,12 @@ func main() {
 	probeDial := flag.String("tls-probe-default-dial", "host.docker.internal:443", "default dial target for probe entries without @host:port")
 	statePath := flag.String("state", "/data/monitor-state.json", "store persistence file")
 	stateInterval := flag.Duration("state-interval", 60*time.Second, "how often to snapshot the store to -state")
+	healthcheck := flag.Bool("healthcheck", false, "probe this binary's own /healthz endpoints and exit 0/1 (Docker HEALTHCHECK)")
 	flag.Parse()
+	selfCfg, selfOn := selfcheck.FromEnv("monitor", selfcheck.LoopbackURL(*addr, "/healthz"))
+	if *healthcheck {
+		os.Exit(selfcheck.RunHealthcheck(selfCfg.URLs...))
+	}
 
 	targets := parseTargets(*targetsFlag)
 	if len(targets) == 0 {
@@ -136,6 +142,10 @@ func main() {
 			"certs":        prober.Snapshot(),
 		})
 	})
+
+	if selfOn {
+		selfcheck.Start(ctx, selfCfg)
+	}
 
 	log.Printf("monitor on %s — scraping %d target(s) every %s", *addr, len(targets), *interval)
 	if err := http.ListenAndServe(*addr, mux); !errors.Is(err, http.ErrServerClosed) {
