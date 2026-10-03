@@ -352,11 +352,9 @@ func TestCacheCoalescesConcurrentMisses(t *testing.T) {
 }
 
 // TestCacheCoalescingFallsThroughOnUncacheable proves waiters woken to an
-// empty cache each go to the backend themselves. One backend per request
-// (pickTier's atomic cursor hands the n picks out round-robin, so each of
-// the n concurrent requests lands on its own *Backend) because tryProxy's
-// per-call ErrorHandler assignment is a pre-existing data race under -race
-// when several goroutines drive the same *Backend at once.
+// empty cache each go to the backend themselves. All n requests share one
+// *Backend, which also exercises concurrent tryProxy calls against the same
+// ReverseProxy.
 func TestCacheCoalescingFallsThroughOnUncacheable(t *testing.T) {
 	const n = 20
 	var hits atomic.Int32
@@ -367,11 +365,7 @@ func TestCacheCoalescingFallsThroughOnUncacheable(t *testing.T) {
 		w.Header().Set("Set-Cookie", "s=1")
 		_, _ = w.Write([]byte("personal"))
 	}
-	backends := make([]*Backend, n)
-	for i := range backends {
-		backends[i] = mkBackend(t, "f.example.org", countingBackend(t, &hits, handler))
-	}
-	g := mkGroupMulti("f.example.org", "", backends...)
+	g := mkGroupMulti("f.example.org", "", mkBackend(t, "f.example.org", countingBackend(t, &hits, handler)))
 	g.CacheTTL = 5 * time.Second
 	r := &Router{}
 	r.Set([]*RouteGroup{g})
