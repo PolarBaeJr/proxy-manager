@@ -43,6 +43,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 	"github.com/bwmarrin/discordgo"
 )
 
@@ -363,6 +364,16 @@ func main() {
 		}
 	})
 
+	// No listener to probe, so the watchdog watches the main loop instead:
+	// it beats after every poll, and a loop wedged on a hung Discord or
+	// dashboard call stops beating. Started before sess.Open() so a hung
+	// gateway connect is caught too.
+	hb := selfcheck.NewHeartbeat()
+	if selfCfg, selfOn := selfcheck.FromEnv("statusbot"); selfOn {
+		selfCfg.Check = hb.Stale(max(10*time.Minute, 4*max(*pollInterval, *statusInterval)))
+		selfcheck.Start(context.Background(), selfCfg)
+	}
+
 	if err := sess.Open(); err != nil {
 		log.Fatalf("open discord session: %v", err)
 	}
@@ -389,6 +400,7 @@ func main() {
 
 	poll()       // establish a baseline immediately so !status works right away
 	pollStatus() // ditto, for the service-status embed
+	hb.Beat()
 	ticker := time.NewTicker(*pollInterval)
 	defer ticker.Stop()
 	statusTicker := time.NewTicker(*statusInterval)
@@ -406,6 +418,7 @@ func main() {
 		case <-statusTicker.C:
 			pollStatus()
 		}
+		hb.Beat()
 	}
 }
 

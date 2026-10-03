@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PolarBaeJr/proxy-manager/internal/selfcheck"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -44,7 +45,12 @@ func main() {
 	// on both hosts" — it must not silently activate for every existing
 	// deployment the moment someone sets a peer secret.
 	peerWrites := flag.Bool("peer-writes", false, "enable write-capable /peer/* handlers on top of the read-only peer mesh (requires DASHBOARD_PEER_SECRET too)")
+	healthcheck := flag.Bool("healthcheck", false, "probe this binary's own /healthz endpoints and exit 0/1 (Docker HEALTHCHECK)")
 	flag.Parse()
+	selfCfg, selfOn := selfcheck.FromEnv("dashboard", selfcheck.LoopbackURL(*addr, "/healthz"))
+	if *healthcheck {
+		os.Exit(selfcheck.RunHealthcheck(selfCfg.URLs...))
+	}
 	peerWritesEnabled = *peerWrites
 
 	metrics := NewMetrics()
@@ -379,8 +385,12 @@ func main() {
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}
 
+	if selfOn {
+		selfcheck.Start(ctx, selfCfg)
+	}
+
 	log.Printf("dashboard on %s", *addr)
-	if err := http.ListenAndServe(*addr, withMetrics(mux, metrics)); !errors.Is(err, http.ErrServerClosed) {
+	if err := http.ListenAndServe(*addr, selfcheck.Handler(withMetrics(mux, metrics))); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
