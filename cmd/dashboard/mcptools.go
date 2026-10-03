@@ -342,6 +342,37 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		},
 	})
 
+	s.Register(Tool{
+		Name:  "get_service_labels",
+		Title: "Get a service's central labels",
+		Description: "Show a service's central (Redis-managed) proxy.* labels: managed (adopted or not), version " +
+			"(pass it as if_version to set_service_labels), labels (the central map), effective (what is in force), " +
+			"container_labels per host and member (raw), drift (container labels the central map overrides — compose " +
+			"edits to managed keys are ignored once adopted), import_preview + conflicts (when not adopted yet), " +
+			"readonly_keys (labels that can only change by recreating), live_keys, store status, and applied: each " +
+			"host's proxy overlay version/source and whether it has the service. A change is live once every " +
+			"proxy's applied.version is at least the global_version after the write (~5s). Live keys: " + strings.Join(managedLabelKeys, ", ") + ".",
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+			"host":    prop("string", "Optional host identity (see \"machine\" in list_services) whose own containers/proxy to report instead of this dashboard's full view. Requires MCP_ALLOW_PEER_WRITES."),
+		}, "service"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "GET", withHost("/api/services/"+url.PathEscape(name)+"/labels", host), nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
 	// Registered read-only: its default (and, without both write opt-ins,
 	// only) mode is a dry run that changes nothing. Executing is refused in
 	// the handler unless MCP_ALLOW_WRITES and MCP_ALLOW_PEER_WRITES are both
@@ -1297,6 +1328,90 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			body := centralEnvSetRequest{RequestID: requestID, IfVersion: uint64(ifVersion), Set: set, Unset: unset,
 				HostOverrides: overrides, UnsetHostOverrides: unsetOverrides}
 			b, err := a.call(ctx, "POST", withHost("/api/services/"+url.PathEscape(name)+"/env", host), body)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	// A central label write applies to the service on EVERY host at once
+	// (shared Redis), so it sits behind the cross-host opt-in too.
+	s.Register(Tool{
+		Name:  "set_service_labels",
+		Title: "Set a service's central labels",
+		Description: "Change a service's live proxy.* labels centrally (Redis). Applies on every host within ~5s with " +
+			"NO container restart or recreate; verify with get_service_labels (applied.version on each host). " +
+			"Settable keys: " + strings.Join(managedLabelKeys, ", ") + ". Identity keys (proxy.enable, proxy.service, " +
+			"proxy.host, proxy.port, proxy.path), auth keys (proxy.auth, proxy.auth.users, proxy.auth.mode) and " +
+			"per-replica keys (proxy.canary, proxy.ab.*, ...) are rejected. The first call on a service adopts it: pass " +
+			"if_version 0 — its current container labels are imported (resolve any conflicts get_service_labels " +
+			"reports via resolve_conflicts, set or unset); after that, container/compose edits to these keys are " +
+			"ignored. Later calls pass if_version = the version from get_service_labels (a stale one is refused with " +
+			"the current version). proxy.drop_headers is tighten-only unless allow_loosen. proxy.weight is refused " +
+			"while a canary is staged.",
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service":    prop("string", "Service name from list_services."),
+			"host":       prop("string", "Optional host identity (see \"machine\" in list_services) to run the write on (its Docker state is used for the guards and the import). Labels are shared, so the change applies everywhere regardless."),
+			"if_version": prop("number", "The version this edit is based on, from get_service_labels; 0 = first adopt/import."),
+			"request_id": prop("string", "Optional idempotency key. Reuse the same one to retry a call whose outcome was unknown (timeout) — it is applied at most once."),
+			"set": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description":          "Keys to set (name -> value), e.g. {\"proxy.health\": \"/healthz\"}.",
+			},
+			"unset": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"},
+				"description": "Key names to unset (the proxy/dashboard default applies).",
+			},
+			"allow_loosen": prop("boolean", "Allow removing headers from proxy.drop_headers."),
+			"resolve_conflicts": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description":          "First adopt only: key -> value to import for a key the hosts/replicas disagree on (\"\" = unset).",
+			},
+		}, "service", "if_version"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			ifVersion, err := argInt(args, "if_version")
+			if err != nil {
+				return "", err
+			}
+			if ifVersion < 0 {
+				return "", fmt.Errorf("if_version must be >= 0")
+			}
+			requestID, err := argOptionalString(args, "request_id")
+			if err != nil {
+				return "", err
+			}
+			set, err := argEnvEdits(args, "set")
+			if err != nil {
+				return "", err
+			}
+			unset, err := argStringSlice(args, "unset")
+			if err != nil {
+				return "", err
+			}
+			resolve, err := argEnvEdits(args, "resolve_conflicts")
+			if err != nil {
+				return "", err
+			}
+			allowLoosen := false
+			if _, ok := args["allow_loosen"]; ok {
+				if allowLoosen, err = argBool(args, "allow_loosen"); err != nil {
+					return "", err
+				}
+			}
+			body := labelsSetRequest{IfVersion: uint64(ifVersion), RequestID: requestID, Set: set, Unset: unset, AllowLoosen: allowLoosen, ResolveConflicts: resolve}
+			b, err := a.call(ctx, "POST", withHost("/api/services/"+url.PathEscape(name)+"/labels", host), body)
 			if err != nil {
 				return "", err
 			}

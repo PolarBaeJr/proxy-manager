@@ -208,6 +208,13 @@ services:
       # isn't, so it has to come in as a real env var or redis.NewClient
       # connects unauthenticated and every call fails with NOAUTH.
       REDIS_PASSWORD:       ${REDIS_PASSWORD:-}
+      REDIS_USERNAME:       ${REDIS_USERNAME:-}
+      # Central labels (README "Central labels"). LABELS_CENTRAL=true makes the
+      # dashboard's decisions read adopted services' labels from Redis (needs
+      # -redis-addr); LABELS_WRITES=true also enables
+      # /api/services/{svc}/labels writes. Empty => off, unchanged.
+      LABELS_CENTRAL:       ${LABELS_CENTRAL:-}
+      LABELS_WRITES:        ${LABELS_WRITES:-}
       # Verifies the proxy's attribution assertion so an action taken through
       # another backend (the MCP server) is audited against the person who
       # asked, not the shared API token. AUDIT ONLY — never authorization.

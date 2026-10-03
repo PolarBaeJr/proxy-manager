@@ -76,6 +76,13 @@ type dockerClient struct {
 	// ab drives A/B tests (abmanager.go). Nil in every test that builds a
 	// dockerClient by hand; the §1.12 guards then still see B's labels.
 	ab *abManager
+	// labels is the central labels store (labelstore.go). Nil when
+	// LABELS_CENTRAL is off (and in every test that builds a dockerClient by
+	// hand) — nil means every decision reads raw container labels.
+	labels labelStore
+	// labelsWrites mirrors LABELS_WRITES: central label writes, including
+	// the setters' redirect for adopted services, are refused without it.
+	labelsWrites bool
 }
 
 func newDockerClient() *dockerClient {
@@ -509,7 +516,7 @@ func (c *dockerClient) removeStopped(ctx context.Context, id string) error {
 // drainStopRemoveAll) — including A/B test finalize (feat-ab-testing),
 // which retires the losing variant's replicas.
 func (c *dockerClient) drainStopRemove(ctx context.Context, ct dockerContainer) error {
-	t := drainSeconds(ct.Labels)
+	t := c.effectiveDrainSeconds(ct.Labels)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(t+15)*time.Second)
 	defer cancel()
 	if err := c.stopContainerT(ctx, ct.ID, t); err != nil {
@@ -1143,7 +1150,11 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 			log.Printf("skip container %s: invalid proxy.path label %q", ct.name(), p)
 			continue
 		}
-		group := ct.Labels[labelGroup]
+		// Decisions and the UI read the central labels of an adopted
+		// service; Members keep the raw container labels (create paths
+		// clone from them).
+		eff := c.effectiveLabels(ct.Labels)
+		group := eff[labelGroup]
 		if group != "" && !validServiceName(group) {
 			// Rendered into an HTML heading client-side on the Status tab —
 			// same XSS boundary as proxy.service/proxy.host above.
@@ -1153,7 +1164,7 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 		isCanary := ct.Labels[labelCanary] == "true"
 		s, ok := byName[name]
 		if !ok {
-			s = &Service{Name: name, Labels: ct.Labels}
+			s = &Service{Name: name, Labels: eff}
 			byName[name] = s
 		}
 		if s.Group == "" {
@@ -1179,11 +1190,11 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 			s.Host = host
 			s.Port = port
 			s.Path = ct.Labels[labelPath]
-			s.Unscalable = ct.Labels[labelUnscalable] == "true"
-			s.Overlap = overlapEnabled(ct.Labels)
-			s.Weight = parseWeightLabel(ct.Labels[labelWeight])
+			s.Unscalable = eff[labelUnscalable] == "true"
+			s.Overlap = overlapEnabled(eff)
+			s.Weight = parseWeightLabel(eff[labelWeight])
 			s.PreviousImage = ct.Labels[labelPrevImage]
-			s.AutoUpdate = ct.Labels[labelAutoUpdate] == "true"
+			s.AutoUpdate = eff[labelAutoUpdate] == "true"
 			s.Replicas++
 		}
 	}
@@ -1314,7 +1325,7 @@ func (c *dockerClient) guardUnscalable(ctx context.Context, name string, desired
 	if len(existing) == 0 {
 		return nil
 	}
-	if existing[0].Labels[labelUnscalable] == "true" && desired != 1 {
+	if c.effectiveLabels(existing[0].Labels)[labelUnscalable] == "true" && desired != 1 {
 		return fmt.Errorf("%q is marked unscalable — replica count must stay at 1", name)
 	}
 	return nil
@@ -1558,7 +1569,11 @@ type replaceTemplate struct {
 	startIdx  int
 }
 
-func (t *replaceTemplate) overlap() bool { return overlapEnabled(t.tplSet[0].Labels) }
+// templateOverlap reads proxy.overlap/proxy.unscalable from the template's
+// EFFECTIVE labels — an adopted service's central labels decide.
+func (c *dockerClient) templateOverlap(t *replaceTemplate) bool {
+	return overlapEnabled(c.effectiveLabels(t.tplSet[0].Labels))
+}
 
 // overlapEnabled reports whether a container's labels opt it into overlap
 // recreates: proxy.overlap only means anything on a proxy.unscalable
@@ -1792,7 +1807,7 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	if err != nil {
 		return err
 	}
-	if tpl.overlap() {
+	if c.templateOverlap(tpl) {
 		return c.rollOverlap(ctx, name, req.Image, tpl)
 	}
 
@@ -1942,11 +1957,12 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 	// An operator rolling replace or an overlap restart of a proxy.overlap
 	// service is an overlap recreate too — same refusals, same early proxy
 	// refresh. Central env propagation (pinnedEnv) keeps its own contract.
-	if opts.kind == rollingKindRestart && !tpl.overlap() {
+	overlap := c.templateOverlap(tpl)
+	if opts.kind == rollingKindRestart && !overlap {
 		return fmt.Errorf("%q is no longer proxy.overlap-enabled — not restarting by recreate", name)
 	}
-	if tpl.overlap() && opts.pinnedEnv == nil {
-		if err := refuseUnsafeOverlap(name, tpl.clone, tpl.newLabels); err != nil {
+	if overlap && opts.pinnedEnv == nil {
+		if err := refuseUnsafeOverlap(name, tpl.clone, c.effectiveLabels(tpl.newLabels)); err != nil {
 			return err
 		}
 		// A singleton must never be left with a broken second copy.
@@ -1964,7 +1980,7 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 // from ctx's cancellation — a caller disconnecting mid-gate must not strand
 // a half-swapped singleton — but bounded by rollingOpTimeout.
 func (c *dockerClient) rollOverlap(ctx context.Context, name, image string, tpl *replaceTemplate) error {
-	if err := refuseUnsafeOverlap(name, tpl.clone, tpl.newLabels); err != nil {
+	if err := refuseUnsafeOverlap(name, tpl.clone, c.effectiveLabels(tpl.newLabels)); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollingOpTimeout)
@@ -2062,6 +2078,9 @@ func (c *dockerClient) rollTemplate(ctx context.Context, name, image string, tpl
 // Lets the dashboard/MCP toggle unattended updates for any label-managed
 // service without requiring a compose edit + `docker compose up -d`.
 func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enabled bool) error {
+	if handled, err := c.redirectLabelSetter(ctx, name, "setAutoUpdateLabel", labelAutoUpdate, strconv.FormatBool(enabled)); handled {
+		return err
+	}
 	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
 	if err != nil {
 		return err
@@ -2097,7 +2116,7 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	// startIdx still scans the full existing set — see replaceService's
 	// identical comment on why naming must consider stale containers too.
 	startIdx := nextReplicaIndex(existing, name)
-	if overlapEnabled(tpl.Labels) || overlapEnabled(newLabels) {
+	if overlapEnabled(c.effectiveLabels(tpl.Labels)) || overlapEnabled(c.effectiveLabels(newLabels)) {
 		return c.rollOverlap(ctx, name, tpl.Image, &replaceTemplate{existing: existing, tplSet: tplSet, env: tc.env, clone: tc.clone, newLabels: newLabels, startIdx: startIdx})
 	}
 	var newIDs []string
@@ -2146,6 +2165,9 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 // up -d`. guardUnscalable is what enforces the "can't scale a singleton"
 // constraint at scale-time; this setter's only job is to flip the label.
 func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enabled bool) error {
+	if handled, err := c.redirectLabelSetter(ctx, name, "setUnscalableLabel", labelUnscalable, strconv.FormatBool(enabled)); handled {
+		return err
+	}
 	all, err := c.listAll(ctx, fmt.Sprintf(`{"label":["%s=%s"]}`, labelService, name))
 	if err != nil {
 		return err
@@ -2181,7 +2203,7 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 	// startIdx still scans the full existing set — see replaceService's
 	// identical comment on why naming must consider stale containers too.
 	startIdx := nextReplicaIndex(existing, name)
-	if overlapEnabled(tpl.Labels) || overlapEnabled(newLabels) {
+	if overlapEnabled(c.effectiveLabels(tpl.Labels)) || overlapEnabled(c.effectiveLabels(newLabels)) {
 		return c.rollOverlap(ctx, name, tpl.Image, &replaceTemplate{existing: existing, tplSet: tplSet, env: tc.env, clone: tc.clone, newLabels: newLabels, startIdx: startIdx})
 	}
 	var newIDs []string
@@ -2259,6 +2281,9 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	if len(canaryOnly(all)) > 0 {
 		return fmt.Errorf("service %q has a staged canary — promote or discard it before retuning the weight", name)
 	}
+	if handled, err := c.redirectLabelSetter(ctx, name, "setWeightLabel", labelWeight, strconv.Itoa(weight)); handled {
+		return err
+	}
 	existing := liveOnly(all)
 	if len(existing) == 0 {
 		return fmt.Errorf("service %q not found (no live replicas)", name)
@@ -2293,7 +2318,7 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	// startIdx still scans the full existing set — see replaceService's
 	// identical comment on why naming must consider stale containers too.
 	startIdx := nextReplicaIndex(existing, name)
-	if overlapEnabled(tpl.Labels) || overlapEnabled(newLabels) {
+	if overlapEnabled(c.effectiveLabels(tpl.Labels)) || overlapEnabled(c.effectiveLabels(newLabels)) {
 		return c.rollOverlap(ctx, name, tpl.Image, &replaceTemplate{existing: existing, tplSet: tplSet, env: tc.env, clone: tc.clone, newLabels: newLabels, startIdx: startIdx})
 	}
 	var newIDs []string
@@ -2706,6 +2731,8 @@ func (c *dockerClient) listRoutes(ctx context.Context, configPath string) ([]Rou
 		return nil, err
 	}
 	for _, ct := range containers {
+		// Mirror the proxy's central-labels overlay (weight, strip, name).
+		ct.Labels = c.effectiveLabels(ct.Labels)
 		host := ct.Labels[labelHost]
 		portStr := ct.Labels[labelPort]
 		if host == "" || portStr == "" {

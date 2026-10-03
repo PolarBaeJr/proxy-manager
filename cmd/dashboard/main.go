@@ -64,7 +64,7 @@ func main() {
 	}
 	var redisClient *redis.Client
 	if *redisAddr != "" {
-		redisClient = redis.NewClient(&redis.Options{Addr: *redisAddr, Password: os.Getenv("REDIS_PASSWORD")})
+		redisClient = redis.NewClient(&redis.Options{Addr: *redisAddr, Username: os.Getenv("REDIS_USERNAME"), Password: os.Getenv("REDIS_PASSWORD")})
 		auth.txRunner = &redisTxRunner{client: redisClient}
 		if err := auth.syncFromRedisOrImport(context.Background()); err != nil {
 			log.Printf("dashboard auth: redis sync failed at startup, continuing with local users until reachable: %v", err)
@@ -93,6 +93,31 @@ func main() {
 	// by the event watcher started below and by invalidateAfterWrite on the
 	// mutation routes. 10s is the hard ceiling if both somehow miss.
 	dc.cache = newContainerCache(dc, 10*time.Second)
+
+	// Central labels (labelstore.go), off unless LABELS_CENTRAL is set and
+	// Redis is configured. Wired here, before any background loop that
+	// reads effective labels (auto-updater, rollouts, rolling ops) starts.
+	// LABELS_WRITES separately enables writes (and the label setters'
+	// redirect for adopted services).
+	var labelsStore *redisLabelStore
+	switch {
+	case isTrue(os.Getenv("LABELS_CENTRAL")) && redisClient == nil:
+		log.Printf("⚠ LABELS_CENTRAL set but -redis-addr is empty — central labels stay off")
+	case isTrue(os.Getenv("LABELS_CENTRAL")):
+		labelsStore = newRedisLabelStore(redisClient)
+		ictx, icancel := context.WithTimeout(context.Background(), 2*time.Second)
+		labelsStore.Refresh(ictx)
+		icancel()
+		dc.labels = labelsStore
+		dc.labelsWrites = isTrue(os.Getenv("LABELS_WRITES"))
+		n := 0
+		if snap := labelsStore.Snapshot(); snap != nil {
+			n = len(snap.Services)
+		}
+		log.Printf("central labels enabled (writes=%v): %d adopted service(s) loaded, redis_ok=%v", dc.labelsWrites, n, labelsStore.RedisOK())
+	case isTrue(os.Getenv("LABELS_WRITES")):
+		log.Printf("⚠ LABELS_WRITES set without LABELS_CENTRAL — central labels stay off")
+	}
 
 	// One-shot visibility check: confirm self-identification (isSelfContainer,
 	// selfidentity.go) actually matches this process's own container among
@@ -316,6 +341,12 @@ func main() {
 	// Background: sample CPU once per second for the header stats widget.
 	go statsLoop(ctx)
 
+	// Background: keep the central labels snapshot current (pub/sub + 5s
+	// version poll).
+	if labelsStore != nil {
+		go labelsStore.Run(ctx)
+	}
+
 	// Background: sample per-container CPU/mem for the Status sub-tab (and
 	// later, statusbot) — served from cache, never blocks a live request.
 	go dockerStatsLoop(ctx, dc)
@@ -381,6 +412,7 @@ func main() {
 		"/peer/duplicate":       peerDuplicateHandler(peerSecret, identity, dc, peerWritesEnabled),
 		"/peer/spread":          peerSpreadHandler(peerSecret, identity, dc, peerWritesEnabled),
 		"/peer/central-env/":    peerCentralEnvHandler(peerSecret, centralEnvState, dc, peerWritesEnabled),
+		"/peer/labels/":         peerLabelsHandler(peerSecret, dc, registry, peerWritesEnabled),
 		"/peer/ab":              peerABHandler(peerSecret, proxyURLFromEnv()),
 	}
 	writesMsg := "(writes disabled)"
@@ -390,10 +422,10 @@ func main() {
 	switch {
 	case peerSecret != "" && len(peerList) > 0:
 		primary = append(primary, peerServer(*peerAddr, peerHandlers))
-		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, /peer/ab, and /peer/stats on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
+		log.Printf("dashboard peers: full mesh — handshaking with %d peer(s) every %s, /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, /peer/labels/, /peer/ab, and /peer/stats on %s %s", len(peerList), *peerSyncInterval, *peerAddr, writesMsg)
 	case peerSecret != "":
 		primary = append(primary, peerServer(*peerAddr, peerHandlers))
-		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, /peer/ab, and /peer/stats enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
+		log.Printf("dashboard peers: /peer/handshake, /peer/service-status, /peer/services, /peer/services/, /peer/discovery/, /peer/images, /peer/images/, /peer/access, /peer/logs/containers, /peer/logs/, /peer/duplicate, /peer/spread, /peer/labels/, /peer/ab, and /peer/stats enabled on %s (receive-only, no outbound peers configured) %s", *peerAddr, writesMsg)
 	case len(peerList) > 0:
 		log.Printf("dashboard peers: peers configured but DASHBOARD_PEER_SECRET empty — handshake disabled")
 	}

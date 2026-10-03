@@ -186,6 +186,8 @@ func autoUpdateSkipReason(ctx context.Context, dc *dockerClient, svc Service, st
 		return "service is fully stopped"
 	case st.Err != "":
 		return "last registry check failed: " + st.Err
+	case !svc.Onboarded && dc.labelsUnknown():
+		return "central labels have not loaded yet (Redis unreachable) — deferred until they do"
 	}
 	for _, ct := range liveOnly(svc.Members) {
 		unknowns, err := dc.inspectHostConfigUnknowns(ctx, ct.ID)
@@ -248,6 +250,14 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 		}
 		_, onboardedSvc := a.onb.Get(svc.Name)
 		if !onboardedSvc {
+			// Central labels are on but have never loaded: whether this
+			// service is adopted — and so what its autoupdate/overlap/health
+			// really are — is unknown. Skip without touching the failure
+			// budget; the next tick retries.
+			if a.dc.labelsUnknown() {
+				log.Printf("autoupdate: %s — central labels not loaded yet (Redis unreachable since start), deferring", svc.Name)
+				continue
+			}
 			// A canary rollout or a rolling replace already owns this
 			// service's containers — deferring (not failing) here matters:
 			// this isn't the service's fault, so it must not burn its

@@ -627,7 +627,9 @@ func (c *dockerClient) checkContainerHealthy(ctx context.Context, ct dockerConta
 		return false, fmt.Sprintf("%s: restarted %d times since creation", ct.name(), restarts), nil
 	}
 
-	healthPath := ct.Labels[labelHealth]
+	// Effective: an adopted service's proxy.health comes from the central
+	// labels, which the new copy's own (cloned, raw) labels may lack.
+	healthPath := c.effectiveLabels(ct.Labels)[labelHealth]
 	if healthPath == "" {
 		return true, "", nil
 	}
