@@ -129,6 +129,22 @@ func (s *AuthStore) refreshLoop(ctx context.Context) {
 				log.Printf("dashboard auth: redis refresh connectivity restored")
 				healthy = true
 			}
+			if raw == nil {
+				// Key gone (Redis restarted empty / wiped): re-seed it from this
+				// instance's users so the other host keeps working without
+				// either dashboard restarting. Same race-safe path as startup.
+				s.mu.RLock()
+				have := len(s.data.Users) > 0
+				s.mu.RUnlock()
+				if have {
+					if err := s.syncFromRedisOrImport(ctx); err != nil {
+						log.Printf("dashboard auth: re-seeding missing redis user state failed: %v", err)
+					} else {
+						log.Printf("dashboard auth: redis user state was missing — re-seeded from local copy")
+					}
+				}
+				continue
+			}
 			if string(raw) == lastRaw {
 				continue
 			}

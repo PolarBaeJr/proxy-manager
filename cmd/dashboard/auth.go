@@ -233,6 +233,13 @@ func (s *AuthStore) mutateUsers(fn func(users []User) ([]User, error)) error {
 				if uerr := json.Unmarshal(cur, &users); uerr != nil {
 					return nil, uerr
 				}
+			} else {
+				// Key absent (Redis restarted without persistence, wiped, or
+				// evicted it): start from the users this instance already holds
+				// rather than an empty list — otherwise the first mutation after
+				// a wipe would write back only its own change and delete every
+				// other account on both hosts.
+				users = s.localUsersCopy()
 			}
 			newUsers, ferr := fn(users)
 			if ferr != nil {
@@ -259,6 +266,15 @@ func (s *AuthStore) mutateUsers(fn func(users []User) ([]User, error)) error {
 		}
 	}
 	return fmt.Errorf("mutateUsers: exceeded %d retries on conflict", maxMutateRetries)
+}
+
+// localUsersCopy returns a copy of the in-memory users so a mutation fn
+// that appends/edits in place can't alias s.data.Users before the Redis
+// write lands.
+func (s *AuthStore) localUsersCopy() []User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]User(nil), s.data.Users...)
 }
 
 // ---- Two-phase user creation: generate → confirm with TOTP ----

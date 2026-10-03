@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeTxRunner is an in-process stand-in for txRunner, matching redisrl_test.go's
@@ -361,4 +362,81 @@ func TestMutateUsersConcurrentWithinOneStore(t *testing.T) {
 	if len(s.data.Users) != 1 || len(s.data.Users[0].Tokens) != n {
 		t.Fatalf("alice's tokens = %+v, want %d (none lost to the concurrent refresh reader)", s.data.Users[0].Tokens, n)
 	}
+}
+
+// A mutation after the Redis key vanished (restart without persistence,
+// wipe, eviction) must keep every existing account, not write back only its
+// own change.
+func TestMutateUsersAfterRedisWipeKeepsAccounts(t *testing.T) {
+	fake := &fakeTxRunner{}
+	s := newRedisBackedStore(t, fake)
+	for _, name := range []string{"alice", "bob"} {
+		name := name
+		if err := s.mutateUsers(func(users []User) ([]User, error) {
+			return append(users, User{Username: name}), nil
+		}); err != nil {
+			t.Fatalf("mutateUsers(%s): %v", name, err)
+		}
+	}
+	fake.mu.Lock()
+	fake.data = nil // Redis wiped
+	fake.gen++
+	fake.mu.Unlock()
+
+	if err := s.mutateUsers(func(users []User) ([]User, error) {
+		return append(users, User{Username: "carol"}), nil
+	}); err != nil {
+		t.Fatalf("mutateUsers(carol): %v", err)
+	}
+	var stored []User
+	if err := json.Unmarshal(fake.data, &stored); err != nil {
+		t.Fatalf("unmarshal fake.data: %v", err)
+	}
+	got := map[string]bool{}
+	for _, u := range stored {
+		got[u.Username] = true
+	}
+	for _, want := range []string{"alice", "bob", "carol"} {
+		if !got[want] {
+			t.Fatalf("after wipe+mutate, redis users = %+v, missing %s", stored, want)
+		}
+	}
+}
+
+// The refresh loop re-seeds a missing key from the local copy so the other
+// host recovers without a dashboard restart.
+func TestRefreshLoopReseedsMissingKey(t *testing.T) {
+	fake := &fakeTxRunner{}
+	s := newRedisBackedStore(t, fake)
+	if err := s.mutateUsers(func(users []User) ([]User, error) {
+		return append(users, User{Username: "alice"}), nil
+	}); err != nil {
+		t.Fatalf("mutateUsers: %v", err)
+	}
+	fake.mu.Lock()
+	fake.data = nil
+	fake.gen++
+	fake.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { s.refreshLoop(ctx); close(done) }()
+	deadline := time.Now().Add(redisUsersRefreshInterval + 3*time.Second)
+	for time.Now().Before(deadline) {
+		raw, _ := fake.Get(ctx, authRedisKey)
+		if raw != nil {
+			var stored []User
+			if err := json.Unmarshal(raw, &stored); err != nil || len(stored) != 1 || stored[0].Username != "alice" {
+				t.Fatalf("re-seeded users = %s (err %v), want [alice]", raw, err)
+			}
+			cancel()
+			<-done
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	t.Fatal("refreshLoop never re-seeded the missing key")
 }
