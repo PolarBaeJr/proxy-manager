@@ -116,6 +116,10 @@ Drop these on any container you want routed:
 
 The cache never serves a personalized response: any request with cookies or auth goes straight to the backend, so an SSO-gated (`proxy.auth`) route is effectively uncached. The routes.json equivalents are `"cache"` and `"cache_paths"`.
 
+### Central labels (in progress)
+
+Live-tunable labels (weight, health, cache, rate limit, sticky, drain, autoupdate, …) of an *adopted* service are moving into Redis so they can change without recreating containers — see [docs/CENTRAL_LABELS_PLAN.md](docs/CENTRAL_LABELS_PLAN.md). The proxy side is in: when `REDIS_ADDR` is set, each proxy overlays the adopted services' managed keys onto its local containers' labels (identity, `proxy.auth*` and `proxy.ab.*` labels always come from the container) and caches the overlay at `-labels-cache` (default `/data/labels-overlay.json`) so it keeps routing the same way through a Redis outage. `GET :8094/labels` reports `{version, source: redis|disk|none, loaded_at, redis_ok, services}`. `REDIS_USERNAME` (optional) selects a Redis ACL user. Nothing writes these keys yet — the dashboard side lands next — and with `REDIS_ADDR` unset the overlay is off entirely.
+
 ### MCP servers
 
 Several MCP servers share one host, one path each:
