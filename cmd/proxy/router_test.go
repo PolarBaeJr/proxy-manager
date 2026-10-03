@@ -6,14 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -978,8 +980,9 @@ func TestPrevHealthScopedByRoute(t *testing.T) {
 // healthLabelWarnSeen is package-level and persists across tests in this
 // binary, so this test uses a container name no other test in the package
 // reuses, and resets its own entry rather than the whole map. No test in
-// this package logs from a goroutine or runs t.Parallel(), so redirecting
-// the shared log.Writer() for the duration of this test is safe.
+// this package runs t.Parallel() or leaves a goroutine logging past its own
+// return, so redirecting the shared log.Writer() for the duration of this
+// test is safe.
 func TestMissingHealthLabelWarningDedup(t *testing.T) {
 	const name = "app-warn-dedup-test-only"
 	healthLabelWarnMu.Lock()
@@ -1020,7 +1023,7 @@ func TestTryProxyClientDisconnectDoesNotMarkUnhealthy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("url.Parse: %v", err)
 	}
-	b := &Backend{URL: target.String(), proxy: httputil.NewSingleHostReverseProxy(target)}
+	b := makeBackend(target.String(), 1, "", "", target, target.Host)
 	b.markHealthy(true)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1104,7 +1107,7 @@ func TestTryProxyBackendErrorMarksUnhealthy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("url.Parse: %v", err)
 	}
-	b := &Backend{URL: target.String(), proxy: httputil.NewSingleHostReverseProxy(target)}
+	b := makeBackend(target.String(), 1, "", "", target, target.Host)
 	b.markHealthy(true)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -1114,6 +1117,170 @@ func TestTryProxyBackendErrorMarksUnhealthy(t *testing.T) {
 
 	if b.healthy() {
 		t.Error("tryProxy left the backend healthy after a genuine connection failure — it should be marked unhealthy")
+	}
+}
+
+// flakyServer answers /ok with 200 "ok" and kills the connection without a
+// response on /fail, so the reverse proxy reports a genuine backend error.
+// /slow blocks until the proxy abandons the request, closing arrived[id]
+// (id from the query string) once the request has reached the backend.
+func flakyServer(t *testing.T, arrived *sync.Map) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fail":
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+		case "/slow":
+			if ch, ok := arrived.Load(r.URL.Query().Get("id")); ok {
+				close(ch.(chan struct{}))
+			}
+			<-r.Context().Done()
+		default:
+			_, _ = w.Write([]byte("ok"))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestTryProxyConcurrentSharedBackend drives ONE *Backend from many
+// goroutines with a mix of failing and succeeding requests. The backend's
+// ErrorHandler used to be reassigned on every tryProxy call, closing over
+// that call's flags: under -race that was a data race on the field, and in
+// practice one request's backend error could be recorded against another
+// request's flags. Every outcome here must match its own request.
+func TestTryProxyConcurrentSharedBackend(t *testing.T) {
+	old := log.Writer()
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(old)
+
+	srv := flakyServer(t, &sync.Map{})
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	b := makeBackend(srv.URL, 1, "", "", u, u.Host)
+	b.markHealthy(true)
+
+	const workers, perWorker = 50, 50
+	var okCount, failCount atomic.Int32
+	errs := make(chan string, workers*perWorker)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				fail := (w+i)%3 == 0
+				path := "/ok"
+				if fail {
+					path = "/fail"
+				}
+				req := httptest.NewRequest(http.MethodGet, path, nil)
+				rec := httptest.NewRecorder()
+				got := tryProxy(rec, req, b)
+				switch {
+				case fail && got:
+					errs <- fmt.Sprintf("worker %d req %d: /fail returned true (served), want false (retry another backend)", w, i)
+				case fail && rec.Body.Len() != 0:
+					errs <- fmt.Sprintf("worker %d req %d: /fail wrote %q to the client, want nothing", w, i, rec.Body.String())
+				case !fail && (!got || rec.Code != http.StatusOK || rec.Body.String() != "ok"):
+					errs <- fmt.Sprintf("worker %d req %d: /ok got tryProxy=%v code=%d body=%q, want true/200/\"ok\"", w, i, got, rec.Code, rec.Body.String())
+				case fail:
+					failCount.Add(1)
+				default:
+					okCount.Add(1)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+
+	n := 0
+	for e := range errs {
+		if n < 10 {
+			t.Error(e)
+		}
+		n++
+	}
+	if n > 0 {
+		t.Fatalf("%d of %d requests had the wrong outcome", n, workers*perWorker)
+	}
+	if okCount.Load() == 0 || failCount.Load() == 0 {
+		t.Fatalf("ok=%d fail=%d, want both > 0", okCount.Load(), failCount.Load())
+	}
+	if b.healthy() {
+		t.Error("backend still healthy after genuine connection failures — want marked unhealthy")
+	}
+}
+
+// TestTryProxyConcurrentClientCancelKeepsHealthy runs client-canceled
+// requests against a shared *Backend alongside normal traffic: the cancels
+// must take the client-disconnect path (stop, no retry) and must never mark
+// the backend unhealthy, and the concurrent normal requests must all succeed.
+func TestTryProxyConcurrentClientCancelKeepsHealthy(t *testing.T) {
+	old := log.Writer()
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(old)
+
+	var arrived sync.Map
+	srv := flakyServer(t, &arrived)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	b := makeBackend(srv.URL, 1, "", "", u, u.Host)
+	b.markHealthy(true)
+
+	const cancels, okWorkers, perWorker = 50, 20, 50
+	errs := make(chan string, cancels+okWorkers*perWorker)
+	var wg sync.WaitGroup
+	for i := 0; i < cancels; i++ {
+		id := strconv.Itoa(i)
+		ch := make(chan struct{})
+		arrived.Store(id, ch)
+		ctx, cancel := context.WithCancel(context.Background())
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-ch
+			cancel()
+		}()
+		go func() {
+			defer wg.Done()
+			defer cancel()
+			req := httptest.NewRequest(http.MethodGet, "/slow?id="+id, nil).WithContext(ctx)
+			rec := httptest.NewRecorder()
+			if !tryProxy(rec, req, b) {
+				errs <- "canceled request " + id + ": tryProxy returned false (retry another backend), want true (stop)"
+			}
+		}()
+	}
+	for w := 0; w < okWorkers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+				rec := httptest.NewRecorder()
+				if got := tryProxy(rec, req, b); !got || rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+					errs <- fmt.Sprintf("worker %d req %d: /ok got tryProxy=%v code=%d body=%q", w, i, got, rec.Code, rec.Body.String())
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+
+	for e := range errs {
+		t.Error(e)
+	}
+	if !b.healthy() {
+		t.Error("client cancellations marked the shared backend unhealthy — they should not")
 	}
 }
 

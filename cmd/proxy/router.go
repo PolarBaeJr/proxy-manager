@@ -70,10 +70,10 @@ type Backend struct {
 const unhealthyAfterConsecutiveFails = 2
 
 // recordHealthCheck applies hysteresis to a periodic probe result — use this
-// from health.go's checkBackend, not markHealthy directly. tryProxy's
-// ErrorHandler (router.go) deliberately keeps calling markHealthy directly:
-// that path has already observed one genuine failed request and needs no
-// corroborating probe before reacting.
+// from health.go's checkBackend, not markHealthy directly. The backend's
+// ErrorHandler (newBackendErrorHandler, router.go) deliberately keeps calling
+// markHealthy directly: that path has already observed one genuine failed
+// request and needs no corroborating probe before reacting.
 func (b *Backend) recordHealthCheck(ok bool) {
 	if ok {
 		b.consecFails.Store(0)
@@ -907,28 +907,50 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 `, status, title, host, status, http.StatusText(status), title, reason)
 }
 
-func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
-	rec := &errCatchingWriter{ResponseWriter: w}
-	failed := false
-	clientGone := false
-	b.proxy.ErrorHandler = func(_ http.ResponseWriter, r *http.Request, err error) {
+// attemptState carries one tryProxy call's outcome out of the backend's
+// shared ErrorHandler. The handler is installed once per *Backend (see
+// newBackendErrorHandler) and runs concurrently for every in-flight request,
+// so per-request flags must travel on the request context rather than in a
+// closure — reassigning ErrorHandler per call raced on the field and could
+// flip a different request's flags.
+type attemptState struct {
+	failed     bool
+	clientGone bool
+}
+
+type attemptKey struct{}
+
+// newBackendErrorHandler builds b's ReverseProxy.ErrorHandler. It writes
+// nothing to the client: tryProxy's caller decides whether to retry another
+// backend or serve the unavailable page.
+func newBackendErrorHandler(b *Backend) func(http.ResponseWriter, *http.Request, error) {
+	return func(_ http.ResponseWriter, r *http.Request, err error) {
+		st, _ := r.Context().Value(attemptKey{}).(*attemptState)
 		// A canceled request context means the CLIENT went away (refresh,
 		// navigation, closed tab) — Go's reverse proxy reports that the same
 		// way it reports a dead backend. Don't let a healthy backend get
 		// marked down just because someone hit stop; that's how a handful of
 		// aborted requests to a group with only one (peer-learned) backend
 		// took the whole group down until the next health tick.
-		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+		if st != nil && errors.Is(err, context.Canceled) && r.Context().Err() != nil {
 			log.Printf("backend %s: client disconnected mid-request, not marking unhealthy", b.URL)
-			clientGone = true
+			st.clientGone = true
 			return
 		}
 		log.Printf("backend %s error: %v — marking unhealthy", b.URL, err)
 		b.markHealthy(false)
-		failed = true
+		if st != nil {
+			st.failed = true
+		}
 	}
+}
+
+func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
+	rec := &errCatchingWriter{ResponseWriter: w}
+	st := &attemptState{}
+	req = req.WithContext(context.WithValue(req.Context(), attemptKey{}, st))
 	b.proxy.ServeHTTP(rec, req)
-	if clientGone {
+	if st.clientGone {
 		// Nobody is waiting for a response, so there's no one left to serve by
 		// retrying — and re-dispatching to a DIFFERENT backend can duplicate
 		// whatever side effect the first backend already started (this
@@ -938,7 +960,7 @@ func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
 		// loop here instead of falling through to another backend.
 		return true
 	}
-	return !(failed && !rec.wroteHeader)
+	return !(st.failed && !rec.wroteHeader)
 }
 
 type errCatchingWriter struct {
@@ -1299,10 +1321,12 @@ func makeBackend(rawURL string, weight int, container, healthPath string, u *url
 		orig(req)
 		req.Host = hostHeader
 	}
-	return &Backend{
+	b := &Backend{
 		URL: rawURL, Weight: weight, Container: container, HealthPath: healthPath, proxy: p,
 		stickyID: backendStickyID(rawURL),
 	}
+	p.ErrorHandler = newBackendErrorHandler(b)
+	return b
 }
 
 // makePeerBackend builds a synthetic *Backend that forwards to another proxy
@@ -1338,9 +1362,11 @@ func makePeerBackend(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool
 	if weight < 1 {
 		weight = 1
 	}
-	return &Backend{
+	b := &Backend{
 		URL: peerBaseURL, Weight: weight, Container: "peer:" + peerID, proxy: p,
 		Learned: true, PeerID: peerID,
 		stickyID: backendStickyID(peerBaseURL),
 	}
+	p.ErrorHandler = newBackendErrorHandler(b)
+	return b
 }
