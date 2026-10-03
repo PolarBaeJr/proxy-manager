@@ -1620,7 +1620,7 @@ func (r *Router) abProxyToGroup(w http.ResponseWriter, req *http.Request, group 
 		d.run.record(abIdx(d.recordVariant()), abTransport, 0, 0, r.clock())
 	}
 	log.Printf("proxy: group %q (host %s) has no healthy backends — serving 503", group.Service, reqHost)
-	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
+	serveUnavailableRetry(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.", transientRetryAfter)
 }
 
 // recordVariant is the variant a request is counted under: the pinned one,

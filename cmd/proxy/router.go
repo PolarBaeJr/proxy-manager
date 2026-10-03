@@ -80,6 +80,12 @@ type Backend struct {
 	// or panic-mode included, while requests already on it finish.
 	ContainerID string
 	draining    atomic.Bool
+
+	// transport is this backend's URL's entry in Router.transports, wired
+	// by Set (nil when a test injected its own proxy.Transport). Per-URL so
+	// a draining backend's idle keep-alive connections can be closed
+	// without touching any other backend's pool.
+	transport *http.Transport
 }
 
 // unhealthyAfterConsecutiveFails gates recordHealthCheck's failure side:
@@ -480,6 +486,14 @@ type Router struct {
 	// draining container still lists as running until it exits; entries
 	// clear on the container's start/die/destroy event or after drainTTL.
 	drainSet map[string]time.Time
+
+	// tombstones are routes that disappeared in a recent Set, served 503
+	// (not 404) until they expire or reappear. Guarded by mu; replaced, never
+	// mutated, so ServeHTTP can walk its copy after RUnlock.
+	tombstones []routeTombstone
+
+	// transports holds one *http.Transport per backend URL, guarded by mu.
+	transports map[string]*http.Transport
 }
 
 // drainTTL bounds how long a stop signal keeps a container out of rotation
@@ -487,31 +501,68 @@ type Router struct {
 // running) — it rejoins rather than staying derouted forever.
 const drainTTL = 10 * time.Minute
 
+// routeTombstoneTTL is how long a route that vanished from Set keeps
+// answering 503 instead of 404 — covers a container restart's rm→create gap
+// and a peer that stops advertising a draining route.
+const routeTombstoneTTL = 5 * time.Minute
+
+// transientRetryAfter is the Retry-After / meta-refresh, in seconds, for
+// 503s expected to clear within moments (restart gaps, tombstoned routes).
+const transientRetryAfter = 5
+
+// routeTombstone is a recently removed route; host is lowercased.
+type routeTombstone struct {
+	host, path string
+	until      time.Time
+}
+
+func newBackendTransport() *http.Transport {
+	return http.DefaultTransport.(*http.Transport).Clone()
+}
+
 // markDraining takes container id out of rotation immediately. The ID is
 // recorded before flipping the live backends, under mu, so a concurrent
 // Set() either sees the entry or publishes groups this loop then flips.
+// Idle keep-alive connections to the drained backends are then closed, so
+// none is reused after the container stops listening.
 func (r *Router) markDraining(id string) {
 	if id == "" {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.drainSet == nil {
 		r.drainSet = map[string]time.Time{}
 	}
 	r.drainSet[id] = r.clock()
 	n := 0
+	var idle []*http.Transport
 	for _, g := range r.groups {
 		for _, b := range g.Backends {
 			if b.ContainerID == id {
 				b.draining.Store(true)
 				n++
+				if b.transport != nil && !containsTransport(idle, b.transport) {
+					idle = append(idle, b.transport)
+				}
 			}
 		}
 	}
+	r.mu.Unlock()
 	if n > 0 {
 		log.Printf("proxy: container %.12s received a stop signal — draining %d backend(s)", id, n)
 	}
+	for _, t := range idle {
+		t.CloseIdleConnections()
+	}
+}
+
+func containsTransport(ts []*http.Transport, t *http.Transport) bool {
+	for _, x := range ts {
+		if x == t {
+			return true
+		}
+	}
+	return false
 }
 
 // clearDraining forgets id. Live backends are not un-flipped here: the
@@ -612,8 +663,13 @@ func (r *Router) Set(groups []*RouteGroup) {
 	}
 	r.reconcileAB(groups)
 	r.applyDrainingLocked(groups)
+	stale := r.reconcileTransportsLocked(groups)
+	r.reconcileTombstonesLocked(prev, groups)
 	r.groups = groups
 	r.mu.Unlock()
+	for _, t := range stale {
+		t.CloseIdleConnections()
+	}
 
 	// Keyed by route identity + backend URL, not the bare URL alone: two
 	// different routes can legitimately point at the same literal backend
@@ -636,6 +692,83 @@ func (r *Router) Set(groups []*RouteGroup) {
 			}
 		}
 	}
+}
+
+// reconcileTransportsLocked gives every backend without a transport its
+// URL's shared one (backends that already have one — reused across Sets, or
+// test-injected — are left alone) and returns transports whose URL is gone,
+// already dropped from the map, for the caller to close after unlocking.
+// Caller holds mu.
+func (r *Router) reconcileTransportsLocked(groups []*RouteGroup) []*http.Transport {
+	if r.transports == nil {
+		r.transports = map[string]*http.Transport{}
+	}
+	live := map[string]bool{}
+	for _, g := range groups {
+		for _, b := range g.Backends {
+			if b.proxy == nil {
+				continue
+			}
+			if b.transport != nil {
+				live[b.URL] = true
+				if r.transports[b.URL] == nil {
+					r.transports[b.URL] = b.transport
+				}
+				continue
+			}
+			if b.proxy.Transport != nil {
+				continue
+			}
+			t := r.transports[b.URL]
+			if t == nil {
+				t = newBackendTransport()
+				r.transports[b.URL] = t
+			}
+			b.proxy.Transport = t
+			b.transport = t
+			live[b.URL] = true
+		}
+	}
+	var stale []*http.Transport
+	for u, t := range r.transports {
+		if !live[u] {
+			delete(r.transports, u)
+			stale = append(stale, t)
+		}
+	}
+	return stale
+}
+
+// reconcileTombstonesLocked tombstones every route key in prev that groups
+// no longer has, keeps unexpired tombstones that haven't come back, and
+// publishes a fresh slice sorted longest path first. Caller holds mu.
+func (r *Router) reconcileTombstonesLocked(prev, groups []*RouteGroup) {
+	now := r.clock()
+	newKeys := map[string]bool{}
+	for _, g := range groups {
+		newKeys[strings.ToLower(g.Host)+"|"+g.PathPrefix] = true
+	}
+	var tombs []routeTombstone
+	seen := map[string]bool{}
+	for _, t := range r.tombstones {
+		key := t.host + "|" + t.path
+		if now.After(t.until) || newKeys[key] || seen[key] {
+			continue
+		}
+		seen[key] = true
+		tombs = append(tombs, t)
+	}
+	for _, g := range prev {
+		host := strings.ToLower(g.Host)
+		key := host + "|" + g.PathPrefix
+		if newKeys[key] || seen[key] {
+			continue
+		}
+		seen[key] = true
+		tombs = append(tombs, routeTombstone{host: host, path: g.PathPrefix, until: now.Add(routeTombstoneTTL)})
+	}
+	sort.SliceStable(tombs, func(i, j int) bool { return len(tombs[i].path) > len(tombs[j].path) })
+	r.tombstones = tombs
 }
 
 func (r *Router) Snapshot() []*RouteGroup {
@@ -763,6 +896,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	r.mu.RLock()
 	groups := r.groups
+	tombs := r.tombstones
 	r.mu.RUnlock()
 
 	reqHost := hostOnly(req.Host)
@@ -782,6 +916,13 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		group = g
 		break
+	}
+	// A route removed moments ago (restart gap, peer stopped advertising a
+	// draining route) answers 503 + short Retry-After rather than 404, unless
+	// a live route matches more specifically.
+	if r.tombstoned(tombs, reqHost, req.URL.Path, group) {
+		serveUnavailableRetry(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.", transientRetryAfter)
+		return
 	}
 	if group == nil {
 		// No route matched: tell the metrics layer to bucket this request as
@@ -1021,7 +1162,31 @@ func (r *Router) proxyToGroup(w http.ResponseWriter, req *http.Request, group *R
 	// UI is the layer that lets the operator choose to hide stopped-service
 	// hosts from the Top hosts / error-rate view via a toggle.
 	log.Printf("proxy: group %q (host %s) has no healthy backends — serving 503", group.Service, reqHost)
-	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
+	serveUnavailableRetry(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.", transientRetryAfter)
+}
+
+// tombstoned reports whether a tombstone covers host+path and is more
+// specific than the live match group (nil = no live match).
+func (r *Router) tombstoned(tombs []routeTombstone, host, path string, group *RouteGroup) bool {
+	if len(tombs) == 0 {
+		return false
+	}
+	now := r.clock()
+	for _, t := range tombs {
+		if !strings.EqualFold(host, t.host) {
+			continue
+		}
+		if t.path != "" && !strings.HasPrefix(path, t.path) {
+			continue
+		}
+		if now.After(t.until) {
+			continue
+		}
+		if group == nil || len(t.path) > len(group.PathPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // maxReplayBody bounds how much of a request body is buffered so a failed
@@ -1077,14 +1242,20 @@ func serveBodyNotReplayable(w http.ResponseWriter, group *RouteGroup, reqHost st
 
 // serveUnavailable writes a small styled HTML page with a 5-minute
 // meta-refresh so the browser silently retries in the background. Used
-// when a host has no healthy backends (all replicas stopped, container
-// crashed, etc.) or when the host has no route at all. The page is
-// intentionally minimal — no JS, no external assets — so it works even
-// when the only thing the proxy can do is fail.
+// when the host has no route at all or the proxy can't serve it for a
+// non-transient reason. The page is intentionally minimal — no JS, no
+// external assets — so it works even when the only thing the proxy can do
+// is fail.
 func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
+	serveUnavailableRetry(w, status, host, reason, 300)
+}
+
+// serveUnavailableRetry is serveUnavailable with retryAfter seconds for both
+// the Retry-After header and the meta-refresh.
+func serveUnavailableRetry(w http.ResponseWriter, status int, host, reason string, retryAfter int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Retry-After", "300")
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	w.WriteHeader(status)
 	title := "Service unavailable"
 	if status == http.StatusNotFound {
@@ -1092,7 +1263,7 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
 	}
 	fmt.Fprintf(w, `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<meta http-equiv=refresh content="300">
+<meta http-equiv=refresh content="%d">
 <title>%d %s · %s</title>
 <style>
   :root{color-scheme:dark}
@@ -1108,7 +1279,7 @@ func serveUnavailable(w http.ResponseWriter, status int, host, reason string) {
   <h1>%s</h1>
   <p>%s</p>
 </div>
-`, status, title, host, status, http.StatusText(status), title, reason)
+`, retryAfter, status, title, host, status, http.StatusText(status), title, reason)
 }
 
 // attemptState carries one tryProxy call's outcome out of the backend's
@@ -1154,6 +1325,11 @@ func tryProxy(w http.ResponseWriter, req *http.Request, b *Backend) bool {
 	st := &attemptState{}
 	req = req.WithContext(context.WithValue(req.Context(), attemptKey{}, st))
 	b.proxy.ServeHTTP(rec, req)
+	if b.draining.Load() && b.transport != nil {
+		// Drained mid-request: markDraining closed only the idle conns, so
+		// close this one too now that it's back in the pool.
+		b.transport.CloseIdleConnections()
+	}
 	if st.clientGone {
 		// Nobody is waiting for a response, so there's no one left to serve by
 		// retrying — and re-dispatching to a DIFFERENT backend can duplicate

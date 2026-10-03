@@ -280,6 +280,7 @@ Restarts and deploys don't drop requests.
 
 - **The Go services drain on SIGTERM.** proxy, dashboard, monitor and auth stop accepting, let in-flight requests finish, cut WebSocket/SSE streams after a short grace, force-close anything left at the deadline, then save state (proxy metrics, monitor store) and exit 0. The proxy's internal `:8094` (metrics, peer sync, `/refresh`) stays up until the main listener has drained.
 - **Replicas are drained before they stop.** When the dashboard retires a replica (scale down, replace, rolling replace, promote, discard, delete), it stops it with a grace of `proxy.drain` seconds and only then removes it. The moment Docker sends the stop signal, the proxy takes that replica out of rotation (sticky and panic-mode routing included) while requests already on it finish. Replicas the dashboard creates with a `proxy.drain` label also get it as their Docker stop timeout.
+- **Restart gaps answer 503, not 404.** While a single-replica service restarts (no live backend), the proxy returns 503 with `Retry-After: 5` and a 5-second meta-refresh, so browsers retry quickly. A route that disappears entirely (container removed, or a peer stops advertising it) keeps returning that same 503 for up to 5 minutes before falling back to 404.
 - **Small request bodies are replayable.** A request that fails before any response is retried on another backend; bodies up to 64 KiB are buffered so the retry sends the full body. A larger body is not retried — it gets a `502`.
 
 | Variable | Default | Meaning |
