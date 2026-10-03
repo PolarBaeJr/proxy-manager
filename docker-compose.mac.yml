@@ -10,8 +10,9 @@
 #     real Mac's, and /mnt/ssd (the Pi's SSD) doesn't exist here at all. The
 #     Stats tab shows no host metrics for this node until that's designed
 #     properly instead of silently mounting the wrong thing.
-#   - adds redis: the peer mesh's shared rate-limit store (see cmd/proxy's
-#     Redis-backed limiter). REDIS_PASSWORD is required (no insecure
+#   - adds redis: the peer mesh's shared, persisted store — rate limits (see
+#     cmd/proxy's Redis-backed limiter) and the shared dashboard accounts /
+#     API keys (cmd/dashboard/authredis.go). REDIS_PASSWORD is required (no insecure
 #     default); set it in .env before bringing this override up.
 #
 # Colima-on-macOS quirks that shaped this file, both learned the hard way:
@@ -63,10 +64,15 @@ services:
       # Loopback only — see quirk (2) above. native nginx's stream{} block
       # is what actually exposes this over Tailscale.
       - "127.0.0.1:6379:6379"
+    # Durable, not a cache: the shared user accounts + API keys
+    # (pmgr:auth:users) live here, so data is persisted (AOF every second +
+    # an RDB snapshot every 5 min) to the image's /data volume, and only keys
+    # WITH a TTL (rate-limit buckets) are ever evicted — never config/auth.
     command: >
       redis-server
       --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env — see docker-compose.mac.yml}
       --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
-      --save ""
-      --appendonly no
+      --maxmemory-policy volatile-lru
+      --save "300 1"
+      --appendonly yes
+      --appendfsync everysec
