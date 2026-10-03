@@ -18,7 +18,11 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"sync"
+
+	"github.com/PolarBaeJr/proxy-manager/internal/httpx"
 )
 
 // memberDrainSeconds is the proxy.drain grace of the service member with
@@ -97,4 +101,69 @@ func startServiceMembers(ctx context.Context, dc *dockerClient, svc Service) (in
 		}
 	}
 	return acted, firstErr
+}
+
+// runReplicaRestart serves POST .../replicas/{member}/restart (local API and
+// peer mesh alike) for a non-canary member the caller already looked up,
+// and returns the mode it ran ("" when it wrote an error). A proxy.overlap
+// singleton gets an async overlap restart — a new copy from the same image
+// reference, health-gated, then the old one drained — tracked as a
+// rolling-replace job (202). Everything else keeps the old stop-then-start
+// (200). Once on the overlap path it never falls back to stop/start.
+func runReplicaRestart(ctx context.Context, w http.ResponseWriter, dc *dockerClient, onb *OnboardedStore, rom *rollingOpManager, proxyURL string, svc Service, member, id string) string {
+	var ct dockerContainer
+	for _, m := range svc.Members {
+		if m.ID == id {
+			ct = m
+			break
+		}
+	}
+	running := 0
+	for _, m := range svc.MemberSummaries {
+		if !m.IsCanary && m.State == "running" {
+			running++
+		}
+	}
+	_, onboarded := onb.Get(svc.Name)
+	// Overlap only for the one live copy of a singleton: a stopped member has
+	// nothing to keep serving, and more than one running isn't a singleton.
+	if ct.State != "running" || onboarded || !overlapEnabled(ct.Labels) || running != 1 {
+		if err := dc.stopContainerT(context.WithoutCancel(ctx), id, memberDrainSeconds(svc, id)); err != nil {
+			httpx.WriteErr(w, err)
+			return ""
+		}
+		if err := dc.startContainer(ctx, id); err != nil {
+			httpx.WriteErr(w, fmt.Errorf("stop succeeded but start failed — replica %q of service %q is now STOPPED (no live backend from it), retry with action=start: %w", member, svc.Name, err))
+			return ""
+		}
+		proxyRefresh(proxyURL)
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "restarted", "mode": "stop-start", "member": member})
+		return "stop-start"
+	}
+	if h := dc.claims.holder(svc.Name); h != "" {
+		http.Error(w, fmt.Sprintf("%q is being recreated by %s right now — retry once it finishes", svc.Name, h), http.StatusConflict)
+		return ""
+	}
+	// Config.Image, not the list's Image: the latter decays to a bare digest
+	// once the creating tag is retagged or removed locally.
+	ref := ct.Image
+	if r, err := dc.inspectConfigImage(ctx, id); err == nil && r != "" && !looksLikeBareDigest(r) {
+		ref = r
+	}
+	if ref == "" || looksLikeBareDigest(ref) {
+		http.Error(w, fmt.Sprintf("can't overlap-restart %q: %s has no image reference to recreate from (only %q)", svc.Name, member, ref), http.StatusBadRequest)
+		return ""
+	}
+	st, err := rom.startWith(svc.Name, ReplaceServiceRequest{Image: ref}, rollingOpts{removeOnGateFailure: true, skipPull: true, kind: rollingKindRestart})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return ""
+	}
+	httpx.WriteJSON(w, http.StatusAccepted, struct {
+		*rollingOpState
+		Mode    string `json:"mode"`
+		Member  string `json:"member"`
+		Message string `json:"message"`
+	}{st, "overlap", member, fmt.Sprintf("overlap restart of %s started: a new copy is created from %s — the image that reference currently points to on this host, not re-pulled — health-gated, then %s is drained; poll GET /api/services/%s/rolling-replace", member, ref, member, svc.Name)})
+	return "overlap"
 }

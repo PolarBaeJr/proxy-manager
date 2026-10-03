@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -124,7 +125,18 @@ type rollingOpts struct {
 	// done, if non-nil, receives the job's final error (nil on success)
 	// exactly once. Must be buffered: the job never blocks on it.
 	done chan error
+	// onReady, if non-nil, runs after a new replica passes its health gate
+	// and before its predecessor is drained — the overlap paths refresh the
+	// proxy here so the new copy is routable before the old one leaves.
+	onReady func(newID string)
+	// kind tags the job in rollingOpState ("" for a replace). A restart
+	// recreates on the image reference the service already runs, so it
+	// does not stamp proxy.previous_image.
+	kind string
 }
+
+// rollingKindRestart is the kind of an overlap restart (runReplicaRestart).
+const rollingKindRestart = "restart"
 
 // errReplicaGateFailed is replaceServiceRolling's "a new replica never became
 // healthy" failure, distinct from every other error (Docker create/start, no
@@ -145,6 +157,8 @@ type rollingOpState struct {
 	Done      int                `json:"done"`
 	Total     int                `json:"total"`
 	Status    string             `json:"status"`
+	Kind      string             `json:"kind,omitempty"`
+	Note      string             `json:"note,omitempty"`
 	LastError string             `json:"last_error,omitempty"`
 	StartedAt time.Time          `json:"started_at"`
 	Replicas  []rollingOpReplica `json:"replicas,omitempty"`
@@ -215,7 +229,11 @@ func (m *rollingOpManager) startWith(name string, req ReplaceServiceRequest, opt
 		Service:   name,
 		Image:     req.Image,
 		Status:    rollingOpStatusRunning,
+		Kind:      opts.kind,
 		StartedAt: time.Now(),
+	}
+	if opts.kind == rollingKindRestart {
+		st.Note = "restart recreates from " + req.Image + " — whatever that reference currently points to on this host (not re-pulled)"
 	}
 	m.ops[name] = st
 	// Snapshot the initial state to return WHILE the lock is still held: the
@@ -250,6 +268,10 @@ func (m *rollingOpManager) startWith(name string, req ReplaceServiceRequest, opt
 				// Values of the env this job was given never reach the
 				// status (API, MCP, UI) even if a Docker error echoed one.
 				s.LastError = scrubEnvValues(err.Error(), opts.pinnedEnv, envMapToSlice(req.Env))
+				var gate errReplicaGateFailed
+				if opts.kind == rollingKindRestart && errors.As(err, &gate) {
+					s.LastError = "new replica never became healthy — removed; old replica still serving: " + s.LastError
+				}
 				return
 			}
 			s.Status = rollingOpStatusCompleted

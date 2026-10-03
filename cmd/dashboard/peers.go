@@ -530,7 +530,7 @@ func peerServicesHandler(secret, identity string, dc *dockerClient, onb *Onboard
 }
 
 // peerServicesMutateHandler returns the HTTP handler for POST
-// /peer/services/{name}/{scale,stop,start,replicas/{member}/{stop,start},
+// /peer/services/{name}/{scale,stop,start,replicas/{member}/{stop,start,restart},
 // autoupdate,singleton,check} on the dedicated peer-handshake port — the write-side
 // counterpart of peerServicesHandler. This establishes the copyable pattern
 // later write-mesh phases (4-5) should reuse: gate on secret+writesEnabled,
@@ -631,7 +631,7 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 		if len(parts) == 2 && strings.HasPrefix(parts[1], "replicas/") && r.Method == http.MethodPost {
 			sub := strings.TrimPrefix(parts[1], "replicas/")
 			memberParts := strings.SplitN(sub, "/", 2)
-			if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start") {
+			if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start" && memberParts[1] != "restart") {
 				http.NotFound(w, r)
 				return
 			}
@@ -660,6 +660,12 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 			}
 			if targetIsCanary {
 				http.Error(w, "canary replicas can't be stopped here — use Discard or Promote", http.StatusConflict)
+				return
+			}
+			if act == "restart" {
+				if mode := runReplicaRestart(r.Context(), w, dc, onb, rom, proxyURL, svc, member, targetID); mode != "" {
+					audit(r, "peer-mesh", "service.replica_restart", name+"/"+member+" ("+mode+")")
+				}
 				return
 			}
 			if act == "stop" {

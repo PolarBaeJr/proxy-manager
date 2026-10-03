@@ -1116,7 +1116,7 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		if len(parts) == 2 && strings.HasPrefix(parts[1], "replicas/") && req.Method == "POST" {
 			sub := strings.TrimPrefix(parts[1], "replicas/")
 			memberParts := strings.SplitN(sub, "/", 2)
-			if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start") {
+			if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start" && memberParts[1] != "restart") {
 				http.NotFound(w, req)
 				return
 			}
@@ -1145,6 +1145,12 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 			}
 			if targetIsCanary {
 				http.Error(w, "canary replicas can't be stopped here — use Discard or Promote", http.StatusConflict)
+				return
+			}
+			if act == "restart" {
+				if mode := runReplicaRestart(req.Context(), w, dc, onb, rom, proxyURLFromEnv(), svc, member, targetID); mode != "" {
+					audit(req, sessionUser(info), "service.replica_restart", name+"/"+member+" ("+mode+")")
+				}
 				return
 			}
 			if act == "stop" {
@@ -2327,7 +2333,7 @@ var serviceMutationForwardTimeout = 55 * time.Second
 // request to the peer identified by host, translating (parts, method) onto
 // its /peer/services/{name}/<sub> counterpart — the write-mesh sibling of
 // forwardImageMutation above. Covers scale, stop, start, replicas/{member}/
-// {stop,start}, autoupdate, check, replace, rolling-replace (start AND its
+// {stop,start,restart}, autoupdate, check, replace, rolling-replace (start AND its
 // status GET — the only GET this function forwards; every other case is a
 // mutation), stage, promote, canary (discard), offboard, weight, and delete —
 // every mutating service action now forwards. The only thing still genuinely
@@ -2350,7 +2356,7 @@ func forwardServiceMutation(w http.ResponseWriter, req *http.Request, host strin
 	case len(parts) == 2 && strings.HasPrefix(parts[1], "replicas/") && req.Method == http.MethodPost:
 		sub := strings.TrimPrefix(parts[1], "replicas/")
 		memberParts := strings.SplitN(sub, "/", 2)
-		if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start") {
+		if len(memberParts) != 2 || (memberParts[1] != "stop" && memberParts[1] != "start" && memberParts[1] != "restart") {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}

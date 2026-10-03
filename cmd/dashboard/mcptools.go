@@ -66,6 +66,45 @@ func (a *apiCaller) call(ctx context.Context, method, path string, body any) ([]
 	return out, nil
 }
 
+// rollingReplaceToolPollInterval is how often a tool re-polls
+// GET /api/services/{name}/rolling-replace while a job is running. A var
+// only so tests can shrink it.
+var rollingReplaceToolPollInterval = 2 * time.Second
+
+// pollRollingOp blocks until the rolling-replace job whose latest state is b
+// is terminal (completed or failed), re-polling statusPath, and returns that
+// final state — the synchronous contract rolling_replace_service and an
+// overlap restart_replica both offer on top of the async job.
+func (a *apiCaller) pollRollingOp(ctx context.Context, statusPath string, b []byte) (string, error) {
+	deadline := time.Now().Add(rollingOpTimeout)
+	for {
+		var st rollingOpState
+		if err := json.Unmarshal(b, &st); err != nil {
+			return "", err
+		}
+		if st.Status == rollingOpStatusCompleted || st.Status == rollingOpStatusFailed {
+			return pretty(b), nil
+		}
+		if !time.Now().Before(deadline) {
+			// The server-side job is itself bounded by rollingOpTimeout, so
+			// hitting this client-side cap means the job should already be
+			// terminal or about to become so — return the last known state
+			// rather than manufacturing an error.
+			return pretty(b), nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(rollingReplaceToolPollInterval):
+		}
+		var err error
+		b, err = a.call(ctx, "GET", statusPath, nil)
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
 // pretty re-indents a JSON response. Tool output is read by a model, so
 // readable beats compact; a non-JSON body passes through untouched.
 func pretty(b []byte) string {
@@ -652,7 +691,10 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			"settle delay, then the old ones are torn down unconditionally, even if the new " +
 			"ones never became healthy. On a multi-replica service this can zero its capacity. " +
 			"Prefer rolling_replace_service, which health-gates each replica one at a time and " +
-			"never drops capacity, for any production multi-replica service.",
+			"never drops capacity, for any production multi-replica service. Exception: on a " +
+			"proxy.overlap service (overlap: true in list_services) this IS health-gated — the " +
+			"new copy must pass its health check before the old one is drained, and is removed " +
+			"(old one untouched) if it never does.",
 		Mutating: true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
@@ -716,10 +758,6 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 		},
 	})
 
-	// rollingReplaceToolPollInterval is how often this tool re-polls
-	// GET /api/services/{name}/rolling-replace while a job is running.
-	const rollingReplaceToolPollInterval = 2 * time.Second
-
 	s.Register(Tool{
 		Name:  "rolling_replace_service",
 		Title: "Replace a service's image one replica at a time",
@@ -729,7 +767,8 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			"leave the service with fewer than " + fmt.Sprint(minHealthyReplicasForRollingReplace) +
 			" healthy replicas across every host (a single-replica service on one host alone " +
 			"cannot pass this — spread it across hosts first, or use replace_service if you " +
-			"accept that risk). The job itself runs asynchronously on the dashboard, but this " +
+			"accept that risk). A proxy.overlap singleton (overlap: true in list_services) is " +
+			"exempt: it is replaced by health-gated overlap instead. The job itself runs asynchronously on the dashboard, but this " +
 			"tool call blocks and polls until it actually finishes (completed or failed) before " +
 			"returning, matching the synchronous contract replace_service documents. Like " +
 			"replace_service, this is NOT reversible.",
@@ -793,33 +832,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 				return "", err
 			}
 
-			deadline := time.Now().Add(rollingOpTimeout)
-			for {
-				var st rollingOpState
-				if err := json.Unmarshal(b, &st); err != nil {
-					return "", err
-				}
-				if st.Status == rollingOpStatusCompleted || st.Status == rollingOpStatusFailed {
-					return pretty(b), nil
-				}
-				if !time.Now().Before(deadline) {
-					// The server-side job is itself bounded by
-					// rollingOpTimeout, so hitting this client-side cap
-					// means the job should already be terminal or about
-					// to become so — return the last known state rather
-					// than manufacturing an error.
-					return pretty(b), nil
-				}
-				select {
-				case <-ctx.Done():
-					return "", ctx.Err()
-				case <-time.After(rollingReplaceToolPollInterval):
-				}
-				b, err = a.call(ctx, "GET", withHost(path, host), nil)
-				if err != nil {
-					return "", err
-				}
-			}
+			return a.pollRollingOp(ctx, withHost(path, host), b)
 		},
 	})
 
@@ -970,7 +983,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 	s.Register(Tool{
 		Name:        "restart_replica",
 		Title:       "Start, stop, or restart a replica",
-		Description: "Start, stop, or restart one replica of a service (not the whole service — use lifecycle_service for that). member must be a NON-canary replica name from list_services' member_summaries (one where is_canary is false/absent) — canary replicas can't be managed here, use resolve_canary instead. restart is stop immediately followed by start; on a service's only running (non-canary) replica this causes a brief window with no live backend for that host, so check member_summaries/replicas count first if that matters.",
+		Description: "Start, stop, or restart one replica of a service (not the whole service — use lifecycle_service for that). member must be a NON-canary replica name from list_services' member_summaries (one where is_canary is false/absent) — canary replicas can't be managed here, use resolve_canary instead. restart is normally stop immediately followed by start; on a service's only running (non-canary) replica this causes a brief window with no live backend for that host, so check member_summaries/replicas count first if that matters. Exception: on a proxy.overlap service (list_services shows overlap: true — an unscalable singleton) restart instead creates a new copy from the image reference the service already runs (whatever that tag points to locally, not re-pulled), waits for it to pass its health check, then drains the old one — no downtime. That runs as a job this call blocks on (it returns the final rolling-replace state; status failed with last_error means the new copy never became healthy and was removed while the old one kept serving). It refuses a service with anonymous volumes or with no HEALTHCHECK/proxy.health rather than falling back to stop/start.",
 		Mutating:    true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
@@ -1004,13 +1017,28 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 				}
 				return pretty(b), nil
 			case "restart":
+				b, err := a.call(ctx, "POST", withHost(base+"restart", host), nil)
+				if err == nil {
+					var r struct {
+						Mode string `json:"mode"`
+					}
+					if json.Unmarshal(b, &r) == nil && r.Mode == "overlap" {
+						return a.pollRollingOp(ctx, withHost("/api/services/"+url.PathEscape(name)+"/rolling-replace", host), b)
+					}
+					return pretty(b), nil
+				}
+				// Only a route-level 404 means an older peer without the
+				// restart endpoint; "replica not found" is a real answer.
+				if !strings.Contains(err.Error(), ": 404 404 page not found") {
+					return "", err
+				}
 				// Abort on stop failure rather than attempting start anyway —
 				// a replica already down for another reason shouldn't be
 				// force-started as a side effect of a restart request.
 				if _, err := a.call(ctx, "POST", withHost(base+"stop", host), nil); err != nil {
 					return "", err
 				}
-				b, err := a.call(ctx, "POST", withHost(base+"start", host), nil)
+				b, err = a.call(ctx, "POST", withHost(base+"start", host), nil)
 				if err != nil {
 					// The stop already succeeded, so this is not a generic
 					// failure — the replica is now down and needs the caller's
