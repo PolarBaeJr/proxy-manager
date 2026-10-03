@@ -303,10 +303,25 @@ func TestCentralEnvConcurrentSetsReadsAndRollingReplace(t *testing.T) {
 		return ok && j.Status == envSyncStatusPending
 	})
 	close(release)
-	j := h.waitJob(t, "app")
+	// Readers hammer until v2 has rolled onto both members, then stop —
+	// NOT until waitJob sees the manager idle: every reader iteration calls
+	// request (dirty → one more loop pass), so the manager could only idle
+	// if a whole pass fit between two reader requests. That livelock ran for
+	// as long as luck allowed, each pass opening fresh fake-Docker TCP
+	// connections, and the thousands of sockets it left in TIME_WAIT
+	// exhausted the ephemeral port range for the tests that ran after it.
+	waitFor(t, "v2 to roll onto both members under concurrent readers", func() bool {
+		ms := h.f.members()
+		for _, mv := range ms {
+			if mv.version != "2" {
+				return false
+			}
+		}
+		return len(ms) == 2
+	})
 	close(stop)
 	readers.Wait()
-	j = h.waitJob(t, "app")
+	j := h.waitJob(t, "app")
 	if j.Status != envSyncStatusConverged || j.Target != 2 {
 		t.Fatalf("job = %+v", j)
 	}
