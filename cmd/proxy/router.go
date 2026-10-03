@@ -59,6 +59,11 @@ type Backend struct {
 	// routes.json. PeerID is the identity of the peer that advertised it.
 	Learned bool
 	PeerID  string
+
+	// Variant is "B" for an A/B test's B replica (proxy.ab.variant=B with a
+	// valid proxy.ab.id, see abtest.go); "" means A. Written once at
+	// construction like DockerUnhealthy.
+	Variant string
 }
 
 // unhealthyAfterConsecutiveFails gates recordHealthCheck's failure side:
@@ -195,6 +200,14 @@ type RouteGroup struct {
 	// a static group can still pick up backends from label-managed
 	// containers that carry the matching proxy.service label.
 	static bool
+
+	// abCfg/ab attach an A/B test (abtest.go). abCfg is set by
+	// assembleGroups only when the group's service has a test and the group
+	// has a B backend; Router.Set resolves it and wires ab, the per-service
+	// runtime that survives refreshes. Both nil = no test, and ServeHTTP
+	// behaves exactly as without A/B support.
+	abCfg *abConfig
+	ab    *abRun
 }
 
 // PeerHopHeader marks a request that has already been forwarded once by a
@@ -237,22 +250,25 @@ func (g *RouteGroup) logPanicOnce(host string) {
 // tier (and vice versa) — this keeps existing local-only routing behavior
 // (and its round-robin sequence) untouched when there are no learned
 // backends at all.
-func (g *RouteGroup) pickHealthy(skip map[*Backend]bool, allowPeer bool) *Backend {
+//
+// variant restricts every tier to backends of that A/B variant ("" = no
+// filter, which is what every non-A/B caller passes).
+func (g *RouteGroup) pickHealthy(skip map[*Backend]bool, allowPeer bool, variant string) *Backend {
 	// Spread collapses the two tiers into one pool, but only for a request
 	// that hasn't already been forwarded once (allowPeer). A hopped request
 	// still gets the local-only tier, which is what keeps two spread proxies
 	// from bouncing a request between each other forever.
 	if g.Spread && allowPeer {
-		if b := g.pickPool(skip, false); b != nil {
+		if b := g.pickPool(skip, false, variant); b != nil {
 			return b
 		}
 		return nil
 	}
-	if b := g.pickTier(skip, false, false); b != nil {
+	if b := g.pickTier(skip, false, false, variant); b != nil {
 		return b
 	}
 	if allowPeer {
-		return g.pickTier(skip, true, false)
+		return g.pickTier(skip, true, false, variant)
 	}
 	return nil
 }
@@ -267,18 +283,18 @@ func (g *RouteGroup) pickHealthy(skip map[*Backend]bool, allowPeer bool) *Backen
 // within the same tiers. Deliberately does NOT drop the DockerUnhealthy
 // floor — see Backend.excludedFrom for why that signal stays load-bearing
 // even in panic mode.
-func (g *RouteGroup) pickAny(skip map[*Backend]bool, allowPeer bool) *Backend {
+func (g *RouteGroup) pickAny(skip map[*Backend]bool, allowPeer bool, variant string) *Backend {
 	if g.Spread && allowPeer {
-		if b := g.pickPool(skip, true); b != nil {
+		if b := g.pickPool(skip, true, variant); b != nil {
 			return b
 		}
 		return nil
 	}
-	if b := g.pickTier(skip, false, true); b != nil {
+	if b := g.pickTier(skip, false, true, variant); b != nil {
 		return b
 	}
 	if allowPeer {
-		return g.pickTier(skip, true, true)
+		return g.pickTier(skip, true, true, variant)
 	}
 	return nil
 }
@@ -286,10 +302,10 @@ func (g *RouteGroup) pickAny(skip map[*Backend]bool, allowPeer bool) *Backend {
 // pickPool is pickTier without the Learned partition: one weighted
 // round-robin over every eligible backend, local and peer alike. ignoreHealth
 // drops the probe-based healthyFlag filter — see pickAny/excludedFrom.
-func (g *RouteGroup) pickPool(skip map[*Backend]bool, ignoreHealth bool) *Backend {
+func (g *RouteGroup) pickPool(skip map[*Backend]bool, ignoreHealth bool, variant string) *Backend {
 	var pool []*Backend
 	for _, b := range g.Backends {
-		if skip[b] || b.excludedFrom(ignoreHealth) {
+		if skip[b] || !b.inVariant(variant) || b.excludedFrom(ignoreHealth) {
 			continue
 		}
 		w := b.Weight
@@ -310,10 +326,10 @@ func (g *RouteGroup) pickPool(skip map[*Backend]bool, ignoreHealth bool) *Backen
 // wantLearned, applying the same skip-set + weighted round-robin logic
 // pickHealthy always used. ignoreHealth drops the probe-based healthyFlag
 // filter — see pickAny/excludedFrom.
-func (g *RouteGroup) pickTier(skip map[*Backend]bool, wantLearned, ignoreHealth bool) *Backend {
+func (g *RouteGroup) pickTier(skip map[*Backend]bool, wantLearned, ignoreHealth bool, variant string) *Backend {
 	var pool []*Backend
 	for _, b := range g.Backends {
-		if skip[b] || b.Learned != wantLearned || b.excludedFrom(ignoreHealth) {
+		if skip[b] || b.Learned != wantLearned || !b.inVariant(variant) || b.excludedFrom(ignoreHealth) {
 			continue
 		}
 		w := b.Weight
@@ -425,6 +441,13 @@ type Router struct {
 
 	auth     *authGate // nil = auth gating disabled (proxy.auth hosts fail closed)
 	authWarn sync.Once
+
+	// peerHopAuth is the expected PeerAuthHeader value (peerHopAuthToken);
+	// "" means no hop is ever authenticated. abRuns holds A/B runtimes keyed
+	// by service, guarded by mu. now overrides the A/B clock in tests.
+	peerHopAuth string
+	abRuns      map[string]*abRun
+	now         func() time.Time
 }
 
 func (r *Router) Set(groups []*RouteGroup) {
@@ -492,6 +515,7 @@ func (r *Router) Set(groups []*RouteGroup) {
 			delete(r.caches, key)
 		}
 	}
+	r.reconcileAB(groups)
 	r.groups = groups
 	r.mu.Unlock()
 
@@ -504,12 +528,12 @@ func (r *Router) Set(groups []*RouteGroup) {
 	prevHealth := map[string]bool{}
 	for _, g := range prev {
 		for _, b := range g.Backends {
-			prevHealth[g.Host+"|"+g.PathPrefix+"|"+b.URL] = b.healthyFlag.Load()
+			prevHealth[g.Host+"|"+g.PathPrefix+"|"+b.URL+"|"+b.Variant] = b.healthyFlag.Load()
 		}
 	}
 	for _, g := range groups {
 		for _, b := range g.Backends {
-			if h, ok := prevHealth[g.Host+"|"+g.PathPrefix+"|"+b.URL]; ok {
+			if h, ok := prevHealth[g.Host+"|"+g.PathPrefix+"|"+b.URL+"|"+b.Variant]; ok {
 				b.healthyFlag.Store(h)
 			} else {
 				b.healthyFlag.Store(true)
@@ -634,7 +658,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// can set this header on a direct request, and skipping the limiter
 	// whenever it's present would be a self-inflicted bypass.
 	hopped := req.Header.Get(PeerHopHeader) != ""
+	// authHop only matters to A/B (abAssign); hopped keeps its meaning above.
+	authHop := hopped && r.hopAuthOK(req.Header.Get(PeerAuthHeader))
 	req.Header.Del(PeerHopHeader)
+	req.Header.Del(PeerAuthHeader)
 
 	r.mu.RLock()
 	groups := r.groups
@@ -723,10 +750,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	// A/B assignment reads cookies too, and must precede the cache decision:
+	// a HIT returns before any backend is picked.
+	var ab *abDecision
+	if group.ab != nil {
+		ab = r.abAssign(w, req, group, origPath, hopped, authHop)
+	}
+
 	// Cache eligibility reads Cookie/Authorization/Range, so like sticky it
 	// must be evaluated BEFORE DropHeaders can delete Cookie — otherwise a
 	// route dropping cookies would happily cache a logged-in user's page.
 	cacheable := cacheRequestEligible(req, group, origPath)
+	if ab != nil && !ab.static {
+		cacheable = false
+	}
 	var key string
 	if group.cache != nil {
 		key = cacheKey(group.Host, origPath, origQuery, req.Header.Get("Accept-Encoding"))
@@ -737,10 +774,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if group.cache == nil {
-		r.proxyToGroup(w, req, group, reqHost, hopped, stickyPin)
+		r.dispatch(w, req, group, reqHost, hopped, stickyPin, ab)
 		return
 	}
-	r.serveWithCache(w, req, group, reqHost, hopped, stickyPin, cacheable, key)
+	r.serveWithCache(w, req, group, reqHost, hopped, stickyPin, ab, cacheable, key)
+}
+
+// dispatch sends a request with an A/B decision through abProxyToGroup and
+// everything else through the unchanged proxyToGroup.
+func (r *Router) dispatch(w http.ResponseWriter, req *http.Request, group *RouteGroup, reqHost string, hopped bool, stickyPin string, ab *abDecision) {
+	if ab != nil {
+		r.abProxyToGroup(w, req, group, reqHost, hopped, stickyPin, ab)
+		return
+	}
+	r.proxyToGroup(w, req, group, reqHost, hopped, stickyPin)
 }
 
 // serveWithCache is the cached-route tail of ServeHTTP. It sits AFTER the
@@ -750,10 +797,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // the cache never gets to answer for an authorize() it didn't run. Sticky
 // routes never store (setStickyCookie queues a Set-Cookie on every attempt)
 // and client no-cache is ignored (see cacheRequestEligible).
-func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, group *RouteGroup, reqHost string, hopped bool, stickyPin string, cacheable bool, key string) {
+func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, group *RouteGroup, reqHost string, hopped bool, stickyPin string, ab *abDecision, cacheable bool, key string) {
 	c := group.cache
 	if !cacheable {
-		r.proxyToGroup(&cacheRecorder{ResponseWriter: w, mode: "BYPASS"}, req, group, reqHost, hopped, stickyPin)
+		r.dispatch(&cacheRecorder{ResponseWriter: w, mode: "BYPASS"}, req, group, reqHost, hopped, stickyPin, ab)
 		return
 	}
 	now := c.now()
@@ -764,7 +811,7 @@ func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, group 
 	// A HEAD miss never fills: the backend's HEAD response has no body to
 	// store, and pretending otherwise would cache an empty 200 for GETs.
 	if req.Method == http.MethodHead {
-		r.proxyToGroup(&cacheRecorder{ResponseWriter: w, mode: "BYPASS"}, req, group, reqHost, hopped, stickyPin)
+		r.dispatch(&cacheRecorder{ResponseWriter: w, mode: "BYPASS"}, req, group, reqHost, hopped, stickyPin, ab)
 		return
 	}
 	f, owner := c.beginFill(key)
@@ -808,7 +855,7 @@ func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, group 
 			c.put(key, e)
 		}
 	}()
-	r.proxyToGroup(rw, req, group, reqHost, hopped, stickyPin)
+	r.dispatch(rw, req, group, reqHost, hopped, stickyPin, ab)
 	completed = true
 }
 
@@ -833,7 +880,7 @@ func (r *Router) proxyToGroup(w http.ResponseWriter, req *http.Request, group *R
 			stickyPin = ""
 		}
 		if b == nil {
-			b = group.pickHealthy(tried, !hopped)
+			b = group.pickHealthy(tried, !hopped, "")
 			if b == nil {
 				// Health data says nothing eligible is left — either every
 				// backend is genuinely down, or the health state is simply
@@ -842,7 +889,7 @@ func (r *Router) proxyToGroup(w http.ResponseWriter, req *http.Request, group *R
 				// is a likelier explanation than every backend being
 				// simultaneously dead. Still gated by allowPeer/tried inside
 				// pickAny, so a hopped request can't loop back onto a peer.
-				if pb := group.pickAny(tried, !hopped); pb != nil {
+				if pb := group.pickAny(tried, !hopped, ""); pb != nil {
 					group.logPanicOnce(reqHost)
 					b = pb
 				}
@@ -1094,6 +1141,7 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 	if err != nil {
 		return nil, nil, err
 	}
+	abs := abScan(containers, time.Now())
 	for _, c := range containers {
 		name := c.name()
 		host := c.Labels[labelHost]
@@ -1148,6 +1196,14 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 					}
 					healthLabelWarnMu.Unlock()
 				}
+			}
+		}
+
+		if backend != nil {
+			if abs.excluded[name] {
+				backend = nil
+			} else if abs.bNames[name] {
+				backend.Variant = abVariantB
 			}
 		}
 
@@ -1268,6 +1324,10 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 			g.RateRPM = defaultRateRPM
 		}
 		sort.SliceStable(g.Backends, func(i, j int) bool { return g.Backends[i].URL < g.Backends[j].URL })
+		// A stopped B has no backend, so the test detaches (§1.2); its run and latch persist and reattach when B returns with the same id.
+		if cfg := abs.configs[g.Service]; cfg != nil && !g.static && g.hasBBackend() {
+			g.abCfg = cfg
+		}
 		out = append(out, g)
 	}
 	return out, backendsByService, nil
@@ -1344,6 +1404,13 @@ func makeBackend(rawURL string, weight int, container, healthPath string, u *url
 // single replica. Values < 1 are floored to 1 by pickHealthy*, so a peer that
 // advertises nothing usable still stays selectable as a failover backend.
 func makePeerBackend(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool, peerID string, weight int) *Backend {
+	return makePeerBackendAuth(peerBaseURL, routeHost, pathPrefix, stripPrefix, peerID, weight, "")
+}
+
+// makePeerBackendAuth is makePeerBackend that also sends hopAuth (see
+// peerHopAuthToken) as PeerAuthHeader, but only on hops whose X-Variant the
+// A/B path stamped (abStamped) — never on a client-supplied one.
+func makePeerBackendAuth(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool, peerID string, weight int, hopAuth string) *Backend {
 	u, err := url.Parse(peerBaseURL)
 	if err != nil {
 		log.Printf("peer backend: bad URL %q: %v", peerBaseURL, err)
@@ -1358,6 +1425,9 @@ func makePeerBackend(peerBaseURL, routeHost, pathPrefix string, stripPrefix bool
 			req.URL.Path = pathPrefix + req.URL.Path
 		}
 		req.Header.Set(PeerHopHeader, "1")
+		if hopAuth != "" && abStamped(req) {
+			req.Header.Set(PeerAuthHeader, hopAuth)
+		}
 	}
 	if weight < 1 {
 		weight = 1

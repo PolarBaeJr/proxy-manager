@@ -71,6 +71,40 @@ const (
 	// of excluding it; the canary still serves everything reachable through
 	// its own default label-managed route exactly as before.
 	labelCanary = "proxy.canary"
+
+	// A/B test labels, written by the dashboard on B replicas only. See
+	// abtest.go and docs/AB_TESTING_PLAN.md §2 for values and bounds.
+	labelABVariant          = "proxy.ab.variant"
+	labelABID               = "proxy.ab.id"
+	labelABAssign           = "proxy.ab.assign"
+	labelABSplit            = "proxy.ab.split"
+	labelABGroups           = "proxy.ab.groups"
+	labelABUIDCookie        = "proxy.ab.uid_cookie"
+	labelABGroupCookie      = "proxy.ab.group_cookie"
+	labelABAnon             = "proxy.ab.anon"
+	labelABSessionIdle      = "proxy.ab.session_idle"
+	labelABPinRefresh       = "proxy.ab.pin_refresh"
+	labelABMaxSession       = "proxy.ab.max_session"
+	labelABStarted          = "proxy.ab.started"
+	labelABEpoch            = "proxy.ab.epoch"
+	labelABPhase            = "proxy.ab.phase"
+	labelABPhaseAt          = "proxy.ab.phase_at"
+	labelABAbortReason      = "proxy.ab.abort_reason"
+	labelABExclude          = "proxy.ab.exclude"
+	labelABStatic           = "proxy.ab.static"
+	labelABCookieJS         = "proxy.ab.cookie_js"
+	labelABOverride         = "proxy.ab.override"
+	labelABAutoAbort        = "proxy.ab.autoabort"
+	labelABMinSamples       = "proxy.ab.min_samples"
+	labelABMinRuntime       = "proxy.ab.min_runtime"
+	labelABWarmup           = "proxy.ab.warmup"
+	labelABWindow           = "proxy.ab.window"
+	labelABWindows          = "proxy.ab.windows"
+	labelABWindowMinSamples = "proxy.ab.window_min_samples"
+	labelABErrDelta         = "proxy.ab.err_delta"
+	labelABErrRatio         = "proxy.ab.err_ratio"
+	labelABP95Ratio         = "proxy.ab.p95_ratio"
+	labelABP95Slack         = "proxy.ab.p95_slack"
 )
 
 // dockerClient is the proxy's READ-ONLY view of the Docker daemon.

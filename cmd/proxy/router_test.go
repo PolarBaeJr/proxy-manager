@@ -646,11 +646,11 @@ func TestPickHealthySkipsLearnedUnlessAllowed(t *testing.T) {
 	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{learned}}
 
 	for i := 0; i < 50; i++ {
-		if b := g.pickHealthy(nil, false); b != nil {
+		if b := g.pickHealthy(nil, false, ""); b != nil {
 			t.Fatal("pickHealthy(nil, false) returned a backend when the only eligible one is learned")
 		}
 	}
-	if b := g.pickHealthy(nil, true); b == nil || !b.Learned {
+	if b := g.pickHealthy(nil, true, ""); b == nil || !b.Learned {
 		t.Fatal("pickHealthy(nil, true) should fall through to the learned tier when no local backend exists")
 	}
 }
@@ -659,7 +659,7 @@ func TestPickHealthySkipsLearnedUnlessAllowed(t *testing.T) {
 // docs/PEER_MESH_PLAN.md specifies a peer is used only "when its own
 // backends for a route are unhealthy or absent" (failover), not load-balanced
 // alongside a working local backend. With one healthy local and one healthy
-// learned backend for the same route, pickHealthy(nil, true) must never
+// learned backend for the same route, pickHealthy(nil, true, "") must never
 // return the learned one while the local stays healthy; once the local is
 // marked unhealthy, it must fail over to the learned backend.
 func TestPickHealthyPrefersLocalOverLearned(t *testing.T) {
@@ -674,14 +674,14 @@ func TestPickHealthyPrefersLocalOverLearned(t *testing.T) {
 	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{local, learned}}
 
 	for i := 0; i < 200; i++ {
-		if b := g.pickHealthy(nil, true); b == nil || b.Learned {
+		if b := g.pickHealthy(nil, true, ""); b == nil || b.Learned {
 			t.Fatal("pickHealthy(nil, true) returned the learned backend while a healthy local backend exists")
 		}
 	}
 
 	local.markHealthy(false)
 	for i := 0; i < 50; i++ {
-		if b := g.pickHealthy(nil, true); b == nil || !b.Learned {
+		if b := g.pickHealthy(nil, true, ""); b == nil || !b.Learned {
 			t.Fatal("pickHealthy(nil, true) should fail over to the learned backend once the local one is unhealthy")
 		}
 	}
@@ -1333,16 +1333,16 @@ func TestPickAnyPanicModeFallback(t *testing.T) {
 	learned.markHealthy(false)
 	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{local, learned}}
 
-	if b := g.pickHealthy(nil, true); b != nil {
+	if b := g.pickHealthy(nil, true, ""); b != nil {
 		t.Fatalf("pickHealthy should return nil when everything is unhealthy, got %v", b.URL)
 	}
-	if b := g.pickAny(nil, true); b != local {
+	if b := g.pickAny(nil, true, ""); b != local {
 		t.Fatalf("pickAny(allowPeer=true) should prefer the local tier even when unhealthy, got %v", b)
 	}
-	if b := g.pickAny(map[*Backend]bool{local: true}, true); b != learned {
+	if b := g.pickAny(map[*Backend]bool{local: true}, true, ""); b != learned {
 		t.Fatalf("pickAny should fall through to the learned tier once local is skipped, got %v", b)
 	}
-	if b := g.pickAny(map[*Backend]bool{local: true}, false); b != nil {
+	if b := g.pickAny(map[*Backend]bool{local: true}, false, ""); b != nil {
 		t.Fatal("pickAny on a hopped request (allowPeer=false) must never select a Learned backend — loop prevention")
 	}
 }
@@ -1360,10 +1360,10 @@ func TestPickAnyStillHonorsDockerUnhealthyFloor(t *testing.T) {
 	fine.markHealthy(false)
 	g := &RouteGroup{Host: "h.example.org", Backends: []*Backend{sick, fine}}
 
-	if b := g.pickAny(nil, true); b != fine {
+	if b := g.pickAny(nil, true, ""); b != fine {
 		t.Fatalf("pickAny should skip the DockerUnhealthy backend and pick the other one, got %v", b)
 	}
-	if b := g.pickAny(map[*Backend]bool{fine: true}, true); b != nil {
+	if b := g.pickAny(map[*Backend]bool{fine: true}, true, ""); b != nil {
 		t.Fatal("pickAny must never select a DockerUnhealthy backend, even as the only thing left")
 	}
 }

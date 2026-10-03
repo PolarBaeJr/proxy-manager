@@ -94,6 +94,9 @@ func main() {
 	// refresh() below. ttl is a multiple of the sync interval so a route
 	// survives a couple of missed pushes before it's dropped.
 	routeStore := newPeerRouteStore(3 * *peerSyncInterval)
+	hopAuth := peerHopAuthToken(peerSecret)
+	routeStore.hopAuth = hopAuth
+	router.peerHopAuth = hopAuth
 
 	refresh := func() {
 		groups, backendsByService, err := assembleGroups(ctx, dc, *staticConfig)
@@ -178,7 +181,7 @@ func main() {
 
 	// Pass refresh into the metrics server so /refresh can be hit by the
 	// dashboard after it edits routes.json — saves a docker restart.
-	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot, ph)
+	metricsServer(*metricsAddr, metrics, access, refresh, router.Snapshot, router.RateLimitSnapshot, router.ABReport, ph)
 	log.Printf("metrics on %s/metrics — access log on %s/access", *metricsAddr, *metricsAddr)
 
 	go dc.streamEvents(ctx, func(action string) {
@@ -192,6 +195,7 @@ func main() {
 		}
 	})
 	go runHealthChecks(ctx, router)
+	go router.runABEvaluator(ctx)
 
 	log.Printf("proxy on %s", *addr)
 	handler := withAccessLog(withMetrics(router, metrics), access)

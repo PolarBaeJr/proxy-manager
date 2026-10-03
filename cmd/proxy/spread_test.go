@@ -33,7 +33,7 @@ func makeBackendForTest(raw string) *Backend {
 func pickCounts(g *RouteGroup, n int, allowPeer bool) map[string]int {
 	out := map[string]int{}
 	for i := 0; i < n; i++ {
-		b := g.pickHealthy(nil, allowPeer)
+		b := g.pickHealthy(nil, allowPeer, "")
 		if b == nil {
 			out["<nil>"]++
 			continue
@@ -94,7 +94,7 @@ func TestSpreadIsLocalOnlyForAlreadyHoppedRequest(t *testing.T) {
 	}
 
 	g.Backends[0].markHealthy(false)
-	if b := g.pickHealthy(nil, false); b != nil {
+	if b := g.pickHealthy(nil, false, ""); b != nil {
 		t.Errorf("pick = %v, want nil (503) rather than re-forwarding a hopped request", b.Container)
 	}
 }

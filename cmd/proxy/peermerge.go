@@ -52,6 +52,9 @@ type PeerRouteStore struct {
 	routes map[string]map[string]learnedRoute
 	ttl    time.Duration
 	now    func() time.Time // injectable for tests
+	// hopAuth is sent on every hop to a peer (see peerHopAuthToken); set
+	// once by main before the first overlay.
+	hopAuth string
 }
 
 func newPeerRouteStore(ttl time.Duration) *PeerRouteStore {
@@ -183,7 +186,7 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup, localBackendsByService ma
 				delete(peersForKey, peerID)
 				continue
 			}
-			b := makePeerBackend(lr.advertise, host, path, lr.stripPrefix, peerID, lr.weight)
+			b := makePeerBackendAuth(lr.advertise, host, path, lr.stripPrefix, peerID, lr.weight, s.hopAuth)
 			if b == nil {
 				continue
 			}
