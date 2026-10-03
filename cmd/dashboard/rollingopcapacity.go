@@ -97,33 +97,42 @@ func peerHealthyReplicas(ctx context.Context, registry *PeerRegistry, secret, na
 // less than peersConfigured — see peerHealthyReplicas — so total can
 // undercount a mesh with an unreachable peer; callers must not treat total
 // as a confirmed mesh-wide count unless peersReachable == peersConfigured.
-func totalHealthyReplicas(ctx context.Context, dc *dockerClient, registry *PeerRegistry, peerSecret, name string) (local, total, peersReachable, peersConfigured int, err error) {
+// overlap reports whether the local service is proxy.overlap-enabled, in
+// which case the peers are not asked at all.
+func totalHealthyReplicas(ctx context.Context, dc *dockerClient, registry *PeerRegistry, peerSecret, name string) (local, total, peersReachable, peersConfigured int, overlap bool, err error) {
 	svcs, err := dc.listServices(ctx)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, false, err
 	}
 	for _, s := range svcs {
 		if s.Name == name {
 			local += healthyNonCanaryReplicas(s)
+			overlap = overlap || s.Overlap
 		}
 	}
 	total = local
+	if overlap {
+		return local, total, 0, 0, true, nil
+	}
 	if registry != nil {
 		peerHealthy, reachable, configured := peerHealthyReplicas(ctx, registry, peerSecret, name)
 		total += peerHealthy
 		peersReachable, peersConfigured = reachable, configured
 	}
-	return local, total, peersReachable, peersConfigured, nil
+	return local, total, peersReachable, peersConfigured, false, nil
 }
 
 // ensureRollingReplaceCapacity refuses to let a rolling-replace start unless
 // name has at least minHealthyReplicasForRollingReplace healthy replicas
 // across the mesh. On a Docker/list error from the LOCAL count, it fails
 // open (returns nil) — matching this codebase's existing convention of not
-// blocking a mutation on a transient inspect error.
+// blocking a mutation on a transient inspect error. A proxy.overlap service
+// is exempt: replaceServiceRolling runs it as an overlap recreate (the new
+// copy is health-gated before the old one drains), so it never has zero
+// copies either.
 func ensureRollingReplaceCapacity(ctx context.Context, dc *dockerClient, registry *PeerRegistry, peerSecret, name string) error {
-	local, total, peersReachable, peersConfigured, err := totalHealthyReplicas(ctx, dc, registry, peerSecret, name)
-	if err != nil {
+	local, total, peersReachable, peersConfigured, overlap, err := totalHealthyReplicas(ctx, dc, registry, peerSecret, name)
+	if err != nil || overlap {
 		return nil
 	}
 	if total < minHealthyReplicasForRollingReplace {
@@ -136,7 +145,7 @@ func ensureRollingReplaceCapacity(ctx context.Context, dc *dockerClient, registr
 		default:
 			caveat = fmt.Sprintf("only %d of %d configured peer(s) answered — an unreachable or slow peer would undercount this, so confirm peer connectivity before retrying", peersReachable, peersConfigured)
 		}
-		return fmt.Errorf("refusing rolling-replace of %q: only %d healthy replica(s) found across the mesh (minimum %d required) — %d locally; %s, or use replace_service if you accept the non-health-gated risk", name, total, minHealthyReplicasForRollingReplace, local, caveat)
+		return fmt.Errorf("refusing rolling-replace of %q: only %d healthy replica(s) found across the mesh (minimum %d required) — %d locally; %s, or set proxy.overlap on a proxy.unscalable service, or use replace_service if you accept the non-health-gated risk", name, total, minHealthyReplicasForRollingReplace, local, caveat)
 	}
 	return nil
 }

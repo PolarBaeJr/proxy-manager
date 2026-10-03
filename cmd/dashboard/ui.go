@@ -2957,8 +2957,37 @@ async function lifecycleReplica(svc, member, act, host) {
   const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
   try {
     if (act === 'restart') {
-      // Forwards host to both legs — stop/start already forward correctly
-      // through the peer-write mesh, restart is just two calls to them.
+      const base = '/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member);
+      let r = null;
+      try {
+        r = await api(base + '/restart' + hostParam, { method:'POST' });
+      } catch (e) {
+        // Only a route-level 404 means an older peer without /restart —
+        // fall through to its two-call stop+start below.
+        if (!(e.status === 404 && /page not found/.test(e.message))) throw e;
+      }
+      if (r && r.mode === 'overlap') {
+        // proxy.overlap: a new copy is health-gated before the old one is
+        // drained — a background job, polled like a rolling replace.
+        toast('restarting ' + member + ' with overlap…', 'ok');
+        for (;;) {
+          await new Promise(res => setTimeout(res, 2500));
+          const st = await api('/api/services/' + encodeURIComponent(svc) + '/rolling-replace' + hostParam);
+          if (st.status === 'completed') { toast('restarted ' + member + ' (overlap)' + (st.note ? ' — ' + st.note : ''), 'ok'); break; }
+          if (st.status === 'failed') { toast('overlap restart failed: ' + (st.last_error || 'unknown error'), 'err'); break; }
+        }
+        _lastServicesHash = '';
+        renderActive();
+        return;
+      }
+      if (r) {
+        toast('restarted ' + member, 'ok');
+        _lastServicesHash = '';
+        renderActive();
+        return;
+      }
+      // Older-peer fallback. Forwards host to both legs — stop/start already
+      // forward correctly through the peer-write mesh.
       await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/stop' + hostParam, { method:'POST' });
       try {
         await api('/api/services/' + encodeURIComponent(svc) + '/replicas/' + encodeURIComponent(member) + '/start' + hostParam, { method:'POST' });

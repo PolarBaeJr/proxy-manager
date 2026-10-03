@@ -458,7 +458,8 @@ func TestReplaceServiceEnvConflictSurfaces(t *testing.T) {
 	}
 }
 
-// restart is stop immediately followed by start, in that order, and the tool
+// Against an older peer without /restart (route-level 404), restart falls
+// back to stop immediately followed by start, in that order, and the tool
 // returns start's result — the caller cares about the end state.
 func TestRestartReplicaStopsThenStarts(t *testing.T) {
 	prev := internalToken
@@ -468,6 +469,10 @@ func TestRestartReplicaStopsThenStarts(t *testing.T) {
 	var calls []string
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		if strings.HasSuffix(r.URL.Path, "/restart") {
+			http.NotFound(w, r)
+			return
+		}
 		w.WriteHeader(200)
 		if strings.HasSuffix(r.URL.Path, "/start") {
 			w.Write([]byte(`{"status":"started"}`))
@@ -485,8 +490,8 @@ func TestRestartReplicaStopsThenStarts(t *testing.T) {
 	if r["isError"] == true {
 		t.Fatalf("tool errored: %v", r["content"])
 	}
-	want := []string{"POST /api/services/app/replicas/m1/stop", "POST /api/services/app/replicas/m1/start"}
-	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+	want := []string{"POST /api/services/app/replicas/m1/restart", "POST /api/services/app/replicas/m1/stop", "POST /api/services/app/replicas/m1/start"}
+	if len(calls) != 3 || calls[0] != want[0] || calls[1] != want[1] || calls[2] != want[2] {
 		t.Fatalf("calls = %v, want %v", calls, want)
 	}
 	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
@@ -495,7 +500,7 @@ func TestRestartReplicaStopsThenStarts(t *testing.T) {
 	}
 }
 
-// If stop fails, restart must not attempt start.
+// If the fallback's stop fails, restart must not attempt start.
 func TestRestartReplicaStopFailureSkipsStart(t *testing.T) {
 	prev := internalToken
 	internalToken = "pmt_internal_test"
@@ -504,6 +509,10 @@ func TestRestartReplicaStopFailureSkipsStart(t *testing.T) {
 	var calls []string
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		if strings.HasSuffix(r.URL.Path, "/restart") {
+			http.NotFound(w, r)
+			return
+		}
 		w.WriteHeader(500)
 		w.Write([]byte(`stop failed`))
 	})
@@ -517,8 +526,8 @@ func TestRestartReplicaStopFailureSkipsStart(t *testing.T) {
 	if r["isError"] != true {
 		t.Fatalf("expected error, got %v", res)
 	}
-	if len(calls) != 1 {
-		t.Fatalf("calls = %v, want just the stop attempt", calls)
+	if len(calls) != 2 {
+		t.Fatalf("calls = %v, want just the restart and stop attempts", calls)
 	}
 }
 
@@ -599,6 +608,10 @@ func TestRestartReplicaStartFailureSaysStopped(t *testing.T) {
 	t.Cleanup(func() { internalToken = prev })
 
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/restart") {
+			http.NotFound(w, r)
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/start") {
 			w.WriteHeader(500)
 			w.Write([]byte(`start failed`))
@@ -845,8 +858,8 @@ func TestHostParamAppendedWhenPeerWritesAllowed(t *testing.T) {
 		})
 	}
 
-	// restart_replica with action=restart calls twice (stop then start),
-	// both of which must carry the host param.
+	// restart_replica with action=restart is one server-side restart call,
+	// which must carry the host param.
 	t.Run("restart_replica restart", func(t *testing.T) {
 		c, calls := stubDash(t, 200, `{"ok":true}`)
 		s := NewServer("t", "v")
@@ -856,11 +869,8 @@ func TestHostParamAppendedWhenPeerWritesAllowed(t *testing.T) {
 		if r := res["result"].(map[string]any); r["isError"] == true {
 			t.Fatalf("tool errored: %v", r["content"])
 		}
-		want := []string{
-			"POST /api/services/app/replicas/m1/stop?host=peer-b",
-			"POST /api/services/app/replicas/m1/start?host=peer-b",
-		}
-		if len(*calls) != 2 || (*calls)[0] != want[0] || (*calls)[1] != want[1] {
+		want := []string{"POST /api/services/app/replicas/m1/restart?host=peer-b"}
+		if len(*calls) != 1 || (*calls)[0] != want[0] {
 			t.Fatalf("calls = %v, want %v", *calls, want)
 		}
 	})

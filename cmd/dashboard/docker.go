@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +41,7 @@ const (
 	labelAutoUpdate = "proxy.autoupdate"     // "true" → engine replaces on newer registry digest
 	labelHealth     = "proxy.health"         // optional HTTP health-check path, e.g. "/healthz"
 	labelDrain      = "proxy.drain"          // seconds a replica gets to finish in-flight work on stop (default 30, max 300)
+	labelOverlap    = "proxy.overlap"        // "true" on an unscalable service → recreates start the new copy, health-gate it, then drain the old
 	// labelMaintPage lives in maintpage.go, next to the sync that consumes it.
 
 	// ociImageLabelPrefix marks labels that describe the IMAGE (baked in by
@@ -289,6 +291,11 @@ type cloneSpec struct {
 	Healthcheck    *healthcheckSpec
 	ManagedAliases []string            // custom aliases to reassert on the managed network's own endpoint
 	ExtraNetworks  []networkAttachment // non-managed networks + aliases to reconnect after create
+	// VolumeDests are the Destinations of every Type "volume" entry in
+	// inspect's top-level Mounts — including image VOLUMEs and Binds-declared
+	// volumes, which never show up in HostConfig.Mounts. Read only by
+	// anonymousVolumes; a recreate does not consume it.
+	VolumeDests []string
 }
 
 // networkAttachment is one non-managed docker network a container is
@@ -639,6 +646,10 @@ func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSp
 		HostConfig struct {
 			Mounts []mountSpec `json:"Mounts"`
 		} `json:"HostConfig"`
+		Mounts []struct {
+			Type        string `json:"Type"`
+			Destination string `json:"Destination"`
+		} `json:"Mounts"`
 		Config struct {
 			Healthcheck *healthcheckSpec `json:"Healthcheck"`
 		} `json:"Config"`
@@ -672,6 +683,11 @@ func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSp
 	}
 
 	spec := cloneSpec{Mounts: resp.HostConfig.Mounts, Healthcheck: resp.Config.Healthcheck}
+	for _, m := range resp.Mounts {
+		if m.Type == "volume" {
+			spec.VolumeDests = append(spec.VolumeDests, m.Destination)
+		}
+	}
 	for name, net := range resp.NetworkSettings.Networks {
 		aliases := filterSelf(net.Aliases)
 		if name == managedNetwork {
@@ -1035,6 +1051,7 @@ type Service struct {
 	Path       string `json:"path,omitempty"`
 	Replicas   int    `json:"replicas"`
 	Unscalable bool   `json:"unscalable,omitempty"`
+	Overlap    bool   `json:"overlap,omitempty"` // proxy.overlap on an unscalable service (overlapEnabled)
 	// Weight is proxy.weight, the per-replica routing weight within the
 	// proxy's pool for this route — and, since the peer mesh advertises the
 	// sum of them, this service's share of cross-host spread traffic too.
@@ -1163,6 +1180,7 @@ func (c *dockerClient) listServices(ctx context.Context) ([]Service, error) {
 			s.Port = port
 			s.Path = ct.Labels[labelPath]
 			s.Unscalable = ct.Labels[labelUnscalable] == "true"
+			s.Overlap = overlapEnabled(ct.Labels)
 			s.Weight = parseWeightLabel(ct.Labels[labelWeight])
 			s.PreviousImage = ct.Labels[labelPrevImage]
 			s.AutoUpdate = ct.Labels[labelAutoUpdate] == "true"
@@ -1540,6 +1558,71 @@ type replaceTemplate struct {
 	startIdx  int
 }
 
+func (t *replaceTemplate) overlap() bool { return overlapEnabled(t.tplSet[0].Labels) }
+
+// overlapEnabled reports whether a container's labels opt it into overlap
+// recreates: proxy.overlap only means anything on a proxy.unscalable
+// service — a scalable one already has rolling replace.
+func overlapEnabled(labels map[string]string) bool {
+	return labels[labelUnscalable] == "true" && strings.EqualFold(strings.TrimSpace(labels[labelOverlap]), "true")
+}
+
+// overlapRefresh tells the proxy about the new copy the moment it passes its
+// health gate, before the old one is drained — a freshly labeled container
+// can 503 until the proxy re-reads. A package var only so tests can record
+// it instead of POSTing to a real proxy.
+var overlapRefresh = func() { proxyRefresh(proxyURLFromEnv()) }
+
+// anonymousVolumes lists the volume mount destinations a recreate would
+// hand a fresh, empty volume: Docker-named volumes (image VOLUMEs, an
+// anonymous --mount) and any volume not carried forward by a named/bind
+// HostConfig.Mounts entry. A stop/start keeps them; any recreate loses them.
+func anonymousVolumes(clone cloneSpec) []string {
+	covered := map[string]bool{}
+	var out []string
+	for _, m := range clone.Mounts {
+		if m.Type == "volume" && m.Source == "" {
+			out = append(out, m.Target)
+			continue
+		}
+		if m.Source != "" {
+			covered[m.Target] = true
+		}
+	}
+	for _, d := range clone.VolumeDests {
+		if !covered[d] && !slices.Contains(out, d) {
+			out = append(out, d)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hasHealthSignal reports whether a new copy with this healthcheck and these
+// labels can be proven ready by waitReplicaReady rather than passing it
+// vacuously: a real Docker HEALTHCHECK (inspect's Config.Healthcheck already
+// includes one inherited from the image) or a proxy.health probe path.
+func hasHealthSignal(hc *healthcheckSpec, labels map[string]string) bool {
+	if hc != nil && len(hc.Test) > 0 && hc.Test[0] != "NONE" {
+		return true
+	}
+	return strings.TrimSpace(labels[labelHealth]) != ""
+}
+
+// refuseUnsafeOverlap is the guard every overlap recreate runs before
+// creating anything. It never falls back to stop/start: an operator who set
+// proxy.overlap asked for the overlap, and silently doing something else
+// would hide why the next restart dropped traffic.
+func refuseUnsafeOverlap(name string, clone cloneSpec, newLabels map[string]string) error {
+	if anon := anonymousVolumes(clone); len(anon) > 0 {
+		return fmt.Errorf("proxy.overlap: %s has anonymous volumes (%s) that a recreate would lose; use a named volume or remove proxy.overlap", name, strings.Join(anon, ", "))
+	}
+	if !hasHealthSignal(clone.Healthcheck, newLabels) {
+		return fmt.Errorf("proxy.overlap requires a HEALTHCHECK or proxy.health so the new copy is proven ready (%s has neither)", name)
+	}
+	return nil
+}
+
 // prepareReplaceTemplate resolves everything a label-managed service replace
 // needs up front — the live/template container sets, the host-config-drop
 // refusal check, merged env, the pulled image, the new containers' labels,
@@ -1679,7 +1762,9 @@ func (c *dockerClient) prepareReplaceTemplate(ctx context.Context, name string, 
 		}
 		newLabels[k] = v
 	}
-	if tpl.Image != "" && tpl.Image != req.Image {
+	// A restart recreates on the same reference — whatever proxy.previous_image
+	// the template already carries stays the rollback target.
+	if tpl.Image != "" && tpl.Image != req.Image && opts.kind != rollingKindRestart {
 		newLabels[labelPrevImage] = tpl.Image
 	}
 
@@ -1706,6 +1791,9 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 	tpl, err := c.prepareReplaceTemplate(ctx, name, req, rollingOpts{})
 	if err != nil {
 		return err
+	}
+	if tpl.overlap() {
+		return c.rollOverlap(ctx, name, req.Image, tpl)
 	}
 
 	var newIDs []string
@@ -1851,7 +1939,51 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 	if err != nil {
 		return err
 	}
+	// An operator rolling replace or an overlap restart of a proxy.overlap
+	// service is an overlap recreate too — same refusals, same early proxy
+	// refresh. Central env propagation (pinnedEnv) keeps its own contract.
+	if opts.kind == rollingKindRestart && !tpl.overlap() {
+		return fmt.Errorf("%q is no longer proxy.overlap-enabled — not restarting by recreate", name)
+	}
+	if tpl.overlap() && opts.pinnedEnv == nil {
+		if err := refuseUnsafeOverlap(name, tpl.clone, tpl.newLabels); err != nil {
+			return err
+		}
+		// A singleton must never be left with a broken second copy.
+		opts.removeOnGateFailure = true
+		if opts.onReady == nil {
+			opts.onReady = func(string) { overlapRefresh() }
+		}
+	}
+	return c.rollTemplate(ctx, name, req.Image, tpl, progress, opts)
+}
 
+// rollOverlap is the synchronous overlap recreate behind replaceService and
+// the label setters: refuse if unsafe, then surge-of-one with the new copy
+// removed if it never becomes healthy (the old one keeps serving). Detached
+// from ctx's cancellation — a caller disconnecting mid-gate must not strand
+// a half-swapped singleton — but bounded by rollingOpTimeout.
+func (c *dockerClient) rollOverlap(ctx context.Context, name, image string, tpl *replaceTemplate) error {
+	if err := refuseUnsafeOverlap(name, tpl.clone, tpl.newLabels); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollingOpTimeout)
+	defer cancel()
+	err := c.rollTemplate(ctx, name, image, tpl, nil, rollingOpts{
+		removeOnGateFailure: true,
+		onReady:             func(string) { overlapRefresh() },
+	})
+	if err == nil {
+		overlapRefresh()
+	}
+	return err
+}
+
+// rollTemplate is replaceServiceRolling's swap loop over an already-resolved
+// template, shared with the overlap recreate paths (replaceService and the
+// label setters), which build their template differently but need the same
+// create → health gate → drain order.
+func (c *dockerClient) rollTemplate(ctx context.Context, name, image string, tpl *replaceTemplate, progress func(done, total int, replicaName, verdict string), opts rollingOpts) error {
 	total := len(tpl.tplSet)
 	if progress != nil {
 		progress(0, total, "", "")
@@ -1860,7 +1992,7 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 	for i, old := range tpl.tplSet {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, tpl.startIdx+i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image:          req.Image,
+			Image:          image,
 			Labels:         tpl.newLabels,
 			Env:            tpl.env,
 			Healthcheck:    tpl.clone.Healthcheck,
@@ -1878,13 +2010,20 @@ func (c *dockerClient) replaceServiceRolling(ctx context.Context, name string, r
 		if err := c.waitReplicaReady(ctx, name, id); err != nil {
 			if opts.removeOnGateFailure {
 				// Its predecessor is still running and serving — the failed
-				// new one would only add a broken backend to the pool.
-				_ = c.stopContainer(ctx, id)
-				if rmErr := c.removeContainer(ctx, id); rmErr != nil {
+				// new one would only add a broken backend to the pool. On a
+				// context that may itself be what failed the gate, so the
+				// cleanup can't be cut short and leave an orphan behind.
+				cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				_ = c.stopContainer(cctx, id)
+				if rmErr := c.removeContainer(cctx, id); rmErr != nil {
 					log.Printf("rolling-replace %s: failed to remove unhealthy new %s: %v", name, cname, rmErr)
 				}
+				ccancel()
 			}
 			return errReplicaGateFailed{err: fmt.Errorf("replaced %d/%d replicas, then failed on %s: %w", i, total, cname, err)}
+		}
+		if opts.onReady != nil {
+			opts.onReady(id)
 		}
 
 		if err := c.drainStopRemove(ctx, old); err != nil {
@@ -1958,6 +2097,9 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 	// startIdx still scans the full existing set — see replaceService's
 	// identical comment on why naming must consider stale containers too.
 	startIdx := nextReplicaIndex(existing, name)
+	if overlapEnabled(tpl.Labels) || overlapEnabled(newLabels) {
+		return c.rollOverlap(ctx, name, tpl.Image, &replaceTemplate{existing: existing, tplSet: tplSet, env: tc.env, clone: tc.clone, newLabels: newLabels, startIdx: startIdx})
+	}
 	var newIDs []string
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
@@ -2039,6 +2181,9 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 	// startIdx still scans the full existing set — see replaceService's
 	// identical comment on why naming must consider stale containers too.
 	startIdx := nextReplicaIndex(existing, name)
+	if overlapEnabled(tpl.Labels) || overlapEnabled(newLabels) {
+		return c.rollOverlap(ctx, name, tpl.Image, &replaceTemplate{existing: existing, tplSet: tplSet, env: tc.env, clone: tc.clone, newLabels: newLabels, startIdx: startIdx})
+	}
 	var newIDs []string
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
@@ -2148,6 +2293,9 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 	// startIdx still scans the full existing set — see replaceService's
 	// identical comment on why naming must consider stale containers too.
 	startIdx := nextReplicaIndex(existing, name)
+	if overlapEnabled(tpl.Labels) || overlapEnabled(newLabels) {
+		return c.rollOverlap(ctx, name, tpl.Image, &replaceTemplate{existing: existing, tplSet: tplSet, env: tc.env, clone: tc.clone, newLabels: newLabels, startIdx: startIdx})
+	}
 	var newIDs []string
 	for i := 0; i < len(tplSet); i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx+i)
