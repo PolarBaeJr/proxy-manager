@@ -263,6 +263,8 @@ Drained, for variant v:
 - or `now ≥ phase_at + max_session` (the server-side deadline, capped at 24h by default).
 - If a proxy is unreachable, only the deadline applies.
 - `force` skips the wait.
+- As built (PR3): the idle path is trusted only when every proxy (local + each peer via `/peer/ab`) is reachable, lists this test id, and reports `tracking_since` (when it began tracking pins for the id). The idle clock runs from `max(last_pinned_at, latest tracking_since)`, so a restarted proxy's empty pin table can't end a drain early. `last_pinned_at` is the max ever observed, persisted in the record (`pinned_max_a/b`). Anything less → deadline only.
+- Finalize promote first rolls every peer running the service onto B's image (see §3, promote-replace), one peer at a time, health-gated; a peer failure leaves the promote pending for `Run` to retry (peers already done are skipped).
 
 ### 1.11 Split and groups changes
 
@@ -270,6 +272,7 @@ Drained, for variant v:
 - They bump `epoch`, so warm-up restarts.
 - Existing pins stay; new sessions see the change.
 - Reset issues a new id and invalidates every pin, so it is allowed only once B is drained (or with force).
+- As built (PR3): B replicas get fixed-width names (`goproxy-<svc>-canary-NNNNNN`) and a reset's new id sorts after the old one. The proxy reads config from the B replica with the smallest (id, name), so during a surge the pick stays on an old replica and switches once, to a new replica that already passed its gate.
 
 ### 1.12 Dashboard guards while a test is active
 
@@ -278,12 +281,12 @@ Drained, for variant v:
 
 | Action | During a test |
 |---|---|
-| replace, rolling-replace, spread | 409 |
+| replace, rolling-replace, spread, stage, rollout | 409 (stage/rollout also guarded explicitly, not just via the canary check — B may run on a peer) |
 | plain promote / `DELETE /canary` on an A/B canary | 409 "use the A/B endpoints" |
-| stage, rollout, weight | already refused (a canary exists) |
-| scale A | allowed. VERIFY template selection never clones a B/canary replica. |
+| weight | already refused (a canary exists) |
+| scale A | allowed (templates from live replicas only, never a B/canary) |
 | autoupdate | deferred |
-| central env edit | ACCEPTED, propagation deferred (`waitIdle` treats `abActive` as busy); runs after finalize |
+| central env edit | ACCEPTED, stored; propagation ends as `deferred_ab_test` (checked under the service claim, origin and peer side) and is re-requested after finalize |
 | central env adopt / release | 409 |
 | onboarded services | A/B refused in v1 |
 
@@ -348,7 +351,10 @@ Dashboard REST under `/api/services/{name}/`:
   - merged stats {A,B: requests, errors, error_rate, p50_ms, p95_ms}, windows, per_host;
   - abort, hint (z-test on error rate), env_pending_version, history.
 - `POST ab/split`, `ab/groups`, `ab/abort`, `ab/promote {force, confirm_aborted}`, `ab/discard {force}`, `ab/reset {force}`.
-- New read-only `GET /peer/ab?service=`: bearer `DASHBOARD_PEER_SECRET`, relays the local proxy's `/ab`.
+- As built (PR3): every POST is async — it persists the intended record and answers `202` with `{id, phase, pending, op}`; container work runs in the background. Poll `GET ab`: `op` clears once applied, `last_error` says why not.
+- New read-only `GET /peer/ab?service=`: bearer `DASHBOARD_PEER_SECRET`, relays the local proxy's `/ab`. `GET /peer/services/{name}/ab` also needs only the secret.
+- New `POST /peer/services/{name}/ab/promote-replace` (secret + `-peer-writes`), body `{id, image}`: the owner's promote asks a peer to rolling-replace its A replicas onto B's image. Refused unless the peer's own proxy lists that test id (not discarding) and the peer doesn't hold B itself. Poll the peer's `GET .../rolling-replace`.
+- Proxy `/ab` gained `tracking_since` per experiment (unix s) for the drain rule above.
 
 ## 4. PR scopes
 

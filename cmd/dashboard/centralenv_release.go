@@ -50,6 +50,9 @@ func startCentralEnvRelease(r *http.Request, ce *centralEnv, svc, actor string) 
 	if !ok {
 		return nil, errCentralEnvNotFound
 	}
+	if ce.sync.dc.abActive(r.Context(), svc) {
+		return nil, errABActive{Service: svc, Hint: "release central env after it ends"}
+	}
 	if rec.State != centralEnvStateReleasing {
 		if err := ce.store.SetState(svc, centralEnvStateReleasing); err != nil {
 			return nil, err

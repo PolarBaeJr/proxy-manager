@@ -738,7 +738,10 @@ func writeCentralEnvErr(w http.ResponseWriter, err error) {
 	var failedHere errCentralEnvFailedHere
 	var cacheFailed errCentralEnvCacheFailed
 	var fwd errCentralEnvPeerForward
+	var ab errABActive
 	switch {
+	case errors.As(err, &ab):
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.As(err, &unknown):
 		httpx.WriteJSON(w, http.StatusGatewayTimeout, map[string]any{"error": err.Error(), "request_id": unknown.RequestID})
 	case errors.As(err, &relay):

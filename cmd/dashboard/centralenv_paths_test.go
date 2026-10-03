@@ -35,6 +35,9 @@ type cenvFakeDocker struct {
 	// onCreate, when set, is called (outside the lock) with every created
 	// container's name — the mesh tests' cross-host ordering log.
 	onCreate func(name string)
+	// onMutate, when set, is called (outside the lock) after every create,
+	// stop and remove — how the A/B relabel test samples the proxy's pick.
+	onMutate func()
 	// createErr, when set and returning non-empty, fails a create with that
 	// text as Docker's error body — how the leak test makes a Docker error
 	// echo env.
@@ -177,10 +180,13 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 			}
 			f.items[id] = ct
 			f.inspect[id] = cenvInspect{env: body.Env, health: body.Healthcheck, edge: aliases, networks: map[string][]string{}, restart: body.HostConfig.RestartPolicy.Name}
-			onCreate := f.onCreate
+			onCreate, onMutate := f.onCreate, f.onMutate
 			f.mu.Unlock()
 			if onCreate != nil {
 				onCreate(name)
+			}
+			if onMutate != nil {
+				onMutate()
 			}
 			json.NewEncoder(w).Encode(map[string]string{"Id": id})
 		case r.Method == http.MethodPost && strings.Contains(p, "/networks/") && strings.HasSuffix(p, "/connect"):
@@ -207,14 +213,22 @@ func (f *cenvFakeDocker) client(t *testing.T) *dockerClient {
 					c.State = "exited"
 					f.items[id] = c
 				}
+				onMutate := f.onMutate
 				f.mu.Unlock()
+				if onMutate != nil {
+					onMutate()
+				}
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodDelete && strings.Contains(p, "/containers/"):
 			id := idFromContainersPath(p)
 			f.mu.Lock()
 			delete(f.items, id)
+			onMutate := f.onMutate
 			f.mu.Unlock()
+			if onMutate != nil {
+				onMutate()
+			}
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodGet && strings.Contains(p, "/containers/") && strings.HasSuffix(p, "/json"):
 			id := idFromContainersPath(p)
@@ -335,7 +349,7 @@ func cenvPaths() []cenvPath {
 		{name: "setWeightLabel", run: func(ctx context.Context, dc *dockerClient) error { return dc.setWeightLabel(ctx, "app", 3) },
 			wantLabel: func(l map[string]string) { l[labelWeight] = "3" }},
 		{name: "createCanaryReplicas", run: func(ctx context.Context, dc *dockerClient) error {
-			return dc.createCanaryReplicas(ctx, "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, 1)
+			return dc.createCanaryReplicas(ctx, "app", ReplaceServiceRequest{Image: "ghcr.io/org/app:v2"}, 1, nil)
 		}, wantLabel: func(l map[string]string) { l[labelCanary] = "true"; l[labelPrevImage] = "ghcr.io/org/app:v1" }},
 		{name: "scaleCanary", canary: true, fromCanary: true, run: func(ctx context.Context, dc *dockerClient) error { return dc.scaleCanary(ctx, "app", 2) }},
 		{name: "promoteCanary", canary: true, fromCanary: true, run: func(ctx context.Context, dc *dockerClient) error { return dc.promoteCanary(ctx, "app") }},
@@ -558,8 +572,10 @@ func TestCreatePathsManagedRefuseEnvEdits(t *testing.T) {
 		"replaceServiceRolling": func(dc *dockerClient) error {
 			return dc.replaceServiceRolling(context.Background(), "app", edit, nil, rollingOpts{})
 		},
-		"createCanaryReplicas": func(dc *dockerClient) error { return dc.createCanaryReplicas(context.Background(), "app", edit, 1) },
-		"stageCanary":          func(dc *dockerClient) error { return dc.stageCanary(context.Background(), "app", edit) },
+		"createCanaryReplicas": func(dc *dockerClient) error {
+			return dc.createCanaryReplicas(context.Background(), "app", edit, 1, nil)
+		},
+		"stageCanary": func(dc *dockerClient) error { return dc.stageCanary(context.Background(), "app", edit) },
 	}
 	for name, run := range runs {
 		t.Run(name, func(t *testing.T) {

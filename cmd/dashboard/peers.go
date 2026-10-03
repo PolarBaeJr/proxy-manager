@@ -542,7 +542,13 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 		rom = newRollingOpManager(dc)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if secret == "" || !writesEnabled {
+		sub := strings.TrimPrefix(r.URL.Path, "/peer/services/")
+		parts := strings.SplitN(sub, "/", 2)
+		name := parts[0]
+		// GET ab is the one read here: a peer's status view of this host's
+		// A/B test needs only the secret, not -peer-writes.
+		abRead := len(parts) == 2 && parts[1] == "ab" && r.Method == http.MethodGet
+		if secret == "" || (!writesEnabled && !abRead) {
 			http.NotFound(w, r)
 			return
 		}
@@ -552,9 +558,6 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		sub := strings.TrimPrefix(r.URL.Path, "/peer/services/")
-		parts := strings.SplitN(sub, "/", 2)
-		name := parts[0]
 		if name == "" {
 			http.NotFound(w, r)
 			return
@@ -574,6 +577,17 @@ func peerServicesMutateHandler(secret, identity string, dc *dockerClient, onb *O
 		// fails CLOSED (403) on a Docker error there too, not just on self==true.
 		if self, err := dc.serviceContainsSelfByName(r.Context(), name); err == nil && self {
 			http.Error(w, "refusing to manage the dashboard's own service from within itself — use docker compose on the host", http.StatusForbidden)
+			return
+		}
+		if len(parts) == 2 && parts[1] == "ab/promote-replace" && r.Method == http.MethodPost {
+			servePeerABPromoteReplace(w, r, dc, onb, registry, secret, rom, name)
+			return
+		}
+		if len(parts) == 2 && serveABAPI(w, r, dc, name, parts[1], "peer-mesh") {
+			return
+		}
+		if err := abGuard(r, dc, name, parts); err != nil {
+			writeABErr(w, err)
 			return
 		}
 		if len(parts) == 2 && parts[1] == "scale" && r.Method == http.MethodPost {

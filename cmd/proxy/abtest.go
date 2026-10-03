@@ -1756,6 +1756,10 @@ type abExperimentReport struct {
 	StaticFallbacks uint64                   `json:"static_fallbacks"`
 	Judge           abJudgeReport            `json:"judge"`
 	Peers           []abPeerReport           `json:"peers"`
+	// TrackingSince is when this proxy began tracking pins for this test id
+	// (unix s) — a restarted proxy starts over, so pinned.last_seen only
+	// proves "no pins" for the time since then.
+	TrackingSince int64 `json:"tracking_since"`
 	// Merged is what judge sees: this proxy plus every fresh, aligned peer.
 	Merged abMergedReport `json:"merged"`
 }
@@ -1802,6 +1806,7 @@ func (run *abRun) report() abExperimentReport {
 		StaticFallbacks: run.staticFallbacks,
 		Judge:           abJudgeReport{Status: run.verdict.Status, Streak: run.js.Streak},
 		Peers:           []abPeerReport{},
+		TrackingSince:   run.firstSeen,
 	}
 	windowsOut := func(ws []abWindow) []abWindowReport {
 		out := []abWindowReport{}

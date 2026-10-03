@@ -257,6 +257,10 @@ func serveCentralEnvAdoptLocal(w http.ResponseWriter, r *http.Request, ce *centr
 		httpx.WriteJSON(w, http.StatusOK, rep)
 		return
 	}
+	if ce.sync.dc.abActive(r.Context(), svc) {
+		writeCentralEnvErr(w, errABActive{Service: svc, Hint: "adopt central env after it ends"})
+		return
+	}
 	if req.RequestID == "" {
 		req.RequestID = newCentralEnvRequestID()
 	}
@@ -544,7 +548,10 @@ type centralEnvView struct {
 	// kept after later jobs replace Job, so a revert or a partial never
 	// silently drops out of view.
 	LastFailure *envSyncFailure `json:"last_failure,omitempty"`
-	Warnings    []string        `json:"warnings"`
+	// ABDeferred: the last propagation was held back by an A/B test — the
+	// version is stored and applies after the test (§0.8).
+	ABDeferred bool     `json:"ab_deferred,omitempty"`
+	Warnings   []string `json:"warnings"`
 }
 
 func hostViewFrom(ps peerCentralEnvStatus, capable bool, target uint64) centralEnvHostView {
@@ -644,6 +651,10 @@ func buildCentralEnvView(ctx context.Context, ce *centralEnv, svc string) (centr
 		view.Warnings = append(view.Warnings, j.Warnings...)
 		if j.Status == envSyncStatusPartial || j.Status == envSyncStatusFailedReverted || j.Status == envSyncStatusDegraded || j.Status == envSyncStatusFailed {
 			view.Warnings = append(view.Warnings, fmt.Sprintf("last propagation of v%d ended %s", j.Target, j.Status))
+		}
+		if j.Status == envSyncStatusDeferred {
+			view.ABDeferred = true
+			view.Warnings = append(view.Warnings, fmt.Sprintf("v%d applies after the A/B test", j.Target))
 		}
 	}
 	if f := view.LastFailure; f != nil && (view.Job == nil || view.Job.Target != f.Version || view.Job.Status != f.Status) {

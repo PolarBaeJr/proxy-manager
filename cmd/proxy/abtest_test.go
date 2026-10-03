@@ -1026,6 +1026,31 @@ func TestABPinnedTracking(t *testing.T) {
 	}
 }
 
+// TestABReportTrackingSince: /ab says since when this proxy has tracked
+// pins for the test id — a fresh run (restart, new id) starts over, a
+// config change under the same id does not.
+func TestABReportTrackingSince(t *testing.T) {
+	f := newABFixture(t, abLabels(), nil)
+	start := f.clk.now().Unix()
+	if rep := f.r.ABReport("svc").Experiments[0]; rep.TrackingSince != start {
+		t.Fatalf("tracking_since = %d, want %d", rep.TrackingSince, start)
+	}
+	f.clk.advance(time.Hour)
+	f.g.abCfg = parseABConfig(abLabels(labelABSplit, "50", labelABStarted, strconv.FormatInt(start, 10)), f.clk.now(), noWarn)
+	f.r.Set([]*RouteGroup{f.g})
+	if rep := f.r.ABReport("svc").Experiments[0]; rep.TrackingSince != start {
+		t.Fatalf("same id after relabel: tracking_since = %d, want %d", rep.TrackingSince, start)
+	}
+	// A fresh Router stands in for a restarted proxy.
+	r2 := &Router{now: f.clk.now}
+	g2 := &RouteGroup{Host: abTestHost, Service: "svc", Backends: []*Backend{newABSrv(t, abTestHost, "A").be, newABSrv(t, abTestHost, "B").be},
+		abCfg: parseABConfig(abLabels(labelABStarted, strconv.FormatInt(start, 10)), f.clk.now(), noWarn)}
+	r2.Set([]*RouteGroup{g2})
+	if rep := r2.ABReport("svc").Experiments[0]; rep.TrackingSince != f.clk.now().Unix() || rep.Pinned.B.LastSeen != 0 {
+		t.Fatalf("restarted proxy: tracking_since = %d last_seen = %d", rep.TrackingSince, rep.Pinned.B.LastSeen)
+	}
+}
+
 // ---- static retry (§1.7) ----
 
 func TestABStatic404Retry(t *testing.T) {

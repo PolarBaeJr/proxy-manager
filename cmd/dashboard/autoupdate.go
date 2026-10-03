@@ -178,6 +178,8 @@ func autoUpdateSkipReason(ctx context.Context, dc *dockerClient, svc Service, st
 		return "auto-update is off for this service"
 	case svc.Image == "":
 		return "no image recorded"
+	case svc.ABTest != nil:
+		return "an A/B test is running — it resumes after the test"
 	case svc.CanaryImage != "":
 		return "a canary is staged — promote or discard first"
 	case svc.AllStopped:
@@ -266,6 +268,14 @@ func (a *autoUpdater) runOnce(ctx context.Context) {
 			// where rom alone would look idle.
 			if !a.dc.claims.tryClaim(svc.Name, autoUpdateClaimOwner) {
 				log.Printf("autoupdate: %s — central env propagation in progress, deferring", svc.Name)
+				continue
+			}
+			// Checked holding the claim an A/B start also needs (§1.12). B
+			// on a peer has no local canary, so shouldAutoUpdate alone
+			// wouldn't see it.
+			if a.dc.abActive(ctx, svc.Name) {
+				a.dc.claims.release(svc.Name, autoUpdateClaimOwner)
+				log.Printf("autoupdate: %s — A/B test in progress, deferring", svc.Name)
 				continue
 			}
 		}
