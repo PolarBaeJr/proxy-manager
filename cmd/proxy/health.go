@@ -22,6 +22,11 @@ const (
 	healthCheckConcurrency = 8
 )
 
+// healthHTTPClient never keeps a probe connection alive, so a backend that
+// stops listening isn't left with pooled conns from its health checks. No
+// Timeout: checkBackend's context bounds each probe.
+var healthHTTPClient = &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DisableKeepAlives: true}}
+
 func runHealthChecks(ctx context.Context, r *Router) {
 	tick := time.NewTicker(healthInterval)
 	defer tick.Stop()
@@ -43,6 +48,9 @@ func runHealthChecks(ctx context.Context, r *Router) {
 func dispatchHealthChecks(ctx context.Context, groups []*RouteGroup, sem chan struct{}, wg *sync.WaitGroup) {
 	for _, g := range groups {
 		for _, b := range g.Backends {
+			if b.draining.Load() {
+				continue
+			}
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
@@ -68,7 +76,7 @@ func checkBackend(b *Backend) {
 
 	if b.HealthPath != "" {
 		req, _ := http.NewRequestWithContext(ctx, "GET", b.URL+b.HealthPath, nil)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := healthHTTPClient.Do(req)
 		if err != nil {
 			log.Printf("health check %s%s: %v (timeout budget %s) — recording failure", b.URL, b.HealthPath, err, healthTimeout)
 			b.recordHealthCheck(false)
