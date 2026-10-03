@@ -296,7 +296,7 @@ func parseUnix(v string) (int64, bool) {
 // parseABConfig parses the proxy.ab.* labels of a B replica. The caller has
 // already validated proxy.ab.variant and proxy.ab.id. Every other invalid
 // value is reported through warn (which dedups) and replaced by its default.
-// Peer-received config (PR2) must go through this same function.
+// Peer-received config goes through this same function (abmesh.go).
 func parseABConfig(labels map[string]string, now time.Time, warn func(key, val string)) *abConfig {
 	c := &abConfig{
 		ID:               labels[labelABID],
@@ -501,7 +501,7 @@ func parseABConfig(labels map[string]string, now time.Time, warn func(key, val s
 }
 
 // labels renders the normalized config back into label form — the shape
-// /ab exposes and PR2's peer payload will carry, so a receiver can re-run
+// /ab exposes and the peer payload carries, so a receiver can re-run
 // parseABConfig on it unchanged.
 func (c *abConfig) labels() map[string]string {
 	assign := c.Assign
@@ -732,7 +732,7 @@ type abWindow struct {
 }
 
 // abSummary is what judge() consumes: one proxy's cumulative counters and
-// its ring of recent windows. PR2 feeds peers' summaries in alongside.
+// its ring of recent windows. Fresh peers' summaries are fed in alongside.
 type abSummary struct {
 	Cumulative [2]abCounters
 	Windows    []abWindow
@@ -759,7 +759,7 @@ type abAbortInfo struct {
 	Reason string `json:"reason"`
 	Detail string `json:"detail,omitempty"`
 	At     int64  `json:"at"`
-	Source string `json:"source"` // "auto" (this proxy's latch) | "label"
+	Source string `json:"source"` // "auto" (this proxy's latch) | "peer" (a peer's latch) | "label"
 }
 
 // abRun is one test's runtime on this proxy, keyed by service in
@@ -787,10 +787,15 @@ type abRun struct {
 	staticFallbacks uint64
 	pinnedLast      [2]int64
 	pinnedNonces    [2]map[string]int64
+	// peers holds each peer's latest validated experiment for this test id
+	// (abmesh.go applyPeerAB); syncInterval is Router.peerSyncInterval.
+	peers        map[string]*abPeerSnap
+	syncInterval time.Duration
+	clock        func() time.Time
 }
 
 func newABRun(service, id string, now time.Time) *abRun {
-	run := &abRun{service: service, id: id, firstSeen: now.Unix()}
+	run := &abRun{service: service, id: id, firstSeen: now.Unix(), peers: map[string]*abPeerSnap{}}
 	run.resetRing()
 	for i := range run.pinnedNonces {
 		run.pinnedNonces[i] = map[string]int64{}
@@ -910,7 +915,10 @@ func (run *abRun) summaryLocked() abSummary {
 }
 
 // evaluate is one evaluator tick for this run: prune idle pins, then judge
-// while running with autoabort on and no latch yet.
+// while running with autoabort on and no latch yet, over this proxy's
+// summary plus every fresh, aligned peer's. With peers in the mesh a window
+// is judged only two sync intervals after it closes, so a peer's final push
+// for it has arrived.
 func (run *abRun) evaluate(now time.Time) {
 	run.mu.Lock()
 	defer run.mu.Unlock()
@@ -926,7 +934,11 @@ func (run *abRun) evaluate(now time.Time) {
 	if run.phase(cfg) != abPhaseRunning || !cfg.AutoAbort {
 		return
 	}
-	st, v := judge(cfg, run.js, run.summaryLocked(), nil, now)
+	judgeNow := now
+	if len(run.peers) > 0 {
+		judgeNow = now.Add(-2 * run.syncEvery())
+	}
+	st, v := judge(cfg, run.js, run.summaryLocked(), run.peerSummariesLocked(now), judgeNow)
 	run.js, run.verdict = st, v
 	if v.Abort {
 		run.latched.Store(true)
@@ -941,22 +953,11 @@ func (run *abRun) evaluate(now time.Time) {
 // proxy's summary and any peers' summaries, it returns the next state and a
 // verdict. Callers only invoke it while the effective phase is running.
 func judge(cfg *abConfig, st abJudgeState, own abSummary, peers []abSummary, now time.Time) (abJudgeState, abVerdict) {
-	var cum [2]abCounters
+	merged := abMergeSummaries(append([]abSummary{own}, peers...))
+	cum := merged.Cumulative
 	byIdx := map[int64]*abWindow{}
-	for _, s := range append([]abSummary{own}, peers...) {
-		for v := range cum {
-			cum[v].add(&s.Cumulative[v])
-		}
-		for _, w := range s.Windows {
-			m, ok := byIdx[w.Index]
-			if !ok {
-				m = &abWindow{Index: w.Index}
-				byIdx[w.Index] = m
-			}
-			for v := range m.V {
-				m.V[v].add(&w.V[v])
-			}
-		}
+	for i := range merged.Windows {
+		byIdx[merged.Windows[i].Index] = &merged.Windows[i]
 	}
 	cur := abWindowIndex(cfg, now)
 	if cur < 0 {
@@ -1113,6 +1114,8 @@ func (r *Router) reconcileAB(groups []*RouteGroup) {
 			run.cfg = cfg
 			run.attached = true
 			run.bLocal = bLocal[svc]
+			run.syncInterval = r.peerSyncInterval
+			run.clock = r.clock
 			run.mu.Unlock()
 		}
 		g.abCfg = cfg
@@ -1129,9 +1132,13 @@ type abDecision struct {
 	cfg      *abConfig
 	variant  string // "A" or "B": the session's variant
 	failover string // variant to fail over to, or "" for none
-	excluded bool
-	static   bool
-	record   bool
+	// failoverFrom is set on a peer's authenticated failover hop: the
+	// pinned variant the forwarder failed over from. variant is then the
+	// target, and the request is recorded as failover_<failoverFrom>.
+	failoverFrom string
+	excluded     bool
+	static       bool
+	record       bool
 }
 
 func abHash(id, value string) uint64 {
@@ -1272,7 +1279,7 @@ func abValidVariant(v string) (string, bool) {
 // abAssign runs the §1.3 precedence for a request to a group with a test.
 // It strips the client's X-Variant, queues the proxy's own cookies and the
 // Vary header, and returns the decision. Never logs request values.
-func (r *Router) abAssign(w http.ResponseWriter, req *http.Request, g *RouteGroup, origPath string, hopped, authHop bool) *abDecision {
+func (r *Router) abAssign(w http.ResponseWriter, req *http.Request, g *RouteGroup, origPath string, hopped, authHop, failoverHop bool) *abDecision {
 	cfg, run := g.abCfg, g.ab
 	now := r.clock()
 	phase := run.phase(cfg)
@@ -1304,10 +1311,17 @@ func (r *Router) abAssign(w http.ResponseWriter, req *http.Request, g *RouteGrou
 		d.excluded = true
 		return finish(abVariantA)
 	}
-	// 2. Authenticated peer hop with a well-formed variant.
+	// 2. Authenticated peer hop with a well-formed variant. A failover hop
+	// serves only the other variant (the forwarder already found none of
+	// the pinned one): no second failover, and hopped means no re-forward.
 	if authHop {
 		if v, ok := abValidVariant(incoming); ok {
 			d.record = !frozen
+			if failoverHop {
+				finish(abOther(v))
+				d.failover, d.failoverFrom = "", v
+				return d
+			}
 			return finish(v)
 		}
 	}
@@ -1558,7 +1572,17 @@ func (r *Router) abProxyToGroup(w http.ResponseWriter, req *http.Request, group 
 		if group.Sticky && !hopped {
 			setStickyCookie(w, group, b.stickyID)
 		}
+		// A hop to a peer running this test carries the session's variant.
+		// Sent to the peer's other pool (failover), it also carries
+		// abFailoverHeader so the peer serves that pool and records the
+		// request once, as failover. Any other peer (older binary, no or a
+		// different test) gets the served variant and no flag, as in PR1.
 		req.Header.Set(abVariantHeader, b.variantName())
+		req.Header.Del(abFailoverHeader)
+		if d.peerRuns(b) && b.variantName() != d.variant {
+			req.Header.Set(abVariantHeader, d.variant)
+			req.Header.Set(abFailoverHeader, "1")
+		}
 		if staticRetry {
 			stw := &abStaticWriter{ResponseWriter: sw, h: http.Header{}}
 			if !tryProxy(stw, req, b) {
@@ -1581,24 +1605,42 @@ func (r *Router) abProxyToGroup(w http.ResponseWriter, req *http.Request, group 
 		return
 	}
 	if d.record && last != nil && !last.Learned {
-		d.run.record(abIdx(d.variant), abTransport, 0, 0, r.clock())
+		d.run.record(abIdx(d.recordVariant()), abTransport, 0, 0, r.clock())
 	}
 	log.Printf("proxy: group %q (host %s) has no healthy backends — serving 503", group.Service, reqHost)
 	serveUnavailable(w, http.StatusServiceUnavailable, reqHost, "Service unavailable at this time, try again later.")
 }
 
+// recordVariant is the variant a request is counted under: the pinned one,
+// which on a failover hop is failoverFrom rather than the served variant.
+func (d *abDecision) recordVariant() string {
+	if d.failoverFrom != "" {
+		return d.failoverFrom
+	}
+	return d.variant
+}
+
+// peerRuns reports whether b is a peer verified to run this same test, and
+// so records what it serves (see Backend.peerTestID).
+func (d *abDecision) peerRuns(b *Backend) bool {
+	return b.Learned && b.peerTestID == d.run.id
+}
+
+// abRecordServed records a request served by a LOCAL backend. One served by
+// a peer running the same test is recorded by that peer — including a
+// failover hop, which the peer counts as failover_<pinned> — so each request
+// is counted exactly once mesh-wide. A failover to any other peer cannot be
+// recorded there, so it is counted here, as in PR1.
 func (r *Router) abRecordServed(d *abDecision, b *Backend, status int, latency time.Duration) {
 	if b.Learned && status >= 500 {
 		d.run.addHopError()
 	}
-	if !d.record || status == 0 {
+	if d.peerRuns(b) || !d.record || status == 0 {
 		return
 	}
 	now := r.clock()
-	if b.variantName() != d.variant {
-		// PR2: a failover served via a learned (peer) backend is counted here
-		// as failover AND by the receiving peer under A; dedupe in PR2.
-		d.run.record(abIdx(d.variant), abFailover, status, latency, now)
+	if d.failoverFrom != "" || b.variantName() != d.variant {
+		d.run.record(abIdx(d.recordVariant()), abFailover, status, latency, now)
 		return
 	}
 	if b.Learned {
@@ -1622,6 +1664,7 @@ func (r *Router) abStaticFallback(w http.ResponseWriter, req *http.Request, grou
 			setter.SetBackend(b.URL)
 		}
 		req.Header.Set(abVariantHeader, b.variantName())
+		req.Header.Del(abFailoverHeader)
 		if tryProxy(w, req, b) {
 			return
 		}
@@ -1699,7 +1742,9 @@ type abExperimentReport struct {
 	HopErrors       uint64                   `json:"hop_errors"`
 	StaticFallbacks uint64                   `json:"static_fallbacks"`
 	Judge           abJudgeReport            `json:"judge"`
-	Peers           []any                    `json:"peers"`
+	Peers           []abPeerReport           `json:"peers"`
+	// Merged is what judge sees: this proxy plus every fresh, aligned peer.
+	Merged abMergedReport `json:"merged"`
 }
 
 type abReport struct {
@@ -1725,8 +1770,9 @@ func (run *abRun) report() abExperimentReport {
 	defer run.mu.Unlock()
 	cfg := run.cfg
 	phase := run.phase(cfg)
+	abort, phaseAt := run.abortLocked()
 	rep := abExperimentReport{
-		Service: run.service, ID: run.id, Phase: phase, PhaseAt: cfg.PhaseAt,
+		Service: run.service, ID: run.id, Phase: phase, PhaseAt: phaseAt, Abort: abort,
 		Config: cfg.labels(), Started: cfg.Started, Epoch: cfg.Epoch,
 		BBackendsLocal: run.bLocal,
 		Cumulative:     abPair[abCountersReport]{abCountersOut(&run.cum[0]), abCountersOut(&run.cum[1])},
@@ -1742,23 +1788,47 @@ func (run *abRun) report() abExperimentReport {
 		HopErrors:       run.hopErrors,
 		StaticFallbacks: run.staticFallbacks,
 		Judge:           abJudgeReport{Status: run.verdict.Status, Streak: run.js.Streak},
-		Peers:           []any{},
+		Peers:           []abPeerReport{},
 	}
-	if run.latched.Load() {
-		a := run.abort
-		rep.Abort = &a
-		if cfg.Phase == abPhaseRunning {
-			rep.PhaseAt = a.At
+	windowsOut := func(ws []abWindow) []abWindowReport {
+		out := []abWindowReport{}
+		for _, w := range ws {
+			start := time.Unix(cfg.Epoch, 0).Add(cfg.Warmup).Add(time.Duration(w.Index) * cfg.Window).Unix()
+			out = append(out, abWindowReport{
+				Index: w.Index, Start: start,
+				V: abPair[abCountersReport]{abCountersOut(&w.V[0]), abCountersOut(&w.V[1])},
+			})
 		}
-	} else if cfg.Phase == abPhaseAborted {
-		rep.Abort = &abAbortInfo{Reason: cfg.AbortReason, At: cfg.PhaseAt, Source: "label"}
+		return out
 	}
-	for _, w := range run.summaryLocked().Windows {
-		start := time.Unix(cfg.Epoch, 0).Add(cfg.Warmup).Add(time.Duration(w.Index) * cfg.Window).Unix()
-		rep.Windows = append(rep.Windows, abWindowReport{
-			Index: w.Index, Start: start,
-			V: abPair[abCountersReport]{abCountersOut(&w.V[0]), abCountersOut(&w.V[1])},
+	own := run.summaryLocked()
+	rep.Windows = windowsOut(own.Windows)
+	now := time.Now()
+	if run.clock != nil {
+		now = run.clock()
+	}
+	fresh, all := run.freshPeersLocked(now)
+	isFresh := map[string]bool{}
+	for _, p := range fresh {
+		isFresh[p] = true
+	}
+	for _, p := range all {
+		s := run.peers[p]
+		aligned := run.abAligned(s.exp)
+		rep.Peers = append(rep.Peers, abPeerReport{
+			Peer: p, Fresh: isFresh[p], AgeS: int64(now.Sub(s.at) / time.Second), Phase: s.exp.phase,
+			Latched: s.exp.latched(), BBackends: s.exp.bBackends, Aligned: aligned,
 		})
+		if isFresh[p] {
+			rep.BBackendsPeer += s.exp.bBackends
+		}
+	}
+	peerSums := run.peerSummariesLocked(now)
+	merged := abMergeSummaries(append([]abSummary{own}, peerSums...))
+	rep.Merged = abMergedReport{
+		Peers:      len(peerSums),
+		Cumulative: abPair[abCountersReport]{abCountersOut(&merged.Cumulative[0]), abCountersOut(&merged.Cumulative[1])},
+		Windows:    windowsOut(merged.Windows),
 	}
 	return rep
 }

@@ -38,6 +38,7 @@ type abSrv struct {
 	gotVariant   atomic.Value
 	gotQuery     atomic.Value
 	gotAuth      atomic.Value
+	gotFailover  atomic.Value
 	setAppCookie bool
 }
 
@@ -47,11 +48,13 @@ func newABSrv(t *testing.T, host, variant string) *abSrv {
 	s.gotVariant.Store("")
 	s.gotQuery.Store("")
 	s.gotAuth.Store("")
+	s.gotFailover.Store("")
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.hits.Add(1)
 		s.gotVariant.Store(r.Header.Get(abVariantHeader))
 		s.gotQuery.Store(r.URL.RawQuery)
 		s.gotAuth.Store(r.Header.Get(PeerAuthHeader))
+		s.gotFailover.Store(r.Header.Get(abFailoverHeader))
 		w.Header().Set("X-Served-By", variant)
 		if s.setAppCookie {
 			w.Header().Add("Set-Cookie", "app_session=xyz; Path=/")

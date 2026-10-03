@@ -229,6 +229,14 @@ Routing and compatibility:
 - An older sender produces one A backend. An older receiver forwards everything.
 - Both proxies must be upgraded before B runs off the entrance host.
 
+Known gaps (PR2):
+
+- A static-404 retry that lands on a peer is counted by that peer.
+- On a test-id conflict (local labels win), authenticated A hops to the peer are counted under the peer's test.
+- A receiver still in `running` honours a promoting forwarder's failover hop (the forwarder is trusted).
+- If the worst-case payload exceeds 1 MiB, the sender drops all experiments from the push (logged); routes still sync.
+- Old receivers never record hopped requests — upgrade both proxies before B runs off the entrance host.
+
 ### 1.10 Phases, abort and drain
 
 Phase labels:

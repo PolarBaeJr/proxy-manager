@@ -67,6 +67,17 @@ type peerRouteInfo struct {
 	// inside one TTL window. Removing the label from the replicas that carry
 	// it is the off-switch, and it only works if adoption stays one-way.
 	Spread bool `json:"spread,omitempty"`
+	// ABID/BBackends/BWeight describe the B share of this route's local
+	// backends when it runs an A/B test with B replicas here. Backends and
+	// Weight stay TOTALS, so a receiver predating A/B in the mesh still sees
+	// one backend with today's weight and simply forwards everything (its
+	// hops carry no X-Variant, and this proxy assigns them itself, unpinned
+	// and unrecorded). A current receiver splits the totals into separate A
+	// and B synthetic backends (peermerge.go's overlay). All omitempty, so a
+	// route without a test serializes exactly as before.
+	ABID      string `json:"ab_id,omitempty"`
+	BBackends int    `json:"b_backends,omitempty"`
+	BWeight   int    `json:"b_weight,omitempty"`
 }
 
 // peerRoutePayload is the body POSTed to a peer's /peer/routes endpoint.
@@ -74,6 +85,9 @@ type peerRoutePayload struct {
 	Peer      string          `json:"peer"`
 	Advertise string          `json:"advertise"`
 	Routes    []peerRouteInfo `json:"routes"`
+	// Experiments carries every attached A/B test (abmesh.go), at most
+	// abMaxPeerExperiments. Omitted when there are none.
+	Experiments peerABList `json:"experiments,omitempty"`
 }
 
 type PeerSync struct {
@@ -125,37 +139,64 @@ func (p *PeerSync) Run(ctx context.Context) {
 // re-advertised back out, which would otherwise let a route bounce around
 // the mesh indefinitely.
 func (p *PeerSync) tick(ctx context.Context) {
-	var routes []peerRouteInfo
-	for _, g := range p.router.Snapshot() {
-		localCount, localWeight := 0, 0
-		// PR2: B backends are counted here too, so a peer without the test
-		// can hop requests that land on B by uid hash with no pin.
-		for _, b := range g.Backends {
-			if !b.Learned {
-				localCount++
-				localWeight += b.Weight
-			}
-		}
-		if localCount == 0 {
-			continue
-		}
-		routes = append(routes, peerRouteInfo{
-			Host: g.Host, PathPrefix: g.PathPrefix, StripPrefix: g.StripPrefix,
-			Name: g.Name, Backends: localCount, Weight: localWeight,
-			RateLimit: g.RateLimit, RateRPM: g.RateRPM, Spread: g.SpreadLocal,
-			Service: g.Service,
-		})
-	}
-	if len(routes) == 0 {
-		return
-	}
-	body, err := json.Marshal(peerRoutePayload{Peer: p.identity, Advertise: p.advertise, Routes: routes})
-	if err != nil {
+	body, ok := buildPeerPayload(p.router, p.identity, p.advertise)
+	if !ok {
 		return
 	}
 	for _, peer := range p.peers {
 		go p.send(ctx, peer, body)
 	}
+}
+
+// buildPeerPayload is tick's payload, as the JSON body to POST; ok=false
+// means there is nothing to advertise.
+func buildPeerPayload(router *Router, identity, advertise string) ([]byte, bool) {
+	var routes []peerRouteInfo
+	for _, g := range router.Snapshot() {
+		localCount, localWeight, bCount, bWeight := 0, 0, 0, 0
+		for _, b := range g.Backends {
+			if !b.Learned {
+				localCount++
+				localWeight += b.Weight
+				if b.Variant == abVariantB {
+					bCount++
+					bWeight += b.Weight
+				}
+			}
+		}
+		if localCount == 0 {
+			continue
+		}
+		ri := peerRouteInfo{
+			Host: g.Host, PathPrefix: g.PathPrefix, StripPrefix: g.StripPrefix,
+			Name: g.Name, Backends: localCount, Weight: localWeight,
+			RateLimit: g.RateLimit, RateRPM: g.RateRPM, Spread: g.SpreadLocal,
+			Service: g.Service,
+		}
+		// B fields only for a group running a test with local B replicas:
+		// an adopted test (B only on a peer) advertises its A count alone.
+		if g.abCfg != nil && bCount > 0 {
+			ri.ABID, ri.BBackends, ri.BWeight = g.abCfg.ID, bCount, bWeight
+		}
+		routes = append(routes, ri)
+	}
+	if len(routes) == 0 {
+		return nil, false
+	}
+	payload := peerRoutePayload{Peer: identity, Advertise: advertise, Routes: routes, Experiments: router.peerABInfos()}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false
+	}
+	if len(body) > peerPayloadMaxBytes {
+		// The receiver would reject the whole push; keep route sync alive.
+		log.Printf("proxy peer route push: payload %d bytes over the %d limit — sending routes without A/B experiments", len(body), peerPayloadMaxBytes)
+		payload.Experiments = nil
+		if body, err = json.Marshal(payload); err != nil {
+			return nil, false
+		}
+	}
+	return body, true
 }
 
 func (p *PeerSync) send(ctx context.Context, peer string, body []byte) {
