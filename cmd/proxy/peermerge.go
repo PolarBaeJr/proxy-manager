@@ -29,7 +29,13 @@ type learnedRoute struct {
 	service  string
 	backends int
 	weight   int
-	lastSeen time.Time
+	// abID/bBackends/bWeight are the B share of backends/weight (which stay
+	// totals), validated in merge; zero when the peer runs no test on this
+	// route or predates A/B in the mesh.
+	abID      string
+	bBackends int
+	bWeight   int
+	lastSeen  time.Time
 }
 
 // peerWeight resolves the weight to give a peer's synthetic backend: the
@@ -55,13 +61,21 @@ type PeerRouteStore struct {
 	// hopAuth is sent on every hop to a peer (see peerHopAuthToken); set
 	// once by main before the first overlay.
 	hopAuth string
+	// exps holds each peer's validated A/B experiments by service, and
+	// expSeen when they last arrived (same TTL as routes). abApply, set once
+	// by main, hands a peer's experiments to Router.applyPeerAB.
+	exps    map[string]map[string]*abPeerExp
+	expSeen map[string]time.Time
+	abApply func(peer string, exps map[string]*abPeerExp)
 }
 
 func newPeerRouteStore(ttl time.Duration) *PeerRouteStore {
 	return &PeerRouteStore{
-		routes: map[string]map[string]learnedRoute{},
-		ttl:    ttl,
-		now:    time.Now,
+		routes:  map[string]map[string]learnedRoute{},
+		ttl:     ttl,
+		now:     time.Now,
+		exps:    map[string]map[string]*abPeerExp{},
+		expSeen: map[string]time.Time{},
 	}
 }
 
@@ -78,7 +92,8 @@ func splitRouteKey(key string) (host, path string) {
 // merge upserts every advertised route (with Backends > 0) into the store,
 // keyed by payload.Peer under its host|path. Returns true only when this
 // merge introduced a new host|path key, a new peer under an existing key, or
-// a changed spread/weight — a bare lastSeen refresh for an already-known
+// a changed spread/weight or A/B state (see the experiments block and
+// peerRouteAB) — a bare lastSeen refresh for an already-known
 // peer/route returns false, so the caller (peerRoutesHandler) can skip an
 // unnecessary refresh()
 // on steady-state pushes and rely on the periodic resync ticker for TTL
@@ -91,10 +106,31 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 		now = time.Now
 	}
 	changed := false
+	// Experiments are replaced wholesale per peer; any change routing
+	// depends on (a test appearing or going, its config, phase, latch or
+	// B ownership) refreshes. Stats-only changes do not.
+	exps := validatePeerExperiments(payload.Peer, payload.Experiments, now())
+	prevExps := s.exps[payload.Peer]
+	if len(prevExps) != len(exps) {
+		changed = true
+	}
+	for svc, e := range exps {
+		if p, ok := prevExps[svc]; !ok || p.fingerprint() != e.fingerprint() {
+			changed = true
+		}
+	}
+	if len(exps) > 0 {
+		s.exps[payload.Peer] = exps
+		s.expSeen[payload.Peer] = now()
+	} else {
+		delete(s.exps, payload.Peer)
+		delete(s.expSeen, payload.Peer)
+	}
 	for _, r := range payload.Routes {
 		if r.Backends <= 0 {
 			continue
 		}
+		abID, bBackends, bWeight := peerRouteAB(r)
 		key := routeKey(r.Host, r.PathPrefix)
 		peersForKey, ok := s.routes[key]
 		if !ok {
@@ -109,7 +145,11 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 		// EXPIRED. Without this, turning spread off (or retuning the weight)
 		// on the peer would sit unapplied here until some unrelated Docker
 		// event happened to trigger a rebuild.
-		if prev, ok := peersForKey[payload.Peer]; !ok || prev.spread != r.Spread || prev.weight != peerWeight(r) {
+		// The B split is the same kind of field; with one, the total count
+		// matters too (an A share dropping to zero removes the A backend).
+		if prev, ok := peersForKey[payload.Peer]; !ok || prev.spread != r.Spread || prev.weight != peerWeight(r) ||
+			prev.abID != abID || prev.bBackends != bBackends || prev.bWeight != bWeight ||
+			(abID != "" && prev.backends != r.Backends) {
 			changed = true
 		}
 		peersForKey[payload.Peer] = learnedRoute{
@@ -127,11 +167,48 @@ func (s *PeerRouteStore) merge(payload peerRoutePayload) bool {
 			// share of the pool exactly what it was, instead of letting
 			// makePeerBackend's floor collapse a 3-replica peer to weight 1
 			// for the length of a rolling deploy.
-			weight:   peerWeight(r),
-			lastSeen: now(),
+			weight:    peerWeight(r),
+			abID:      abID,
+			bBackends: bBackends,
+			bWeight:   bWeight,
+			lastSeen:  now(),
 		}
 	}
 	return changed
+}
+
+// peerRouteAB validates a route's B fields: a well-formed id, a B count
+// within the total, and a B weight within the total weight (defaulting to
+// the B count, as peerWeight does for the total). Anything else means "no
+// B here", which overlay turns into the legacy single backend.
+func peerRouteAB(r peerRouteInfo) (string, int, int) {
+	if r.ABID == "" || !abIDRe.MatchString(r.ABID) || r.BBackends <= 0 || r.BBackends > r.Backends || r.BWeight < 0 {
+		return "", 0, 0
+	}
+	bw := r.BWeight
+	if bw == 0 {
+		bw = r.BBackends
+	}
+	if bw > peerWeight(r) {
+		return "", 0, 0
+	}
+	return r.ABID, r.BBackends, bw
+}
+
+// applyAB hands a peer's current experiments to the router (abApply). The
+// handler calls it on every push, after any refresh the push caused, so a
+// newly adopted test already has a run to write into.
+func (s *PeerRouteStore) applyAB(peer string) {
+	s.mu.Lock()
+	apply := s.abApply
+	exps := map[string]*abPeerExp{}
+	for svc, e := range s.exps[peer] {
+		exps[svc] = e
+	}
+	s.mu.Unlock()
+	if apply != nil {
+		apply(peer, exps)
+	}
 }
 
 // overlay appends a synthetic learned backend (via makePeerBackend) for
@@ -178,16 +255,19 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup, localBackendsByService ma
 	for _, g := range groups {
 		byKey[routeKey(g.Host, g.PathPrefix)] = g
 	}
+	for peer, seen := range s.expSeen {
+		if now().Sub(seen) > s.ttl {
+			delete(s.exps, peer)
+			delete(s.expSeen, peer)
+		}
+	}
+	testIDs, adopt := s.abTestIDs(groups)
 
 	for key, peersForKey := range s.routes {
 		host, path := splitRouteKey(key)
 		for peerID, lr := range peersForKey {
 			if now().Sub(lr.lastSeen) > s.ttl {
 				delete(peersForKey, peerID)
-				continue
-			}
-			b := makePeerBackendAuth(lr.advertise, host, path, lr.stripPrefix, peerID, lr.weight, s.hopAuth)
-			if b == nil {
 				continue
 			}
 			g, ok := byKey[key]
@@ -216,6 +296,16 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup, localBackendsByService ma
 				byKey[key] = g
 				groups = append(groups, g)
 			}
+			testID := testIDs[g.Service]
+			bs := s.peerBackendsFor(lr, host, path, s.abSplitFor(g, testID, lr))
+			if len(bs) == 0 {
+				continue
+			}
+			if e := s.exps[peerID][g.Service]; testID != "" && !g.static && e != nil && e.id == testID {
+				for _, b := range bs {
+					b.peerTestID = testID
+				}
+			}
 			// Spread is the one advertised field adopted onto an EXISTING
 			// local group, unlike RateLimit/RateRPM above — it has to be, or
 			// the cross-host scale that set proxy.spread on the peer's
@@ -228,12 +318,13 @@ func (s *PeerRouteStore) overlay(groups []*RouteGroup, localBackendsByService ma
 			if lr.spread {
 				g.Spread = true
 			}
-			g.Backends = append(g.Backends, b)
+			g.Backends = append(g.Backends, bs...)
 		}
 		if len(peersForKey) == 0 {
 			delete(s.routes, key)
 		}
 	}
+	abAttach(groups, adopt)
 	return groups
 }
 
@@ -259,6 +350,11 @@ func (s *PeerRouteStore) hasExpired() bool {
 			if now().Sub(lr.lastSeen) > s.ttl {
 				return true
 			}
+		}
+	}
+	for _, seen := range s.expSeen {
+		if now().Sub(seen) > s.ttl {
+			return true
 		}
 	}
 	return false
@@ -288,14 +384,17 @@ func peerRoutesHandler(secret string, store *PeerRouteStore, refresh func()) htt
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		// The body limit bounds everything a peer can make us decode; a body
+		// over it is truncated and fails to decode, so it is rejected whole.
 		var payload peerRoutePayload
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload); err != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, peerPayloadMaxBytes)).Decode(&payload); err != nil {
 			http.Error(w, "bad payload", http.StatusBadRequest)
 			return
 		}
 		if store.merge(payload) && refresh != nil {
 			refresh()
 		}
+		store.applyAB(payload.Peer)
 		w.WriteHeader(http.StatusNoContent)
 	})
 }

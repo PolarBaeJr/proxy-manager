@@ -97,6 +97,8 @@ func main() {
 	hopAuth := peerHopAuthToken(peerSecret)
 	routeStore.hopAuth = hopAuth
 	router.peerHopAuth = hopAuth
+	routeStore.abApply = router.applyPeerAB
+	router.peerSyncInterval = *peerSyncInterval
 
 	refresh := func() {
 		groups, backendsByService, err := assembleGroups(ctx, dc, *staticConfig)

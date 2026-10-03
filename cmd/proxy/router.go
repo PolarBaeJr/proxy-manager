@@ -64,6 +64,12 @@ type Backend struct {
 	// valid proxy.ab.id, see abtest.go); "" means A. Written once at
 	// construction like DockerUnhealthy.
 	Variant string
+
+	// peerTestID is, for a learned backend, the A/B test id the peer was
+	// verified to run for this group's service (its experiment validated
+	// and matches ours); "" otherwise. Only such a peer gets the hop
+	// protocol — session variant + abFailoverHeader, recorded by the peer.
+	peerTestID string
 }
 
 // unhealthyAfterConsecutiveFails gates recordHealthCheck's failure side:
@@ -208,6 +214,11 @@ type RouteGroup struct {
 	// behaves exactly as without A/B support.
 	abCfg *abConfig
 	ab    *abRun
+	// abLocal is this proxy's own label config for the group's service even
+	// while no local B backend runs (e.g. mid-recreate), so peermerge.go's
+	// overlay can let local labels win over a peer's test and attach them
+	// when only a peer's B is up.
+	abLocal *abConfig
 }
 
 // PeerHopHeader marks a request that has already been forwarded once by a
@@ -448,6 +459,9 @@ type Router struct {
 	peerHopAuth string
 	abRuns      map[string]*abRun
 	now         func() time.Time
+	// peerSyncInterval is the peer push cadence (-peer-sync-interval); A/B
+	// merged judging treats a peer as stale after three of them. 0 = 5s.
+	peerSyncInterval time.Duration
 }
 
 func (r *Router) Set(groups []*RouteGroup) {
@@ -660,8 +674,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	hopped := req.Header.Get(PeerHopHeader) != ""
 	// authHop only matters to A/B (abAssign); hopped keeps its meaning above.
 	authHop := hopped && r.hopAuthOK(req.Header.Get(PeerAuthHeader))
+	failoverHop := authHop && req.Header.Get(abFailoverHeader) == "1"
 	req.Header.Del(PeerHopHeader)
 	req.Header.Del(PeerAuthHeader)
+	req.Header.Del(abFailoverHeader)
 
 	r.mu.RLock()
 	groups := r.groups
@@ -754,7 +770,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// a HIT returns before any backend is picked.
 	var ab *abDecision
 	if group.ab != nil {
-		ab = r.abAssign(w, req, group, origPath, hopped, authHop)
+		ab = r.abAssign(w, req, group, origPath, hopped, authHop, failoverHop)
 	}
 
 	// Cache eligibility reads Cookie/Authorization/Range, so like sticky it
@@ -1325,8 +1341,11 @@ func assembleGroups(ctx context.Context, dc *dockerClient, configPath string) ([
 		}
 		sort.SliceStable(g.Backends, func(i, j int) bool { return g.Backends[i].URL < g.Backends[j].URL })
 		// A stopped B has no backend, so the test detaches (§1.2); its run and latch persist and reattach when B returns with the same id.
-		if cfg := abs.configs[g.Service]; cfg != nil && !g.static && g.hasBBackend() {
-			g.abCfg = cfg
+		if cfg := abs.configs[g.Service]; cfg != nil && !g.static {
+			g.abLocal = cfg
+			if g.hasBBackend() {
+				g.abCfg = cfg
+			}
 		}
 		out = append(out, g)
 	}
