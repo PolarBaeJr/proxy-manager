@@ -166,6 +166,15 @@ func TestUIWeightCapMatchesServer(t *testing.T) {
 	}
 }
 
+// TestUIABCapsMatchServer: the A/B start dialog's replica max is a literal
+// in the dashboard HTML, like the weight cap above.
+func TestUIABCapsMatchServer(t *testing.T) {
+	want := "const MAX_AB_REPLICAS = " + strconv.Itoa(abMaxReplicas) + ";"
+	if !strings.Contains(dashboardHTML, want) {
+		t.Errorf("dashboard HTML does not contain %q — the UI cap has drifted from abMaxReplicas", want)
+	}
+}
+
 // TestSetWeightLabelRefusesDuringCanary: a label setter only recreates the
 // live set, and promoteCanary later recreates the staged containers from
 // their stage-time labels — so a weight applied now would be reverted then,

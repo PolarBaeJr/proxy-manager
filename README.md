@@ -114,6 +114,7 @@ Drop these on any container you want routed:
 | `proxy.sticky=true` |   | ✓ | cookie-based session affinity — pins a client to the backend it first hit for this route (default: off) |
 | `proxy.cache=5s` |   | ✓ | opt-in micro-cache for whole `GET`/`HEAD` 200 responses for this TTL (default: off) — bypassed for any request carrying `Cookie`, `Authorization` or `Range`; never stores responses with `Set-Cookie`, `Cache-Control: private/no-store/no-cache`, a `Vary` other than `Accept-Encoding`, or a body over 1 MiB; concurrent misses for one URL are coalesced into a single backend hit; `X-Cache: HIT|MISS|BYPASS` on every response |
 | `proxy.cache.paths=/api/schedule,/standings` |   | ✓ | optional comma-separated client-path prefixes eligible for caching (default: every path on the route) |
+| `proxy.ab.*` |   |   | A/B test config — written by the dashboard on B replicas only, never set by hand; see [A/B testing](#ab-testing) |
 
 The cache never serves a personalized response: any request with cookies or auth goes straight to the backend, so an SSO-gated (`proxy.auth`) route is effectively uncached. The routes.json equivalents are `"cache"` and `"cache_paths"`.
 
@@ -166,9 +167,97 @@ dispatch through the dashboard's own API handlers in-process — so
 `guardUnscalable`, canary bookkeeping and the audit log all still apply — using
 a credential the process mints for itself at startup and never persists.
 
-Read-only unless `MCP_ALLOW_WRITES=true`.
+Read-only unless `MCP_ALLOW_WRITES=true`: every mutating tool (including the A/B tools) is only registered with it, and a `host` argument that targets another dashboard additionally needs `MCP_ALLOW_PEER_WRITES=true`.
 
 Containers must share the **`edge`** Docker network with the proxy. See `examples/docker-compose-sample.yml`.
+
+---
+
+## A/B testing
+
+An A/B test runs two builds of one service side by side and measures them. **B** is a canary (`proxy.canary=true` plus `proxy.ab.*` labels) on a **different image**; **A** is the service's live replicas. Tests are per `proxy.service` (prod and staging may share hostnames), label-managed services only — onboarded (routes.json) services are refused. B is image-only: a start request carrying `env` is refused, so a client-visible difference (including `NEXT_PUBLIC_*`) needs its own image. Design: [docs/AB_TESTING_PLAN.md](docs/AB_TESTING_PLAN.md).
+
+**Workflow.**
+
+- **UI:** a service's `…` menu → *Start A/B test…*. The card then shows the phase, a live A-vs-B table (requests, error rate, p50/p95, sample sufficiency), drain progress, and Split / Groups / Abort / Promote / Discard / Reset.
+- **REST** (elevated; add `?host=<peer>` to act on a peer's service):
+
+  | Route | Body |
+  |---|---|
+  | `GET /api/services/{name}/ab` | — status: state, phase, pending, op, last_error, config, drain, stats, windows, per_host, abort, hint, env_pending_note, history |
+  | `POST /api/services/{name}/ab` | start: `image` (required), `replicas` (1..10), `split`, `assign`, `header`, `groups`, `uid_cookie`, `group_cookie`, `anon`, `session_idle`, `pin_refresh`, `max_session`, `exclude[]`, `static[]`, `cookie_js`, `override`, `thresholds{}` |
+  | `POST …/ab/split` | `{"split": 0..100}` |
+  | `POST …/ab/groups` | `{"groups": {"name": "A"\|"B"}}` (`{}` clears) |
+  | `POST …/ab/abort` | — |
+  | `POST …/ab/promote` | `{"force", "confirm_aborted"}` |
+  | `POST …/ab/discard` | `{"force"}` |
+  | `POST …/ab/reset` | `{"force"}` |
+
+  Every POST is asynchronous: it answers `202` with `{id, phase, pending, op}` and the containers follow in the background. Poll `GET ab` — `op` clears once applied, `last_error` says why it didn't. A second op while one is being applied is `409` ("already in progress").
+- **MCP:** `get_ab_test` (read), and `start_ab_test`, `set_ab_split`, `set_ab_groups`, `resolve_ab_test` (`promote` / `discard` / `abort` / `reset`), which need `MCP_ALLOW_WRITES` (plus `MCP_ALLOW_PEER_WRITES` for a `host` argument). The write tools block until the change is applied, then return the status.
+
+**Assignment.** `proxy.ab.assign` is `cookie` (default, browsers), `header:<Name>` (API clients: a hash of that header, no pin) or `random` (per request). For a cookie-mode request the first match wins:
+
+1. An excluded path → A, no pin, not counted.
+2. An authenticated peer hop → the forwarded `X-Variant`.
+3. A valid session pin for the current test → its variant.
+4. `?pm_variant=A|B`, only with `proxy.ab.override=true` (off by default — prefer a `qa:B` group); routed, never counted.
+5. The app's `ab_group` cookie, if the group is in `proxy.ab.groups`.
+6. The app's `ab_uid` cookie → split by hash.
+7. Signed out → split by the `ab_anon` cookie (16 random hex, 30 days, HttpOnly, Secure, SameSite=Lax), set once by the proxy; with `proxy.ab.anon=false`, a random draw per session.
+
+The hash includes the test id, so every test (and every reset) gets its own cohort, and both proxies agree.
+
+**Cookies.** `ab_uid` (`^[A-Za-z0-9_-]{1,64}$`, an opaque account hash) and `ab_group` (`^[a-z0-9_-]{1,32}$`) are set by the app; the proxy only reads them, when it creates a pin, and never parses the auth cookie. The pin `ab_v_<8 hex of sha256(service)>` is a session cookie (HttpOnly, Secure, Lax), unsigned but strictly parsed; a forged pin only lets a visitor pick their own variant, and the server-side drain deadline caps that. `proxy.ab.cookie_js=true` adds a JS-readable `ab_vjs_<hash>` holding `A` or `B`. Each request reaches the backend with `X-Variant: A|B` (the variant actually served) so the app can log conversions.
+
+**Excluded paths** (`proxy.ab.exclude`) always go to A, are never pinned and never counted — cron jobs, webhooks and health checks. Badminton uses `/api/cron,/api/webhooks,/api/passkey,/api/discord,/api/calendar,/api/health`. A `GET`/`HEAD` 404 under `proxy.ab.static` (default `/_next/static/`, `none` disables) is retried once on the other variant, so a page and its assets never come from different builds.
+
+**Phases.** A visitor is never moved mid-session: every change applies to new sessions only.
+
+| Phase | New sessions | Pinned sessions | header/random | Judging |
+|---|---|---|---|---|
+| running | split / groups | keep their variant | split | on |
+| aborted / discarding | A | keep their variant | A | frozen |
+| promoting | B | keep their variant | B | off |
+
+The one exception is an outage: a B-pinned session with no healthy B fails over to A (and back once B recovers).
+
+**Drain.** Promote and discard flip the phase at once (`pending` is set) and finalize once the old variant has drained: no pinned traffic for `session_idle` across every proxy, or `max_session` (default 24h) after the phase change. The idle path counts only when every proxy is reachable and lists the test, and its clock starts no earlier than when each proxy began tracking the test (so a restarted proxy can't end a drain early); otherwise only the deadline applies (`deadline_only`). `force` skips the wait. Finalizing a promote first rolls every **peer** running the service onto B's image (health-gated, one peer at a time), then makes B the live set; a peer without `-peer-writes` leaves the promote pending with `last_error`. Reset starts a new test id and invalidates every pin, so it needs B drained (or `force`).
+
+**Auto-abort** (`proxy.ab.autoabort`, default on). Every 10s the proxy judges tumbling windows (`window`, default 5m, after a `warmup` of 3m). Judging starts once both variants have `min_samples` (500) requests and the test has run `min_runtime` (15m); a window with fewer than `window_min_samples` (50) per variant is neutral. A window is bad when B's error rate is more than `err_delta` (2) points above A's **and** at least `err_ratio` (2)× it, or when B's p95 exceeds `p95_ratio` (1.5)× A's plus `p95_slack` (200ms). `windows` (2) consecutive bad windows abort: new sessions go to A, B stays up, and the dashboard relabels B `aborted` within ~15s. Errors are 5xx plus transport failures and failovers; 4xx is not an error. On a low-traffic service the status shows *insufficient samples* — auto-abort can't fire until both variants reach `min_samples`. Promoting an aborted B needs `confirm_aborted`.
+
+**Labels** (B replicas only, written by the dashboard — never set by hand; read from the container, not live via Redis):
+
+| Label | Default | Allowed values |
+|---|---|---|
+| `proxy.ab.variant` / `proxy.ab.id` | — | `B` / `^[a-z0-9]{4,16}$` |
+| `proxy.ab.assign` | cookie | cookie \| random \| header:<token ≤64B, not Cookie/Host> |
+| `proxy.ab.split` | 10 | 0..100 (ungrouped and signed-out sessions) |
+| `proxy.ab.groups` | — | ≤32 `name:A\|B`, names `[a-z0-9_-]{1,32}` |
+| `proxy.ab.uid_cookie` / `group_cookie` | ab_uid / ab_group | cookie-name token ≤64B |
+| `proxy.ab.anon` | true | bool |
+| `proxy.ab.session_idle` | 30m | 5m..24h |
+| `proxy.ab.pin_refresh` | 5m | 1m..session_idle/2 |
+| `proxy.ab.max_session` | 24h | 1h..7d |
+| `proxy.ab.started` / `epoch` | — | unix seconds (epoch anchors the warm-up) |
+| `proxy.ab.phase` / `phase_at` / `abort_reason` | running | see Phases |
+| `proxy.ab.exclude` | — | ≤32 prefixes starting with `/`, ≤256B |
+| `proxy.ab.static` | /_next/static/ | same rules; `none` disables |
+| `proxy.ab.cookie_js` / `override` | false | bool |
+| `proxy.ab.autoabort` | true | bool |
+| `proxy.ab.min_samples` | 500 | 1..1e7 |
+| `proxy.ab.min_runtime` | 15m | 0..24h |
+| `proxy.ab.warmup` | 3m | 0..1h |
+| `proxy.ab.window` / `windows` | 5m / 2 | 1m..1h / 1..12 |
+| `proxy.ab.window_min_samples` | 50 | 1..1e6 |
+| `proxy.ab.err_delta` / `err_ratio` | 2 / 2 | 0.1..100 (points) / 1..100 |
+| `proxy.ab.p95_ratio` / `p95_slack` | 1.5 / 200ms | 1..100 / 0..60s |
+
+**Guards while a test runs.** Replace, rolling replace, spread, stage and rollout are refused (`409`); plain Promote/Discard canary on B is refused ("use the A/B endpoints"); scaling A is allowed; auto-update is deferred; central env adopt/release are refused. A **central env edit is accepted** but its propagation is deferred until the test is promoted or discarded (the status shows `env_pending_note`).
+
+**Peer prerequisites.** Both proxies must run the A/B mesh build before B runs on any host other than the public entrance, and the promote roll needs `-peer-writes` on every peer that runs the service.
+
+**Cloudflare.** HTML caching must stay off for a tested host — a cached page would be served across variants. The proxy itself never micro-caches a tested route's non-static paths and sends `Vary: Cookie` (or the assign header).
 
 ---
 

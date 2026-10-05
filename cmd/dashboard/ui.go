@@ -620,6 +620,7 @@ footer.app code{color:var(--muted)}
 <dialog id="dlg-duplicate-service"></dialog>
 <dialog id="dlg-spread-service"></dialog>
 <dialog id="dlg-adopt-env"></dialog>
+<dialog id="dlg-ab-start"></dialog>
 
 <div id="toasts"></div>
 
@@ -1464,6 +1465,10 @@ const MAX_SVC_WEIGHT = 100;
 // the dialog, not a correctness gate (the server refuses out-of-range
 // regardless).
 const MAX_SPREAD_REPLICAS = 10;
+// Mirror abMaxReplicas and the split bound in abtest.go — the server is the
+// real gate; TestUIABCapsMatchServer fails if the replica cap drifts.
+const MAX_AB_REPLICAS = 10;
+const MAX_AB_SPLIT = 100;
 let _lastServicesHash = '';
 // This host's own peer identity (DASHBOARD_HOST, see peers.go), lazily
 // fetched once from /api/peers. null means "not known yet" — foreignSvc()
@@ -1599,6 +1604,7 @@ async function renderServices() {
   const hash = JSON.stringify(svcs) + '|' + _selfIdentity + '|' + JSON.stringify(_peerWrites) + '|' + authState.elevated_until + '|' + pinnedName;
   if (hash === _lastServicesHash && el.children.length) {
     fillServiceStatsPanels().catch(() => {});
+    paintABPanels().catch(() => {});
     return;
   }
   _lastServicesHash = hash;
@@ -1707,7 +1713,8 @@ async function renderServices() {
     // checking host1 alone is equivalent to checking every instance. Canary
     // isn't part of the merge key, though, so any instance (not just host1)
     // can be mid-canary independently of the others.
-    a.recreateEligible = !a.host1.managed && !a.instances.some(i => !!i.s.canary_image);
+    // An A/B test refuses every recreate (abGuard) while it runs.
+    a.recreateEligible = !a.host1.managed && !a.instances.some(i => !!i.s.canary_image) && !a.instances.some(i => !!i.s.ab_test);
   }
   // Distinct merge units per group, so the folder header's "N services"
   // reflects logical services rather than raw per-host instances.
@@ -1777,7 +1784,10 @@ async function renderServices() {
         : 'Auto-update enabled from the dashboard — newer digests are pulled + replaced automatically';
       badges += ' <span class="pill ok" title="' + auTitle + '">' + I.arrowup + 'auto-update</span>';
     }
-    if (canary)             badges += ' <span class="pill info"><span class="gl"></span>canary live</span>';
+    if (s.ab_test) {
+      badges += ' <span class="pill info"><span class="gl"></span>A/B · ' + esc(s.ab_test.phase) + '</span>';
+      if (s.ab_test.op) badges += ' <span class="pill muted">applying…</span>';
+    } else if (canary) badges += ' <span class="pill info"><span class="gl"></span>canary live</span>';
     if (managed)            badges += ' <span class="pill muted" title="No proxy.host/port configured — no traffic routed (lifecycle/image tracking only)">' + I.rocket + 'managed · no route</span>';
     else if (s.onboarded)   badges += ' <span class="pill muted" title="Adopted from an unlabelled container — replace/canary disabled">' + I.rocket + 'onboarded</span>';
     // Tracked BOTH via live proxy.* labels AND the onboarded.json store —
@@ -1793,7 +1803,7 @@ async function renderServices() {
     if (!merged) {
       facts += '<tr><td>Host</td><td>' + (managed ? '<span class="meta">—</span>' : '<span class="ident">' + esc(s.host) + (s.path ? esc(s.path) : '') + '</span>') + '</td></tr>';
     }
-    if (canary)              facts += '<tr><td>Canary</td><td><span class="ident" style="color:#5eb4ff">' + esc(s.canary_image) + '</span> <span class="meta">· ' + s.canary_replicas + ' replica' + (s.canary_replicas === 1 ? '' : 's') + '</span></td></tr>';
+    if (canary)              facts += '<tr><td>' + (s.ab_test ? 'B (A/B)' : 'Canary') + '</td><td><span class="ident" style="color:#5eb4ff">' + esc(s.canary_image) + '</span> <span class="meta">· ' + s.canary_replicas + ' replica' + (s.canary_replicas === 1 ? '' : 's') + '</span></td></tr>';
     else if (s.previous_image) facts += '<tr><td>Previous</td><td><span class="ident dim">' + esc(s.previous_image) + '</span></td></tr>';
     if (!merged) {
       facts += '<tr><td>Port</td><td' + (managed ? ' class="meta">—' : ' class="num">' + s.port) + '</td></tr>';
@@ -1821,6 +1831,10 @@ async function renderServices() {
     let menuExtra = '';
     if (managed) {
       actions = '<button class="btn primary" ' + svcLockedAttr(s) + ' onclick="onboardDialog(\'' + sn + '\', ' + (s.port || 0) + ', \'' + esc(s.path || '') + '\')">' + I.rocket + 'Add route…' + svcLk(s) + '</button>';
+    } else if (s.ab_test) {
+      // An A/B test's B is a canary, but only the /ab endpoints may resolve
+      // it — plain Promote/Discard would 409 (abGuard).
+      actions = abActionButtons(s, sn, hostAttr);
     } else if (canary) {
       actions = '<button class="btn primary" ' + svcWriteAttr(s) + hostAttr + ' onclick="promoteCanary(\'' + sn + '\', this.dataset.host)">' + I.check + 'Promote canary' + svcWriteLk(s) + '</button>'
               + '<button class="btn" ' + svcWriteAttr(s) + hostAttr + ' onclick="discardCanary(\'' + sn + '\', this.dataset.host)">' + I.x + 'Discard' + svcWriteLk(s) + '</button>';
@@ -1841,7 +1855,8 @@ async function renderServices() {
                   ? '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', false, this.dataset.host)">' + I.lock + 'Singleton: on' + svcWriteLk(s) + '</button>'
                   : '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="toggleSingleton(\'' + sn + '\', true, this.dataset.host)">' + I.unlock + 'Singleton: off' + svcWriteLk(s) + '</button>'))
               + (s.onboarded ? '' : '<button ' + dupAttr(s) + hostAttr + ' onclick="openDuplicate(\'' + sn + '\', ' + (s.port || 0) + ', this.dataset.host)">' + I.layers + 'Duplicate to host…' + dupLk(s) + '</button>')
-              + (s.onboarded ? '' : '<button ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>');
+              + (s.onboarded ? '' : '<button ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>')
+              + (s.onboarded ? '' : '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="openABStart(\'' + sn + '\', this.dataset.host)">' + I.activity + 'Start A/B test…' + svcWriteLk(s) + '</button>');
     } else {
       // When update_available is true, surface a one-click Update before
       // the other actions — it's the most common click in this state.
@@ -1893,6 +1908,9 @@ async function renderServices() {
               // distinct from Duplicate, which creates an independent second
               // service. Same onboarded/unscalable gates as Duplicate.
               + (s.onboarded ? '' : '<button ' + spreadAttr(s) + hostAttr + ' onclick="openSpread(\'' + sn + '\', this.dataset.host)">' + I.globe + 'Spread to host…' + spreadLk(s) + '</button>')
+              // A/B test: B is a canary on a different image (label-managed
+              // services only — the server refuses onboarded ones).
+              + (s.onboarded ? '' : '<button ' + svcWriteAttr(s) + hostAttr + ' onclick="openABStart(\'' + sn + '\', this.dataset.host)">' + I.activity + 'Start A/B test…' + svcWriteLk(s) + '</button>')
               + ((s.onboarded || foreignSvc(s)) ? '' : centralEnvButtons(s.name, (s.labels || {})['pmgr.env.origin'] || ''));
     }
     // Per-replica list with stop/start per row. Hidden when there's only one
@@ -2023,7 +2041,9 @@ async function renderServices() {
       html += '<div class="svc-instance' + (isFirstOfUnit ? '' : ' sep') + '">'
            +  '<div class="svc-instance-label">' + esc(label) + badges + '</div>';
     }
-    html += facts + memberList + '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>';
+    // Live A/B stats (paintABPanels), per instance: each host's test.
+    const abPanel = s.ab_test ? '<div class="ab-panel" data-ab-svc="' + sn + '" data-ab-phase="' + esc(s.ab_test.phase) + '"' + hostAttr + '></div>' : '';
+    html += facts + abPanel + memberList + '<div class="actionzone">' + actions + '<div class="sep"></div>' + menu + '</div>';
     if (merged) html += '</div>';
 
     if (isLastOfUnit) {
@@ -2055,6 +2075,83 @@ async function renderServices() {
   // failed) unit rollout so it doesn't silently vanish on this tick's re-render.
   for (const ukey in _rollingJobs) paintUnitJobStatus(ukey);
   paintCentralEnvLines().catch(() => {});
+  paintABPanels().catch(() => {});
+}
+
+// ---- A/B test panel ----
+// One GET /api/services/{svc}/ab per expanded card with a test — it fans
+// out to every peer's /peer/ab, so it is cached 5s — keyed by service and
+// host, since a merged card can show a test per host. Plain fetch, never
+// api(), so a lapsed session can't pop a sign-in/2FA dialog on every
+// re-render; a non-elevated viewer just sees the phase from the summary.
+let _abView = {};
+function abViewKey(svc, host) { return svc + '|' + (host || ''); }
+async function paintABPanels() {
+  const els = document.querySelectorAll('.svc-card:not(.collapsed) [data-ab-svc]');
+  for (const el of els) {
+    const svc = el.dataset.abSvc, host = el.dataset.host || '';
+    if (!isElevated()) {
+      paintServicePanelIfChanged(el, '<div class="meta" style="padding:6px 0">' + I.activity + 'A/B test · <b>' + esc(el.dataset.abPhase || '') + '</b></div>');
+      continue;
+    }
+    const key = abViewKey(svc, host);
+    let c = _abView[key];
+    if (!c || Date.now() - c.at > 5000) {
+      try {
+        const r = await fetch('/api/services/' + encodeURIComponent(svc) + '/ab' + (host ? '?host=' + encodeURIComponent(host) : ''));
+        c = r.ok ? { at: Date.now(), view: await r.json() } : { at: Date.now(), error: 'status ' + r.status };
+      } catch (e) {
+        c = { at: Date.now(), error: e.message };
+      }
+      _abView[key] = c;
+    }
+    paintServicePanelIfChanged(el, abPanelHTML(c, el.dataset.abPhase || ''));
+  }
+}
+const AB_JUDGE_LABEL = { warmup: 'warm-up', insufficient_samples: 'insufficient samples', min_runtime: 'min runtime', ok: 'ok', abort: 'abort' };
+function abPanelHTML(c, phase) {
+  let html = '<div class="subhead" style="margin-top:12px">' + I.activity + 'A/B test</div>';
+  if (c.error) return html + '<span class="pill warn">' + I.alert + 'A/B status unavailable: ' + esc(c.error) + '</span>';
+  const v = c.view || {};
+  if (v.state !== 'active') return html + '<div class="meta">Phase <b>' + esc(phase) + '</b> — no test record on this host.</div>';
+  html += '<div class="meta" style="margin-bottom:8px"><span class="pill info">' + esc(v.phase) + '</span>'
+    + (v.pending ? ' <span class="pill warn">pending ' + esc(v.pending) + '</span>' : '')
+    + (v.op ? ' <span class="pill muted">applying… (' + esc(v.op) + ')</span>' : '')
+    + ' <span class="ident dim">' + esc(v.id) + '</span> · B <span class="ident">' + esc(v.image) + '</span></div>';
+  if (v.last_error) html += '<div class="meta" style="color:var(--red);margin-bottom:8px">' + esc(v.last_error) + '</div>';
+  // Samples per variant are stats.X.requests; auto-abort can't judge below
+  // proxy.ab.min_samples (default 500) — not hint's own, lower cutoff.
+  const minSamples = +(v.config || {})['proxy.ab.min_samples'] || 500;
+  html += '<table style="margin-bottom:8px"><thead><tr><th>Variant</th><th>Requests</th><th>Error rate</th><th>p50</th><th>p95</th><th>Samples</th></tr></thead><tbody>';
+  for (const k of ['A', 'B']) {
+    const st = (v.stats || {})[k] || {};
+    const n = +st.requests || 0;
+    html += '<tr><td>' + k + '</td><td>' + fmt(n) + '</td><td>' + pct((+st.error_rate || 0) * 100) + '</td>'
+      + '<td>' + Math.round(+st.p50_ms || 0) + ' ms</td><td>' + Math.round(+st.p95_ms || 0) + ' ms</td>'
+      + '<td>' + (n < minSamples ? '<span class="pill warn">insufficient samples (' + n + '/' + minSamples + ')</span>' : '<span class="pill ok">' + n + '</span>') + '</td></tr>';
+  }
+  html += '</tbody></table>';
+  const h0 = (v.per_host || [])[0];
+  if (v.phase === 'running' && h0 && h0.judge) {
+    html += '<div class="meta">Auto-abort judge: <b>' + esc(AB_JUDGE_LABEL[h0.judge.status] || h0.judge.status) + '</b></div>';
+  }
+  const d = v.drain;
+  if (d && d.variant) {
+    html += '<div class="meta">' + (d.drained ? esc(d.variant) + ' drained'
+      : 'Draining ' + esc(d.variant) + ' — ~' + (+d.active_sessions_approx || 0) + ' sessions, drains by ' + esc(d.drains_by ? new Date(d.drains_by * 1000).toLocaleString() : '—'))
+      + (d.deadline_only ? ' <span class="pill muted" title="a proxy could not be asked, so only the max_session deadline can end the drain">deadline only</span>' : '') + '</div>';
+  }
+  if (v.abort) html += '<div class="meta" style="color:var(--yellow)">Aborted: ' + esc(v.abort.reason) + ' (' + esc(v.abort.source) + ')' + (v.abort.detail ? ' — ' + esc(v.abort.detail) : '') + '</div>';
+  if (v.hint && v.hint.text) html += '<div class="meta">' + esc(v.hint.text) + '</div>';
+  if (v.env_pending_note) html += '<div class="meta" style="color:var(--yellow)">' + esc(v.env_pending_note) + '</div>';
+  const hosts = v.per_host || [];
+  if (hosts.length > 1 || hosts.some(h => !h.reachable || (h.id && h.id !== v.id))) {
+    html += '<div class="meta" style="margin-top:6px">' + hosts.map(h => {
+      const bad = !h.reachable ? 'unreachable' + (h.error ? ': ' + h.error : '') : (h.id && h.id !== v.id ? 'test id ' + h.id : '');
+      return esc(machineLabel(h.host)) + ' ' + (bad ? '<span class="pill warn">' + esc(bad) + '</span>' : '<span class="pill ok">' + esc(h.phase || 'ok') + '</span>');
+    }).join(' · ') + '</div>';
+  }
+  return html;
 }
 
 // ---- Central env status line ----
@@ -3701,6 +3798,125 @@ async function discardCanary(name, host) {
     toast('discarded canary for ' + name); renderActive();
   } catch (e) { toast(e.message, 'err'); }
 }
+// ---- A/B test actions ----
+// Every action POSTs to /api/services/{svc}/ab[/op] (202: applied in the
+// background), then drops the cached panel so the next render re-reads
+// it. The host arrives via data-host/this.dataset.host, like every other
+// write-mesh action — never spliced into the onclick string.
+function abActionButtons(s, sn, hostAttr) {
+  const t = s.ab_test;
+  const busy = t.op === 'start' || t.op === 'finalize_promote' || t.op === 'finalize_discard';
+  const attr = busy ? 'disabled title="an A/B change is being applied"' : svcWriteAttr(s);
+  const lock = busy ? '' : svcWriteLk(s);
+  const btn = (cls, fn, icon, label, arg) => '<button class="' + cls + '" ' + attr + hostAttr + ' onclick="' + fn + '(\'' + sn + '\', this.dataset.host' + (arg || '') + ')">' + icon + label + lock + '</button>';
+  const reconf = btn('btn', 'abSetSplit', I.scissors, 'Split…') + btn('btn', 'abSetGroups', I.users, 'Groups…');
+  switch (t.phase) {
+    case 'running':
+      return reconf + btn('btn', 'abAbort', I.alert, 'Abort') + btn('btn primary', 'abPromote', I.check, 'Promote B', ', false')
+        + btn('btn', 'abDiscard', I.x, 'Discard B', ', false') + btn('btn', 'abReset', I.refresh, 'Reset');
+    case 'aborted':
+      return reconf + btn('btn', 'abPromote', I.check, 'Promote B', ', false')
+        + btn('btn primary', 'abDiscard', I.x, 'Discard B', ', false') + btn('btn', 'abReset', I.refresh, 'Reset');
+    case 'promoting':
+      return btn('btn primary', 'abPromote', I.check, 'Finish promote now', ', true');
+    case 'discarding':
+      return btn('btn', 'abDiscard', I.x, 'Discard now', ', true');
+  }
+  return '';
+}
+function openABStart(name, host) {
+  const f = $('#form-ab-start');
+  f.reset();
+  f.serviceName.value = name;
+  f.dataset.host = host || '';
+  $('#dlg-ab-start').showModal();
+}
+async function abPost(name, host, op, body, msg) {
+  const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
+  await api('/api/services/' + encodeURIComponent(name) + '/ab' + (op ? '/' + op : '') + hostParam, { method: 'POST', body: JSON.stringify(body) });
+  toast(msg);
+  delete _abView[abViewKey(name, host)];
+  _lastServicesHash = '';
+  renderActive();
+}
+// abParseGroups reads "name:A, name:B" (commas or newlines) into the
+// {name: "A"|"B"} body; the server validates names.
+function abParseGroups(text) {
+  const out = {};
+  for (const part of String(text || '').split(/[,\n]/)) {
+    const p = part.trim();
+    if (!p) continue;
+    const i = p.lastIndexOf(':');
+    const k = i > 0 ? p.slice(0, i).trim() : '';
+    const val = i > 0 ? p.slice(i + 1).trim().toUpperCase() : '';
+    if (!k || (val !== 'A' && val !== 'B')) throw new Error('groups must be name:A or name:B, got "' + p + '"');
+    out[k] = val;
+  }
+  return out;
+}
+function abConfig(name, host) {
+  const c = _abView[abViewKey(name, host)];
+  return (c && c.view && c.view.config) || {};
+}
+async function abSetSplit(name, host) {
+  const raw = await promptDialog('Percent of ungrouped and signed-out sessions sent to B (0–' + MAX_AB_SPLIT + '). New sessions only — pinned sessions keep their variant. B is recreated with the new label and the warm-up restarts.', abConfig(name, host)['proxy.ab.split'] || '10', {title: 'A/B split', okLabel: 'Apply'});
+  if (raw === null) return;
+  const n = Number(String(raw).trim());
+  if (String(raw).trim() === '' || !Number.isInteger(n) || n < 0 || n > MAX_AB_SPLIT) { toast('split must be a whole number 0–' + MAX_AB_SPLIT, 'err'); return; }
+  try { await abPost(name, host, 'split', { split: n }, 'A/B split for ' + name + ' → ' + n + '% — applying'); }
+  catch (e) { toast(e.message, 'err'); }
+}
+async function abSetGroups(name, host) {
+  const raw = await promptDialog('Groups as name:A or name:B, comma-separated, matched against the app’s ab_group cookie. Empty clears them. New sessions only; B is recreated and the warm-up restarts.', abConfig(name, host)['proxy.ab.groups'] || '', {title: 'A/B groups', okLabel: 'Apply', placeholder: 'staff:B, qa:B'});
+  if (raw === null) return;
+  let groups;
+  try { groups = abParseGroups(raw); } catch (e) { toast(e.message, 'err'); return; }
+  try { await abPost(name, host, 'groups', { groups }, 'A/B groups for ' + name + ' updated — applying'); }
+  catch (e) { toast(e.message, 'err'); }
+}
+async function abAbort(name, host) {
+  if (!(await confirmDialog('Abort the A/B test? New sessions go to A; B stays up and sessions already pinned to B keep it until they end. Promote, discard or reset it afterwards.', {title: 'Abort A/B test', danger: true, okLabel: 'Abort'}))) return;
+  try { await abPost(name, host, 'abort', {}, 'aborted the A/B test for ' + name); }
+  catch (e) { toast(e.message, 'err'); }
+}
+async function abPromote(name, host, force) {
+  const msg = force
+    ? 'Finish promoting B now? A’s remaining pinned sessions move to B immediately, every peer running ' + name + ' is rolled onto B’s image, and B becomes the live set.'
+    : 'Promote B? New sessions go to B now. Once A’s pinned sessions drain (idle, or the max_session deadline — 24h by default) every peer running ' + name + ' is rolled onto B’s image and B becomes the live set.';
+  if (!(await confirmDialog(msg, {title: 'Promote B', okLabel: force ? 'Promote now' : 'Promote'}))) return;
+  const done = 'promoting B for ' + name + (force ? '' : ' — finalizes once A drains');
+  try {
+    try {
+      await abPost(name, host, 'promote', { force: !!force }, done);
+    } catch (e) {
+      // An aborted B (by hand, or latched by the proxy) needs an explicit
+      // confirm — keyed on the flag name the server's message carries.
+      if (!(e.status === 409 && String(e.message).includes('confirm_aborted'))) throw e;
+      if (!(await confirmDialog(e.message, {title: 'Promote an aborted B?', danger: true, okLabel: 'Promote anyway'}))) return;
+      await abPost(name, host, 'promote', { force: !!force, confirm_aborted: true }, done);
+    }
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function abDiscard(name, host, force) {
+  const msg = force
+    ? 'Discard B now? B’s remaining pinned sessions move to A immediately and B’s replicas are removed.'
+    : 'Discard B? New sessions go to A now; B’s replicas are removed once its pinned sessions drain (idle, or the max_session deadline — 24h by default).';
+  if (!(await confirmDialog(msg, {title: 'Discard B', danger: true, okLabel: force ? 'Discard now' : 'Discard'}))) return;
+  try { await abPost(name, host, 'discard', { force: !!force }, 'discarding B for ' + name + (force ? '' : ' — removed once B drains')); }
+  catch (e) { toast(e.message, 'err'); }
+}
+async function abReset(name, host) {
+  if (!(await confirmDialog('Reset the A/B test? It restarts under a new id with fresh stats and a new cohort; every existing pin becomes invalid.', {title: 'Reset A/B test', okLabel: 'Reset'}))) return;
+  try {
+    try {
+      await abPost(name, host, 'reset', { force: false }, 'reset the A/B test for ' + name);
+    } catch (e) {
+      if (!(e.status === 409 && String(e.message).includes('with force'))) throw e;
+      if (!(await confirmDialog(e.message + ' Reset now anyway? Sessions pinned to B are reassigned.', {title: 'B has not drained', danger: true, okLabel: 'Reset now'}))) return;
+      await abPost(name, host, 'reset', { force: true }, 'reset the A/B test for ' + name);
+    }
+  } catch (e) { toast(e.message, 'err'); }
+}
 async function rollback(name, prevImage, host) {
   if (!(await confirmDialog('Replace ' + name + ' with ' + prevImage + '?', {title: 'Rollback', okLabel: 'Rollback'}))) return;
   const hostParam = host ? '?host=' + encodeURIComponent(host) : '';
@@ -5048,6 +5264,45 @@ function buildDialogs() {
     +   '<button type="submit" class="btn primary">' + I.check + 'Spread</button>'
     + '</div></form></div>';
 
+  // Start A/B test. Only fields the operator sets are sent — everything
+  // else is the proxy's default. There is no env field: B is image-only.
+  const abNum = (name, label, ph) => '<div class="field"><label>' + label + '</label><input name="' + name + '" type="number" step="any" placeholder="' + ph + '"></div>';
+  const abTxt = (name, label, ph) => '<div class="field"><label>' + label + '</label><input name="' + name + '" placeholder="' + ph + '"></div>';
+  $('#dlg-ab-start').innerHTML =
+    '<div class="dlg"><div class="dlg-head"><div class="di">' + I.activity + '</div>'
+    + '<div><h3>Start A/B test</h3><div class="dsub">B runs as canary replicas on a different image; A is the live replicas. Each session stays on its variant.</div></div>'
+    + '<button class="x" type="button" onclick="document.getElementById(\'dlg-ab-start\').close()">' + I.x + '</button></div>'
+    + '<form id="form-ab-start"><div class="dlg-body">'
+    + '<input type="hidden" name="serviceName">'
+    + '<div class="field-group"><div class="gl-title">' + I.layers + 'Variant B</div>'
+    +   '<div class="field"><label>B image</label><input name="image" placeholder="ghcr.io/org/app:tag" required><div class="hint">B is image-only — env changes need a different image.</div></div>'
+    +   '<div class="field-row"><div class="field"><label>B replicas</label><input name="replicas" type="number" min="1" max="' + MAX_AB_REPLICAS + '" value="1" required></div>'
+    +   '<div class="field"><label>Split to B (%)</label><input name="split" type="number" min="0" max="' + MAX_AB_SPLIT + '" value="10" required></div></div></div>'
+    + '<div class="field-group"><div class="gl-title">' + I.users + 'Assignment</div>'
+    +   '<div class="field-row"><div class="field"><label>Assign by</label><select name="assign"><option value="cookie">cookie (browsers)</option><option value="random">random (per request)</option><option value="header">header (API clients)</option></select></div>'
+    +   abTxt('header', 'Header name', 'only with assign = header') + '</div>'
+    +   '<div class="field"><label>Groups <span class="hint" style="display:inline">(name:A or name:B per line, matched against the app’s ab_group cookie)</span></label><textarea name="groups" placeholder="staff:B&#10;qa:B"></textarea></div>'
+    +   '<div class="field"><label>Excluded path prefixes <span class="hint" style="display:inline">(one per line — always A, never pinned or counted)</span></label><textarea name="exclude" placeholder="/api/cron&#10;/api/webhooks&#10;/api/passkey&#10;/api/discord&#10;/api/calendar&#10;/api/health"></textarea></div></div>'
+    + '<details class="field-group"><summary class="gl-title">' + I.cpu + 'Advanced</summary>'
+    +   '<div class="field"><label>Static path prefixes <span class="hint" style="display:inline">(404 retried on the other variant; default /_next/static/, "none" disables)</span></label><textarea name="static" placeholder="/_next/static/"></textarea></div>'
+    +   '<div class="field-row">' + abTxt('uid_cookie', 'UID cookie', 'ab_uid') + abTxt('group_cookie', 'Group cookie', 'ab_group') + '</div>'
+    +   '<div class="field check"><input type="checkbox" name="anon" id="ab-anon" checked><label for="ab-anon">Split signed-out visitors by a per-browser cookie (ab_anon)</label></div>'
+    +   '<div class="field check"><input type="checkbox" name="cookie_js" id="ab-cookie-js"><label for="ab-cookie-js">Also set a JS-readable variant cookie (ab_vjs_)</label></div>'
+    +   '<div class="field check"><input type="checkbox" name="override" id="ab-override"><label for="ab-override">Allow the ?pm_variant= QA override<div class="hint">Off by default — prefer a qa:B group.</div></label></div>'
+    +   '<div class="field-row">' + abTxt('session_idle', 'Session idle', '30m') + abTxt('pin_refresh', 'Pin refresh', '5m') + '</div>'
+    +   abTxt('max_session', 'Max session (drain deadline)', '24h')
+    +   '<div class="field check"><input type="checkbox" name="autoabort" id="ab-autoabort" checked><label for="ab-autoabort">Auto-abort when B is clearly worse</label></div>'
+    +   '<div class="field-row">' + abNum('t_min_samples', 'Min samples', '500') + abTxt('t_min_runtime', 'Min runtime', '15m') + '</div>'
+    +   '<div class="field-row">' + abTxt('t_warmup', 'Warm-up', '3m') + abTxt('t_window', 'Window', '5m') + '</div>'
+    +   '<div class="field-row">' + abNum('t_windows', 'Bad windows to abort', '2') + abNum('t_window_min_samples', 'Window min samples', '50') + '</div>'
+    +   '<div class="field-row">' + abNum('t_err_delta', 'Error delta (pp)', '2') + abNum('t_err_ratio', 'Error ratio', '2') + '</div>'
+    +   '<div class="field-row">' + abNum('t_p95_ratio', 'p95 ratio', '1.5') + abTxt('t_p95_slack', 'p95 slack', '200ms') + '</div>'
+    + '</details>'
+    + '</div><div class="dialog-actions">'
+    +   '<button type="button" class="btn" onclick="document.getElementById(\'dlg-ab-start\').close()">Cancel</button>'
+    +   '<button type="submit" class="btn primary">' + I.check + 'Start test</button>'
+    + '</div></form></div>';
+
   // New DNS — type-aware. The content field swaps shape per type:
   //   A    → IPv4 input
   //   AAAA → IPv6 input
@@ -5303,6 +5558,51 @@ function wireDialogForms() {
       if (resp.warnings && resp.warnings.length) showSpreadWarnings(resp.warnings);
       renderActive();
     } catch (e) { toast(e.message, 'err'); }
+    finally { if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; } }
+  };
+
+  $('#form-ab-start').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const name = f.serviceName.value;
+    const lines = (v) => String(v || '').split(/[\n,]/).map(x => x.trim()).filter(Boolean);
+    const body = { image: f.image.value.trim(), replicas: +f.replicas.value, split: +f.split.value };
+    if (f.assign.value !== 'cookie') body.assign = f.assign.value;
+    if (f.header.value.trim()) body.header = f.header.value.trim();
+    try {
+      const groups = abParseGroups(f.groups.value);
+      if (Object.keys(groups).length) body.groups = groups;
+    } catch (err) { toast(err.message, 'err'); return; }
+    const exclude = lines(f.exclude.value), statics = lines(f.static.value);
+    if (exclude.length) body.exclude = exclude;
+    if (statics.length) body.static = statics;
+    for (const k of ['uid_cookie', 'group_cookie', 'session_idle', 'pin_refresh', 'max_session']) {
+      if (f[k].value.trim()) body[k] = f[k].value.trim();
+    }
+    if (!f.anon.checked) body.anon = false;
+    if (f.cookie_js.checked) body.cookie_js = true;
+    if (f.override.checked) body.override = true;
+    const th = {};
+    if (!f.autoabort.checked) th.autoabort = false;
+    for (const k of ['min_samples', 'windows', 'window_min_samples', 'err_delta', 'err_ratio', 'p95_ratio']) {
+      if (f['t_' + k].value.trim()) th[k] = +f['t_' + k].value;
+    }
+    for (const k of ['min_runtime', 'warmup', 'window', 'p95_slack']) {
+      if (f['t_' + k].value.trim()) th[k] = f['t_' + k].value.trim();
+    }
+    if (Object.keys(th).length) body.thresholds = th;
+    const submitBtn = f.querySelector('button[type="submit"]');
+    const original = submitBtn ? submitBtn.innerHTML : '';
+    if (submitBtn) { submitBtn.disabled = true; submitBtn.innerHTML = '<span class="spinner"></span>Working…'; }
+    try {
+      const hostParam = f.dataset.host ? '?host=' + encodeURIComponent(f.dataset.host) : '';
+      await api('/api/services/' + encodeURIComponent(name) + '/ab' + hostParam, { method: 'POST', body: JSON.stringify(body) });
+      $('#dlg-ab-start').close();
+      toast('starting A/B test for ' + name + ' — B is passing its health gate');
+      delete _abView[abViewKey(name, f.dataset.host)];
+      _lastServicesHash = '';
+      renderActive();
+    } catch (err) { toast(err.message, 'err'); }
     finally { if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = original; } }
   };
 
