@@ -67,12 +67,12 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	ro := NewServer("t", "v")
 	registerMCPTools(ro, c, false, false)
 	names := toolNames(t, ro)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "rolling_replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "rolling_replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record", "start_ab_test", "set_ab_split", "set_ab_groups", "resolve_ab_test"} {
 		if names[w] {
 			t.Errorf("mutating tool %q registered in read-only mode", w)
 		}
 	}
-	for _, r := range []string{"list_services", "list_routes", "get_logs", "maintenance_status", "list_dns", "check_for_update"} {
+	for _, r := range []string{"list_services", "list_routes", "get_logs", "maintenance_status", "list_dns", "check_for_update", "get_ab_test"} {
 		if !names[r] {
 			t.Errorf("read tool %q missing", r)
 		}
@@ -81,7 +81,7 @@ func TestWriteToolsAbsentUnlessAllowed(t *testing.T) {
 	rw := NewServer("t", "v")
 	registerMCPTools(rw, c, true, false)
 	rwNames := toolNames(t, rw)
-	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "rolling_replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record"} {
+	for _, w := range []string{"set_maintenance", "scale_service", "lifecycle_service", "set_autoupdate", "stage_canary", "replace_service", "rolling_replace_service", "resolve_canary", "onboard_service", "offboard_service", "restart_replica", "spread_service", "create_dns_record", "update_dns_record", "delete_dns_record", "start_ab_test", "set_ab_split", "set_ab_groups", "resolve_ab_test"} {
 		if !rwNames[w] {
 			t.Errorf("mutating tool %q missing when writes are allowed", w)
 		}
@@ -252,6 +252,14 @@ func TestToolsCallCorrectEndpoints(t *testing.T) {
 		{"create_dns_record", `{"type":"A","name":"x.example","content":"1.2.3.4"}`, "POST /api/cf/records?zone="},
 		{"update_dns_record", `{"id":"rec1","content":"1.2.3.4"}`, "PATCH /api/cf/records/rec1?zone="},
 		{"delete_dns_record", `{"id":"rec1"}`, "DELETE /api/cf/records/rec1?zone="},
+		{"get_ab_test", `{"service":"app"}`, "GET /api/services/app/ab"},
+		{"start_ab_test", `{"service":"app","image":"i:v2"}`, "POST /api/services/app/ab"},
+		{"set_ab_split", `{"service":"app","split":40}`, "POST /api/services/app/ab/split"},
+		{"set_ab_groups", `{"service":"app","groups":{"staff":"B"}}`, "POST /api/services/app/ab/groups"},
+		{"resolve_ab_test", `{"service":"app","action":"promote"}`, "POST /api/services/app/ab/promote"},
+		{"resolve_ab_test", `{"service":"app","action":"discard"}`, "POST /api/services/app/ab/discard"},
+		{"resolve_ab_test", `{"service":"app","action":"abort"}`, "POST /api/services/app/ab/abort"},
+		{"resolve_ab_test", `{"service":"app","action":"reset"}`, "POST /api/services/app/ab/reset"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
@@ -301,6 +309,30 @@ func TestArgumentValidation(t *testing.T) {
 		{"create_dns_record", `{"name":"x.example","content":"1.2.3.4"}`},              // missing type
 		{"update_dns_record", `{"id":"rec1"}`},                                         // no fields to update
 		{"delete_dns_record", `{}`},                                                    // missing id
+
+		{"start_ab_test", `{"service":"app"}`},                                             // missing image
+		{"start_ab_test", `{"service":"app","image":"i:v2","env":{}}`},                     // env refused
+		{"start_ab_test", `{"service":"app","image":"i:v2","replicas":11}`},                // over the cap
+		{"start_ab_test", `{"service":"app","image":"i:v2","replicas":2.5}`},               // fractional
+		{"start_ab_test", `{"service":"app","image":"i:v2","split":101}`},                  // out of range
+		{"start_ab_test", `{"service":"app","image":"i:v2","assign":"bogus"}`},             // unknown mode
+		{"start_ab_test", `{"service":"app","image":"i:v2","header":"X-Api-Key"}`},         // header with cookie assign
+		{"start_ab_test", `{"service":"app","image":"i:v2","groups":{"Bad":"B"}}`},         // bad group name
+		{"start_ab_test", `{"service":"app","image":"i:v2","groups":{"x":"C"}}`},           // not A/B
+		{"start_ab_test", `{"service":"app","image":"i:v2","exclude":["nope"]}`},           // prefix without /
+		{"start_ab_test", `{"service":"app","image":"i:v2","thresholds":{"bogus":1}}`},     // unknown threshold
+		{"start_ab_test", `{"service":"app","image":"i:v2","thresholds":{"err_delta":0}}`}, // out of range
+		{"start_ab_test", `{"service":"app","image":"i:v2","thresholds":"x"}`},             // not an object
+		{"set_ab_split", `{"service":"app"}`},                                              // missing split
+		{"set_ab_split", `{"service":"app","split":"10"}`},                                 // string
+		{"set_ab_split", `{"service":"app","split":101}`},                                  // out of range
+		{"set_ab_groups", `{"service":"app"}`},                                             // missing groups
+		{"set_ab_groups", `{"service":"app","groups":"x"}`},                                // not an object
+		{"set_ab_groups", `{"service":"app","groups":{"x":"C"}}`},                          // not A/B
+		{"resolve_ab_test", `{"service":"app","action":"nuke"}`},                           // unknown action
+		{"resolve_ab_test", `{"service":"app","action":"discard","confirm_aborted":true}`}, // promote only
+		{"resolve_ab_test", `{"service":"app","action":"abort","force":true}`},             // abort has no force
+		{"resolve_ab_test", `{"service":"app","action":"promote","force":"yes"}`},          // string not bool
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {
@@ -750,7 +782,7 @@ func TestOnboardServiceRequiresHostAndPort(t *testing.T) {
 	}
 }
 
-// The 18 tools that support peer targeting, and the argument key each one
+// The 23 tools that support peer targeting, and the argument key each one
 // reads it under. onboard_service alone uses "peer_host" — its own "host"
 // key already means the hostname to ROUTE.
 var peerTargetableTools = map[string]string{
@@ -772,6 +804,11 @@ var peerTargetableTools = map[string]string{
 	"sync_service_env":        "host",
 	"get_service_labels":      "host",
 	"set_service_labels":      "host",
+	"get_ab_test":             "host",
+	"start_ab_test":           "host",
+	"set_ab_split":            "host",
+	"set_ab_groups":           "host",
+	"resolve_ab_test":         "host",
 }
 
 // spread_service is peer-targeted by construction — its "target" is not
@@ -838,6 +875,11 @@ func TestHostParamAppendedWhenPeerWritesAllowed(t *testing.T) {
 		{"resolve_canary", `{"service":"app","action":"discard","host":"peer-b"}`, "?host=peer-b"},
 		{"onboard_service", `{"service":"app","host":"app.example.com","port":8080,"peer_host":"peer-b"}`, "?host=peer-b"},
 		{"offboard_service", `{"service":"app","host":"peer-b"}`, "?host=peer-b"},
+		{"get_ab_test", `{"service":"app","host":"peer-b"}`, "?host=peer-b"},
+		{"start_ab_test", `{"service":"app","image":"i:v2","host":"peer-b"}`, "?host=peer-b"},
+		{"set_ab_split", `{"service":"app","split":40,"host":"peer-b"}`, "?host=peer-b"},
+		{"set_ab_groups", `{"service":"app","groups":{},"host":"peer-b"}`, "?host=peer-b"},
+		{"resolve_ab_test", `{"service":"app","action":"abort","host":"peer-b"}`, "?host=peer-b"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tool+" "+tc.args, func(t *testing.T) {

@@ -105,6 +105,89 @@ func (a *apiCaller) pollRollingOp(ctx context.Context, statusPath string, b []by
 	}
 }
 
+// abToolPollInterval is how often an A/B tool re-polls
+// GET /api/services/{name}/ab while its op is being applied. A var only so
+// tests can shrink it.
+var abToolPollInterval = 2 * time.Second
+
+// pollABOp blocks until the A/B op whose 202 body is accepted has been
+// applied — op cleared, the test gone, or last_error set — re-polling
+// statusPath, and returns the final status. It never waits on pending: a
+// non-force promote/discard drains for up to max_session, and the
+// manager's Run loop finalizes it later. A failed op is an error carrying
+// the status, so the model can't mistake it for success.
+func (a *apiCaller) pollABOp(ctx context.Context, statusPath string, accepted []byte) (string, error) {
+	var acc struct {
+		ID string `json:"id"`
+		Op string `json:"op"`
+	}
+	if err := json.Unmarshal(accepted, &acc); err != nil || acc.Op == "" {
+		return pretty(accepted), nil
+	}
+	deadline := time.Now().Add(abOpTimeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(abToolPollInterval):
+		}
+		b, err := a.call(ctx, "GET", statusPath, nil)
+		if err != nil {
+			return "", err
+		}
+		var st abStatusView
+		if err := json.Unmarshal(b, &st); err != nil {
+			return "", err
+		}
+		out := pretty(stripABHist(b))
+		// A start can turn into finalize_discard (B removal after a failed
+		// start); any other op change means ours was applied.
+		settled := st.State == "none" || st.Op == "" || st.LastError != "" || (acc.Op == abOpStart && st.Op != abOpStart)
+		if !settled {
+			if time.Now().Before(deadline) {
+				continue
+			}
+			// The server-side op is bounded by abOpTimeout too: return the
+			// last known state rather than manufacturing an error.
+			return out, nil
+		}
+		if st.LastError != "" {
+			return "", fmt.Errorf("A/B %s failed: %s\n%s", acc.Op, st.LastError, out)
+		}
+		if acc.Op == abOpStart && st.State == "none" {
+			if n := len(st.History); n > 0 && st.History[n-1].Outcome == "start_failed" && (acc.ID == "" || st.History[n-1].ID == acc.ID) {
+				return "", fmt.Errorf("A/B test failed to start: %s\n%s", st.History[n-1].Detail, out)
+			}
+		}
+		return out, nil
+	}
+}
+
+// stripABHist drops the 64-bucket latency histograms from a GET ab
+// body's windows — bulky, and the per-variant p50/p95 already summarize
+// them. Falls back to the untouched body on any decode error.
+func stripABHist(b []byte) []byte {
+	var v map[string]any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return b
+	}
+	ws, _ := v["windows"].([]any)
+	for _, w := range ws {
+		wm, _ := w.(map[string]any)
+		vars, _ := wm["variants"].(map[string]any)
+		for _, c := range vars {
+			if c, ok := c.(map[string]any); ok {
+				delete(c, "hist")
+			}
+		}
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return b
+	}
+	return out
+}
+
 // pretty re-indents a JSON response. Tool output is read by a model, so
 // readable beats compact; a non-JSON body passes through untouched.
 func pretty(b []byte) string {
@@ -370,6 +453,39 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 				return "", err
 			}
 			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
+		Name:  "get_ab_test",
+		Title: "Get a service's A/B test",
+		Description: "Show a service's A/B test (B = canary replicas on a different image, A = the live replicas): " +
+			"state (active | none), id, image, replicas, phase (running | aborted | promoting | discarding), " +
+			"pending (promote | discard waiting for the old variant's pinned sessions to drain — up to max_session, " +
+			"default 24h — after which the dashboard finalizes it), op (a change still being applied) and last_error, " +
+			"config (the proxy.ab.* labels), drain, stats (A and B: requests, errors, error_rate, p50_ms, p95_ms, " +
+			"merged across hosts), per_host (reachability, stats, pinned sessions, and judge status: warmup, " +
+			"min_runtime, insufficient_samples — auto-abort can't fire yet, fewer than proxy.ab.min_samples " +
+			"(default 500) requests per variant — ok, or abort), abort, hint, env_pending_note, and the history " +
+			"of past tests. Per-window latency histograms are omitted.",
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+			"host":    prop("string", "Optional host identity (see \"machine\" in list_services) whose test to read instead of this dashboard's. Requires MCP_ALLOW_PEER_WRITES."),
+		}, "service"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			b, err := a.call(ctx, "GET", withHost("/api/services/"+url.PathEscape(name)+"/ab", host), nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(stripABHist(b)), nil
 		},
 	})
 
@@ -907,6 +1023,247 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 				return pretty(b), nil
 			}
 			return "", fmt.Errorf("action must be \"promote\" or \"discard\", got %q", action)
+		},
+	})
+
+	// The A/B tools POST to the async /ab endpoints and then poll GET ab
+	// until the change is applied (pollABOp). The backend validators run
+	// first here too, so a bad argument never reaches the dashboard.
+	abBusyNote := " The A/B lock is held until the change is applied, so an op sent right after another can briefly fail with \"already in progress\" — retry it."
+	abHostProp := prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES.")
+	abGroupsProp := func(desc string) map[string]any {
+		return map[string]any{
+			"type":                 "object",
+			"additionalProperties": map[string]any{"type": "string", "enum": []string{"A", "B"}},
+			"description":          desc,
+		}
+	}
+	abStrings := func(desc string) map[string]any {
+		return map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": desc}
+	}
+
+	s.Register(Tool{
+		Name:  "start_ab_test",
+		Title: "Start an A/B test",
+		Description: "Start an A/B test on a label-managed service: B is a canary with a DIFFERENT IMAGE (image-only — " +
+			"env is refused; build a different image for B), A is the live replicas. New sessions are split by account " +
+			"(ab_uid / ab_group cookies the app sets), a signed-out visitor's ab_anon cookie, a header, or randomly, and " +
+			"each session stays pinned to its variant. The proxy records per-variant requests, error rate and p50/p95, " +
+			"and auto-aborts (new sessions back to A) when B is clearly worse. The QA override ?pm_variant= is off unless " +
+			"override is true. This call blocks while B is created and passes its health gate, then returns get_ab_test's " +
+			"status." + abBusyNote,
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service":      prop("string", "Service name from list_services."),
+			"image":        prop("string", "B's full image reference including tag."),
+			"replicas":     prop("number", "B replicas, 1.."+fmt.Sprint(abMaxReplicas)+" (default 1)."),
+			"split":        prop("number", "Percent of ungrouped and signed-out sessions sent to B, 0..100 (default 10)."),
+			"assign":       map[string]any{"type": "string", "enum": []string{"cookie", "random", "header"}, "description": "cookie (default, browsers), random (per request), or header (API clients: hash of the header named by header)."},
+			"header":       prop("string", "Header name to hash, only with assign=header."),
+			"groups":       abGroupsProp("Group name -> \"A\" or \"B\", matched against the app's ab_group cookie (names a-z 0-9 _ -, 1..32). Grouped accounts skip the split."),
+			"uid_cookie":   prop("string", "Cookie holding the app's opaque account hash (default ab_uid)."),
+			"group_cookie": prop("string", "Cookie holding the app's group name (default ab_group)."),
+			"anon":         prop("boolean", "Split signed-out visitors by a per-browser ab_anon cookie (default true); false draws per session."),
+			"session_idle": prop("string", "A pinned session ends after this long idle, 5m..24h (default 30m)."),
+			"pin_refresh":  prop("string", "How often the pin cookie is refreshed, 1m..session_idle/2 (default 5m)."),
+			"max_session":  prop("string", "Longest a session keeps its variant, and the drain deadline, 1h..168h (default 24h)."),
+			"exclude":      abStrings("Path prefixes that always go to A, unpinned and uncounted (e.g. /api/cron, /api/webhooks, /api/health)."),
+			"static":       abStrings("Static path prefixes retried on the other variant after a 404 (default /_next/static/); [\"none\"] disables."),
+			"cookie_js":    prop("boolean", "Also set a non-HttpOnly ab_vjs_ cookie holding A or B for client-side code (default false)."),
+			"override":     prop("boolean", "Allow the ?pm_variant=A|B QA override (default false — prefer a qa:B group)."),
+			"thresholds": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"autoabort":          prop("boolean", "Auto-abort on (default true)."),
+					"min_samples":        prop("number", "Requests per variant before judging starts (default 500)."),
+					"min_runtime":        prop("string", "Runtime before judging starts, 0..24h (default 15m)."),
+					"warmup":             prop("string", "Warm-up after start or a split/groups change, 0..1h (default 3m)."),
+					"window":             prop("string", "Judging window, 1m..1h (default 5m)."),
+					"windows":            prop("number", "Consecutive bad windows that abort, 1..12 (default 2)."),
+					"window_min_samples": prop("number", "Requests per variant for a window to count (default 50)."),
+					"err_delta":          prop("number", "Error-rate gap in percentage points, 0.1..100 (default 2)."),
+					"err_ratio":          prop("number", "Error-rate ratio B/A, 1..100 (default 2)."),
+					"p95_ratio":          prop("number", "p95 latency ratio B/A, 1..100 (default 1.5)."),
+					"p95_slack":          prop("string", "Extra p95 allowance, 0..60s (default 200ms)."),
+				},
+				"additionalProperties": false,
+				"description":          "Auto-abort tuning; omit for the defaults.",
+			},
+			"host": abHostProp,
+		}, "service", "image"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			if _, ok := args["env"]; ok {
+				return "", fmt.Errorf("env is not supported in an A/B test (B is image-only in v1) — build a different image for B")
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			req, err := argABStart(args)
+			if err != nil {
+				return "", err
+			}
+			if _, err := abConfigLabels(req); err != nil {
+				return "", err
+			}
+			path := withHost("/api/services/"+url.PathEscape(name)+"/ab", host)
+			b, err := a.call(ctx, "POST", path, req)
+			if err != nil {
+				return "", err
+			}
+			return a.pollABOp(ctx, path, b)
+		},
+	})
+
+	s.Register(Tool{
+		Name:        "set_ab_split",
+		Title:       "Change an A/B test's split",
+		Description: "Change the percent of ungrouped and signed-out sessions sent to B. Applies to NEW sessions only (pinned sessions keep their variant), restarts the warm-up, and recreates B with the new label (health-gated). Allowed while running or aborted." + abBusyNote,
+		Mutating:    true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+			"split":   prop("number", "Percent to B, 0..100."),
+			"host":    abHostProp,
+		}, "service", "split"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			split, err := argInt(args, "split")
+			if err != nil {
+				return "", err
+			}
+			if err := abCheckInt("split", split, 0, 100); err != nil {
+				return "", err
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			base := "/api/services/" + url.PathEscape(name) + "/ab"
+			b, err := a.call(ctx, "POST", withHost(base+"/split", host), struct {
+				Split int `json:"split"`
+			}{split})
+			if err != nil {
+				return "", err
+			}
+			return a.pollABOp(ctx, withHost(base, host), b)
+		},
+	})
+
+	s.Register(Tool{
+		Name:        "set_ab_groups",
+		Title:       "Change an A/B test's groups",
+		Description: "Replace the group -> variant map (matched against the app's ab_group cookie). Affects NEW sessions only, restarts the warm-up, and recreates B with the new label (health-gated). Allowed while running or aborted." + abBusyNote,
+		Mutating:    true,
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Service name from list_services."),
+			"groups":  abGroupsProp("The complete new map, group name -> \"A\" or \"B\" (names a-z 0-9 _ -, 1..32). {} clears it."),
+			"host":    abHostProp,
+		}, "service", "groups"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			if _, ok := args["groups"]; !ok {
+				return "", fmt.Errorf("missing required argument %q", "groups")
+			}
+			groups, err := argABGroups(args, "groups")
+			if err != nil {
+				return "", err
+			}
+			if err := abValidateGroups(groups); err != nil {
+				return "", err
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			base := "/api/services/" + url.PathEscape(name) + "/ab"
+			b, err := a.call(ctx, "POST", withHost(base+"/groups", host), map[string]any{"groups": groups})
+			if err != nil {
+				return "", err
+			}
+			return a.pollABOp(ctx, withHost(base, host), b)
+		},
+	})
+
+	s.Register(Tool{
+		Name:  "resolve_ab_test",
+		Title: "Promote, discard, abort or reset an A/B test",
+		Description: "End or steer an A/B test. promote: new sessions go to B; once A's pinned sessions drain (idle, or " +
+			"max_session — default 24h) the dashboard makes B the live set. Promote finalize first rolls every PEER host " +
+			"running the service onto B's image (health-gated; a peer needs -peer-writes, else the promote stays pending " +
+			"with last_error). An aborted B needs confirm_aborted. discard: new sessions go to A; B is removed once its " +
+			"sessions drain. Without force, promote and discard return once the phase has flipped (pending is set) and " +
+			"finalize later; force skips the drain and finalizes now, cutting pinned sessions over. abort: new sessions go " +
+			"to A, B stays up (pins keep their variant). reset: a new test id with fresh stats, invalidating every pin; " +
+			"needs B drained unless force." + abBusyNote,
+		Mutating: true,
+		InputSchema: schema(map[string]any{
+			"service":         prop("string", "Service name from list_services."),
+			"action":          map[string]any{"type": "string", "enum": []string{"promote", "discard", "abort", "reset"}, "description": "promote, discard, abort or reset"},
+			"force":           prop("boolean", "promote/discard/reset only: skip the drain (default false)."),
+			"confirm_aborted": prop("boolean", "promote only: promote a B that was aborted (default false)."),
+			"host":            abHostProp,
+		}, "service", "action"),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			name, err := argString(args, "service")
+			if err != nil {
+				return "", err
+			}
+			action, err := argString(args, "action")
+			if err != nil {
+				return "", err
+			}
+			var force, confirm bool
+			if _, ok := args["force"]; ok {
+				if force, err = argBool(args, "force"); err != nil {
+					return "", err
+				}
+			}
+			if _, ok := args["confirm_aborted"]; ok {
+				if confirm, err = argBool(args, "confirm_aborted"); err != nil {
+					return "", err
+				}
+			}
+			var body any
+			switch action {
+			case "promote":
+				body = struct {
+					Force          bool `json:"force"`
+					ConfirmAborted bool `json:"confirm_aborted"`
+				}{force, confirm}
+			case "discard", "reset":
+				if confirm {
+					return "", fmt.Errorf("confirm_aborted only applies to promote")
+				}
+				body = struct {
+					Force bool `json:"force"`
+				}{force}
+			case "abort":
+				if force || confirm {
+					return "", fmt.Errorf("abort takes no force or confirm_aborted")
+				}
+			default:
+				return "", fmt.Errorf("action must be \"promote\", \"discard\", \"abort\" or \"reset\", got %q", action)
+			}
+			host, err := hostArg(args, "host", allowPeerWrites)
+			if err != nil {
+				return "", err
+			}
+			base := "/api/services/" + url.PathEscape(name) + "/ab"
+			b, err := a.call(ctx, "POST", withHost(base+"/"+action, host), body)
+			if err != nil {
+				return "", err
+			}
+			return a.pollABOp(ctx, withHost(base, host), b)
 		},
 	})
 
@@ -1516,6 +1873,89 @@ func argAdoptRequest(args map[string]any) (centralEnvAdoptRequest, error) {
 		}
 	}
 	return req, nil
+}
+
+// argABStart reads start_ab_test's arguments into the typed request, so
+// nothing outside abStartRequest (env above all) can reach the wire.
+// Bounds are checked by the caller with the backend's abConfigLabels.
+func argABStart(args map[string]any) (abStartRequest, error) {
+	req := abStartRequest{Replicas: 1}
+	var err error
+	if req.Image, err = argString(args, "image"); err != nil {
+		return req, err
+	}
+	if _, ok := args["replicas"]; ok {
+		if req.Replicas, err = argInt(args, "replicas"); err != nil {
+			return req, err
+		}
+	}
+	if _, ok := args["split"]; ok {
+		split, err := argInt(args, "split")
+		if err != nil {
+			return req, err
+		}
+		req.Split = &split
+	}
+	for key, dst := range map[string]*string{"assign": &req.Assign, "header": &req.Header, "uid_cookie": &req.UIDCookie,
+		"group_cookie": &req.GroupCookie, "session_idle": &req.SessionIdle, "pin_refresh": &req.PinRefresh, "max_session": &req.MaxSession} {
+		if *dst, err = argOptionalString(args, key); err != nil {
+			return req, err
+		}
+	}
+	if req.Groups, err = argABGroups(args, "groups"); err != nil {
+		return req, err
+	}
+	if _, ok := args["anon"]; ok {
+		anon, err := argBool(args, "anon")
+		if err != nil {
+			return req, err
+		}
+		req.Anon = &anon
+	}
+	for key, dst := range map[string]*bool{"cookie_js": &req.CookieJS, "override": &req.Override} {
+		if _, ok := args[key]; ok {
+			if *dst, err = argBool(args, key); err != nil {
+				return req, err
+			}
+		}
+	}
+	if req.Exclude, err = argStringSlice(args, "exclude"); err != nil {
+		return req, err
+	}
+	if req.Static, err = argStringSlice(args, "static"); err != nil {
+		return req, err
+	}
+	if raw, ok := args["thresholds"]; ok {
+		b, _ := json.Marshal(raw)
+		dec := json.NewDecoder(strings.NewReader(string(b)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req.Thresholds); err != nil {
+			return req, fmt.Errorf("argument \"thresholds\" must be an object of autoabort, min_samples, min_runtime, warmup, window, windows, window_min_samples, err_delta, err_ratio, p95_ratio, p95_slack: %v", err)
+		}
+	}
+	return req, nil
+}
+
+// argABGroups reads an optional {group name: "A"|"B"} object. Names and
+// values are validated by the caller with abValidateGroups.
+func argABGroups(args map[string]any, key string) (map[string]string, error) {
+	v, ok := args[key]
+	if !ok {
+		return nil, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("argument %q must be an object of group name -> \"A\" or \"B\"", key)
+	}
+	out := make(map[string]string, len(m))
+	for name, raw := range m {
+		s, ok := raw.(string)
+		if !ok {
+			return nil, fmt.Errorf("argument %q: value for %q must be \"A\" or \"B\"", key, name)
+		}
+		out[name] = s
+	}
+	return out, nil
 }
 
 // refuseLiteralCredentials rejects a literal value for any key that looks

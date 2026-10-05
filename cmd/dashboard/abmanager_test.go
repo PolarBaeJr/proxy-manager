@@ -1746,3 +1746,29 @@ func TestABRelabelNamesStayBounded(t *testing.T) {
 		t.Fatalf("25 relabels took %s", d)
 	}
 }
+
+// TestABNewOpClearsLastError: a new op must not report an earlier op's
+// failure while it is still being applied — a poller would stop on it.
+func TestABNewOpClearsLastError(t *testing.T) {
+	withFastAB(t)
+	h := newABHarness(t, nil, "")
+	if _, err := h.m.Start(context.Background(), "app", abStartRequest{Image: "ghcr.io/org/app:v2", Replicas: 1}, false); err != nil {
+		t.Fatal(err)
+	}
+	rec := h.record(t)
+	rec.LastError = "boom"
+	if err := h.m.store.put("app", rec); err != nil {
+		t.Fatal(err)
+	}
+	next, err := h.m.SetSplit("app", 40, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.LastError != "" {
+		t.Fatalf("persisted record still carries last_error %q", next.LastError)
+	}
+	abWaitIdle(t, h.m, "app")
+	if got := h.record(t).LastError; got != "" {
+		t.Fatalf("last_error after the split = %q", got)
+	}
+}

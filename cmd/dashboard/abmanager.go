@@ -579,7 +579,9 @@ func (m *abManager) mutate(svc string, async bool, prep func(cur *abRecord, now 
 		l.Unlock()
 		return nil, abConflict("%q is being changed by %s — try again when it finishes", svc, m.dc.claims.holder(svc))
 	}
-	next.LastAttempt = m.now().Unix()
+	// A new op starts clean: an earlier failure's error would otherwise
+	// show as this op's until exec finishes.
+	next.LastAttempt, next.LastError = m.now().Unix(), ""
 	if err := m.store.put(svc, next); err != nil {
 		m.dc.claims.release(svc, abClaimOwner)
 		l.Unlock()
