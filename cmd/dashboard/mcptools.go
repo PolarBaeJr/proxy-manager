@@ -202,30 +202,6 @@ func pretty(b []byte) string {
 	return string(out)
 }
 
-// stripServiceLabels drops each service's raw Labels map before it reaches
-// an MCP client. Labels carries every proxy.* AND docker-compose-generated
-// label verbatim — by far the biggest thing in a /api/services response once
-// there are more than a couple of services — and no MCP tool here reads it
-// back. The dashboard UI is a different consumer of the same /api/services
-// endpoint and still needs Labels (ui.go checks proxy.autoupdate directly),
-// so this only trims the MCP-facing copy, never the underlying API response.
-// Falls back to the untouched body on any decode error rather than hiding
-// the real response behind a swallowed error.
-func stripServiceLabels(b []byte) []byte {
-	var svcs []Service
-	if err := json.Unmarshal(b, &svcs); err != nil {
-		return b
-	}
-	for i := range svcs {
-		svcs[i].Labels = nil
-	}
-	out, err := json.Marshal(svcs)
-	if err != nil {
-		return b
-	}
-	return out
-}
-
 // hostArg reads the optional peer-targeting argument named by key, gated
 // separately from allowWrites: a model acting on a hallucinated or wrong
 // host could mutate a service it never meant to touch, so reaching another
@@ -266,37 +242,62 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 	// ---- read-only ----
 
 	s.Register(Tool{
-		Name:        "list_services",
-		Title:       "List services",
-		Description: "List every service the proxy manages: image, replica count, running count, host, whether an image update is available, canary state, and (image_check_error) whether the registry/distribution check for its image is currently failing.",
-		InputSchema: schema(map[string]any{}),
-		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
+		Name:  "list_services",
+		Title: "List services",
+		Description: "List every service the proxy manages. With no arguments this returns a SUMMARY, one line per service: " +
+			"name, machine (only for a service on another host), routed host+path, image, running/total replicas, " +
+			"flags (shown only when true: all-stopped, update-available, update-blocked, image-check-error, " +
+			"canary:<image>x<replicas>, ab-test:<phase>, ab-pending:<op>, auto-update, unscalable, overlap, onboarded, " +
+			"dual-tracked, central-env, weight:<n>), and members= — the exact container names of its replicas, each " +
+			"marked [canary], [<state>] (e.g. [exited]) and/or [unhealthy]/[starting] when it is not a plain running " +
+			"replica. Pass service for the full JSON of one service (member ids, backends, previous image, and the " +
+			"image_check_error and autoupdate_skip_reason text behind the image-check-error/update-blocked flags). " +
+			"The central-env flag is best-effort — get_service_env is authoritative. Onboarded-only services list no " +
+			"container names.",
+		InputSchema: schema(map[string]any{
+			"service": prop("string", "Optional. Service name; returns full JSON for that service on every machine it runs on. Omit for the summary."),
+		}),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			service, err := argOptionalString(args, "service")
+			if err != nil {
+				return "", err
+			}
 			b, err := a.call(ctx, "GET", "/api/services", nil)
 			if err != nil {
 				return "", err
 			}
-			return pretty(stripServiceLabels(b)), nil
+			return renderServices(b, service)
 		},
 	})
 
 	s.Register(Tool{
-		Name:        "list_routes",
-		Title:       "List routes",
-		Description: "List the host/path routes the proxy currently serves and their backends, from both container labels and static config.",
-		InputSchema: schema(map[string]any{}),
-		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
+		Name:  "list_routes",
+		Title: "List routes",
+		Description: "List the host/path routes the proxy currently serves and their backends, from both container labels and static config. " +
+			"With no arguments this returns a summary, one line per route: host+path, service, name, source " +
+			"(static/containers/mixed), backend count and the first few backends (container name, or URL for a static " +
+			"backend, with its weight when not 1), and flags (strip, no-backends). Pass hostname for the full JSON of " +
+			"the routes on one hostname.",
+		InputSchema: schema(map[string]any{
+			"hostname": prop("string", "Optional. A ROUTED hostname (e.g. app.example.com), not a machine/peer identity; returns full JSON for the routes on that hostname. Omit for the summary."),
+		}),
+		Handler: func(ctx context.Context, args map[string]any) (string, error) {
+			hostname, err := argOptionalString(args, "hostname")
+			if err != nil {
+				return "", err
+			}
 			b, err := a.call(ctx, "GET", "/api/routes", nil)
 			if err != nil {
 				return "", err
 			}
-			return pretty(b), nil
+			return renderRoutes(b, hostname)
 		},
 	})
 
 	s.Register(Tool{
 		Name:        "get_logs",
 		Title:       "Get container logs",
-		Description: "Fetch recent log lines for one container. Use list_services first for exact container names.",
+		Description: "Fetch recent log lines for one container. Use list_services first — each line's members= list has the exact container names.",
 		InputSchema: schema(map[string]any{
 			"container": prop("string", "Exact container name."),
 			"tail":      prop("number", "Trailing lines to return (default 200, max 2000)."),
@@ -341,11 +342,14 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 	})
 
 	s.Register(Tool{
-		Name:        "list_dns",
-		Title:       "List DNS records",
-		Description: "List Cloudflare DNS records for a zone. Omit zone for the default.",
+		Name:  "list_dns",
+		Title: "List DNS records",
+		Description: "List Cloudflare DNS records for a zone. Omit zone for the default. With no name this returns a summary, " +
+			"one line per record (type, name, content, proxied or dns-only, ttl when not automatic, id); long content " +
+			"is truncated there. Pass name for the full JSON of the matching records.",
 		InputSchema: schema(map[string]any{
 			"zone": prop("string", "Zone domain, e.g. polardev.org. Omit for the default."),
+			"name": prop("string", "Optional. Record name; exact match (case-insensitive), else substring. Returns full JSON for the matches. Omit for the summary."),
 		}),
 		Handler: func(ctx context.Context, args map[string]any) (string, error) {
 			// argOptionalString, not argString: an explicit zone:"" is a
@@ -356,11 +360,15 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			if err != nil {
 				return "", err
 			}
+			name, err := argOptionalString(args, "name")
+			if err != nil {
+				return "", err
+			}
 			b, err := a.call(ctx, "GET", "/api/cf/records?zone="+url.QueryEscape(zone), nil)
 			if err != nil {
 				return "", err
 			}
-			return pretty(b), nil
+			return renderDNS(b, name)
 		},
 	})
 
@@ -839,7 +847,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			"ones never became healthy. On a multi-replica service this can zero its capacity. " +
 			"Prefer rolling_replace_service, which health-gates each replica one at a time and " +
 			"never drops capacity, for any production multi-replica service. Exception: on a " +
-			"proxy.overlap service (overlap: true in list_services) this IS health-gated — the " +
+			"proxy.overlap service (the overlap flag in list_services) this IS health-gated — the " +
 			"new copy must pass its health check before the old one is drained, and is removed " +
 			"(old one untouched) if it never does.",
 		Mutating: true,
@@ -914,7 +922,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			"leave the service with fewer than " + fmt.Sprint(minHealthyReplicasForRollingReplace) +
 			" healthy replicas across every host (a single-replica service on one host alone " +
 			"cannot pass this — spread it across hosts first, or use replace_service if you " +
-			"accept that risk). A proxy.overlap singleton (overlap: true in list_services) is " +
+			"accept that risk). A proxy.overlap singleton (the overlap flag in list_services) is " +
 			"exempt: it is replaced by health-gated overlap instead. The job itself runs asynchronously on the dashboard, but this " +
 			"tool call blocks and polls until it actually finishes (completed or failed) before " +
 			"returning, matching the synchronous contract replace_service documents. Like " +
@@ -1371,11 +1379,11 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 	s.Register(Tool{
 		Name:        "restart_replica",
 		Title:       "Start, stop, or restart a replica",
-		Description: "Start, stop, or restart one replica of a service (not the whole service — use lifecycle_service for that). member must be a NON-canary replica name from list_services' member_summaries (one where is_canary is false/absent) — canary replicas can't be managed here, use resolve_canary instead. restart is normally stop immediately followed by start; on a service's only running (non-canary) replica this causes a brief window with no live backend for that host, so check member_summaries/replicas count first if that matters. Exception: on a proxy.overlap service (list_services shows overlap: true — an unscalable singleton) restart instead creates a new copy from the image reference the service already runs (whatever that tag points to locally, not re-pulled), waits for it to pass its health check, then drains the old one — no downtime. That runs as a job this call blocks on (it returns the final rolling-replace state; status failed with last_error means the new copy never became healthy and was removed while the old one kept serving). It refuses a service with anonymous volumes or with no HEALTHCHECK/proxy.health rather than falling back to stop/start.",
+		Description: "Start, stop, or restart one replica of a service (not the whole service — use lifecycle_service for that). member must be a NON-canary replica name from list_services' members= list that is not marked [canary] — canary replicas can't be managed here, use resolve_canary instead. restart is normally stop immediately followed by start; on a service's only running (non-canary) replica this causes a brief window with no live backend for that host, so check the replicas=running/total count first if that matters. Exception: on a proxy.overlap service (list_services shows the overlap flag — an unscalable singleton) restart instead creates a new copy from the image reference the service already runs (whatever that tag points to locally, not re-pulled), waits for it to pass its health check, then drains the old one — no downtime. That runs as a job this call blocks on (it returns the final rolling-replace state; status failed with last_error means the new copy never became healthy and was removed while the old one kept serving). It refuses a service with anonymous volumes or with no HEALTHCHECK/proxy.health rather than falling back to stop/start.",
 		Mutating:    true,
 		InputSchema: schema(map[string]any{
 			"service": prop("string", "Service name from list_services."),
-			"member":  prop("string", "Replica name from list_services' member_summaries."),
+			"member":  prop("string", "Replica name from list_services' members= list."),
 			"action":  map[string]any{"type": "string", "enum": []string{"start", "stop", "restart"}, "description": "start, stop, or restart"},
 			"host":    prop("string", "Optional peer hostname/identity (see the \"machine\" field returned by list_services) to target a service on a DIFFERENT dashboard host instead of this one. Requires MCP_ALLOW_PEER_WRITES."),
 		}, "service", "member", "action"),
