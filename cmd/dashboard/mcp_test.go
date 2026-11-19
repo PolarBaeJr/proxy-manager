@@ -241,6 +241,7 @@ func TestToolsCallCorrectEndpoints(t *testing.T) {
 		{"list_routes", `{"hostname":"app.example"}`, "GET /api/routes"},
 		{"list_dns", `{}`, "GET /api/cf/records?zone="},
 		{"list_dns", `{"name":"x"}`, "GET /api/cf/records?zone="},
+		{"list_peers", `{}`, "GET /api/v1/peers"},
 		{"maintenance_status", `{}`, "GET /api/maintenance"},
 		{"get_logs", `{"container":"my app","tail":50}`, "GET /api/logs/my%20app?tail=50"},
 		{"set_maintenance", `{"host":"x.example","enabled":true}`, "POST /api/maintenance/x.example"},

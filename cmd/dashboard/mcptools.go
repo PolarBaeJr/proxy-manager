@@ -328,6 +328,20 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 	})
 
 	s.Register(Tool{
+		Name:        "list_peers",
+		Title:       "List peer dashboards",
+		Description: "Show this dashboard's own identity/version and every configured peer dashboard's reachability, identity, version, whether it's behind the mesh floor, and whether it accepts peer writes.",
+		InputSchema: schema(map[string]any{}),
+		Handler: func(ctx context.Context, _ map[string]any) (string, error) {
+			b, err := a.call(ctx, "GET", "/api/v1/peers", nil)
+			if err != nil {
+				return "", err
+			}
+			return pretty(b), nil
+		},
+	})
+
+	s.Register(Tool{
 		Name:        "maintenance_status",
 		Title:       "Maintenance status",
 		Description: "Show which hosts currently serve the maintenance page, and which have their own custom page.",

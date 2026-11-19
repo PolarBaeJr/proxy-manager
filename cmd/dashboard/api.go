@@ -1794,7 +1794,24 @@ func newDashboardMux(dc *dockerClient, cf *cloudflareRegistry, auth *AuthStore, 
 		}
 	}))
 
-	return mux
+	// Alias every route above under /api/v1/ too, without touching any of
+	// the ~50 individual HandleFunc registrations: strip "/api/v1" then
+	// re-add "/api" so the same request re-enters the mux as its original
+	// /api/* path — exact vs. subtree routes (e.g. "/api/services" vs
+	// "/api/services/") resolve identically either way. Deliberately
+	// additive, not a cutover: existing /api/* callers (ui.go, mcptools.go,
+	// peers.go) are untouched and keep working, so a Mac/Pi redeploy skew
+	// never breaks mesh calls mid-rollout — see
+	// project_pi_compose_diverges_from_repo. New callers can target
+	// /api/v1/*.
+	reAPIPrefix := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		req.URL.Path = "/api" + req.URL.Path
+		mux.ServeHTTP(w, req)
+	})
+	versioned := http.NewServeMux()
+	versioned.Handle("/", mux)
+	versioned.Handle("/api/v1/", http.StripPrefix("/api/v1", reAPIPrefix))
+	return versioned
 }
 
 // buildManagedServices is the shared local-services assembly behind both
