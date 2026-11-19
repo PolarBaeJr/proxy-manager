@@ -202,18 +202,18 @@ func TestToolFailureIsResultNotProtocolError(t *testing.T) {
 	}
 }
 
-// list_services strips each service's raw Labels map before it reaches the
-// model — Labels carries every proxy.* and docker-compose-generated label
-// verbatim and is by far the biggest thing in the response once there's more
-// than a couple of services, and no MCP tool reads it back. Unrelated fields
-// must survive untouched.
+// list_services' full-JSON detail (service given) strips each service's raw
+// Labels map before it reaches the model — Labels carries every proxy.* and
+// docker-compose-generated label verbatim and is by far the biggest thing in
+// the response once there's more than a couple of services, and no MCP tool
+// reads it back. Unrelated fields must survive untouched.
 func TestListServicesStripsLabels(t *testing.T) {
 	body := `[{"name":"app","group":"app","image":"ghcr.io/org/app:v1","host":"app.example","port":8080,"replicas":1,"autoupdate_skip_reason":"stopped retrying after 3 consecutive failures: boom","labels":{"com.docker.compose.project":"stack","proxy.enable":"true","proxy.host":"app.example"}}]`
 	c, _ := stubDash(t, 200, body)
 	s := NewServer("t", "v")
 	registerMCPTools(s, c, true, false)
 
-	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_services","arguments":{}}}`)
+	res, _ := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_services","arguments":{"service":"app"}}}`)
 	r := res["result"].(map[string]any)
 	text := r["content"].([]any)[0].(map[string]any)["text"].(string)
 	if strings.Contains(text, "labels") || strings.Contains(text, "com.docker.compose") {
@@ -224,7 +224,7 @@ func TestListServicesStripsLabels(t *testing.T) {
 	}
 	// The sticky blocked-reason fallback (autoupdate.go's autoUpdateBlockStore)
 	// is exactly the kind of "why is this stuck" signal an MCP client needs —
-	// stripServiceLabels must only drop Labels, never this.
+	// the detail view must only drop Labels, never this.
 	if !strings.Contains(text, "stopped retrying after 3 consecutive failures") {
 		t.Errorf("list_services dropped autoupdate_skip_reason: %s", text)
 	}
@@ -236,6 +236,11 @@ func TestToolsCallCorrectEndpoints(t *testing.T) {
 		tool, args, wantCall string
 	}{
 		{"list_services", `{}`, "GET /api/services"},
+		{"list_services", `{"service":"app"}`, "GET /api/services"},
+		{"list_routes", `{}`, "GET /api/routes"},
+		{"list_routes", `{"hostname":"app.example"}`, "GET /api/routes"},
+		{"list_dns", `{}`, "GET /api/cf/records?zone="},
+		{"list_dns", `{"name":"x"}`, "GET /api/cf/records?zone="},
 		{"maintenance_status", `{}`, "GET /api/maintenance"},
 		{"get_logs", `{"container":"my app","tail":50}`, "GET /api/logs/my%20app?tail=50"},
 		{"set_maintenance", `{"host":"x.example","enabled":true}`, "POST /api/maintenance/x.example"},
@@ -309,6 +314,9 @@ func TestArgumentValidation(t *testing.T) {
 		{"create_dns_record", `{"name":"x.example","content":"1.2.3.4"}`},              // missing type
 		{"update_dns_record", `{"id":"rec1"}`},                                         // no fields to update
 		{"delete_dns_record", `{}`},                                                    // missing id
+		{"list_services", `{"service":1}`},                                             // selector not a string
+		{"list_routes", `{"hostname":true}`},                                           // selector not a string
+		{"list_dns", `{"name":1}`},                                                     // selector not a string
 
 		{"start_ab_test", `{"service":"app"}`},                                             // missing image
 		{"start_ab_test", `{"service":"app","image":"i:v2","env":{}}`},                     // env refused

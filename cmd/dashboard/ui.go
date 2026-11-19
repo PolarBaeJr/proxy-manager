@@ -380,6 +380,7 @@ tr.disc-child td:first-child{padding-left:28px}
 .note.info{border-color:var(--info-border);background:var(--info-bg)}
 .note.info svg{color:var(--info)}
 .meta{font-size:12px;color:var(--muted)}
+.meta>svg{width:13px;height:13px;flex:none;vertical-align:-2px;margin-right:5px}
 .copybar{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:7px 9px;margin-top:8px}
 .copybar code{flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
 
