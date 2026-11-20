@@ -373,7 +373,8 @@ type OnboardRequest struct {
 // bindings, capabilities, a static IP/links/driver opts on a second docker
 // network, ...) is refused rather than silently downgraded — a second docker
 // network with nothing unreproducible on it is carried forward instead (see
-// cloneSpec.ExtraNetworks).
+// cloneSpec.ExtraNetworks), and so are extra_hosts entries (see
+// cloneSpec.ExtraHosts).
 func (c *dockerClient) onboardContainer(ctx context.Context, name string, req OnboardRequest) error {
 	if req.Host == "" || req.Port <= 0 {
 		return fmt.Errorf("host and port are required")
@@ -461,7 +462,7 @@ func (c *dockerClient) onboardContainer(ctx context.Context, name string, req On
 	for i := 1; i <= req.Replicas; i++ {
 		cname := fmt.Sprintf("goproxy-%s-%d", name, i)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image: image, Labels: labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts},
+			Image: image, Labels: labels, Env: env, HostConfig: hostConfig{Mounts: clone.Mounts, ExtraHosts: clone.ExtraHosts},
 			ManagedAliases: clone.ManagedAliases, ExtraNetworks: clone.ExtraNetworks,
 		})
 		if err != nil {

@@ -77,6 +77,61 @@ func TestInspectHostConfigUnknownsMountsOnlyPasses(t *testing.T) {
 	}
 }
 
+// TestInspectHostConfigUnknownsExtraHostsPasses proves ExtraHosts alone
+// (inspectCloneSpec carries it forward) does not trigger a refusal.
+func TestInspectHostConfigUnknownsExtraHostsPasses(t *testing.T) {
+	dc := hostConfigStub(t, `{
+		"Image": "sha256:abc",
+		"HostConfig": {
+			"NetworkMode": "edge",
+			"ExtraHosts": ["host.docker.internal:host-gateway"]
+		},
+		"Config": {},
+		"NetworkSettings": {"Networks": {"edge": {}}}
+	}`, "")
+
+	got, err := dc.inspectHostConfigUnknowns(context.Background(), "id1")
+	if err != nil {
+		t.Fatalf("inspectHostConfigUnknowns: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("refused = %v, want none (ExtraHosts is carried forward by inspectCloneSpec)", got)
+	}
+}
+
+// TestInspectHostConfigUnknownsDnsStillRefusedWithExtraHosts proves dropping
+// ExtraHosts from the refuse list did not loosen its neighbours: custom DNS
+// servers are still not reproducible by a recreate.
+func TestInspectHostConfigUnknownsDnsStillRefusedWithExtraHosts(t *testing.T) {
+	dc := hostConfigStub(t, `{
+		"Image": "sha256:abc",
+		"HostConfig": {
+			"NetworkMode": "edge",
+			"ExtraHosts": ["host.docker.internal:host-gateway"],
+			"Dns": ["1.1.1.1"]
+		},
+		"Config": {},
+		"NetworkSettings": {"Networks": {"edge": {}}}
+	}`, "")
+
+	got, err := dc.inspectHostConfigUnknowns(context.Background(), "id1")
+	if err != nil {
+		t.Fatalf("inspectHostConfigUnknowns: %v", err)
+	}
+	var sawDns bool
+	for _, f := range got {
+		if f == "Dns" {
+			sawDns = true
+		}
+		if f == "ExtraHosts" {
+			t.Errorf("refused = %v, want ExtraHosts absent", got)
+		}
+	}
+	if !sawDns {
+		t.Fatalf("refused = %v, want it to contain Dns", got)
+	}
+}
+
 func TestInspectHostConfigUnknownsPortBindingsRefused(t *testing.T) {
 	dc := hostConfigStub(t, `{
 		"Image": "sha256:abc",

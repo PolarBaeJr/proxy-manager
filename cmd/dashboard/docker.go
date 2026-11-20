@@ -259,6 +259,7 @@ type hostConfig struct {
 	} `json:"RestartPolicy"`
 	Mounts       []mountSpec              `json:"Mounts,omitempty"`
 	PortBindings map[string][]portBinding `json:"PortBindings,omitempty"`
+	ExtraHosts   []string                 `json:"ExtraHosts,omitempty"`
 }
 
 // portBinding mirrors Docker Engine API's HostConfig.PortBindings entry
@@ -292,9 +293,16 @@ type healthcheckSpec struct {
 
 // cloneSpec is the subset of a container's HostConfig/Config that must ride
 // forward when it's recreated (replace/stage/promote/scale/onboard) but
-// isn't part of the labels/env already carried elsewhere.
+// isn't part of the labels/env already carried elsewhere. ExtraHosts rides
+// forward on same-host recreates only — it is host-local, so the cross-host
+// duplicate/spread paths deliberately leave it behind.
 type cloneSpec struct {
-	Mounts         []mountSpec
+	Mounts []mountSpec
+	// ExtraHosts is the template's HostConfig.ExtraHosts (compose
+	// `extra_hosts`), carried verbatim and in inspect order — never sorted
+	// or deduped, since order decides which entry wins for a hostname
+	// listed twice.
+	ExtraHosts     []string
 	Healthcheck    *healthcheckSpec
 	ManagedAliases []string            // custom aliases to reassert on the managed network's own endpoint
 	ExtraNetworks  []networkAttachment // non-managed networks + aliases to reconnect after create
@@ -638,10 +646,10 @@ func (c *dockerClient) inspectRestartCount(ctx context.Context, id string) (int,
 }
 
 // inspectCloneSpec returns the HostConfig/Config fields a recreate must carry
-// forward — Mounts (bind mounts / named volumes), Healthcheck, and every
-// docker network the container is attached to (with its custom DNS
-// aliases) — which createBody drops today if the caller doesn't thread them
-// through.
+// forward — Mounts (bind mounts / named volumes), ExtraHosts (verbatim, in
+// inspect order), Healthcheck, and every docker network the container is
+// attached to (with its custom DNS aliases) — which createBody drops today
+// if the caller doesn't thread them through.
 func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSpec, error) {
 	body, err := c.get(ctx, "/containers/"+id+"/json")
 	if err != nil {
@@ -651,7 +659,8 @@ func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSp
 	var resp struct {
 		Name       string `json:"Name"`
 		HostConfig struct {
-			Mounts []mountSpec `json:"Mounts"`
+			Mounts     []mountSpec `json:"Mounts"`
+			ExtraHosts []string    `json:"ExtraHosts"`
 		} `json:"HostConfig"`
 		Mounts []struct {
 			Type        string `json:"Type"`
@@ -689,7 +698,7 @@ func (c *dockerClient) inspectCloneSpec(ctx context.Context, id string) (cloneSp
 		return out
 	}
 
-	spec := cloneSpec{Mounts: resp.HostConfig.Mounts, Healthcheck: resp.Config.Healthcheck}
+	spec := cloneSpec{Mounts: resp.HostConfig.Mounts, ExtraHosts: resp.HostConfig.ExtraHosts, Healthcheck: resp.Config.Healthcheck}
 	for _, m := range resp.Mounts {
 		if m.Type == "volume" {
 			spec.VolumeDests = append(spec.VolumeDests, m.Destination)
@@ -767,12 +776,12 @@ func (c *dockerClient) inspectConfigImage(ctx context.Context, id string) (strin
 // createContainer cannot carry forward — are checked. NetworkMode and
 // RestartPolicy are intentionally excluded: createContainer already
 // hardcodes/manages both. Mounts is intentionally excluded: Phase 0's
+// inspectCloneSpec carries it forward. ExtraHosts is intentionally excluded:
 // inspectCloneSpec carries it forward.
 var hostConfigRefuseFields = []string{
 	"PortBindings",
 	"Binds",
 	"Dns", "DnsSearch", "DnsOptions",
-	"ExtraHosts",
 	"CapAdd", "CapDrop",
 	"Privileged",
 	"Devices",
@@ -860,6 +869,8 @@ var endpointRefuseFields = []string{"IPAMConfig", "Links", "DriverOpts"}
 // Config.Healthcheck is deliberately NOT checked here: inspectCloneSpec
 // carries it forward on every recreate path (see cloneSpec), so unlike
 // Cmd/Entrypoint it no longer needs a refuse-rather-than-drop guard.
+// HostConfig.ExtraHosts is NOT checked for the same reason: inspectCloneSpec
+// carries it forward verbatim on every same-host recreate.
 //
 // Extra (non-managed) networks are likewise NOT blanket-refused: inspectCloneSpec
 // carries every network a container is attached to — plus its custom DNS
@@ -1380,7 +1391,7 @@ func (c *dockerClient) scaleServiceWithHealthcheck(ctx context.Context, name str
 			n := nextReplicaIndex(existing, name) + i
 			cname := fmt.Sprintf("goproxy-%s-%d", name, n)
 			id, err := c.createContainer(ctx, cname, createBody{
-				Image: tpl.Image, Labels: tc.labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+				Image: tpl.Image, Labels: tc.labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts, ExtraHosts: tc.clone.ExtraHosts},
 				ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
 			})
 			if err != nil {
@@ -1819,7 +1830,7 @@ func (c *dockerClient) replaceService(ctx context.Context, name string, req Repl
 			Labels:         tpl.newLabels,
 			Env:            tpl.env,
 			Healthcheck:    tpl.clone.Healthcheck,
-			HostConfig:     hostConfig{Mounts: tpl.clone.Mounts},
+			HostConfig:     hostConfig{Mounts: tpl.clone.Mounts, ExtraHosts: tpl.clone.ExtraHosts},
 			ManagedAliases: tpl.clone.ManagedAliases,
 			ExtraNetworks:  tpl.clone.ExtraNetworks,
 		})
@@ -2012,7 +2023,7 @@ func (c *dockerClient) rollTemplate(ctx context.Context, name, image string, tpl
 			Labels:         tpl.newLabels,
 			Env:            tpl.env,
 			Healthcheck:    tpl.clone.Healthcheck,
-			HostConfig:     hostConfig{Mounts: tpl.clone.Mounts},
+			HostConfig:     hostConfig{Mounts: tpl.clone.Mounts, ExtraHosts: tpl.clone.ExtraHosts},
 			ManagedAliases: tpl.clone.ManagedAliases,
 			ExtraNetworks:  tpl.clone.ExtraNetworks,
 		})
@@ -2127,7 +2138,7 @@ func (c *dockerClient) setAutoUpdateLabel(ctx context.Context, name string, enab
 			Labels:         newLabels,
 			Env:            tc.env,
 			Healthcheck:    tc.clone.Healthcheck,
-			HostConfig:     hostConfig{Mounts: tc.clone.Mounts},
+			HostConfig:     hostConfig{Mounts: tc.clone.Mounts, ExtraHosts: tc.clone.ExtraHosts},
 			ManagedAliases: tc.clone.ManagedAliases,
 			ExtraNetworks:  tc.clone.ExtraNetworks,
 		})
@@ -2214,7 +2225,7 @@ func (c *dockerClient) setUnscalableLabel(ctx context.Context, name string, enab
 			Labels:         newLabels,
 			Env:            tc.env,
 			Healthcheck:    tc.clone.Healthcheck,
-			HostConfig:     hostConfig{Mounts: tc.clone.Mounts},
+			HostConfig:     hostConfig{Mounts: tc.clone.Mounts, ExtraHosts: tc.clone.ExtraHosts},
 			ManagedAliases: tc.clone.ManagedAliases,
 			ExtraNetworks:  tc.clone.ExtraNetworks,
 		})
@@ -2329,7 +2340,7 @@ func (c *dockerClient) setWeightLabel(ctx context.Context, name string, weight i
 			Labels:         newLabels,
 			Env:            tc.env,
 			Healthcheck:    tc.clone.Healthcheck,
-			HostConfig:     hostConfig{Mounts: tc.clone.Mounts},
+			HostConfig:     hostConfig{Mounts: tc.clone.Mounts, ExtraHosts: tc.clone.ExtraHosts},
 			ManagedAliases: tc.clone.ManagedAliases,
 			ExtraNetworks:  tc.clone.ExtraNetworks,
 		})
@@ -2426,7 +2437,7 @@ func (c *dockerClient) createCanaryReplicas(ctx context.Context, name string, re
 			cname = abCanaryName(name, startIdx+i)
 		}
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image: req.Image, Labels: canaryLabels, Env: env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+			Image: req.Image, Labels: canaryLabels, Env: env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts, ExtraHosts: tc.clone.ExtraHosts},
 			ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
 		})
 		if err != nil {
@@ -2505,7 +2516,7 @@ func (c *dockerClient) scaleCanary(ctx context.Context, name string, target int)
 		for i := 0; i < target-current; i++ {
 			cname := fmt.Sprintf("goproxy-%s-canary-%d", name, startIdx+i)
 			id, err := c.createContainer(ctx, cname, createBody{
-				Image: tpl.Image, Labels: tc.labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+				Image: tpl.Image, Labels: tc.labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts, ExtraHosts: tc.clone.ExtraHosts},
 				ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
 			})
 			if err != nil {
@@ -2596,7 +2607,7 @@ func (c *dockerClient) promoteCanary(ctx context.Context, name string) error {
 		startIdx := nextReplicaIndex(all, name)
 		cname := fmt.Sprintf("goproxy-%s-%d", name, startIdx)
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image: ct.Image, Labels: labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+			Image: ct.Image, Labels: labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts, ExtraHosts: tc.clone.ExtraHosts},
 			ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
 		})
 		if err != nil {

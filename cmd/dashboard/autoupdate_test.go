@@ -133,6 +133,48 @@ func TestAutoUpdateSkipReasonHostConfigRefusal(t *testing.T) {
 	}
 }
 
+// TestAutoUpdateSkipReasonExtraHostsNotRefused is the counterpart for
+// compose `extra_hosts`: inspectCloneSpec carries HostConfig.ExtraHosts
+// forward, so a service whose only non-default HostConfig field is ExtraHosts
+// must not be skipped.
+func TestAutoUpdateSkipReasonExtraHostsNotRefused(t *testing.T) {
+	containers := []dockerContainer{{
+		ID: "c1", Names: []string{"/app"}, State: "running", Image: "ghcr.io/org/app:v1",
+		Labels: map[string]string{labelEnable: "true", labelService: "app", labelHost: "app.example", labelPort: "80", labelAutoUpdate: "true"},
+	}}
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode(containers)
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			json.NewEncoder(w).Encode(map[string]any{
+				"Image":           "sha256:imgid",
+				"HostConfig":      map[string]any{"ExtraHosts": []string{"host.docker.internal:host-gateway"}},
+				"Config":          map[string]any{},
+				"NetworkSettings": map[string]any{"Networks": map[string]any{}},
+			})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+
+	ctx := context.Background()
+	svcs, err := dc.listServices(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := pickService(svcs, "app")
+	if app == nil {
+		t.Fatal("listServices did not return \"app\"")
+	}
+
+	st := &imageStatus{Image: "ghcr.io/org/app:v1", UpdateAvailable: true}
+	if reason := autoUpdateSkipReason(ctx, dc, *app, st); reason != "" {
+		t.Fatalf("autoUpdateSkipReason = %q, want \"\" — ExtraHosts is carried forward, not refused", reason)
+	}
+}
+
 // TestAutoUpdateBlockStore proves the store's own Set/Clear/Get semantics,
 // including nil-receiver safety for call sites (mostly tests) that don't
 // care about this feature and pass a nil *autoUpdateBlockStore.
