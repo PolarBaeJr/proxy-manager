@@ -361,6 +361,9 @@ func runServiceSpread(ctx context.Context, dc *dockerClient, registry *PeerRegis
 	}
 
 	var warnings []string
+	if len(clone.ExtraHosts) > 0 {
+		warnings = append(warnings, fmt.Sprintf("the template's extra_hosts entries are host-local and are not carried to %s — the replica there will not resolve those hostnames unless it is given its own", req.Target))
+	}
 	if bad := unreachableEnvKeys(env); len(bad) > 0 {
 		if !req.AllowUnreachableEnv {
 			return SpreadServiceResponse{}, fmt.Errorf(
@@ -704,6 +707,9 @@ func peerSpreadHandler(secret, identity string, dc *dockerClient, writesEnabled 
 			// proxy, so it needs no host port — which also keeps
 			// inspectHostConfigUnknowns from refusing to replace/autoupdate
 			// it later, the way a duplicated container is refused today.
+			// ExtraHosts (like the template's extra networks) is
+			// deliberately not carried cross-host either: it is host-local
+			// config, and the origin only warns about leaving it behind.
 			dc.pullImage(r.Context(), req.Image)
 			id, err := dc.createContainer(r.Context(), cname, createBody{
 				Image:        req.Image,

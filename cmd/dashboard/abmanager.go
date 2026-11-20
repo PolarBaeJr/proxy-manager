@@ -185,7 +185,7 @@ func (c *dockerClient) relabelABReplicas(ctx context.Context, name, image string
 		}
 		last = cname
 		id, err := c.createContainer(ctx, cname, createBody{
-			Image: firstNonEmpty(image, old.Image), Labels: labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts},
+			Image: firstNonEmpty(image, old.Image), Labels: labels, Env: tc.env, Healthcheck: tc.clone.Healthcheck, HostConfig: hostConfig{Mounts: tc.clone.Mounts, ExtraHosts: tc.clone.ExtraHosts},
 			ManagedAliases: tc.clone.ManagedAliases, ExtraNetworks: tc.clone.ExtraNetworks,
 		})
 		if err != nil {

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -314,6 +318,75 @@ func TestServicesSpreadDropsOutOfRangeWeight(t *testing.T) {
 	_, body := cap.first(t)
 	if _, ok := body.Labels[labelWeight]; ok {
 		t.Errorf("%s present = %q, want absent — an out-of-range weight must fall back to the default, not reach the peer", labelWeight, body.Labels[labelWeight])
+	}
+}
+
+// TestServicesSpreadWarnsAndDropsExtraHosts proves extra_hosts is host-local
+// on the spread path: the origin still spreads (a warning, never a refusal),
+// nothing about it crosses the peer wire, and the replica is created without
+// it.
+func TestServicesSpreadWarnsAndDropsExtraHosts(t *testing.T) {
+	t.Setenv("DASHBOARD_PEER_SECRET", "s3cret")
+
+	target, cap := newSpreadTargetServer(t)
+	targetURL, err := url.Parse(target.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var peerBody []byte
+	forward := httputil.NewSingleHostReverseProxy(targetURL)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if strings.HasSuffix(r.URL.Path, "/peer/spread") {
+			mu.Lock()
+			peerBody = b
+			mu.Unlock()
+		}
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(front.Close)
+
+	dc := dockerStub(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			json.NewEncoder(w).Encode(spreadAppContainers())
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			w.Write([]byte(`{"Image":"sha256:abc","Config":{"Env":[]},"HostConfig":{"Mounts":[],"ExtraHosts":["host.docker.internal:host-gateway"]},"NetworkSettings":{"Networks":{"edge":{}}}}`))
+		default:
+			w.Write([]byte("{}"))
+		}
+	}))
+
+	rec := postSpread(t, dc, front, `{"target":"dashboard-b"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s — extra_hosts must warn, never refuse", rec.Code, rec.Body.String())
+	}
+
+	var resp SpreadServiceResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(resp.Warnings, "\n")
+	if !strings.Contains(joined, "extra_hosts") {
+		t.Errorf("warnings = %q, want the dropped extra_hosts named", joined)
+	}
+
+	mu.Lock()
+	wire := string(peerBody)
+	mu.Unlock()
+	if wire == "" {
+		t.Fatal("peer never saw a spread request")
+	}
+	lower := strings.ToLower(wire)
+	if strings.Contains(lower, "extrahosts") || strings.Contains(lower, "extra_hosts") || strings.Contains(wire, "host-gateway") {
+		t.Errorf("peer spread request carries extra hosts: %s", wire)
+	}
+
+	_, body := cap.first(t)
+	if len(body.HostConfig.ExtraHosts) != 0 {
+		t.Errorf("ExtraHosts = %v, want none on the spread replica", body.HostConfig.ExtraHosts)
 	}
 }
 
