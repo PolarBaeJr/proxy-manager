@@ -493,6 +493,9 @@ footer.app code{color:var(--muted)}
 .log-view .line{display:block;padding:1px 0}
 .log-view .line.stderr{color:#ffa48a}
 .log-view .line .src{color:var(--muted-2);user-select:none;display:inline-block;width:54px;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.log-view .line .ts{color:var(--muted-2);user-select:none;margin-right:10px;font-size:11px}
+.log-view .line .ts:empty{display:none}
+.log-view .line .rep{color:var(--muted);user-select:none;margin-left:10px;font-size:11px;border:1px solid var(--border-2);border-radius:999px;padding:0 6px}
 .log-view .empty{color:var(--muted);font-style:italic}
 .log-view .hit{background:rgba(240,200,73,.18);color:#fff;border-radius:2px;padding:0 2px}
 .log-status{display:flex;gap:10px;align-items:center;margin-top:8px;font-size:11.5px;color:var(--muted)}
@@ -4343,6 +4346,16 @@ async function fetchLogs(force) {
   }
 }
 
+// logTime renders a log line's RFC3339 timestamp as local HH:MM:SS ('' when
+// the line has none).
+function logTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d)) return '';
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
 function paintLogs() {
   const view = $('#log-view');
   if (!view) return;
@@ -4354,7 +4367,15 @@ function paintLogs() {
     return;
   }
   const wasAtBottom = (view.scrollHeight - view.scrollTop - view.clientHeight) < 24;
-  const out = filtered.map(l => {
+  // Consecutive lines with the same stream and text collapse into one row
+  // carrying a ×N count and the first–last time.
+  const groups = [];
+  for (const l of filtered) {
+    const g = groups[groups.length - 1];
+    if (g && g.stream === l.stream && g.text === l.text) { g.n++; g.last = l.ts || g.last; }
+    else groups.push({stream: l.stream, text: l.text, ts: l.ts || '', last: l.ts || '', n: 1});
+  }
+  const out = groups.map(l => {
     let text = esc(l.text || '');
     if (q) {
       // Substring highlight via indexOf — avoids regex injection from special
@@ -4370,7 +4391,10 @@ function paintLogs() {
       text = parts;
     }
     return '<span class="line ' + (l.stream === 'stderr' ? 'stderr' : 'stdout') + '">'
-         +    '<span class="src">' + (l.stream || 'stdout') + '</span>' + text + '</span>';
+         +    '<span class="ts"' + (l.ts ? ' title="' + esc(l.ts + (l.n > 1 && l.last !== l.ts ? ' – ' + l.last : '')) + '"' : '') + '>'
+         +      logTime(l.ts) + (l.n > 1 && l.last && l.last !== l.ts ? '–' + logTime(l.last) : '') + '</span>'
+         +    '<span class="src">' + (l.stream || 'stdout') + '</span>' + text
+         +    (l.n > 1 ? '<span class="rep">×' + l.n + '</span>' : '') + '</span>';
   }).join('');
   view.innerHTML = out;
   if (wasAtBottom) view.scrollTop = view.scrollHeight;

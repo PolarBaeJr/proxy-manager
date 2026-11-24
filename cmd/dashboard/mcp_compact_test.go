@@ -413,7 +413,7 @@ func TestGetLogsGroupsStreamsAndCollapsesRepeats(t *testing.T) {
 	if isErr {
 		t.Fatalf("unexpected error: %s", text)
 	}
-	want := "6 log lines — grouped by stream, consecutive repeats collapsed as (×N).\n" +
+	want := "6 log lines — grouped by stream, times UTC, consecutive repeats collapsed as (×N).\n" +
 		"[stdout]\nboot\n[stderr]\nprobe failed  (×3)\nother\n[stdout]\nprobe failed"
 	if text != want {
 		t.Errorf("got:\n%s\nwant:\n%s", text, want)
@@ -428,4 +428,29 @@ func TestGetLogsWrappedEmptyAndFallback(t *testing.T) {
 	wantAll(t, text, "0 log lines.")
 	text, _, _ = compactTool(t, `{"error":"nope"}`, "get_logs", `{"container":"c"}`)
 	wantAll(t, text, `"error"`, "nope")
+}
+
+func TestGetLogsTimestamps(t *testing.T) {
+	body := `[{"stream":"stderr","text":"probe failed","ts":"2026-11-24T01:00:00Z"},
+ {"stream":"stderr","text":"probe failed","ts":"2026-11-24T01:00:10Z"},
+ {"stream":"stderr","text":"done","ts":"2026-11-24T01:00:11Z"}]`
+	text, _, _ := compactTool(t, body, "get_logs", `{"container":"c"}`)
+	wantAll(t, text,
+		"2026-11-24T01:00:00Z..2026-11-24T01:00:10Z probe failed  (×2)",
+		"\n2026-11-24T01:00:11Z done")
+}
+
+func TestSplitLogTimestamp(t *testing.T) {
+	for _, c := range []struct{ in, ts, text string }{
+		{"2026-11-24T01:02:03.123456789Z hello world", "2026-11-24T01:02:03Z", "hello world"},
+		{"2026-11-24T01:02:03.5-08:00 x", "2026-11-24T09:02:03Z", "x"},
+		{"2026-11-24T01:02:03Z", "2026-11-24T01:02:03Z", ""},
+		{"no stamp here", "", "no stamp here"},
+		{"", "", ""},
+	} {
+		ts, text := splitLogTimestamp(c.in)
+		if ts != c.ts || text != c.text {
+			t.Errorf("%q: got (%q,%q) want (%q,%q)", c.in, ts, text, c.ts, c.text)
+		}
+	}
 }
