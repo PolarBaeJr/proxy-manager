@@ -49,6 +49,9 @@ func (c *dockerClient) listContainerSummaries(ctx context.Context) ([]containerS
 type logLine struct {
 	Stream string `json:"stream"` // "stdout" | "stderr"
 	Text   string `json:"text"`
+	// TS is the Docker-recorded time of the line (RFC3339, UTC), empty when
+	// the daemon's prefix was missing or unparseable.
+	TS string `json:"ts,omitempty"`
 }
 
 // containerLogs fetches up to `tail` lines from a container. The Docker daemon
@@ -61,7 +64,7 @@ func (c *dockerClient) containerLogs(ctx context.Context, idOrName string, tail 
 	if tail > 5000 {
 		tail = 5000
 	}
-	q := fmt.Sprintf("/containers/%s/logs?stdout=1&stderr=1&timestamps=0&tail=%d",
+	q := fmt.Sprintf("/containers/%s/logs?stdout=1&stderr=1&timestamps=1&tail=%d",
 		idOrName, tail)
 	body, err := c.get(ctx, q)
 	if err != nil {
@@ -124,10 +127,26 @@ func validContainerName(s string) bool {
 	return true
 }
 
+// splitLogTimestamp peels the RFC3339Nano prefix Docker adds with
+// timestamps=1 off a line, returning it truncated to seconds. A line with no
+// parseable prefix comes back whole with an empty timestamp.
+func splitLogTimestamp(line string) (ts, text string) {
+	head, rest, ok := strings.Cut(line, " ")
+	if !ok {
+		head, rest = line, ""
+	}
+	t, err := time.Parse(time.RFC3339Nano, head)
+	if err != nil {
+		return "", line
+	}
+	return t.UTC().Format(time.RFC3339), rest
+}
+
 func splitLines(data []byte, stream string) []logLine {
 	out := []logLine{}
 	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
-		out = append(out, logLine{Stream: stream, Text: line})
+		ts, text := splitLogTimestamp(line)
+		out = append(out, logLine{Stream: stream, Text: text, TS: ts})
 	}
 	return out
 }

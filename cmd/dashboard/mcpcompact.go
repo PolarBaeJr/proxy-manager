@@ -350,7 +350,8 @@ func renderDNS(b []byte, name string) (string, error) {
 
 // renderLogs renders a GET /api/logs/{container} body as plain text: a
 // "[stream]" header only where the stream changes, then that run's lines,
-// with consecutive identical lines collapsed to one "text  (×N)". Accepts
+// each prefixed with its UTC time when known, with consecutive identical
+// lines collapsed to one "first..last text  (×N)". Accepts
 // the bare line array or an object carrying it under "lines".
 func renderLogs(b []byte) string {
 	var lines []logLine
@@ -367,17 +368,24 @@ func renderLogs(b []byte) string {
 		return "0 log lines."
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "%d log lines — grouped by stream, consecutive repeats collapsed as (×N).\n", len(lines))
+	fmt.Fprintf(&sb, "%d log lines — grouped by stream, times UTC, consecutive repeats collapsed as (×N).\n", len(lines))
 	stream := ""
 	for i := 0; i < len(lines); {
 		l := lines[i]
 		n := 1
-		for i+n < len(lines) && lines[i+n] == l {
+		for i+n < len(lines) && lines[i+n].Stream == l.Stream && lines[i+n].Text == l.Text {
 			n++
 		}
 		if l.Stream != stream {
 			stream = l.Stream
 			fmt.Fprintf(&sb, "[%s]\n", stream)
+		}
+		if l.TS != "" {
+			sb.WriteString(l.TS)
+			if last := lines[i+n-1].TS; n > 1 && last != "" && last != l.TS {
+				sb.WriteString(".." + last)
+			}
+			sb.WriteByte(' ')
 		}
 		sb.WriteString(l.Text)
 		if n > 1 {
