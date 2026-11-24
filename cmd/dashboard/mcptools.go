@@ -297,7 +297,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 	s.Register(Tool{
 		Name:        "get_logs",
 		Title:       "Get container logs",
-		Description: "Fetch recent log lines for one container. Use list_services first — each line's members= list has the exact container names.",
+		Description: "Fetch recent log lines for one container as plain text, grouped by stream with consecutive repeats collapsed. Use list_services first — each line's members= list has the exact container names.",
 		InputSchema: schema(map[string]any{
 			"container": prop("string", "Exact container name."),
 			"tail":      prop("number", "Trailing lines to return (default 200, max 2000)."),
@@ -323,7 +323,7 @@ func registerMCPTools(s *Server, a *apiCaller, allowWrites, allowPeerWrites bool
 			if err != nil {
 				return "", err
 			}
-			return string(b), nil
+			return renderLogs(b), nil
 		},
 	})
 

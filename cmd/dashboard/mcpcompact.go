@@ -347,3 +347,44 @@ func renderDNS(b []byte, name string) (string, error) {
 	}
 	return strings.Join(lines, "\n"), nil
 }
+
+// renderLogs renders a GET /api/logs/{container} body as plain text: a
+// "[stream]" header only where the stream changes, then that run's lines,
+// with consecutive identical lines collapsed to one "text  (×N)". Accepts
+// the bare line array or an object carrying it under "lines".
+func renderLogs(b []byte) string {
+	var lines []logLine
+	if err := json.Unmarshal(b, &lines); err != nil {
+		var wrapped struct {
+			Lines []logLine `json:"lines"`
+		}
+		if err := json.Unmarshal(b, &wrapped); err != nil || wrapped.Lines == nil {
+			return pretty(b)
+		}
+		lines = wrapped.Lines
+	}
+	if len(lines) == 0 {
+		return "0 log lines."
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%d log lines — grouped by stream, consecutive repeats collapsed as (×N).\n", len(lines))
+	stream := ""
+	for i := 0; i < len(lines); {
+		l := lines[i]
+		n := 1
+		for i+n < len(lines) && lines[i+n] == l {
+			n++
+		}
+		if l.Stream != stream {
+			stream = l.Stream
+			fmt.Fprintf(&sb, "[%s]\n", stream)
+		}
+		sb.WriteString(l.Text)
+		if n > 1 {
+			fmt.Fprintf(&sb, "  (×%d)", n)
+		}
+		sb.WriteByte('\n')
+		i += n
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
