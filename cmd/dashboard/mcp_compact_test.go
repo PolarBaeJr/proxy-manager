@@ -404,3 +404,28 @@ func TestListToolSchemasDocumentSelector(t *testing.T) {
 		t.Errorf("saw %d of %d tools", seen, len(want))
 	}
 }
+
+func TestGetLogsGroupsStreamsAndCollapsesRepeats(t *testing.T) {
+	body := `[{"stream":"stdout","text":"boot"},
+ {"stream":"stderr","text":"probe failed"},{"stream":"stderr","text":"probe failed"},{"stream":"stderr","text":"probe failed"},
+ {"stream":"stderr","text":"other"},{"stream":"stdout","text":"probe failed"}]`
+	text, isErr, _ := compactTool(t, body, "get_logs", `{"container":"c"}`)
+	if isErr {
+		t.Fatalf("unexpected error: %s", text)
+	}
+	want := "6 log lines — grouped by stream, consecutive repeats collapsed as (×N).\n" +
+		"[stdout]\nboot\n[stderr]\nprobe failed  (×3)\nother\n[stdout]\nprobe failed"
+	if text != want {
+		t.Errorf("got:\n%s\nwant:\n%s", text, want)
+	}
+	wantNone(t, text, `"stream"`, `"text"`)
+}
+
+func TestGetLogsWrappedEmptyAndFallback(t *testing.T) {
+	text, _, _ := compactTool(t, `{"container":"c","lines":[{"stream":"stderr","text":"x"}]}`, "get_logs", `{"container":"c"}`)
+	wantAll(t, text, "1 log lines", "[stderr]\nx")
+	text, _, _ = compactTool(t, `[]`, "get_logs", `{"container":"c"}`)
+	wantAll(t, text, "0 log lines.")
+	text, _, _ = compactTool(t, `{"error":"nope"}`, "get_logs", `{"container":"c"}`)
+	wantAll(t, text, `"error"`, "nope")
+}

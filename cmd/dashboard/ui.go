@@ -2859,15 +2859,15 @@ function unitActionButtons(agg, svcName) {
       : '<button class="btn primary" ' + dis + hostsAttr + ' onclick="openStageUnit(this)">' + I.rocket + 'Stage new version' + lkHtml + '</button>')
     + '<button class="btn" ' + dis + hostsAttr + ' onclick="openReplaceUnit(this)">' + I.swap + 'Replace' + lkHtml + '</button>'
     + (agg.anyStopped
-        ? '<button disabled title="Start every host in this unit first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
-        : '<button ' + dis + hostsAttr + ' onclick="openAddEnvUnit(this)">' + I.plus + 'Add env…' + lkHtml + '</button>');
+        ? '<button class="btn" disabled title="Start every host in this unit first — adding env clones a running replica\'s config">' + I.plus + 'Add env…</button>'
+        : '<button class="btn" ' + dis + hostsAttr + ' onclick="openAddEnvUnit(this)">' + I.plus + 'Add env…' + lkHtml + '</button>');
   if (agg.hasLocal && !agg.instances.some(i => i.onboarded)) {
     const envHosts = [];
     for (const i of agg.instances) {
       const h = i.writable ? (i.machine || _selfIdentity) : '';
       if (h && !envHosts.includes(h)) envHosts.push(h);
     }
-    html += centralEnvButtons(svcName, unitCentralOrigin(agg), envHosts);
+    html += centralEnvButtons(svcName, unitCentralOrigin(agg), envHosts, 'btn');
   }
   return html;
 }
@@ -2876,11 +2876,14 @@ function unitActionButtons(agg, svcName) {
 // origin — and Release on a managed one, which the API forwards to the
 // origin wherever it is. Elevated sessions only: adopt/release restart the
 // service on every host.
-function centralEnvButtons(svcName, origin, hosts) {
+function centralEnvButtons(svcName, origin, hosts, cls) {
   if (!isElevated()) return '';
   const sn = esc(svcName);
-  if (!origin) return '<button data-svc-name="' + sn + '" data-adopt-hosts="' + esc(JSON.stringify(hosts || [])) + '" onclick="openAdoptEnv(this.dataset.svcName, JSON.parse(this.dataset.adoptHosts))">' + I.layers + 'Adopt central env…</button>';
-  return '<button data-svc-name="' + sn + '" data-central-origin="' + esc(origin) + '" onclick="releaseCentralEnv(this.dataset.svcName, this.dataset.centralOrigin)">' + I.layers + 'Release central env…</button>';
+  // cls: the kebab menu styles bare buttons itself; the unit action bar
+  // needs .btn or the icon renders unsized.
+  const c = cls ? ' class="' + cls + '"' : '';
+  if (!origin) return '<button' + c + ' data-svc-name="' + sn + '" data-adopt-hosts="' + esc(JSON.stringify(hosts || [])) + '" onclick="openAdoptEnv(this.dataset.svcName, JSON.parse(this.dataset.adoptHosts))">' + I.layers + 'Adopt central env…</button>';
+  return '<button' + c + ' data-svc-name="' + sn + '" data-central-origin="' + esc(origin) + '" onclick="releaseCentralEnv(this.dataset.svcName, this.dataset.centralOrigin)">' + I.layers + 'Release central env…</button>';
 }
 
 function toggleMenu(e, id) {
